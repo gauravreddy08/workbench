@@ -1,0 +1,211 @@
+---
+// A toy weight update dW (24 x 24) built from a known spectrum, next to its best rank-r fit B·A and
+// the leftover error. Slider picks r. The shape strip draws W (d x d) beside B (d x r) and A (r x d)
+// to scale, and the readouts give parameter counts for the toy and for a real d = 4096 layer.
+// The fit shown is the best any rank-r product can do (truncated SVD), so it is a ceiling for LoRA.
+// Usage: <LoRARank />
+---
+<div class="lr" data-fig="lora-rank">
+  <svg viewBox="0 0 560 420" role="img" aria-label="Target weight update, its rank-r reconstruction and the error, with B and A drawn to scale and an error versus rank curve">
+    <text x="10" y="16" class="strong">TARGET ΔW</text>
+    <text x="203" y="16" class="strong">B · A (RANK <tspan data-el="rk">4</tspan>)</text>
+    <text x="396" y="16" class="strong">ERROR ΔW − B·A</text>
+    <g data-layer="m0"></g>
+    <g data-layer="m1"></g>
+    <g data-layer="m2"></g>
+    <rect x="10" y="24" width="154" height="154" class="ink" stroke-width="1" />
+    <rect x="203" y="24" width="154" height="154" class="ink" stroke-width="1" />
+    <rect x="396" y="24" width="154" height="154" class="ink" stroke-width="1" />
+
+    <text x="10" y="206" class="strong">SHAPES TO SCALE · d = 24</text>
+    <rect x="10" y="216" width="72" height="72" class="fill-paper" stroke-width="1.2" />
+    <text x="46" y="256" text-anchor="middle">W d×d</text>
+    <text x="46" y="318" text-anchor="middle" data-el="nW">d² = 576</text>
+    <text x="100" y="256" text-anchor="middle" class="strong">vs</text>
+    <rect data-el="B" x="118" y="216" width="12" height="72" class="fill-wash" stroke-width="1.2" />
+    <text data-el="Bl" x="124" y="302" text-anchor="middle">B</text>
+    <rect data-el="A" x="142" y="216" width="72" height="12" class="fill-wash" stroke-width="1.2" />
+    <text data-el="Al" x="178" y="242" text-anchor="middle">A</text>
+    <text x="178" y="318" text-anchor="middle" data-el="nBA">192</text>
+
+    <text x="320" y="206" class="strong">ERROR VS RANK</text>
+    <rect x="320" y="216" width="230" height="110" class="ink" stroke-width="1" />
+    <path data-el="curve" d="" class="blue" stroke-width="1.5" />
+    <line data-el="cur" x1="0" y1="216" x2="0" y2="326" class="ink dash" stroke-width="1" />
+    <circle data-el="dot" cx="0" cy="0" r="3.5" class="fill-blue" />
+    <text x="320" y="340">r = 1</text>
+    <text x="550" y="340" text-anchor="end">r = 24 (FULL)</text>
+    <text x="316" y="226" text-anchor="end">100%</text>
+    <text x="316" y="326" text-anchor="end">0</text>
+
+    <text x="10" y="372" class="strong">SINGULAR VALUES OF ΔW · KEPT IN BLUE</text>
+    <g data-layer="spec"></g>
+  </svg>
+  <div class="ctl">
+    <label>rank r <input type="range" min="1" max="24" step="1" value="4" data-in="r" /><output data-out="r">4</output></label>
+  </div>
+  <div class="ctl">
+    <span>update</span>
+    <button class="btn" type="button" data-t="low" aria-pressed="true">Few directions</button>
+    <button class="btn" type="button" data-t="noisy" aria-pressed="false">Few + noise</button>
+    <button class="btn" type="button" data-t="full" aria-pressed="false">Many directions</button>
+  </div>
+  <div class="ctl">
+    <span>error ‖ΔW−BA‖/‖ΔW‖ <span class="readout" data-out="err">-</span></span>
+    <span>toy params: d² <span class="readout">576</span> vs 2dr <span class="readout" data-out="toy">-</span></span>
+  </div>
+  <div class="ctl">
+    <span>at d = 4096: d² <span class="readout">16.8M</span> vs 2dr <span class="readout" data-out="real">-</span> (<span class="readout" data-out="pct">-</span>)</span>
+  </div>
+</div>
+
+<style>
+  .lr svg { width: 100%; }
+</style>
+
+<script>
+  const D = 24;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    return e;
+  };
+  // seeded gaussian, so every reader sees the same matrix
+  let seed = 11;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const gauss = () => {
+    const u = Math.max(rnd(), 1e-9), v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  // random orthonormal basis (Gram-Schmidt): columns are directions
+  const orth = (): number[][] => {
+    const cols: number[][] = [];
+    for (let j = 0; j < D; j++) {
+      let v = Array.from({ length: D }, gauss);
+      for (const c of cols) {
+        const dot = v.reduce((s, x, i) => s + x * c[i], 0);
+        v = v.map((x, i) => x - dot * c[i]);
+      }
+      const n = Math.hypot(...v);
+      cols.push(v.map((x) => x / n));
+    }
+    return cols;
+  };
+  const U = orth();
+  const V = orth();
+  const SPECTRA: Record<string, number[]> = {
+    // a handful of strong directions: what a format or style change tends to look like
+    low: Array.from({ length: D }, (_, i) => (i < 4 ? [1, 0.7, 0.45, 0.3][i] : 0.0)),
+    // the same few directions plus a floor of small ones
+    noisy: Array.from({ length: D }, (_, i) => (i < 4 ? [1, 0.7, 0.45, 0.3][i] : 0.05)),
+    // energy spread over many directions: lots of unrelated new facts
+    full: Array.from({ length: D }, (_, i) => 1 / (1 + 0.12 * i)),
+  };
+  const build = (s: number[], r: number) => {
+    const M = new Float64Array(D * D);
+    for (let k = 0; k < r; k++) {
+      if (!s[k]) continue;
+      for (let i = 0; i < D; i++) for (let j = 0; j < D; j++) M[i * D + j] += s[k] * U[k][i] * V[k][j];
+    }
+    return M;
+  };
+  const relErr = (s: number[], r: number) => {
+    const tot = s.reduce((a, x) => a + x * x, 0);
+    const rest = s.slice(r).reduce((a, x) => a + x * x, 0);
+    return Math.sqrt(rest / tot);
+  };
+  const fmt = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e4 ? Math.round(n / 1e3) + 'k' : n.toLocaleString('en-US'));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="lora-rank"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const rIn = q<HTMLInputElement>('[data-in="r"]');
+    const tBtns = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-t]'));
+    const layers = [0, 1, 2].map((i) => q<SVGGElement>(`[data-layer="m${i}"]`));
+    const X0 = [10, 203, 396], Y0 = 24, CELL = 154 / D;
+    // build the three grids of cells once
+    const cells: SVGRectElement[][] = layers.map((g, li) => {
+      const arr: SVGRectElement[] = [];
+      for (let i = 0; i < D; i++)
+        for (let j = 0; j < D; j++) {
+          const c = mk('rect', { x: (X0[li] + j * CELL).toFixed(2), y: (Y0 + i * CELL).toFixed(2), width: (CELL + 0.2).toFixed(2), height: (CELL + 0.2).toFixed(2) }) as SVGRectElement;
+          g.appendChild(c);
+          arr.push(c);
+        }
+      return arr;
+    });
+    const specG = q<SVGGElement>('[data-layer="spec"]');
+    let target = 'low';
+
+    const paint = (arr: SVGRectElement[], M: Float64Array, scale: number) => {
+      for (let k = 0; k < arr.length; k++) {
+        const v = M[k] / scale;
+        const a = Math.min(1, Math.abs(v));
+        arr[k].setAttribute('style', `fill:${v >= 0 ? 'var(--blue)' : 'var(--ink)'};fill-opacity:${(a * 0.9).toFixed(3)}`);
+      }
+    };
+
+    const render = () => {
+      const r = Number(rIn.value);
+      const s = SPECTRA[target];
+      const T = build(s, D);
+      const R = build(s, r);
+      const E = T.map((x, k) => x - R[k]);
+      let mx = 0;
+      for (const x of T) mx = Math.max(mx, Math.abs(x));
+      paint(cells[0], T, mx);
+      paint(cells[1], R, mx);
+      paint(cells[2], E, mx);
+
+      // shapes to scale (72 px = 24 rows)
+      const w = (72 * r) / D;
+      q('[data-el="B"]').setAttribute('width', w.toFixed(1));
+      q('[data-el="Bl"]').setAttribute('x', (118 + w / 2).toFixed(1));
+      q('[data-el="A"]').setAttribute('x', (118 + w + 12).toFixed(1));
+      q('[data-el="A"]').setAttribute('height', w.toFixed(1));
+      q('[data-el="Al"]').setAttribute('x', (118 + w + 12 + 36).toFixed(1));
+      q('[data-el="Al"]').setAttribute('y', (216 + w + 14).toFixed(1));
+      q('[data-el="nBA"]').setAttribute('x', (118 + (w + 12 + 72) / 2).toFixed(1));
+      q('[data-el="nBA"]').textContent = `B+A = ${2 * D * r}`;
+      q('[data-el="rk"]').textContent = String(r);
+
+      // error curve
+      const px = (k: number) => 320 + ((k - 1) / (D - 1)) * 230;
+      const py = (e: number) => 326 - e * 100;
+      let d = '';
+      for (let k = 1; k <= D; k++) d += `${k === 1 ? 'M' : 'L'}${px(k).toFixed(1)},${py(relErr(s, k)).toFixed(1)}`;
+      q('[data-el="curve"]').setAttribute('d', d);
+      const e = relErr(s, r);
+      q('[data-el="cur"]').setAttribute('x1', px(r).toFixed(1));
+      q('[data-el="cur"]').setAttribute('x2', px(r).toFixed(1));
+      q('[data-el="dot"]').setAttribute('cx', px(r).toFixed(1));
+      q('[data-el="dot"]').setAttribute('cy', py(e).toFixed(1));
+
+      // spectrum bars
+      specG.replaceChildren();
+      const bw = 540 / D;
+      s.forEach((v, k) => {
+        const h = Math.max(1, v * 34);
+        specG.appendChild(mk('rect', { x: (10 + k * bw + 1).toFixed(1), y: (414 - h).toFixed(1), width: (bw - 2).toFixed(1), height: h.toFixed(1), class: k < r ? 'fill-blue' : 'fill-paper', 'stroke-width': 1 }));
+      });
+
+      out('r').textContent = String(r);
+      out('err').textContent = `${(e * 100).toFixed(1)}%`;
+      out('toy').textContent = `${2 * D * r}`;
+      const real = 2 * 4096 * r;
+      out('real').textContent = fmt(real);
+      out('pct').textContent = `${((100 * real) / 4096 ** 2).toFixed(2)}% of W`;
+    };
+
+    rIn.addEventListener('input', render);
+    tBtns.forEach((b) =>
+      b.addEventListener('click', () => {
+        target = b.dataset.t!;
+        tBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

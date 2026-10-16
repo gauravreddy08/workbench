@@ -1,0 +1,782 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import VecScanCost from '../components/figures/VecScanCost.astro';
+import VecSearchStepper from '../components/figures/VecSearchStepper.astro';
+
+## Today
+
+- Treat an embedding as a point in space, and say exactly when cosine, dot product and Euclidean distance give the same ranking.
+- Work out, on a napkin, what brute-force search over 100 million vectors costs in bytes, multiply-adds and milliseconds, and why the answer is set by memory bandwidth.
+- Explain the three classic ways around it (IVF, product quantization, HNSW) in plain words, and which dial on each trades recall for speed or memory.
+- Build all of them on real MS MARCO embeddings on the Spark, measure recall@10 against brute force, and plot recall against queries per second and memory.
+- Put an approximate index in front of a cross-encoder, the two-stage pipeline you work on, and measure what each stage costs and buys in NDCG.
+
+Prerequisites: [How does it scale?](/lessons/back-of-envelope/) (napkin math) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bandwidth-bound vs compute-bound). Helpful: [Why is NumPy 100x faster?](/lessons/cpu-caches/). Rough time: one evening to read, one long session on the Spark.
+
+## The Problem
+
+Your cross-encoder is good. Give it a query and a passage and it reads them together, every word of one attending to every word of the other, and outputs one relevance score. It is also slow on purpose: one forward pass of a small transformer per pair. Call it a millisecond per pair on a GPU when batched, which is generous.
+
+Now the index has 100 million passages. Scoring all of them for one query is 100 million forward passes. At a millisecond each that is 28 hours. Per query.
+
+So nobody does that. Search systems run in two stages. First, a cheap stage pulls a thousand or so plausible candidates out of the hundred million. Then the expensive model, your model, reorders only those. The ranker can only reorder what it is handed: if the right passage isn't in the thousand, no amount of training on your side brings it back.
+
+The cheap stage, for a growing share of systems, works like this. A small <Term w="bi-encoder">A model that turns a query and a document into vectors separately, so documents can be turned into vectors once, ahead of time. Relevance is then a simple vector comparison. Contrast with a cross-encoder, which must see both texts together.</Term> turns every passage into a list of numbers ahead of time, say 768 of them. At query time it turns the query into 768 numbers too, and the job becomes: which of the 100 million stored lists is closest to this one?
+
+That sounds easy. It's one dot product per passage. Let's see what "one dot product per passage" costs when there are 100 million passages, and then spend the rest of the lesson cheating our way out of it.
+
+<Origin year="1975–2016" title="The curse of dimensionality, and forty years of cheating">
+
+Finding the nearest point is an old problem. In 1975 Jon Bentley invented the k-d tree, which splits space in half again and again, like a binary search over coordinates. In two or three dimensions it is wonderful: a query only visits a few boxes. In 100 dimensions it collapses. There are so many directions that the query's neighbourhood touches almost every box, and the tree ends up checking nearly everything. People called this the curse of dimensionality, and for a while it looked like exact fast search in high dimensions was hopeless.
+
+So the field gave up on exact. In 1998 Piotr Indyk and Rajeev Motwani formalized approximate nearest neighbour search with locality-sensitive hashing: accept "very close" instead of "closest", and you can be fast. In 2011 Hervé Jégou, Matthijs Douze and Cordelia Schmid showed you could compress vectors 30-100× and still search them (product quantization, with an inverted file of clusters in front), which made billion-image search fit in RAM. In 2016 Yury Malkov and Dmitry Yashunin published HNSW, a layered graph you walk like a road network, which became the default in most vector databases. Then in 2019-2020 dense retrieval models like DPR made "embed everything, find the nearest" a standard first stage for text search, and every one of these old tricks found a second career.
+
+</Origin>
+
+## The Idea
+
+### An embedding is a point
+
+An <Term w="embedding">A fixed-length list of numbers that a model outputs for a piece of text (or an image, or a user). The model is trained so that things with similar meaning get similar lists.</Term> is a list of numbers, like 768 floats. Read the list as coordinates, and it is a point in a 768-dimensional space. Two numbers would be a point on a map. Three would be a point in a room. 768 is a point in a space you can't picture, but every rule you know from the map still holds: points have distances, and some points are closer than others.
+
+The <Term w="embedding model">The neural network that produces embeddings, for example a small sentence-transformer. Trained so that a query lands near the passages that answer it.</Term> was trained to arrange that space for you. A query like "how do I reset my router" lands near passages about routers and modem lights and far from passages about pasta. Search becomes geometry: find the stored points nearest the query point. That task is called <Term w="k-nearest neighbours" label="kNN">k-nearest neighbours: given a query point, find the k stored points closest to it. "Nearest neighbour search" usually means this.</Term>.
+
+<Figure n="001" title="POINTS, ANGLES, DISTANCES" caption="Left: meaning becomes position, and search becomes 'which points are near the query'. Right: three ways to say 'near'. Cosine looks only at the angle. Dot product is the angle times both lengths. Euclidean (L2) is the straight-line gap. On unit-length vectors all three rank neighbours identically.">
+<svg viewBox="0 0 640 270" role="img" aria-label="Left, a 2D scatter of text snippets with a query near router passages. Right, two vectors on a unit circle showing the angle and the straight-line distance between them.">
+  <rect x="8" y="12" width="296" height="246" class="fill-paper" stroke-width="1" />
+  <text x="20" y="32" class="strong">EMBEDDING SPACE (2 OF 768 DIMS)</text>
+  <circle cx="165" cy="128" r="44" class="blue dash" stroke-width="1" />
+  <line x1="157" y1="128" x2="173" y2="128" class="ink" stroke-width="1.5" />
+  <line x1="165" y1="120" x2="165" y2="136" class="ink" stroke-width="1.5" />
+  <text x="112" y="104" class="strong">QUERY</text>
+  <circle cx="186" cy="112" r="3.5" class="fill-blue" />
+  <text x="198" y="106" class="blue-t">reset router</text>
+  <circle cx="190" cy="150" r="3.5" class="fill-blue" />
+  <text x="214" y="160" class="blue-t">modem lights</text>
+  <circle cx="140" cy="158" r="3.5" class="fill-blue" />
+  <text x="70" y="182">wifi drops</text>
+  <circle cx="58" cy="226" r="3" class="fill-paper" stroke-width="1" />
+  <text x="66" y="230">pasta recipe</text>
+  <circle cx="92" cy="208" r="3" class="fill-paper" stroke-width="1" />
+  <text x="100" y="212">tomato sauce</text>
+  <circle cx="196" cy="60" r="3" class="fill-paper" stroke-width="1" />
+  <text x="204" y="64">gpu memory</text>
+  <circle cx="232" cy="230" r="3" class="fill-paper" stroke-width="1" />
+  <text x="200" y="250">tax forms</text>
+  <path d="M574,214 A150,150 0 0 0 424,64" class="ink dash" stroke-width="1" />
+  <line x1="424" y1="214" x2="590" y2="214" class="ink" stroke-width="1" />
+  <line x1="424" y1="214" x2="424" y2="44" class="ink" stroke-width="1" />
+  <line x1="424" y1="214" x2="565" y2="163" class="blue" stroke-width="1.5" />
+  <line x1="424" y1="214" x2="499" y2="84" class="blue" stroke-width="1.5" />
+  <circle cx="565" cy="163" r="3.5" class="fill-blue" />
+  <circle cx="499" cy="84" r="3.5" class="fill-blue" />
+  <text x="572" y="160" class="strong">a</text>
+  <text x="506" y="80" class="strong">b</text>
+  <line x1="565" y1="163" x2="499" y2="84" class="ink dash" stroke-width="1.2" />
+  <text x="540" y="116">L2</text>
+  <path d="M462,200 A40,40 0 0 0 444,179" class="blue" stroke-width="1.2" />
+  <text x="466" y="190" class="blue-t">θ</text>
+  <text x="330" y="32" class="strong">UNIT CIRCLE</text>
+  <text x="330" y="240">cos θ = a·b / (|a| |b|)</text>
+  <text x="330" y="256">unit length: |a − b|² = 2 − 2 cos θ</text>
+</svg>
+</Figure>
+
+### Three ways to say "near"
+
+There are three common measures, and you will see all three in library flags.
+
+- <Term w="dot product">Multiply the two vectors position by position and add up the results. a·b = a₁b₁ + a₂b₂ + ... + a₇₆₈b₇₆₈. Bigger means more similar.</Term>: 768 multiplies and 768 adds. Big when the vectors point the same way and are long.
+- <Term w="cosine similarity">The dot product divided by both vectors' lengths. It is the cosine of the angle between them: 1 for the same direction, 0 for unrelated (at right angles), −1 for opposite.</Term>: the dot product with length divided out, so it only measures the angle.
+- <Term w="Euclidean distance" label="L2 distance">The straight-line distance between two points: subtract position by position, square, add, take the square root. Smaller means more similar. Called L2 after the mathematical name of this norm.</Term>: the straight-line gap between the points. Small means similar.
+
+Here is the identity that ties them together. Expand the squared L2 distance:
+
+```text
+|a − b|²  =  |a|²  +  |b|²  −  2 (a · b)
+```
+
+Now suppose every vector has length 1 (you <Term w="normalize">Divide a vector by its own length so it has length exactly 1. It keeps the direction and throws away the size.</Term>d them). Then `|a|² = |b|² = 1`, the dot product *is* the cosine, and
+
+```text
+|a − b|²  =  2 − 2 cos θ
+```
+
+The squared distance is a fixed, decreasing function of the cosine. So sorting by smallest L2, by biggest dot product, and by biggest cosine gives the exact same order. That's why a lot of systems normalize everything and then use whichever operation their hardware or library does fastest, which is usually a plain dot product.
+
+When the vectors aren't normalized, they disagree. Dot product rewards length: a long vector that points roughly the right way can beat a short one that points exactly the right way. Some retrieval models are trained to use that (length can encode "this passage is generally useful"), and for those you must search by dot product, not cosine. The rule: **use the similarity the model was trained with.** The model card tells you. The small sentence-transformer you'll use in Build It was trained with cosine and outputs normalized vectors, so all three agree.
+
+<Predict id="cos-l2">
+Two unit-length vectors have cosine similarity 0.8. What's their Euclidean distance? If a third vector has cosine 0.6 with the first, is it closer or farther in L2?
+<Fragment slot="answer">
+
+`|a − b|² = 2 − 2(0.8) = 0.4`, so the distance is √0.4 ≈ 0.63. For cosine 0.6: `2 − 1.2 = 0.8`, distance ≈ 0.89. Farther. Lower cosine always means larger L2 on unit vectors, so the rankings match.
+
+</Fragment>
+</Predict>
+
+### Brute force, and what it costs
+
+The honest way to find the nearest neighbours: compute the similarity between the query and every stored vector, keep the top k. This is <Term w="brute force" label="brute-force kNN">Exact nearest neighbour search by comparing the query to every stored vector. Always correct. Cost grows linearly with the number of vectors. Also called flat or exhaustive search.</Term> (FAISS calls it a "flat" index). It's exact. Let's price it, back-of-envelope style.
+
+For N vectors of d dimensions, one query costs **N × d multiply-adds**. And to do them, the machine has to read every stored number once.
+
+For 100 million passages at 768 dimensions in 32-bit floats:
+
+- **Multiply-adds per query:** 10⁸ × 768 ≈ 7.7 × 10¹⁰. About 77 billion.
+- **Bytes:** 10⁸ × 768 × 4 bytes = 307 GB. That's the size of the index, and every query reads all of it.
+- **Does it fit on the Spark?** The spec sheet says 128 GB. No. Even at 16 bits per number (154 GB) it doesn't.
+- **If it did fit, how fast?** The Spark's spec-sheet memory bandwidth is about 273 GB/s. Reading 307 GB takes 307 / 273 ≈ **1.1 seconds**. Per query.
+
+<Predict id="compute-or-bandwidth">
+Is that 1.1 seconds limited by compute or by memory? The Spark's GPU can do on the order of tens of trillions of 32-bit multiply-adds per second (check the spec sheet). Work out how long the 77 billion multiply-adds would take if memory were free.
+<Fragment slot="answer">
+
+At even 10 trillion multiply-adds per second, 77 billion take about 8 ms. Reading the bytes takes about 1,100 ms. Memory is the bottleneck by two orders of magnitude.
+
+Here's the reason, in the language of [Why ~17 tokens per second?](/lessons/bandwidth-bound/): each 4-byte number is read once and used in exactly one multiply-add for this query. That's a quarter of a multiply-add per byte. The chip can do dozens of operations in the time it takes to fetch one byte, so it sits waiting. Single-query brute force is bandwidth-bound, exactly like decoding one token: read everything, do almost nothing with each piece.
+
+The same fix applies, too. Batch 1,000 queries together and each number you read gets used 1,000 times. Now it's a matrix multiply, compute-bound, and throughput jumps. You'll measure this. It's why offline jobs (like computing ground truth) brute force happily on a GPU, while a live service answering one query at a time can't.
+
+</Fragment>
+</Predict>
+
+Play with the knobs. Note how the read time scales with every factor, and which ones you can actually change.
+
+<Figure n="002" title="WHAT BRUTE FORCE COSTS" caption="One query, checked against every stored vector. Index size is vectors × bytes per vector, and the time to read it once at the machine's spec-sheet memory bandwidth is a floor on single-query latency. Fewer bytes per vector (fp16, int8, product quantization) helps linearly. Only not reading most of the vectors helps by orders of magnitude.">
+
+<VecScanCost />
+
+</Figure>
+
+Two ways out appear.
+
+1. **Read fewer bytes per vector.** Store them smaller. fp16 halves it, int8 quarters it, and product quantization (below) shrinks each vector to tens of bytes.
+2. **Read fewer vectors.** Don't look at most of the index. Somehow jump to the right neighbourhood and only check points there.
+
+Every serious vector index does one or both. And every one of them gives up the guarantee of the exact answer to do it.
+
+### Approximate, and the triangle
+
+<Term w="Approximate nearest neighbour" label="ANN">Approximate nearest neighbour search: return points that are probably the nearest, or very close to the nearest, in exchange for being much faster than brute force.</Term> search means: return the true nearest neighbours *most of the time*, much faster. The way you score "most of the time" is <Term w="recall@k">For ANN: of the true k nearest neighbours (found by brute force), what fraction did the index return in its top k? 0.95 means it found 9.5 of the true 10, on average over queries.</Term>.
+
+Be careful, because you already know a different recall from ranking. In [ranking metrics](/lessons/ranking-metrics/), recall asks "did we find the *relevant* documents?", judged by human labels. ANN recall asks "did we find the *same* top 10 that brute force would?", judged by the exact search over the same embeddings. The first measures the embedding model. The second measures only the index. If the embedding model ranks the right passage 400th, a perfect index still returns it 400th. Keep the two apart: ANN recall@10 = 0.98 can sit next to a retrieval recall@10 of 0.6.
+
+Every index lives somewhere in a triangle with three corners:
+
+- **Recall.** How often you get the true neighbours.
+- **Latency** (or its flip side, queries per second). How much work per query.
+- **Memory.** How many bytes per vector, plus the index's own structures.
+
+You can buy any one with the other two. Look at more of the index: recall up, speed down. Compress the vectors: memory down, recall down. Add a graph of links between vectors: speed and recall up, memory up. Index *build time* is a fourth cost that hides off to the side: some indexes take hours to build and can't easily absorb new vectors.
+
+The rest of the Idea is three tricks. Each one is a different bet about which corner to give up.
+
+### IVF: sort the library into rooms
+
+Picture a library with 100 million books and no catalogue. Brute force reads every spine. A smarter librarian first sorts the books into a thousand rooms by topic. When you ask a question, she figures out which few rooms your question belongs to, and only searches those.
+
+That's an <Term w="inverted file index" label="IVF">Inverted file index. Split the vectors into clusters ahead of time; store, for each cluster, the list of vectors in it. At query time, find the few clusters nearest the query and only search their lists.</Term>. Mechanically:
+
+1. **Train.** Run <Term w="k-means">A clustering algorithm: pick k centre points, assign every vector to its nearest centre, move each centre to the average of its vectors, repeat. The result splits the space into k regions.</Term> on (a sample of) your vectors to get `nlist` cluster centres, called <Term w="centroid">The centre point of a cluster: the average of the vectors assigned to it.</Term>s. Each centroid owns the region of space closer to it than to any other centroid. Those regions are called <Term w="Voronoi cells">The regions you get by giving every point in space to its nearest centre. Draw the borders and the space looks like a cracked tile floor.</Term>.
+2. **Add.** Put every vector in the list of its nearest centroid.
+3. **Search.** Compare the query to all `nlist` centroids (cheap: a thousand, not a hundred million). Pick the `nprobe` nearest. Brute-force only the vectors in those cells.
+
+The cost per query is roughly `nlist + nprobe × (N / nlist)` distance computations. For 100 million vectors, `nlist = 65,536` (2¹⁶) and `nprobe = 64`: that's 65,536 + 64 × 1,526 ≈ 160,000 distances instead of 100 million. About 600× less work.
+
+Where's the catch? The border. The query's true nearest neighbour can sit just across the line in a cell you didn't open. In 768 dimensions, a cell has a huge number of neighbouring cells, and the query often lands near several borders at once. `nprobe` is the dial: probe 1 cell and you miss a lot; probe more and recall climbs toward 1 while speed falls linearly. The FAISS docs suggest `nlist` somewhere between about 4√N and 16√N; then you sweep `nprobe`.
+
+### Product quantization: describe each vector in a few bytes
+
+IVF reads fewer vectors. It doesn't make them smaller, so 100 million × 768 floats still needs 307 GB. <Term w="product quantization" label="PQ">Compress a vector by cutting it into m short pieces and replacing each piece with the ID (one byte) of the closest entry in a small learned codebook for that piece. A 768-float vector becomes m bytes.</Term> fixes the memory corner.
+
+The analogy: describing a face to a sketch artist. You don't send a photo. You say "eyes: type 17, nose: type 203, mouth: type 4", picking each from a book of 256 standard shapes. The artist rebuilds an approximate face from a handful of numbers.
+
+PQ does exactly that to a vector:
+
+1. Cut the 768 numbers into `m = 96` consecutive pieces of 8 numbers each.
+2. For piece 1, run k-means with 256 centres on piece 1 of all your vectors. That's piece 1's <Term w="codebook">For one piece of the vector, a list of 256 representative short vectors learned by k-means. A piece is stored as the index (0-255) of the closest one, which fits in one byte.</Term>. Same for each of the 96 pieces.
+3. Store each vector as 96 bytes: for each piece, the ID of its nearest codebook entry.
+
+The memory math: 768 × 4 = 3,072 bytes becomes 96 bytes. **32× smaller.** 100 million vectors go from 307 GB to 9.6 GB, plus the IDs that IVF stores alongside (8 bytes each in FAISS, another 0.8 GB). That fits on the Spark with room to spare. Use `m = 48` and it's 64× smaller, at a further cost in accuracy.
+
+<Figure n="003" title="PRODUCT QUANTIZATION" caption="Top: a 768-float vector is cut into 96 pieces of 8; each piece is replaced by the ID of its nearest entry in that piece's 256-entry codebook. 3,072 bytes become 96. Bottom: at query time you never decompress. Precompute the query's similarity to every codebook entry once (a 96 × 256 table), then each stored vector's score is 96 table lookups added up.">
+<svg viewBox="0 0 640 300" role="img" aria-label="A long vector split into pieces, each mapped to a one-byte code, and a lookup table used to score codes">
+  <text x="10" y="22" class="strong">ONE VECTOR · 768 FLOATS · 3,072 BYTES</text>
+  <rect x="10" y="32" width="70" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="80" y="32" width="70" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="150" y="32" width="70" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="220" y="32" width="70" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="290" y="32" width="220" height="26" class="fill-paper dash" stroke-width="1" />
+  <rect x="510" y="32" width="70" height="26" class="fill-wash" stroke-width="1.2" />
+  <text x="45" y="49" text-anchor="middle">8 dims</text>
+  <text x="115" y="49" text-anchor="middle">8 dims</text>
+  <text x="185" y="49" text-anchor="middle">8 dims</text>
+  <text x="255" y="49" text-anchor="middle">8 dims</text>
+  <text x="400" y="49" text-anchor="middle">… 91 more pieces …</text>
+  <text x="545" y="49" text-anchor="middle">8 dims</text>
+  <line x1="45" y1="58" x2="45" y2="98" class="ink" stroke-width="1" />
+  <line x1="115" y1="58" x2="115" y2="98" class="ink" stroke-width="1" />
+  <line x1="185" y1="58" x2="185" y2="98" class="ink" stroke-width="1" />
+  <line x1="255" y1="58" x2="255" y2="98" class="ink" stroke-width="1" />
+  <line x1="545" y1="58" x2="545" y2="98" class="ink" stroke-width="1" />
+  <text x="300" y="82">NEAREST OF 256 CODEBOOK ENTRIES, PER PIECE</text>
+  <rect x="25" y="100" width="40" height="24" class="fill-blue" />
+  <rect x="95" y="100" width="40" height="24" class="fill-blue" />
+  <rect x="165" y="100" width="40" height="24" class="fill-blue" />
+  <rect x="235" y="100" width="40" height="24" class="fill-blue" />
+  <rect x="525" y="100" width="40" height="24" class="fill-blue" />
+  <text x="45" y="116" text-anchor="middle" style="fill:var(--paper)">17</text>
+  <text x="115" y="116" text-anchor="middle" style="fill:var(--paper)">203</text>
+  <text x="185" y="116" text-anchor="middle" style="fill:var(--paper)">4</text>
+  <text x="255" y="116" text-anchor="middle" style="fill:var(--paper)">88</text>
+  <text x="545" y="116" text-anchor="middle" style="fill:var(--paper)">131</text>
+  <text x="400" y="116" text-anchor="middle">…</text>
+  <text x="10" y="146" class="blue-t">STORED: 96 ONE-BYTE CODES · 96 BYTES · 32× SMALLER</text>
+  <line x1="10" y1="164" x2="630" y2="164" class="ink dash" stroke-width="1" />
+  <text x="10" y="186" class="strong">AT QUERY TIME</text>
+  <rect x="10" y="198" width="220" height="84" class="fill-paper" stroke-width="1.2" />
+  <text x="20" y="218" class="strong">TABLE, ONCE PER QUERY</text>
+  <text x="20" y="236">96 pieces × 256 entries</text>
+  <text x="20" y="252">= similarity of each query</text>
+  <text x="20" y="268">piece to each codebook entry</text>
+  <line x1="230" y1="240" x2="256" y2="240" class="ink" stroke-width="1.2" />
+  <rect x="256" y="198" width="378" height="84" class="fill-wash" stroke-width="1.2" />
+  <text x="266" y="218" class="strong">SCORE ONE STORED VECTOR</text>
+  <text x="266" y="238">T[0][17] + T[1][203] + T[2][4] + … + T[95][131]</text>
+  <text x="266" y="258">96 lookups, no decompression</text>
+  <text x="266" y="274" class="blue-t">BYTES READ PER VECTOR: 96, NOT 3,072</text>
+</svg>
+</Figure>
+
+The clever part is the bottom half of the figure. To score a compressed vector you don't rebuild it. You split the *query* into the same 96 pieces and compute, once, the similarity of each query piece to each of the 256 codebook entries for that piece. That's a 96 × 256 table, about 25,000 numbers, small enough to sit in cache. Now any stored vector's (approximate) dot product with the query is the sum of 96 table lookups, one per code. This is called <Term w="asymmetric distance computation" label="ADC">Scoring compressed database vectors against an uncompressed query, using a precomputed table. "Asymmetric" because only one side is compressed, which keeps more accuracy than compressing both.</Term>. Fewer bytes read, cheap arithmetic, and in a bandwidth-bound problem fewer bytes is exactly what you need.
+
+The price is accuracy. Each piece is snapped to the nearest of 256 shapes, so every score is a little wrong, and the ranking near the top gets shuffled. The standard fix is cheap: ask the PQ index for the top 100, then re-score those 100 with the full-precision vectors (kept on disk or in slower memory) and keep the best 10. This "compressed search, exact <Term w="re-rank">Take a short list of candidates from a cheap scorer and re-order it with a more accurate (and more expensive) scorer.</Term>" pattern is the whole lesson in miniature, and you'll see it again at the end.
+
+In FAISS the combination of the two ideas is `IVF65536,PQ96`: room-sorting to read fewer vectors, PQ to make each one small.
+
+### HNSW: highways, then local roads
+
+The third trick throws out the rooms entirely. Instead, build a graph: connect each vector to a handful of its near neighbours. To search, start somewhere, look at your neighbours, step to whichever is closest to the query, and repeat until no neighbour is closer. That's <Term w="greedy search">At each step, move to whichever neighbour is closest to the target, and stop when none is closer. Fast, but can get stuck in a spot that is locally best and not globally best.</Term> on a graph, and it's how you'd find a friend's house in a town with no map: keep taking whichever street heads most directly toward it.
+
+On its own this is slow for a big graph. If every link is short, crossing the whole space takes thousands of tiny steps. The fix is the one road networks use. You don't drive across the country on residential streets. You take local roads to a highway, the highway across most of the distance, and local roads again at the end.
+
+A <Term w="HNSW">Hierarchical Navigable Small World graph. Vectors are linked into several layers of graphs: the top layers hold few vectors with long links, the bottom layer holds every vector with short links. Search walks down the layers.</Term> index builds exactly that, in layers:
+
+- **Layer 0** contains every vector, each linked to its nearest neighbours. Local roads.
+- **Layer 1** contains a random subset, about one in M of them, linked to their nearest neighbours *within that subset*. Because the subset is sparse, those links are longer. A regional highway.
+- **Layer 2** keeps one in M of those, with even longer links. And so on up, until the top layer has a handful of vectors.
+
+Each vector's top layer is chosen at random when it's inserted, with exponentially falling odds, like flipping coins. If that sounds like a <Term w="skip list">A sorted linked list with extra "express" lists on top that skip over many elements, built by coin flips. Search runs along the express lane, then drops down. Lookups take about log N steps.</Term>, it is: HNSW is the skip list idea with graphs instead of sorted lists.
+
+<Figure n="004" title="HNSW: THE LAYERS" caption="The same points on three layers, drawn on one line for clarity. The search enters at the top, takes a few long hops toward the query, drops down a layer from wherever it stopped, and finishes with short hops on the bottom layer, which holds every point. Each layer down has more nodes and shorter links.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Three layers of a graph; a search path takes long hops on the top layer and short hops on the bottom">
+  <text x="10" y="50" class="strong">LAYER 2</text>
+  <text x="10" y="66">HIGHWAY</text>
+  <text x="10" y="136" class="strong">LAYER 1</text>
+  <text x="10" y="152">REGIONAL</text>
+  <text x="10" y="226" class="strong">LAYER 0</text>
+  <text x="10" y="242">LOCAL ROADS</text>
+  <text x="10" y="258">EVERY POINT</text>
+  <line x1="123" y1="54" x2="604" y2="54" class="ink" stroke-width="0.6" />
+  <line x1="123" y1="140" x2="604" y2="140" class="ink" stroke-width="0.6" />
+  <line x1="123" y1="230" x2="604" y2="230" class="ink" stroke-width="0.6" />
+  <line x1="140" y1="60" x2="140" y2="226" class="ink dash" stroke-width="0.8" />
+  <line x1="364" y1="60" x2="364" y2="226" class="ink dash" stroke-width="0.8" />
+  <line x1="570" y1="60" x2="570" y2="226" class="ink dash" stroke-width="0.8" />
+  <line x1="235" y1="146" x2="235" y2="226" class="ink dash" stroke-width="0.8" />
+  <line x1="467" y1="146" x2="467" y2="226" class="ink dash" stroke-width="0.8" />
+  <circle cx="140" cy="54" r="6" class="fill-paper" stroke-width="1.3" />
+  <circle cx="364" cy="54" r="6" class="fill-paper" stroke-width="1.3" />
+  <circle cx="570" cy="54" r="6" class="fill-paper" stroke-width="1.3" />
+  <circle cx="140" cy="140" r="5" class="fill-paper" stroke-width="1.2" />
+  <circle cx="235" cy="140" r="5" class="fill-paper" stroke-width="1.2" />
+  <circle cx="364" cy="140" r="5" class="fill-paper" stroke-width="1.2" />
+  <circle cx="467" cy="140" r="5" class="fill-paper" stroke-width="1.2" />
+  <circle cx="570" cy="140" r="5" class="fill-paper" stroke-width="1.2" />
+  <circle cx="140" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="166" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="192" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="213" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="235" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="260" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="286" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="314" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="338" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="364" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="388" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="415" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="441" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="467" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="487" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="510" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="536" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="570" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="596" cy="230" r="3.5" class="fill-paper" stroke-width="1" />
+  <text x="122" y="30">ENTRY</text>
+  <path d="M140,48 Q252,14 364,48" class="blue" stroke-width="2" />
+  <path d="M364,48 Q467,14 570,48" class="blue" stroke-width="2" />
+  <line x1="570" y1="60" x2="570" y2="134" class="blue" stroke-width="2" />
+  <path d="M570,134 Q518,112 467,134" class="blue" stroke-width="2" />
+  <line x1="467" y1="146" x2="467" y2="224" class="blue" stroke-width="2" />
+  <path d="M467,224 Q477,214 487,224" class="blue" stroke-width="2" />
+  <path d="M487,224 Q498,214 510,224" class="blue" stroke-width="2" />
+  <line x1="507" y1="250" x2="507" y2="282" class="ink" stroke-width="1.5" />
+  <line x1="499" y1="266" x2="515" y2="266" class="ink" stroke-width="1.5" />
+  <text x="521" y="270" class="strong">QUERY</text>
+  <circle cx="510" cy="230" r="7" class="blue" stroke-width="1.5" />
+  <text x="140" y="290" class="blue-t">2 LONG HOPS · 1 MEDIUM · 2 SHORT</text>
+</svg>
+</Figure>
+
+Three parameters control it, and they are the ones you'll tune:
+
+- **`M`**: how many links each node keeps per layer (the bottom layer usually gets 2M). More links means more ways to route around a dead end, so better recall, more memory (each link is a 4-byte ID: at M = 32 that's about 64 × 4 = 256 extra bytes per vector on layer 0), and slower builds. Typical: 16 to 64.
+- **`efConstruction`**: when inserting a vector, how wide a search to run to find its neighbours. Bigger means a better-wired graph and a slower build. Typical: 100 to 500. Set once; you can't change it after building.
+- **`efSearch`** (often just `ef`): the width of the search on the bottom layer at query time. Instead of keeping only the single best node, the search keeps a running list of the best `ef` nodes it has seen, and keeps expanding the closest unexplored one until nothing in the queue can beat the worst of its list. Bigger `ef` explores more, so recall up, speed down. This is the dial you turn per query, live, with no rebuild.
+
+Two more details from the paper that matter. The search on the upper layers is plain greedy (`ef = 1`): those layers only need to get you to the right neighbourhood. And when choosing a node's links, HNSW doesn't just take the M nearest. It skips a candidate if it's closer to an already-chosen neighbour than to the node itself. That keeps a few links pointing *away*, toward other clusters, instead of M links all pointing into the same tight huddle. Without it, clustered data breaks the graph into islands that greedy search can't leave.
+
+Now try both indexes on a small map. Click to place a query anywhere. In HNSW mode, step through and watch the big dark dots (the upper-layer nodes) carry the search across the map in a few hops, then the bottom layer fill in locally. In IVF mode, watch it measure the cell centres first and then scan whole cells.
+
+<Figure n="005" title="WALK THE INDEX" caption="600 points in 2D. HNSW: greedy hops on the sparse upper layers, then a beam search of width ef on the bottom layer. IVF: rank all 12 cell centres, then scan the nprobe nearest cells exactly. The counter compares distance computations with brute force's 600. In 2D both indexes rarely miss; in 768 dimensions the misses are real, and ef and nprobe are how you buy them back. You'll measure that in Build It." wide>
+
+<VecSearchStepper />
+
+</Figure>
+
+Things to try:
+
+1. **HNSW, query in a far corner.** The first hops are huge. Count the hops per layer: roughly constant, a handful each, which is why the cost grows roughly with log N instead of N.
+2. **HNSW, slide `ef` from 5 to 40.** The distance count rises and the found set stays perfect. This 2D map is too easy to show misses. On real 768-dimension data, low `ef` misses a lot (you'll see recall around 0.8-0.9 at small `ef`).
+3. **IVF, `nprobe = 1`, put the query right on a dotted border.** Some true neighbours sit in the cell next door, and IVF misses them. Bump `nprobe` to 2.
+4. **Compare the counters.** On this map HNSW checks about 40-70 points, IVF with `nprobe = 2` about 120. Brute force always 600. At 100 million points the gap is enormous.
+
+### Why not always HNSW?
+
+HNSW is the default in most vector databases because its recall-vs-speed curve is usually the best at a given memory budget, and it handles inserts without retraining. But look at the memory: it stores full vectors *plus* the links. 100 million × (3,072 + ~300) bytes is about 340 GB. It doesn't compress, and its access pattern hops randomly through memory, so it really wants the whole thing in RAM.
+
+A rough guide:
+
+| Index | Memory per 768-d vector | Speed at high recall | Notes |
+| --- | --- | --- | --- |
+| Flat (brute force) | 3,072 B | slowest | exact; the ground truth |
+| IVF-Flat | 3,072 B + 8 B ID | fast | needs training; recall falls off near cell borders |
+| IVF-PQ (m = 96) | ~104 B | fast | 30× less memory; re-rank with full vectors for accuracy |
+| HNSW (M = 32) | ~3,300 B | fastest | big; no training; easy inserts; slow builds; deletes are awkward |
+
+At the 100 million scale on one box, IVF-PQ is often the only thing that fits. At a few million, HNSW in RAM is hard to beat. At billions, people combine the ideas (graph indexes over compressed vectors, with full vectors on SSD, as in Microsoft's DiskANN).
+
+### Filters make everything harder
+
+Real queries come with conditions: "nearest passages, but only English, only from the last month, only this customer's documents". This sounds trivial and is one of the hardest problems in the field.
+
+- **Post-filter**: search the index for the top 1,000, then throw away the ones that fail the filter. If 1% of the corpus passes the filter, about 10 of your 1,000 survive, and you wanted 100. You can raise the 1,000, but for a very selective filter you'd need to search nearly everything.
+- **Pre-filter**: first find every vector that passes, then brute force over just those. Great when the filter keeps few vectors (brute force over 10,000 is fast). Terrible when it keeps 40% of 100 million.
+- **Filter during the search**: skip failing vectors as you go. For IVF that's fine: you just skip entries while scanning a cell. For HNSW it's subtle: if you refuse to *step through* failing nodes, the graph falls apart into disconnected islands and greedy search gets stuck. If you step through them but don't return them, you waste work on a selective filter. Libraries let you pass a filter function (hnswlib has one; FAISS has an `IDSelector`), and newer research such as ACORN (2024) builds denser graphs so filtered searches stay connected.
+
+Production systems usually decide per query, using an estimate of how selective the filter is: pre-filter plus brute force when few vectors pass, filtered graph search otherwise. Keep this in mind when someone says "just add a WHERE clause to the vector search".
+
+### Hybrid search: words and vectors
+
+Embeddings are good at meaning ("cheap flights" finds "low-cost airfare") and bad at exact strings: product codes, error messages, rare names, a specific version number. The decades-old keyword method is the opposite. <Term w="BM25">A classic keyword ranking formula (Robertson and others, 1990s). Scores a document by how often it contains the query's words, weighting rare words more and dampening repeated ones and long documents. Runs on an inverted index of words.</Term> scores documents by the query words they contain, with rare words counting more. It finds `CUDA error 700` instantly, and has no idea that "car" and "automobile" mean the same thing.
+
+So many systems run both and merge the lists: <Term w="hybrid search">Running a keyword search (like BM25) and a vector search for the same query and merging their result lists, to get the strengths of both.</Term>. The scores aren't comparable (BM25 is unbounded, cosine sits between −1 and 1), so the usual merge ignores scores and uses ranks: <Term w="reciprocal rank fusion" label="RRF">Merge several ranked lists by giving each document the sum over lists of 1 / (k + its rank in that list), with k usually 60. Documents near the top of several lists win.</Term>. Each document gets `1/(60 + rank)` from each list it appears in, summed. Simple, robust, and hard to beat without training a model to do the merge.
+
+### The two-stage pipeline you work on
+
+Put it all together and you get the shape of most modern search stacks:
+
+<Figure n="006" title="RETRIEVE CHEAP, RERANK EXPENSIVE" caption="Each stage sees fewer items and spends more per item. The ANN index and BM25 each pull about a thousand candidates out of 100 million in milliseconds; fusion merges them; the cross-encoder spends real compute on just the top 100. Latencies are rough orders of magnitude; you'll measure your own.">
+<svg viewBox="0 0 640 250" role="img" aria-label="A funnel from 100 million documents through ANN and BM25 retrieval to a cross-encoder reranker and a final top 10">
+  <rect x="10" y="40" width="100" height="170" class="fill-paper" stroke-width="1.2" />
+  <text x="60" y="110" text-anchor="middle" class="strong">CORPUS</text>
+  <text x="60" y="128" text-anchor="middle">100M</text>
+  <text x="60" y="144" text-anchor="middle">passages</text>
+  <rect x="140" y="50" width="120" height="58" class="fill-wash" stroke-width="1.2" />
+  <text x="200" y="72" text-anchor="middle" class="strong">ANN INDEX</text>
+  <text x="200" y="88" text-anchor="middle">HNSW / IVF-PQ</text>
+  <text x="200" y="102" text-anchor="middle">~1-10 ms</text>
+  <rect x="140" y="142" width="120" height="58" class="fill-paper" stroke-width="1.2" />
+  <text x="200" y="164" text-anchor="middle" class="strong">BM25</text>
+  <text x="200" y="180" text-anchor="middle">keyword index</text>
+  <text x="200" y="194" text-anchor="middle">~1-10 ms</text>
+  <line x1="110" y1="90" x2="140" y2="80" class="ink" stroke-width="1" />
+  <line x1="110" y1="160" x2="140" y2="170" class="ink" stroke-width="1" />
+  <line x1="260" y1="80" x2="300" y2="115" class="ink" stroke-width="1" />
+  <line x1="260" y1="170" x2="300" y2="135" class="ink" stroke-width="1" />
+  <text x="266" y="68">1000</text>
+  <text x="266" y="196">1000</text>
+  <rect x="300" y="100" width="80" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="340" y="122" text-anchor="middle" class="strong">FUSE</text>
+  <text x="340" y="138" text-anchor="middle">RRF</text>
+  <line x1="380" y1="125" x2="420" y2="125" class="ink" stroke-width="1" />
+  <text x="384" y="116">top 100</text>
+  <rect x="420" y="88" width="120" height="74" class="fill-blue" />
+  <text x="480" y="112" text-anchor="middle" class="strong" style="fill:var(--paper)">CROSS-ENCODER</text>
+  <text x="480" y="130" text-anchor="middle" style="fill:var(--paper)">100 forward passes</text>
+  <text x="480" y="146" text-anchor="middle" style="fill:var(--paper)">~10-100 ms GPU</text>
+  <line x1="540" y1="125" x2="570" y2="125" class="ink" stroke-width="1" />
+  <rect x="570" y="104" width="60" height="42" class="fill-paper" stroke-width="1.2" />
+  <text x="600" y="122" text-anchor="middle" class="strong">TOP</text>
+  <text x="600" y="138" text-anchor="middle" class="strong">10</text>
+  <text x="140" y="236">CHEAP PER ITEM, MANY ITEMS</text>
+  <text x="420" y="236" class="blue-t">EXPENSIVE PER ITEM, FEW ITEMS</text>
+  <text x="140" y="28" class="blue-t">RECALL IS SET HERE</text>
+  <text x="420" y="28" class="blue-t">PRECISION IS SET HERE</text>
+</svg>
+</Figure>
+
+The division of labour is the important idea. The first stage's job is **recall**: get the right passage somewhere into the candidate list. It can be sloppy about order. The second stage's job is **precision**: put the right passage at the top. It can be slow per item, because there are only a hundred items.
+
+That gives you a budget to reason about. Say the whole request must finish in 100 ms. If the reranker scores 100 pairs in 40 ms, the retrieval stage gets what's left. If you rerank 300 pairs instead of 100, you might catch a few more good passages that retrieval ranked low, but you pay 3× on the reranker. And an ANN index at recall@10 = 0.95 instead of 0.99 might cost you nothing at all end to end, because the passages it misses are the near-duplicates at ranks 8-10 that the reranker would have reordered anyway. Or it might cost you a lot. You can't reason your way to the answer. You measure it, end to end, in <Term w="NDCG">Normalized discounted cumulative gain. Each relevant result earns credit that shrinks with its position (1/log₂(rank + 1)), summed and divided by the best possible score, so 1.0 means a perfect ordering. NDCG@10 looks only at the top 10.</Term>, which is what the Build is for.
+
+## Build It
+
+Everything runs on the Spark. Make a folder, say `~/workbench/vecsearch/`, and a virtual environment. The libraries: `faiss-cpu` (Meta's vector search library; it has ARM64 Linux wheels on PyPI, but check, and the GPU build is usually installed through conda, so check its install docs for ARM64), `hnswlib` (the reference HNSW implementation from the paper's authors), `sentence-transformers` for the models, and `datasets` for MS MARCO.
+
+<Task id="t0" title="Get a slice of MS MARCO" agent="ok">
+
+MS MARCO passage ranking has about 8.8 million passages and a "dev small" set of 6,980 queries with human labels (usually one relevant passage per query). Embedding all 8.8M is a good overnight job later. Tonight, build a 500,000-passage slice that is guaranteed to contain the relevant passages for 1,000 dev queries, padded with random others as distractors.
+
+The BEIR copy on Hugging Face is the easiest to load (the corpus parquet is about 1.6 GB):
+
+```python
+# make_slice.py
+import random, json, pyarrow.parquet as pq
+from huggingface_hub import hf_hub_download
+from datasets import load_dataset
+
+corpus_path = hf_hub_download("BeIR/msmarco", "corpus/corpus-00000-of-00001.parquet", repo_type="dataset")
+query_path = hf_hub_download("BeIR/msmarco", "queries/queries-00000-of-00001.parquet", repo_type="dataset")
+qrels = load_dataset("BeIR/msmarco-qrels", split="validation")  # the dev small labels
+
+random.seed(0)
+rel: dict[str, set[str]] = {}
+for r in qrels:
+    rel.setdefault(str(r["query-id"]), set()).add(str(r["corpus-id"]))
+qids = random.sample(sorted(rel), 1000)
+need = set().union(*(rel[q] for q in qids))
+
+corpus = pq.read_table(corpus_path, columns=["_id", "text"]).to_pandas()
+is_rel = corpus["_id"].isin(need)
+others = corpus[~is_rel].sample(500_000 - int(is_rel.sum()), random_state=0)
+sl = corpus[is_rel]._append(others).sample(frac=1, random_state=0).reset_index(drop=True)
+sl.to_parquet("passages.parquet")
+
+queries = pq.read_table(query_path).to_pandas().set_index("_id")["text"]
+json.dump({q: {"text": queries[q], "rel": sorted(rel[q])} for q in qids}, open("queries.json", "w"))
+print(len(sl), "passages,", len(qids), "queries")
+```
+
+(Column names and file paths are from the BEIR dataset card as of late 2026; if they've moved, look at the card. `_append` is pandas' internal name for concat on a frame; swap in `pd.concat` if your pandas complains.)
+
+</Task>
+
+<Task id="t1" title="Embed it on the GPU" agent="ok">
+
+Use a small bi-encoder trained on MS MARCO with cosine similarity: `sentence-transformers/msmarco-MiniLM-L6-cos-v5` (384 dimensions, 6 layers). Ask for normalized output so dot product equals cosine.
+
+```python
+# embed.py
+import json, time, numpy as np, pandas as pd
+from sentence_transformers import SentenceTransformer
+
+m = SentenceTransformer("sentence-transformers/msmarco-MiniLM-L6-cos-v5", device="cuda")
+p = pd.read_parquet("passages.parquet")
+qs = json.load(open("queries.json"))
+
+t = time.perf_counter()
+xb = m.encode(p["text"].tolist(), batch_size=512, normalize_embeddings=True,
+              convert_to_numpy=True, show_progress_bar=True).astype("float32")
+print(f"{len(xb)} passages in {time.perf_counter() - t:.0f}s")
+xq = m.encode([v["text"] for v in qs.values()], normalize_embeddings=True).astype("float32")
+np.save("xb.npy", xb); np.save("xq.npy", xq)
+print(xb.shape, xq.shape, "norms:", np.linalg.norm(xb[:3], axis=1))
+```
+
+Write down the passages-per-second number. It's the cost of re-indexing when you change the embedding model, which is a real operational cost: 8.8M passages at your rate is how long?
+
+</Task>
+
+<Task id="t2" title="Brute force: the ground truth and the stopwatch" agent="hands">
+
+Brute force does two jobs: it's the exact answer every index is graded against, and it's the baseline latency. Write it three ways and time each.
+
+```python
+# brute.py
+import time, numpy as np, torch
+
+xb = np.load("xb.npy"); xq = np.load("xq.npy"); k = 10
+
+def topk_numpy_one(q: np.ndarray, k: int) -> np.ndarray:
+    """One query (shape [d]) against all of xb. Return indices of the k highest dot products, best first.
+    Hint: xb @ q, then np.argpartition for the top k, then sort just those k."""
+    ...
+
+def topk_numpy_batch(Q: np.ndarray, k: int) -> np.ndarray:
+    """All queries at once (shape [nq, d]) -> [nq, k]. One matrix multiply."""
+    ...
+
+def topk_torch_gpu(Q: torch.Tensor, B: torch.Tensor, k: int) -> torch.Tensor:
+    """Same, on the GPU with torch.topk. Time it with torch.cuda.synchronize() before stopping the clock."""
+    ...
+
+if __name__ == "__main__":
+    # 1. time topk_numpy_one over 100 queries -> ms per query
+    # 2. time topk_numpy_batch over all 1000 -> ms per query
+    # 3. time topk_torch_gpu, batch of 1 and batch of 1000 (warm up once first)
+    # 4. save the exact top-100 for every query as gt.npy (you'll need 100, not just 10, later)
+    ...
+```
+
+Before you run it, predict: the slice is 500,000 × 384 × 4 bytes. How many MB is that, and at the Spark's spec-sheet bandwidth what is the fastest one query could possibly be?
+
+</Task>
+
+<Task id="t3" title="Three indexes, three dials" agent="hands">
+
+Build each index once, then sweep its query-time dial. For every setting record recall@10 (against `gt.npy`), queries per second, and memory. The FAISS calls have this shape (check the FAISS wiki if signatures have moved):
+
+```python
+import faiss, hnswlib
+
+d = xb.shape[1]
+flat = faiss.IndexFlatIP(d); flat.add(xb)                               # brute force, for sanity
+
+quant = faiss.IndexFlatIP(d)                                            # IVF: k-means cells
+ivf = faiss.IndexIVFFlat(quant, d, nlist, faiss.METRIC_INNER_PRODUCT)
+ivf.train(xb); ivf.add(xb); ivf.nprobe = 16
+D, I = ivf.search(xq, 10)
+
+quant2 = faiss.IndexFlatIP(d)                                           # IVF + PQ: m bytes per vector
+ivfpq = faiss.IndexIVFPQ(quant2, d, nlist, m, 8, faiss.METRIC_INNER_PRODUCT)
+
+hnsw = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)          # HNSW, M = 32
+hnsw.hnsw.efConstruction = 200; hnsw.add(xb); hnsw.hnsw.efSearch = 64
+
+h = hnswlib.Index(space="ip", dim=d)                                    # or hnswlib directly
+h.init_index(max_elements=len(xb), M=32, ef_construction=200)
+h.add_items(xb); h.set_ef(64); labels, dists = h.knn_query(xq, k=10)
+```
+
+What to write yourself:
+
+- `recall_at_k(I, gt, k)`: mean over queries of `|set(I[i][:k]) & set(gt[i][:k])| / k`.
+- A sweep loop. IVF: `nlist = 4096` (about 6√N for N = 500k), `nprobe` in 1, 2, 4, 8, 16, 32, 64, 128. IVF-PQ: `m = 48` (384 / 8 dims per piece), same `nprobe` values. HNSW: `M` 16 and 32, `efSearch` in 10, 16, 32, 64, 128, 256.
+- Timing done two ways: the whole batch of 1,000 queries at once (throughput), and one query at a time in a loop (latency, what a live service sees). Pin threads with `faiss.omp_set_num_threads(1)` for the per-query numbers so you compare algorithms, not thread pools.
+- Memory: compute it from the formulas in the Idea section (vectors × bytes + IDs + links) and check against the size of `faiss.serialize_index(index)` (a byte array) or the process's RSS.
+- Build time for each index. HNSW's will surprise you.
+- One more variant: IVF-PQ asked for the top 100, then re-scored with the full vectors from `xb`, keeping the best 10. Recall@10 of that.
+
+</Task>
+
+<Task id="t4" title="Plot the trade-off" agent="review">
+
+Make two plots, with matplotlib:
+
+1. **Recall@10 (x) vs queries per second (y, log scale)**, one line per index type, one point per dial setting. This is the standard ANN-benchmarks plot. Up and to the right is better. Mark the brute-force point.
+2. **Recall@10 vs memory (MB)**, same points.
+
+Then have an agent review the measurement code (not the plotting) for unfair comparisons: warm-up runs missing, thread counts differing between indexes, including build time in query time, `gt` computed with a different metric than the index.
+
+</Task>
+
+<Task id="t5" title="Two stages: ANN, then your cross-encoder" agent="hands">
+
+Now the part that matters for your job. Wire retrieval into a reranker and measure what reaches the user. Use your own cross-encoder if you can load it here; otherwise the public `cross-encoder/ms-marco-MiniLM-L-6-v2`, which takes `(query, passage)` pairs and returns one score per pair.
+
+```python
+# two_stage.py
+from sentence_transformers import CrossEncoder
+ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cuda")  # or your model
+
+def retrieve(qvec, index, depth: int) -> list[int]:
+    """Top `depth` passage row ids from the ANN index."""
+    ...
+
+def rerank(qtext: str, ids: list[int], top: int) -> list[int]:
+    """Score (qtext, passage) for every id with ce.predict(pairs, batch_size=...), return the best `top` ids."""
+    ...
+
+def ndcg_at_10(ranked_ids: list[int], relevant: set[int]) -> float:
+    """Binary relevance: DCG = sum over hits of 1/log2(rank + 1), divided by the best possible DCG."""
+    ...
+```
+
+Run this grid over the 1,000 queries and record mean NDCG@10, MRR@10 (one over the rank of the first relevant passage, 0 if it's not in the top 10; MS MARCO's official metric), recall@100 (of labelled-relevant passages, not ANN recall) and per-query latency of each stage:
+
+- Retrieval alone (no rerank, depth 100 so recall@100 means something), with brute force and with HNSW at `efSearch` 100 and 256. FAISS quietly uses `max(efSearch, k)`, so an `efSearch` below the depth you ask for does nothing.
+- Retrieve depth 1000 with HNSW (`ef` at least 1000, since `ef` must be at least k), rerank the top 10, 50, 100, 200 with the cross-encoder.
+- Same, but with brute-force retrieval, to isolate what the approximate index costs end to end.
+
+Hints: map passage row ids to their BEIR `_id` to compare against labels. Time the reranker with the GPU synchronized. Use `batch_size` around 64-128 for the cross-encoder and note how latency grows with rerank depth.
+
+</Task>
+
+<DoneWhen>
+
+- `gt.npy` exists and every index's recall@10 is measured against it.
+- You have the recall-vs-QPS and recall-vs-memory plots with three index families on them.
+- You've filled in the two-stage table and can say, with numbers, how much NDCG the approximate index costs after reranking, and what reranking 200 instead of 100 buys.
+- You can pick an index and its settings for "100 ms budget, 128 GB box, 100M passages" and defend it with arithmetic.
+
+</DoneWhen>
+
+## Measure
+
+Fill these in on the Spark. Predict each blank cell before you run it.
+
+**Brute force (500k × 384, fp32)**
+
+| Method | ms per query | Effective GB/s | Your prediction |
+| --- | --- | --- | --- |
+| numpy, one query at a time | | | |
+| numpy, batch of 1,000 | | n/a | |
+| torch GPU, batch of 1 | | | |
+| torch GPU, batch of 1,000 | | n/a | |
+
+Effective GB/s for the one-at-a-time rows is `index bytes / time per query`. Compare it to the 273 GB/s spec. You won't reach it from one CPU thread; the GPU path should get much closer.
+
+**Indexes (1 thread, one query at a time)**
+
+| Index | Setting | Recall@10 | QPS | Memory | Build time |
+| --- | --- | --- | --- | --- | --- |
+| Flat | — | 1.000 | | | 0 |
+| IVF4096,Flat | nprobe 8 | | | | |
+| IVF4096,Flat | nprobe 32 | | | | |
+| IVF4096,PQ48 | nprobe 32 | | | | |
+| IVF4096,PQ48 + exact re-rank of 100 | nprobe 32 | | | | |
+| HNSW32 | ef 16 | | | | |
+| HNSW32 | ef 64 | | | | |
+| HNSW32 | ef 256 | | | | |
+
+**Two stages (1,000 dev queries)**
+
+| Retrieval | Rerank depth | NDCG@10 | MRR@10 | Retrieval ms | Rerank ms |
+| --- | --- | --- | --- | --- | --- |
+| Brute force | none | | | | 0 |
+| HNSW ef 100 | none | | | | 0 |
+| Brute force | 100 | | | | |
+| HNSW ef 1000 | 10 | | | | |
+| HNSW ef 1000 | 100 | | | | |
+| HNSW ef 1000 | 200 | | | | |
+
+For reference, I ran the same pipeline on an M4 Pro MacBook (spec-sheet bandwidth 273 GB/s, same as the Spark), embedding on the Mac's GPU, FAISS 1.15 on the CPU, one thread for the index rows. The embedding took 699 s for 500,000 passages, about 715 per second. Yours will differ; the shapes should not.
+
+| Brute force (768 MB) | ms per query | Effective GB/s |
+| --- | --- | --- |
+| numpy, one query at a time (multithreaded BLAS) | 7.0 | 109 |
+| FAISS flat, one query at a time, 1 thread | 10.9 | 70 |
+| FAISS flat, batch of 1,000, 1 thread | 0.28 | n/a |
+| torch on the Mac GPU, batch of 1 | 3.8 | 204 |
+| torch on the Mac GPU, batch of 1,000 | 0.58 | n/a |
+
+| Index (1 thread) | Recall@10 | QPS, batched | ms per query, one at a time | Memory | Build |
+| --- | --- | --- | --- | --- | --- |
+| Flat | 1.000 | 3,605 | 10.9 | 768 MB | 0 |
+| IVF4096,Flat nprobe 8 | 0.681 | 30,506 | 0.13 | 772 MB | 16 s |
+| IVF4096,Flat nprobe 32 | 0.822 | 9,106 | 0.19 | 772 MB | 16 s |
+| IVF4096,Flat nprobe 128 | 0.913 | 2,433 | 0.50 | 772 MB | 16 s |
+| IVF4096,PQ48 nprobe 32 | 0.624 | 11,363 | 0.18 | 28 MB | 20 s |
+| IVF4096,PQ48 nprobe 32 + exact re-rank of 100 | 0.819 | | | 28 MB + full vectors | 20 s |
+| HNSW32 ef 16 | 0.897 | 8,001 | 0.13 | 904 MB | 71 s |
+| HNSW32 ef 64 | 0.976 | 2,755 | 0.38 | 904 MB | 71 s |
+| HNSW32 ef 256 | 0.996 | 828 | 1.37 | 904 MB | 71 s |
+
+Two-stage, first 300 of the 1,000 queries, public MiniLM cross-encoder on the Mac GPU, HNSW32:
+
+| Retrieval | Rerank depth | NDCG@10 | MRR@10 | Retrieval ms | Rerank ms |
+| --- | --- | --- | --- | --- | --- |
+| Brute force | none | 0.774 | 0.739 | 6.8 | 0 |
+| HNSW ef 100 | none | 0.763 | 0.729 | 0.6 | 0 |
+| HNSW ef 256 | none | 0.775 | 0.740 | 1.3 | 0 |
+| Brute force | 100 | 0.841 | 0.809 | 7.2 | 125 |
+| HNSW ef 1000 | 10 | 0.808 | 0.784 | 4.7 | 16 |
+| HNSW ef 1000 | 50 | 0.841 | 0.810 | 4.6 | 61 |
+| HNSW ef 1000 | 100 | 0.841 | 0.809 | 4.7 | 125 |
+| HNSW ef 1000 | 200 | 0.841 | 0.809 | 4.7 | 233 |
+
+What the numbers should tell you:
+
+**Brute force is bandwidth-bound one query at a time and compute-bound in a batch.** One query at a time, the best path read 768 MB in 3.8 ms, about 200 GB/s, close to the spec. A batch of 1,000 on one CPU thread was 39× faster per query than one at a time on that same thread, because each byte read got reused 1,000 times. That's the Predict answer, measured. (If your numpy batch row looks slow, check you used `argpartition`, not a full sort of 500,000 scores per query: my first try did, and the sort cost more than the matrix multiply.)
+
+**Real embeddings are hard for IVF.** With 4,096 cells of about 120 vectors each, `nprobe = 8` found only 68% of the true top 10. The neighbours of a 384-dimension query are scattered across many cells. HNSW at `ef = 64` got 0.976 at 0.38 ms, about 28× faster than single-thread brute force. That's why HNSW is the default when it fits in RAM.
+
+**PQ trades recall for 27× less memory, and exact re-ranking buys most of it back.** 48 bytes per vector (plus the 8-byte ID) dropped recall from 0.82 to 0.62 at `nprobe = 32`. Re-scoring the top 100 with the full vectors brought it to 0.82: exactly IVF-Flat's recall at the same `nprobe`. The re-rank fixes PQ's shuffling of the order; it can't fix what IVF never looked at.
+
+**HNSW builds slowly.** 71 s for half a million vectors on 10 threads, against 16 s for IVF. At 100 million, multiply by more than 200 (insertion cost grows faster than linearly). Plan for hours.
+
+**End to end, the approximate index cost nothing.** After reranking the top 100, HNSW and brute force both scored NDCG@10 0.841. The few true neighbours HNSW misses rarely matter once a cross-encoder reorders the list. Reranking added 0.07 NDCG over retrieval alone, which is the reason your job exists.
+
+**Rerank depth past 50 bought nothing here and cost linearly.** 50, 100 and 200 all scored 0.841, while rerank time went 61 → 125 → 233 ms on the Mac's GPU. On the Spark your cross-encoder will be faster, but the shape holds: find the knee of NDCG against depth and stop there. One caveat: these scores are high (full MS MARCO MRR@10 for small bi-encoders is closer to 0.3) because a 500k slice has 17× fewer distractors than the real 8.8M corpus. Compare configurations against each other, not against leaderboards.
+
+## Break It
+
+**1. Forget to normalize.** Re-embed the slice without `normalize_embeddings=True` (or multiply a random 10% of `xb` rows by 3) and search with `IndexFlatIP`. Recall against the cosine ground truth drops, and the top results fill up with long vectors. Then normalize and search with `IndexFlatL2`: rankings match `IndexFlatIP` exactly, which is the identity from the Idea, checked. Lesson: the metric is part of the model's contract.
+
+**2. Make IVF's training sample lie.** Train the IVF quantizer on only the first 10,000 vectors after sorting the passages by length (or by any field correlated with topic), then add all 500k. Many cells end up huge and many nearly empty, and at the same `nprobe` your recall and speed both get worse, because a few giant cells are scanned every time. Print the sizes of the 20 biggest inverted lists (`ivf.invlists.list_size(i)`). This is what happens in production when the corpus drifts after the index was trained, and why IVF indexes get periodically retrained.
+
+**3. A selective filter.** Tag each passage with a random "language" so that 1% are "de". Ask for the top 10 German passages three ways: post-filter HNSW top 100 (count how often you get fewer than 10), post-filter top 5,000, and pre-filter then brute force over the ~5,000 matching vectors. The pre-filtered brute force is both exact and fast here. Now make the filter keep 50% and redo it. The winner flips.
+
+**4. Starve the reranker.** Set HNSW `efSearch = 10` and retrieve only 10 candidates, then rerank them. The cross-encoder can't find a passage it was never shown: NDCG@10 is capped by retrieval's recall@10. Push the depth to 100 and watch NDCG climb even though the ANN index itself didn't change. Your ranker's ceiling is set one stage earlier.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. When do cosine similarity, dot product and Euclidean distance give the same ranking, and when don't they?</summary>
+
+When every vector has length 1. Then the dot product equals the cosine, and squared Euclidean distance is `2 − 2 × cosine`, a decreasing function of it, so all three sort neighbours in the same order. Without normalization, dot product also rewards vector length, so a long vector pointing roughly the right way can outrank a short one pointing exactly right. Some models are trained to use that, so you use whatever similarity the model was trained with, and normalize only if it was trained with cosine.
+
+</details>
+
+<details>
+<summary>2. How long does brute-force search over 100 million 768-dimension vectors take on one machine, and what's the bottleneck?</summary>
+
+100M × 768 × 4 bytes is 307 GB, which doesn't fit in the Spark's 128 GB at all, and every query has to read all of it. If it did fit, at about 273 GB/s that's about 1.1 seconds per query. The 77 billion multiply-adds would take only milliseconds on the GPU, so it's bandwidth-bound: each byte is used in a quarter of a multiply-add. Batching many queries turns it into a matrix multiply and makes it compute-bound, which is fine offline but not for live single queries. To be fast you need to read fewer bytes per vector (fp16, int8, product quantization) and, much more importantly, read fewer vectors (IVF, HNSW).
+
+</details>
+
+<details>
+<summary>3. Explain IVF, PQ and HNSW to someone who has never heard of them, and name the dial on each.</summary>
+
+IVF sorts vectors into clusters with k-means ahead of time; a query compares itself to the cluster centres and only searches the `nprobe` nearest clusters. Misses happen when a true neighbour sits just across a cluster border; raising `nprobe` fixes that at linear cost. PQ shrinks each vector by cutting it into pieces and storing, for each piece, the one-byte ID of the nearest of 256 learned shapes; a 768-float vector becomes 96 bytes, scored by adding up lookups in a small per-query table. Its dial is `m`, the number of pieces (more bytes, more accurate), and it's usually followed by exact re-scoring of the top candidates. HNSW links every vector to a few near neighbours, and builds sparser layers on top with longer links, like highways over local roads; a search takes long greedy hops on top and refines on the bottom. Its query dial is `efSearch`, how many candidates the bottom-layer search keeps; build-time dials are `M` (links per node) and `efConstruction`.
+
+</details>
+
+<details>
+<summary>4. How does each index scale to a billion vectors, and what would you build?</summary>
+
+Brute force scales linearly in both memory and time: 3 TB of fp32 at 768 dims, seconds per query. HNSW's query cost grows roughly with log N, but its memory grows linearly with full vectors plus links (over 3 TB), and it wants everything in RAM because it hops randomly; the build also takes a long time and is hard to parallelize across machines. IVF-PQ's memory is around 100 bytes per vector (about 100 GB), and its query cost is roughly `nlist + nprobe × N / nlist`, so you grow `nlist` with N. For a billion I'd shard across several machines (each shard holding an IVF-PQ or a compressed-graph index), search all shards in parallel, merge their top-k, and keep full-precision vectors on SSD to re-score the top few hundred, the way DiskANN-style systems do. Sharding also brings tail latency into it: the query is as slow as the slowest shard.
+
+</details>
+
+<details>
+<summary>5. In a retrieve-then-rerank pipeline, how do you decide the ANN settings and the rerank depth?</summary>
+
+Start from the latency budget and measure end to end. The reranker's cost grows linearly with depth (100 pairs vs 200 pairs), and the retrieval stage's job is only to get the relevant passages into that depth, not to order them well. So ANN recall@10 isn't the target; what matters is the final NDCG@10 after reranking, and whether the index's misses fall inside or outside the reranked set. I'd sweep `efSearch` and rerank depth together, plot NDCG@10 against total p99 latency, and pick the cheapest point within a small margin of the brute-force-plus-rerank NDCG. Often a fairly sloppy index is fine because the reranker reorders the top anyway, and often hybrid retrieval (adding BM25 via RRF) buys more than a more exact index, because it catches passages the embedding model ranks badly.
+
+</details>
+
+## Go Deeper
+
+- **Yu. A. Malkov and D. A. Yashunin, "Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs"** (arXiv 2016, IEEE TPAMI 2018). The HNSW paper. Short, readable, and section 4's neighbour-selection heuristic is the detail most explanations skip.
+- **Hervé Jégou, Matthijs Douze, Cordelia Schmid, "Product Quantization for Nearest Neighbor Search"** (IEEE TPAMI 2011). Introduces PQ, asymmetric distance computation and the IVF + PQ combination. Figures worth staring at.
+- **Jeff Johnson, Matthijs Douze, Hervé Jégou, "Billion-scale similarity search with GPUs"** (2017), and **Matthijs Douze et al., "The Faiss library"** (2024). How FAISS is built, and a survey of the whole index zoo from the people who wrote it.
+- **[The FAISS wiki](https://github.com/facebookresearch/faiss/wiki)** on GitHub, especially "Guidelines to choose an index" and "The index factory". The practical rules of thumb for `nlist`, `m` and when to use what.
+- **Martin Aumüller, Erik Bernhardsson, Alexander Faithfull, "ANN-Benchmarks"** ([ann-benchmarks.com](https://ann-benchmarks.com)). The standard recall-vs-QPS plots for every library on common datasets. Compare your plot's shape to theirs.
+- **Suhas Jayaram Subramanya et al., "DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node"** (NeurIPS 2019). What to do when the vectors don't fit in RAM: a graph built for SSDs, with compressed vectors in memory.
+- **Rodrigo Nogueira and Kyunghyun Cho, "Passage Re-ranking with BERT"** (2019), and **Vladimir Karpukhin et al., "Dense Passage Retrieval for Open-Domain Question Answering"** (EMNLP 2020). The two papers behind the two stages you work on: a cross-encoder reranker on MS MARCO, and a bi-encoder retriever that beat BM25.
+- **Gordon Cormack, Charles Clarke, Stefan Büttcher, "Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods"** (SIGIR 2009). Two pages, and the reason hybrid search is a one-liner.
+
+## Connections
+
+This lesson is [How does it scale?](/lessons/back-of-envelope/) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) applied to search: brute force is one division (bytes over bandwidth), and the fix is the same as in decoding, read fewer bytes or reuse them across a batch. Product quantization is a cousin of [Quantization](/lessons/quantization/): fewer bits per number, accuracy traded for bandwidth. IVF's inverted lists and BM25's word lists are both indexes in the sense of [Indexes and B-trees](/lessons/indexes/): precomputed structure that lets a read skip most of the data, paid for at write time.
+
+Next, [Ranking metrics and eval sets](/lessons/ranking-metrics/) goes deep on the NDCG and MRR you measured in the two-stage table, and on the harder question of whether 1,000 queries are enough to trust a difference of 0.01. And [p99 and load testing](/lessons/tail-latency/) explains why the retrieval stage's per-query latency, not its batch throughput, is the number your search service lives or dies by.

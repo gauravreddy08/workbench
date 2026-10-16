@@ -1,0 +1,903 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import BatchGantt from '../components/figures/BatchGantt.astro';
+
+## Today
+
+- Explain, with one division, why serving 64 users at once costs barely more per step than serving one, and where that stops being true.
+- Name the three taxes of static batching (padding, waiting for the longest, head-of-line blocking) and show how a wait window and then continuous batching remove them.
+- Write your own decode loop where sequences join and leave the batch at every step, and prove it produces exactly the same tokens as one-at-a-time `generate`.
+- Read a throughput-vs-latency plot, pick a batch size from an SLO, and say whether memory, bandwidth or compute is what stops you adding more users.
+- Add two rows to `SCOREBOARD.md`, and watch the c = 16 row stop being embarrassing.
+
+Prerequisites: [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your naive server, `bench.py`, `SCOREBOARD.md`) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the roofline). [Memory math](/lessons/memory-math/) and [the KV cache](/lessons/kv-cache/) help with the last section. Time: an evening for static batching, a weekend for continuous batching, an evening of benchmark runs.
+
+## The Problem
+
+Open the results from the baseline lesson and look at c = 16. Sixteen workers, each asking for 256 tokens. Your naive server served them one at a time, so the sixteenth person waited about five minutes for their first word, and the server's total throughput was the same ~13 tok/s it managed for one person. You added fifteen users and got only waiting.
+
+Now look at the roofline from the bandwidth lesson. One decode step reads 16 GB of weights to do 16 GFLOPs of math. The GPU spends more than 99% of every step waiting for bytes. And yet the server makes each user wait for every other user's entire answer, while the math units do nothing.
+
+That is the absurd part. The GPU has room for dozens of users in every step. The server only lets one in.
+
+Fixing it sounds like one line: "process several requests together". It isn't. Requests arrive at random times. Prompts have different lengths. One user wants a one-word answer and the next wants an essay. Put them in a batch naively and the one-word answer waits for the essay, the essay waits for a batch to fill up, and the user who arrives one millisecond after the batch started waits for all of it. Getting batching right for LLMs took the field until 2022, and the fix changed what an inference server is.
+
+<Origin year="2022" title="Orca: schedule iterations, not requests">
+
+Batching in model serving is old. Clipper (Crankshaw et al., NSDI 2017), TensorFlow Serving and NVIDIA's Triton all batched requests: gather a few, run them through the model together, return all the answers. That works beautifully for an image classifier, where every request is one forward pass of the same shape and takes the same time.
+
+LLMs broke the assumption. A request is not one forward pass; it is hundreds, one per output token, and nobody knows in advance how many. Serving systems in 2021 (NVIDIA's FasterTransformer, served through Triton) still batched at the level of whole requests: a batch went in, ran until its longest member was done, and came out together.
+
+In 2022 Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim and Byung-Gon Chun at Seoul National University and FriendliAI published Orca at OSDI. Their idea: let the scheduler make a decision after *every iteration*, every single forward pass. A finished sequence leaves immediately; a new one joins at the next step. They called it iteration-level scheduling, reported up to 36.9× the throughput of FasterTransformer at the same latency on a GPT-3 175B model, and within about a year every serious engine (vLLM, Hugging Face TGI, TensorRT-LLM, which calls it "in-flight batching") worked this way. The name that stuck is continuous batching.
+
+</Origin>
+
+## The Idea
+
+### One read, many users
+
+Recap the kitchen from the bandwidth lesson: a chef who chops a thousand onions a second, fed by one slow delivery van. Decode is the van's speed. Every step, the full model drives across town so the chef can do one token of work.
+
+Batching is noticing that the van can carry everyone's onions. Put 64 users' latest tokens in the same step and each weight, once it arrives, is used 64 times instead of once. The expensive part of the step, reading 16 GB, happens once. What grows with the batch is only what is *not* shared:
+
+- **Math.** 64 tokens of matrix-vector work instead of one. Still tiny next to the ridge point.
+- **The KV caches.** Each user's past keys and values are their own bytes, and attention reads all of them every step. Weights are shared across a batch; <Term w="KV caches">The stored keys and values of every past token of one sequence, in every layer. Attention reads the whole thing at every decode step. 128 KiB per token for Llama 3.1 8B in bf16.</Term> are not.
+
+So a decode step costs roughly:
+
+```text
+step time  ≈  (weight bytes + B × KV bytes per user) ÷ bandwidth
+
+Llama 3.1 8B, bf16, 1K tokens of context per user, spec-sheet 273 GB/s:
+  weights      16.06 GB            → 58.8 ms, paid once per step
+  KV per user  1,024 × 128 KiB     → 0.134 GB → 0.49 ms each
+```
+
+<Predict id="b64-step">
+
+On those numbers, how much longer does one decode step take with 64 users in the batch than with 1? And what happens to total tokens per second?
+
+<Fragment slot="answer">
+
+About 1.5× longer: 58.8 + 64 × 0.49 ≈ 90 ms instead of about 59 ms. But that step now produces 64 tokens instead of one, so total throughput goes from about 17 tok/s to about 64 / 0.090 ≈ 710 tok/s, roughly 42× more, while each user's own stream slows from 17 to 11 tok/s. Math never even enters into it at this size: 64 tokens × 16 GFLOPs is about 1 TFLOP per step, under 10 ms at 125 TFLOP/s, and it overlaps with the memory traffic anyway.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="001" title="ONE READ, B TOKENS" caption="Spec-sheet ceilings for Llama 3.1 8B in bf16 on the Spark, 1K tokens of context per user. The blue part of each step is the weights, read once no matter how many users ride along. The light part is everyone's own KV cache, which grows with the batch.">
+
+<svg viewBox="0 0 560 230" role="img" aria-label="Bar chart of decode step time for batch sizes 1 to 256, split into shared weight reads and per-user KV cache reads, with total and per-user throughput">
+  <text x="10" y="18" class="strong">BATCH</text>
+  <text x="60" y="18" class="strong">TIME PER DECODE STEP</text>
+  <text x="400" y="18" text-anchor="end" class="strong">STEP</text>
+  <text x="466" y="18" text-anchor="end" class="strong">TOTAL</text>
+  <text x="550" y="18" text-anchor="end" class="strong">PER USER</text>
+  <line x1="10" y1="26" x2="550" y2="26" class="ink" stroke-width="1" />
+
+  <text x="10" y="48">B = 1</text>
+  <rect x="60" y="37" width="94" height="14" class="fill-blue" />
+  <rect x="154" y="37" width="1" height="14" class="fill-wash" stroke-width="0.8" />
+  <text x="400" y="48" text-anchor="end">59 MS</text>
+  <text x="466" y="48" text-anchor="end" class="blue-t">17</text>
+  <text x="550" y="48" text-anchor="end">17</text>
+
+  <text x="10" y="78">B = 4</text>
+  <rect x="60" y="67" width="94" height="14" class="fill-blue" />
+  <rect x="154" y="67" width="3" height="14" class="fill-wash" stroke-width="0.8" />
+  <text x="400" y="78" text-anchor="end">61 MS</text>
+  <text x="466" y="78" text-anchor="end" class="blue-t">66</text>
+  <text x="550" y="78" text-anchor="end">16</text>
+
+  <text x="10" y="108">B = 16</text>
+  <rect x="60" y="97" width="94" height="14" class="fill-blue" />
+  <rect x="154" y="97" width="13" height="14" class="fill-wash" stroke-width="0.8" />
+  <text x="400" y="108" text-anchor="end">67 MS</text>
+  <text x="466" y="108" text-anchor="end" class="blue-t">240</text>
+  <text x="550" y="108" text-anchor="end">15</text>
+
+  <text x="10" y="138">B = 64</text>
+  <rect x="60" y="127" width="94" height="14" class="fill-blue" />
+  <rect x="154" y="127" width="50" height="14" class="fill-wash" stroke-width="0.8" />
+  <text x="400" y="138" text-anchor="end">90 MS</text>
+  <text x="466" y="138" text-anchor="end" class="blue-t">710</text>
+  <text x="550" y="138" text-anchor="end">11</text>
+
+  <text x="10" y="168">B = 256</text>
+  <rect x="60" y="157" width="94" height="14" class="fill-blue" />
+  <rect x="154" y="157" width="201" height="14" class="fill-wash" stroke-width="0.8" />
+  <text x="400" y="168" text-anchor="end">185 MS</text>
+  <text x="466" y="168" text-anchor="end" class="blue-t">1,390</text>
+  <text x="550" y="168" text-anchor="end">5</text>
+
+  <line x1="10" y1="184" x2="550" y2="184" class="ink" stroke-width="1" />
+  <rect x="10" y="196" width="12" height="10" class="fill-blue" />
+  <text x="28" y="205">WEIGHTS: 16 GB, SHARED, READ ONCE PER STEP</text>
+  <rect x="10" y="212" width="12" height="10" class="fill-wash" stroke-width="0.8" />
+  <text x="28" y="221">KV CACHES: 0.13 GB EACH, NOT SHARED</text>
+  <text x="550" y="221" text-anchor="end">TOK/S, CEILINGS</text>
+</svg>
+
+</Figure>
+
+Read the table top to bottom. Up to a batch of 16 the step barely moves; throughput is close to free. By 64 the KV caches are a third of the traffic and each user feels it. By 256 they are most of the traffic, each user gets 5 tok/s, and you are trading their experience for your throughput. Notice what never showed up: the compute roof. At 1K context the Spark runs out of *bandwidth for KV caches* long before it runs out of math. (Real servers land below these ceilings, as your naive one did. The shape is what matters.)
+
+That is the whole economic case. One GPU-hour costs the same whether it makes 17 tokens a second or 700. Batching is how an inference company divides that hour by 40.
+
+### Static batching and its three taxes
+
+The simplest way to batch: collect B requests, pad them to the same shape, run them through `generate` together, return everyone's answer when it finishes. This is <Term w="static batching">Forming a fixed group of requests and running the whole group from start to finish together. Nobody joins or leaves until the whole group is done.</Term>, and it was the standard way to batch models before Orca. It has three problems, and each one has a cost you can see.
+
+<Figure n="002" title="THE THREE TAXES OF STATIC BATCHING" caption="Top: prompts of different lengths are padded to the longest, and the padding is real work. Bottom: a batch of four runs until its longest member is done. Short answers hold their slot doing nothing; a request that arrives just after the batch starts waits for all of it.">
+
+<svg viewBox="0 0 560 300" role="img" aria-label="Padding of four prompts to equal length, then a batch timeline where short sequences hold idle slots and a late request waits">
+  <text x="10" y="16" class="strong">1 · PADDING</text>
+  <text x="550" y="16" text-anchor="end">LEFT-PADDED TO THE LONGEST PROMPT</text>
+  <g>
+    <text x="10" y="40">R1</text>
+    <rect x="40" y="30" width="216" height="12" class="fill-wash" stroke-width="0.8" />
+    <text x="10" y="56">R2</text>
+    <rect x="40" y="46" width="126" height="12" class="fill-paper dash" stroke-width="0.8" />
+    <rect x="166" y="46" width="90" height="12" class="fill-wash" stroke-width="0.8" />
+    <text x="10" y="72">R3</text>
+    <rect x="40" y="62" width="54" height="12" class="fill-paper dash" stroke-width="0.8" />
+    <rect x="94" y="62" width="162" height="12" class="fill-wash" stroke-width="0.8" />
+    <text x="10" y="88">R4</text>
+    <rect x="40" y="78" width="180" height="12" class="fill-paper dash" stroke-width="0.8" />
+    <rect x="220" y="78" width="36" height="12" class="fill-wash" stroke-width="0.8" />
+  </g>
+  <text x="270" y="50">DASHED = PAD TOKENS</text>
+  <text x="270" y="66">COMPUTED, MASKED, THROWN AWAY</text>
+  <text x="270" y="82" class="blue-t">HERE: 42% OF THE PREFILL IS PADDING</text>
+
+  <line x1="10" y1="106" x2="550" y2="106" class="ink dash" stroke-width="1" />
+
+  <text x="10" y="126" class="strong">2 · WAIT FOR THE LONGEST  ·  3 · HEAD-OF-LINE BLOCKING</text>
+  <g>
+    <text x="10" y="152">R1</text>
+    <rect x="40" y="142" width="10" height="12" class="fill-blue" />
+    <rect x="50" y="142" width="290" height="12" class="fill-wash" stroke-width="0.8" />
+    <text x="10" y="172">R2</text>
+    <rect x="40" y="162" width="10" height="12" class="fill-blue" />
+    <rect x="50" y="162" width="70" height="12" class="fill-wash" stroke-width="0.8" />
+    <rect x="120" y="164" width="220" height="8" class="fill-paper dash" stroke-width="0.8" />
+    <text x="10" y="192">R3</text>
+    <rect x="40" y="182" width="10" height="12" class="fill-blue" />
+    <rect x="50" y="182" width="170" height="12" class="fill-wash" stroke-width="0.8" />
+    <rect x="220" y="184" width="120" height="8" class="fill-paper dash" stroke-width="0.8" />
+    <text x="10" y="212">R4</text>
+    <rect x="40" y="202" width="10" height="12" class="fill-blue" />
+    <rect x="50" y="202" width="30" height="12" class="fill-wash" stroke-width="0.8" />
+    <rect x="80" y="204" width="260" height="8" class="fill-paper dash" stroke-width="0.8" />
+    <text x="10" y="240">R5</text>
+    <line x1="70" y1="236" x2="340" y2="236" class="ink dash" stroke-width="1" />
+    <circle cx="70" cy="236" r="3" class="fill-blue" />
+    <rect x="340" y="230" width="10" height="12" class="fill-blue" />
+    <rect x="350" y="230" width="60" height="12" class="fill-wash" stroke-width="0.8" />
+  </g>
+  <line x1="340" y1="134" x2="340" y2="250" class="ink" stroke-width="1" />
+  <text x="344" y="146">BATCH ENDS</text>
+  <text x="350" y="172">HELD SLOTS: A FREE SEAT</text>
+  <text x="350" y="186">NOBODY MAY TAKE</text>
+  <text x="70" y="262">R5 ARRIVES HERE, WAITS FOR THE WHOLE BATCH</text>
+  <text x="10" y="290" class="blue-t">SLOT USE: 30 + 8 + 18 + 4 = 60 OF 4 × 30 = 120 SLOT-STEPS · 50%</text>
+</svg>
+
+</Figure>
+
+**Tax 1: <Term w="padding">Filler tokens added to the shorter sequences so a batch is one rectangular tensor. They are masked out of attention so they do not change the answer, but the GPU still computes and stores them.</Term>.** A GPU wants a rectangle: B rows of the same length. Prompts are not the same length, so the short ones get filler tokens, plus an <Term w="attention mask">A tensor of 1s and 0s, one per token position, telling attention which positions are real. Positions marked 0 get a score of minus infinity, so they receive zero weight after softmax.</Term> so attention ignores them. The answer comes out right, but the filler is real computation and real KV cache memory. For decoder models you pad on the *left*, so every row's last real token sits in the same final column, which is where the next token gets appended.
+
+**Tax 2: waiting for the longest.** Output lengths vary wildly: "yes" is one token, a code review is a thousand. A static batch runs until its longest member is done. Every row that finished early keeps its place in every step until then, producing padding tokens that get thrown away. In the figure, half of all slot-steps are wasted. In a real chat workload, where one long answer in a batch is common, it can be worse.
+
+**Tax 3: <Term w="head-of-line blocking">When one slow item at the front of a line holds up everything behind it, even items that would be quick. The term comes from networking: a packet at the head of a queue blocking the ones behind.</Term>.** R5 arrives a moment after the batch started. The GPU had room for it in every step after that (R4 left early), but the batch is closed. R5 waits for the whole thing, then gets its turn. Its time to first token is the length of the *longest answer in someone else's batch*.
+
+### Don't wait forever: dynamic batching
+
+There is a fourth problem hiding in "collect B requests". What if only three show up? A pure static batcher waits for the fourth. At 3 a.m., when one person sends one request, they wait until three strangers wake up.
+
+<Predict id="static-deadlock">
+
+Your static batching server uses B = 16 and waits for 16 requests before running anything. Your benchmark harness runs a closed loop at c = 4, warming up with 3 requests first. What does the benchmark report?
+
+<Fragment slot="answer">
+
+Nothing, ever. In a closed loop there are never more than 4 requests in the system (and during the sequential warm-up, only one). The batch never reaches 16, so the server never runs anything, and the workers wait forever on their first request. It is a deadlock, and it also bites at c = 16: when the run winds down and fewer than 16 requests are left, the last batch never fills, and the run never finishes. I watched exactly this happen while testing this lesson's code: the final few requests of a run just hung.
+
+</Fragment>
+
+</Predict>
+
+The fix is a deadline. <Term w="dynamic batching">Static batching with a time limit: start the batch when it is full or when the oldest waiting request has waited a maximum time, whichever comes first. Triton's version of this is called the dynamic batcher.</Term> starts a batch when it is full *or* when the oldest waiting request has waited for a fixed <Term w="max wait window">The longest a request may sit in the queue waiting for a batch to fill. Every request pays up to this much extra latency, in exchange for a fuller batch. Typical values are a few to a few tens of milliseconds.</Term>, whichever comes first. NVIDIA Triton's dynamic batcher calls this `max_queue_delay_microseconds`. The window is a dial: zero means "never wait, batch whatever is there", large means "wait for fuller batches". Each request pays up to one window of extra latency, and in return the GPU runs fuller steps.
+
+Dynamic batching fixes the deadlock. It does not fix taxes 2 and 3. Once a batch starts, it is still closed until its longest member finishes.
+
+### Continuous batching: decide at every step
+
+Go back to what the GPU actually does. A request is not one big operation. It is a prefill followed by hundreds of tiny, identical decode steps, and each step is a natural break point. At every step the scheduler could ask: who is done? Who is waiting? Who should be in the next step?
+
+That is <Term w="iteration-level scheduling">Making the scheduling decision before every forward pass ("iteration") instead of once per request. Sequences join the running batch the step after they arrive and leave the step they finish.</Term>, Orca's idea, and today everyone calls it <Term w="continuous batching">Iteration-level scheduling applied to LLM serving: the batch is a changing set of sequences, each at its own position in its own answer. Also called in-flight batching (NVIDIA's term) or dynamic batching at the token level.</Term>. The batch stops being a group that travels together. It becomes a bus with seats: at every stop someone gets off and someone gets on, and the bus never waits at the terminal.
+
+The server becomes a loop that never ends:
+
+1. **Admit.** If there are free seats and requests waiting, take some in. Run their prefill (this produces their first token).
+2. **Step.** Run one forward pass for every sequence in the batch. Each gets one new token.
+3. **Emit.** Send each new token to its own user's stream.
+4. **Evict.** Any sequence that just hit its stop token or its `max_tokens` leaves. Its seat and its KV cache are freed at once.
+
+<Figure n="003" title="FOUR WAYS TO SCHEDULE TEN REQUESTS" caption="The same ten requests, scheduled four ways. Switch policies and compare the readouts. Try mixed vs equal lengths, trickle vs all at once, and drag the batch slots. Step time is treated as constant because decode is bandwidth-bound; Fig. 001 shows it actually creeps up as the batch grows." wide>
+
+<BatchGantt />
+
+</Figure>
+
+Things to try, in order:
+
+- **Mixed lengths, trickle in, 4 slots.** No batching takes 160 steps for everything and uses a quarter of the GPU's slots. Static gets that to 92 steps, but its slot strip is full of grey: seats held by finished sequences. Continuous finishes in 46 steps with about 87% of slots busy, and its mean time to first token falls from 28 steps (static) to under 6.
+- **Dynamic, drag max wait.** At 0 it launches tiny batches immediately; turn it up and batches get fuller but everyone waits longer to start. Neither end fixes the grey.
+- **Equal lengths, all at once.** Static, dynamic and continuous become *identical*. When everyone arrives together and wants the same amount, there is nothing for continuous batching to fix. Remember this one; it matters for your benchmark.
+- **8 slots, mixed lengths.** Continuous gets every request its first token within a step or so of arriving, because there is always a free seat. The cost of more slots is memory, which is the last section.
+
+Your harness runs a <Term w="closed loop">A load test where each of c workers sends its next request only after the previous answer finishes, so exactly c requests are always in flight.</Term> with a fixed `max_tokens` and `ignore_eos`: every request has the *same* length, and at c = 16 all sixteen start at once and finish at once. That is the "equal lengths, all at once" case. So expect dynamic batching to look surprisingly good at c = 16 in your results, and plan one extra run with mixed lengths to see the real difference.
+
+### Prefill and decode in the same step
+
+There is a wrinkle the figure hides. A new request needs a prefill: its whole prompt, hundreds or thousands of tokens, through the model in one pass. Running sequences need one decode token each. What happens to them while a newcomer prefills?
+
+In the simplest design, which you are about to build, a step is *either* a prefill for the newcomers *or* a decode for everyone else. When a 2,000-token prompt arrives, every running stream freezes for that prefill. From the bandwidth lesson, prefill of 2,000 tokens is about 2 × 8 billion × 2,000 = 32 trillion operations; on the Spark that is on the order of half a second or more. Sixty-three users see their text stop for half a second because one user pasted a document. Their <Term w="ITL">Inter-token latency: the gap between consecutive tokens of one stream. A prefill stall shows up as one huge gap (your harness's max_gap).</Term> has a spike in it.
+
+Orca mixed them: one forward pass could contain the newcomer's prompt tokens *and* everyone else's decode tokens, because the big matrix multiplies do not care which request a token belongs to. Only attention does (each token must attend to its own sequence's past), so Orca ran attention separately per request and batched everything else, a trick it called <Term w="selective batching">Orca's technique: flatten all tokens from all requests in a step into one list for the matrix multiplies (which treat tokens independently), but split them back up by request for attention (which must not mix sequences).</Term>.
+
+That fixes the separate step, but not the size. A 2,000-token prompt still makes one giant step. <Term w="chunked prefill">Splitting a long prompt's prefill into pieces of a few hundred tokens and doing one piece per step, alongside the running decodes, so no single step gets much slower than the others. From the SARATHI and Sarathi-Serve papers; now standard in vLLM and SGLang.</Term> (Agrawal et al., the SARATHI work in 2023 and Sarathi-Serve at OSDI 2024) splits the long prompt into chunks and does one chunk per step, filling a fixed per-step <Term w="token budget">The maximum number of tokens (prefill plus decode) the scheduler will put in one forward pass. It bounds how slow any one step can get.</Term> with decodes first and prefill chunks after. The decodes stay smooth; the newcomer's TTFT gets a little longer. And there is a nice bonus hiding in the roofline: decode steps are memory-bound and prefill is compute-bound, so mixing them puts both halves of the chip to work in the same pass.
+
+<Figure n="004" title="THE SCHEDULER LOOP, AND ONE STEP'S TOKENS" caption="Top: continuous batching is a loop that runs once per forward pass. Middle: seats change hands at every step. Bottom: with chunked prefill, each step carries every running sequence's one decode token plus a slice of a newcomer's long prompt, up to a fixed token budget.">
+
+<svg viewBox="0 0 560 330" role="img" aria-label="Scheduler loop of admit, step, emit, evict; a table of batch slots changing over steps; and a bar showing one step's token budget split between decode tokens and a prefill chunk">
+  <rect x="20" y="14" width="100" height="34" class="fill-paper" stroke-width="1" />
+  <text x="70" y="35" text-anchor="middle" class="strong">ADMIT</text>
+  <rect x="160" y="14" width="110" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="215" y="35" text-anchor="middle" class="strong">ONE FORWARD</text>
+  <rect x="310" y="14" width="100" height="34" class="fill-paper" stroke-width="1" />
+  <text x="360" y="35" text-anchor="middle" class="strong">EMIT</text>
+  <rect x="450" y="14" width="100" height="34" class="fill-paper" stroke-width="1" />
+  <text x="500" y="35" text-anchor="middle" class="strong">EVICT</text>
+  <line x1="120" y1="31" x2="156" y2="31" class="ink" stroke-width="1" />
+  <polygon points="156,27 162,31 156,35" class="fill-blue" />
+  <line x1="270" y1="31" x2="306" y2="31" class="ink" stroke-width="1" />
+  <polygon points="306,27 312,31 306,35" class="fill-blue" />
+  <line x1="410" y1="31" x2="446" y2="31" class="ink" stroke-width="1" />
+  <polygon points="446,27 452,31 446,35" class="fill-blue" />
+  <path d="M500 48 V62 H70 V52" class="ink" stroke-width="1" fill="none" />
+  <polygon points="66,54 70,48 74,54" class="fill-blue" />
+  <text x="285" y="76" text-anchor="middle">ONCE PER TOKEN, FOREVER</text>
+
+  <text x="10" y="102" class="strong">SLOT</text>
+  <text x="80" y="102">T1</text><text x="130" y="102">T2</text><text x="180" y="102">T3</text><text x="230" y="102">T4</text>
+  <text x="280" y="102">T5</text><text x="330" y="102">T6</text><text x="380" y="102">T7</text><text x="430" y="102">T8</text>
+  <text x="10" y="124">0</text>
+  <rect x="72" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="94" y="124" text-anchor="middle">A</text>
+  <rect x="122" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="144" y="124" text-anchor="middle">A</text>
+  <rect x="172" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="194" y="124" text-anchor="middle">A</text>
+  <rect x="222" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="244" y="124" text-anchor="middle">A</text>
+  <rect x="272" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="294" y="124" text-anchor="middle">A</text>
+  <rect x="322" y="112" width="44" height="16" class="fill-blue" /><text x="344" y="124" text-anchor="middle" style="fill:var(--paper)">E</text>
+  <rect x="372" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="394" y="124" text-anchor="middle">E</text>
+  <rect x="422" y="112" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="444" y="124" text-anchor="middle">E</text>
+  <text x="10" y="146">1</text>
+  <rect x="72" y="134" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="94" y="146" text-anchor="middle">B</text>
+  <rect x="122" y="134" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="144" y="146" text-anchor="middle">B</text>
+  <rect x="172" y="134" width="44" height="16" class="fill-blue" /><text x="194" y="146" text-anchor="middle" style="fill:var(--paper)">D</text>
+  <rect x="222" y="134" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="244" y="146" text-anchor="middle">D</text>
+  <rect x="272" y="134" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="294" y="146" text-anchor="middle">D</text>
+  <rect x="322" y="134" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="344" y="146" text-anchor="middle">D</text>
+  <rect x="372" y="134" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="394" y="146" text-anchor="middle">D</text>
+  <rect x="422" y="134" width="44" height="16" class="fill-paper dash" stroke-width="0.8" />
+  <text x="10" y="168">2</text>
+  <rect x="72" y="156" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="94" y="168" text-anchor="middle">C</text>
+  <rect x="122" y="156" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="144" y="168" text-anchor="middle">C</text>
+  <rect x="172" y="156" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="194" y="168" text-anchor="middle">C</text>
+  <rect x="222" y="156" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="244" y="168" text-anchor="middle">C</text>
+  <rect x="272" y="156" width="44" height="16" class="fill-paper dash" stroke-width="0.8" />
+  <rect x="322" y="156" width="44" height="16" class="fill-blue" /><text x="344" y="168" text-anchor="middle" style="fill:var(--paper)">F</text>
+  <rect x="372" y="156" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="394" y="168" text-anchor="middle">F</text>
+  <rect x="422" y="156" width="44" height="16" class="fill-wash" stroke-width="0.8" /><text x="444" y="168" text-anchor="middle">F</text>
+  <text x="472" y="124">← E JOINS</text>
+  <text x="472" y="146">B LEFT AT T2</text>
+  <text x="472" y="168">SOLID = PREFILL</text>
+  <text x="72" y="190">B FINISHES AFTER T2; D TAKES ITS SEAT AT T3. NO ONE WAITS FOR A, THE LONG ONE.</text>
+
+  <line x1="10" y1="206" x2="550" y2="206" class="ink dash" stroke-width="1" />
+
+  <text x="10" y="228" class="strong">ONE STEP WITH CHUNKED PREFILL · TOKEN BUDGET 512</text>
+  <rect x="10" y="240" width="60" height="22" class="fill-blue" />
+  <rect x="70" y="240" width="470" height="22" class="fill-wash" stroke-width="1" />
+  <text x="40" y="255" text-anchor="middle" style="fill:var(--paper)">63</text>
+  <text x="305" y="255" text-anchor="middle" class="blue-t">449 TOKENS: CHUNK 2 OF A 2,000-TOKEN PROMPT</text>
+  <text x="10" y="280">63 RUNNING USERS × 1 DECODE TOKEN</text>
+  <text x="10" y="298">WITHOUT CHUNKING: ONE STEP OF 2,063 TOKENS, AND 63 STREAMS FREEZE FOR IT</text>
+  <text x="10" y="316" class="blue-t">WITH CHUNKING: FIVE STEPS OF ≤ 512, EVERY STREAM KEEPS MOVING</text>
+</svg>
+
+</Figure>
+
+### The trade: throughput vs latency
+
+Batching is not free for the user. Every user in a batch shares the step, so a bigger batch is a slower step for everyone: in Figure 001, per-user speed falls from 17 to 11 tok/s as the batch grows from 1 to 64. Prefills from newcomers stall or slow the step further. And a dynamic batcher's wait window is pure added latency.
+
+So a serving system does not maximize throughput. It maximizes throughput *subject to a promise*. That promise is an <Term w="SLO">Service level objective: a target for a metric that you commit to, such as "p99 time to first token under 1 second" or "at least 10 tokens per second per stream".</Term>. A typical LLM SLO has two parts: TTFT (how long until text starts, usually as a p99) and ITL (how steady the text is, usually p50 or p90). Reading speed is a useful anchor: people read roughly 4 to 6 words a second, so a stream much below 8 to 10 tok/s starts to feel like waiting.
+
+The number that captures "throughput, but only the useful kind" is <Term w="goodput">Throughput counting only requests that met their SLO. A server doing 700 tok/s where half the requests blew their TTFT target has a goodput of roughly 350. The DistServe paper (OSDI 2024) popularized it for LLM serving.</Term>. Pushing the batch size up raises throughput until requests start missing their deadlines; past that knee, goodput falls even while raw throughput keeps climbing.
+
+<Figure n="005" title="THE CURVE YOUR PLOT SHOULD MAKE" caption="Schematic, not data: what throughput vs p99 TTFT typically looks like for your three servers as concurrency goes 1, 4, 16, 64. Points to the left of the SLO line are usable. Your own plot replaces this.">
+
+<svg viewBox="0 0 560 260" role="img" aria-label="Schematic plot of throughput against p99 time to first token for naive, static and continuous batching servers, with an SLO line">
+  <line x1="60" y1="220" x2="500" y2="220" class="ink" stroke-width="1" />
+  <line x1="60" y1="20" x2="60" y2="220" class="ink" stroke-width="1" />
+  <text x="280" y="250" text-anchor="middle">P99 TTFT (LOG SCALE) →</text>
+  <text x="60" y="236" text-anchor="middle">0.1 S</text>
+  <text x="165" y="236" text-anchor="middle">1 S</text>
+  <text x="270" y="236" text-anchor="middle">10 S</text>
+  <text x="375" y="236" text-anchor="middle">100 S</text>
+  <text x="480" y="236" text-anchor="middle">1000 S</text>
+  <text x="14" y="30">TOK/S</text>
+  <text x="54" y="62" text-anchor="end">450</text>
+  <text x="54" y="155" text-anchor="end">180</text>
+  <text x="54" y="218" text-anchor="end">13</text>
+
+  <line x1="165" y1="20" x2="165" y2="220" class="blue dash" stroke-width="1.2" />
+  <text x="170" y="32" class="blue-t">SLO: P99 TTFT 1 S</text>
+
+  <polyline points="78,215 352,215 425,215 490,215" class="ink dash" stroke-width="1.2" fill="none" />
+  <circle cx="78" cy="215" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="352" cy="215" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="425" cy="215" r="3" class="fill-paper" stroke-width="1" />
+  <text x="500" y="208" text-anchor="end">NAIVE · FLAT, MINUTES</text>
+
+  <polyline points="92,215 112,202 155,155 352,155" class="ink" stroke-width="1.2" fill="none" />
+  <circle cx="112" cy="202" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="155" cy="155" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="352" cy="155" r="3" class="fill-paper" stroke-width="1" />
+  <text x="352" y="146" text-anchor="middle">STATIC B=16 · C=64 QUEUES</text>
+
+  <polyline points="78,215 102,202 123,152 160,58" class="blue" stroke-width="1.5" fill="none" />
+  <circle cx="102" cy="202" r="3" class="fill-blue" />
+  <circle cx="123" cy="152" r="3" class="fill-blue" />
+  <circle cx="160" cy="58" r="3" class="fill-blue" />
+  <text x="176" y="62" class="blue-t">CONTINUOUS · C=64</text>
+  <text x="130" y="140" class="blue-t">C=16</text>
+</svg>
+
+</Figure>
+
+Three shapes. The naive server is a flat line sliding right: more users, same throughput, much longer waits. Static batching climbs while the batch can absorb users, then hits B and slides right like the naive one, because extra users queue behind whole batches. Continuous batching climbs steeply and stays to the left, until the batch gets so big that steps slow down (Figure 001) or memory runs out.
+
+### Memory is the real batch-size limit
+
+So far the batch limit has been bandwidth: bigger batches mean slower steps. On many machines a harder wall comes first. Every running sequence keeps its whole KV cache in GPU memory, for as long as it runs. That memory has to exist.
+
+From [memory math](/lessons/memory-math/), Llama 3.1 8B's cache is 128 KiB per token: 2 (K and V) × 32 layers × 8 KV heads × 128 dimensions × 2 bytes. A user at 4K tokens of context holds 512 MiB. Now count seats:
+
+<Figure n="006" title="WHO FITS IN 128 GB" caption="Approximate. The Spark's 128 GB is shared by the CPU, the OS and the GPU, so take ~90 GB for KV caches as a round planning number and measure your own. Bottom: a padded cache reserves the longest row's length for every row.">
+
+<svg viewBox="0 0 560 280" role="img" aria-label="Memory bar for 128 GB split into OS and runtime, weights and KV pool, a table of how many users fit at each context length, and padded cache waste">
+  <text x="10" y="16" class="strong">DGX SPARK · 128 GB UNIFIED (SPEC SHEET)</text>
+  <rect x="10" y="26" width="76" height="26" class="fill-paper" stroke-width="1" />
+  <text x="48" y="43" text-anchor="middle">OS+RT</text>
+  <rect x="86" y="26" width="64" height="26" class="fill-blue" />
+  <text x="118" y="43" text-anchor="middle" style="fill:var(--paper)">16 GB</text>
+  <rect x="150" y="26" width="400" height="26" class="fill-wash" stroke-width="1" />
+  <text x="350" y="43" text-anchor="middle" class="blue-t">KV POOL ≈ 90 GB ≈ 690,000 TOKENS</text>
+  <text x="48" y="66" text-anchor="middle">~20 GB</text>
+  <text x="118" y="66" text-anchor="middle">8B BF16</text>
+
+  <text x="10" y="94" class="strong">CONTEXT PER USER</text>
+  <text x="200" y="94" class="strong">KV PER USER</text>
+  <text x="340" y="94" class="strong">USERS THAT FIT</text>
+  <line x1="10" y1="100" x2="550" y2="100" class="ink" stroke-width="1" />
+  <text x="10" y="118">512 TOKENS</text><text x="200" y="118">64 MIB</text><text x="340" y="118" class="blue-t">~1,300</text>
+  <text x="10" y="136">4K TOKENS</text><text x="200" y="136">512 MIB</text><text x="340" y="136" class="blue-t">~170</text>
+  <text x="10" y="154">32K TOKENS</text><text x="200" y="154">4 GIB</text><text x="340" y="154" class="blue-t">~21</text>
+  <text x="10" y="172">128K TOKENS</text><text x="200" y="172">16 GIB</text><text x="340" y="172" class="blue-t">~5</text>
+
+  <line x1="10" y1="190" x2="550" y2="190" class="ink dash" stroke-width="1" />
+  <text x="10" y="210" class="strong">YOUR PADDED CACHE: EVERY ROW AS LONG AS THE LONGEST</text>
+  <rect x="10" y="220" width="300" height="10" class="fill-wash" stroke-width="0.8" />
+  <rect x="10" y="234" width="150" height="10" class="fill-paper dash" stroke-width="0.8" />
+  <rect x="160" y="234" width="150" height="10" class="fill-wash" stroke-width="0.8" />
+  <rect x="10" y="248" width="260" height="10" class="fill-paper dash" stroke-width="0.8" />
+  <rect x="270" y="248" width="40" height="10" class="fill-wash" stroke-width="0.8" />
+  <text x="324" y="230">REAL TOKENS: 490 OF 900</text>
+  <text x="324" y="244">DASHED = RESERVED, UNUSED</text>
+  <text x="324" y="258" class="blue-t">FIX: PAGED ATTENTION (NEXT LESSONS)</text>
+</svg>
+
+</Figure>
+
+On the Spark with an 8B model, memory is generous: at your benchmark's ~300 tokens of context per request, a thousand users fit. Bandwidth (Figure 001) and your server's overhead will stop you long before memory does. That is unusual, and it is the Spark's 128 GB talking. Move the same model to a 24 GB gaming card and the picture flips: 16 GB of weights leaves maybe 6 GB for caches, about 46,000 tokens, so around 11 users at 4K context. On a data-center GPU serving a 70B model, memory is almost always the wall. That is why the next big idea in serving, vLLM's paged attention, is about memory, not speed.
+
+Three things make the memory wall worse than the table:
+
+- **Padding.** The simple cache you are about to build is one rectangular tensor: every row is as long as the longest row. A batch with one 4,000-token conversation and sixty-three short chats reserves 4,000 tokens for everyone.
+- **You do not know the future.** A request that asks for `max_tokens` 4,096 *might* use all of it. Reserve for the worst case and you fit fewer users; reserve less and you may run out mid-answer.
+- **Running out mid-answer.** When memory fills, real engines <Term w="preempt">Pause a running sequence to free its memory: either copy its KV cache to CPU memory (swap) or throw it away and recompute it later from the prompt and the tokens generated so far (recompute).</Term> a running sequence and bring it back later. Your server will simply refuse to admit more than a fixed number of sequences.
+
+[Paged attention and prefix caching](/lessons/prefix-caching/) fixes the first two by storing caches in small fixed-size blocks, like the pages in [virtual memory](/lessons/virtual-memory/), so a sequence only holds what it has used.
+
+## Build It
+
+You are upgrading your server twice: first to dynamic batching (an asyncio queue and a collector in front of a padded batch `generate`), then to continuous batching (your own decode loop, sequences joining and leaving every step). Same API, same harness, two more rows on the scoreboard.
+
+```text
+inference/
+  server_naive.py      # from the baseline lesson, unchanged
+  common.py            # today: shared model loading and SSE helpers
+  server_static.py     # today: queue + collector + padded batch generate
+  engine.py            # today: the continuous batching engine
+  test_engine.py       # today: proves engine == generate, token for token
+  server_cb.py         # today: the engine behind the same API
+  plot.py              # today: throughput vs p99 TTFT
+  prompts/mixed.jsonl  # today: prompts with varied max_tokens
+```
+
+**Develop on your Mac, run on the Spark.** Every piece of this lesson runs on a laptop CPU with a tiny Llama-shaped model, `HuggingFaceTB/SmolLM2-135M-Instruct` (135M parameters, grouped-query attention like Llama 3). Use it with `MODEL_ID` and fp32 while you write and test; switch to Llama 3.1 8B in bf16 on the Spark for the real runs. This lesson's code was checked that way, on transformers 5.20 and PyTorch 2.14.
+
+<Task id="t1" title="Pull the shared parts into common.py" agent="ok">
+
+Both new servers need the same model loading and SSE helpers your naive server has. Move them into one module:
+
+```python
+# common.py: shared by every server in this track.
+import json, os, time, uuid
+
+import torch
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+MODEL_ID = os.environ.get("MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+DEVICE = os.environ.get("DEVICE", "cuda")
+DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=DTYPE).to(DEVICE).eval()  # older transformers: torch_dtype=
+
+_eos = model.generation_config.eos_token_id
+EOS = set(_eos if isinstance(_eos, list) else [_eos])  # Llama 3.1 Instruct has several
+
+
+class ChatRequest(BaseModel):
+    model: str | None = None
+    messages: list[dict]
+    max_tokens: int = 256
+    temperature: float = 0.0
+    stream: bool = True
+    ignore_eos: bool = False
+
+
+def sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def chunk(rid, created, delta, finish=None, usage=None) -> dict:
+    return {"id": rid, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "usage": usage}
+
+
+class Detok:
+    """Turn a growing list of token ids into text deltas. Decoding token by token breaks
+    multi-byte characters, so decode the whole list and emit only the new suffix."""
+    def __init__(self):
+        self.sent = ""
+
+    def delta(self, ids: list[int]) -> str:
+        text = tokenizer.decode(ids, skip_special_tokens=True)
+        if text.endswith("�") or len(text) <= len(self.sent):  # half a character: wait
+            return ""
+        out, self.sent = text[len(self.sent):], text
+        return out
+```
+
+Decoding the full list every token is quadratic, but at 256 tokens it costs microseconds. Real servers keep a small window instead.
+
+</Task>
+
+<Task id="t2" title="Dynamic batching: a queue, a collector, one padded generate" agent="hands">
+
+`server_static.py`. The shape of the whole thing:
+
+- The endpoint is now `async def`. It wraps the request in a `Job` (the request plus its own `asyncio.Queue` of output tokens), puts the job on one shared `pending` queue, and streams whatever arrives on its own queue.
+- One background task, the **collector**, takes jobs off `pending` and forms batches: up to `MAX_BATCH` jobs, or whatever has arrived when the oldest has waited `MAX_WAIT_MS`.
+- The collector runs each batch with one `model.generate` call on left-padded inputs, in a worker thread, and waits for it to finish before forming the next batch. That waiting is static batching's head-of-line blocking, on purpose.
+- A custom streamer gets the batch's new tokens after every step and routes each one to its job's queue.
+
+The streamer is the interesting part. `generate` calls `streamer.put(...)` once with the prompt ids, then once per step with a tensor of shape `[B]`: one new token per row. It calls `streamer.end()` when it is done. You write the class:
+
+```python
+from transformers.generation.streamers import BaseStreamer
+
+class BatchStreamer(BaseStreamer):
+    def __init__(self, jobs: list["Job"], loop: asyncio.AbstractEventLoop): ...
+
+    def put(self, value):
+        """First call: the prompt ids. Skip it. Every later call: value[i] is row i's new token.
+        For each job not yet done: count it, decide if this token finishes the job
+        (its own max_tokens, or an EOS when not ignore_eos), and hand (token, done) to the job.
+        You are on generate's thread, not the event loop's, so you may NOT call
+        job.q.put_nowait directly. Use self.loop.call_soon_threadsafe(job.q.put_nowait, item)."""
+
+    def end(self):
+        """Mark any job that is still open as done, so no client waits forever."""
+```
+
+And the collector:
+
+```python
+pending: asyncio.Queue  # create it inside FastAPI's lifespan, on the running loop
+
+async def collector():
+    loop = asyncio.get_running_loop()
+    while True:
+        batch = [await pending.get()]          # sleep until there is at least one job
+        # keep taking jobs until len(batch) == MAX_BATCH or the window since the first job closes.
+        # asyncio.wait_for(pending.get(), timeout) raises TimeoutError when the window runs out.
+        # MAX_WAIT_MS = inf means pure static batching: wait for a full batch, forever.
+        await asyncio.to_thread(run_batch, batch, loop)
+```
+
+Hints:
+
+- **Left padding.** `tokenizer.padding_side = "left"`, and set `tokenizer.pad_token = tokenizer.eos_token` if the tokenizer has none (Llama 3's does not). Build each prompt string with `apply_chat_template(..., tokenize=False)`, then tokenize the list with `padding=True, add_special_tokens=False` (the template already added the begin-of-text token).
+- **One `max_new_tokens` per batch.** It is the batch's largest `max_tokens`. Each job stops *emitting* at its own limit, but `generate` keeps computing its row until the longest is done. That is tax 2, and you can see it in your results.
+- **`ignore_eos`.** If every job in the batch has it, pass `min_new_tokens=max_new_tokens` like the naive server did.
+- **Usage.** Record each job's prompt length from the attention mask (`mask.sum()`), and count completion tokens in the endpoint as they arrive.
+- **The endpoint reads with `await job.q.get()`**, feeds token ids to a `Detok`, and yields SSE events exactly like the naive server, ending with `usage` and `[DONE]`.
+- **Start the collector in a lifespan handler** (`@asynccontextmanager async def lifespan(app)`, then `FastAPI(lifespan=lifespan)`), so it runs on the same event loop as the endpoints.
+- If `run_batch` raises, `asyncio.to_thread` re-raises inside the collector, the collector task dies, and every future request hangs. Wrap it in `try/except`, log, and mark the batch's jobs done.
+
+</Task>
+
+<Task id="t3" title="The continuous batching engine" agent="hands">
+
+This is the heart of the lesson: your own decode loop over a changing set of sequences. Correctness first; speed comes from engines you will read in [serving engines](/lessons/serving-engines/).
+
+**The design.** The running batch keeps one padded KV cache: per layer, keys and values of shape `[B, kv_heads, L, head_dim]`, where row *i* is sequence *i*, left-padded so that every row's latest token sits in column L − 1. Next to it, an attention mask `[B, L]` with 1 for real positions. Each decode step appends one column. Admitting sequences means prefilling them, then left-padding the two caches to the same length and stacking them. Evicting means keeping only some rows, then trimming leading columns no remaining row uses.
+
+The cache plumbing depends on the transformers version, so take these helpers as given. They convert between Hugging Face's <Term w="DynamicCache">Hugging Face's default KV cache object: per layer, a keys tensor and a values tensor that grow by one position each step. The forward pass takes it as past_key_values and returns it grown.</Term> and plain per-layer tensors:
+
+```python
+# engine.py
+from dataclasses import dataclass, field
+import torch
+from transformers import DynamicCache
+
+# Version-specific: checked on transformers 5.x. On 4.4x the equivalents were
+# DynamicCache.from_legacy_cache(tuple_of_(k, v)) and cache.key_cache[i] / cache.value_cache[i].
+def kv_tensors(cache) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    return [(layer.keys, layer.values) for layer in cache.layers]
+
+def make_cache(kvs) -> DynamicCache:
+    return DynamicCache(ddp_cache_data=kvs)
+
+def left_pad(x: torch.Tensor, n: int, dim: int) -> torch.Tensor:
+    """Prepend n zeros along dim."""
+    if n == 0:
+        return x
+    shape = list(x.shape); shape[dim] = n
+    return torch.cat([x.new_zeros(shape), x], dim=dim)
+```
+
+The engine is yours:
+
+```python
+@dataclass
+class Seq:
+    rid: str
+    prompt: list[int]
+    max_new: int
+    ignore_eos: bool = False
+    out: list[int] = field(default_factory=list)
+    done: bool = False
+
+
+class Engine:
+    def __init__(self, model, eos: set[int], max_batch: int = 64):
+        self.model, self.eos, self.max_batch = model, eos, max_batch
+        self.waiting: list[Seq] = []
+        self.running: list[Seq] = []
+        self.cache = None   # DynamicCache for self.running, or None when empty
+        self.mask = None    # [B, L] long tensor
+
+    def pick(self, seqs, logits) -> list[int]:
+        """Greedy next token per row. For ignore_eos rows, set the EOS logits to -inf first."""
+
+    def prefill(self, seqs) -> tuple[DynamicCache, torch.Tensor]:
+        """Left-pad the prompts into one [n, P] batch, run one forward pass,
+        append each sequence's first token, return (cache, mask)."""
+
+    def merge(self, cache, mask):
+        """Add newly prefilled rows to the running cache: left-pad both to the same L, then cat on dim 0."""
+
+    def evict(self, keep: list[int]):
+        """Keep only rows `keep` of cache and mask, then drop leading columns no remaining row uses."""
+
+    def step(self) -> list[Seq]:
+        """One iteration. Admit up to the free seats; if anyone was admitted, this step is their prefill.
+        Otherwise decode one token for every running sequence. Then mark and evict finished ones.
+        Return the sequences that got a new token this step (so the server can stream them)."""
+```
+
+Hints, roughly in the order you will need them:
+
+- **Position ids.** With left padding, a row's padding must not count as position. In prefill, `position_ids = (mask.cumsum(-1) - 1).clamp(min=0)`. In decode, the new token's position is the number of real tokens already in that row: `mask.sum(-1, keepdim=True)`, computed *before* you append the new mask column.
+- **The decode call.** `model(input_ids=[B, 1] last tokens, attention_mask=mask with the new column, position_ids=..., past_key_values=self.cache, use_cache=True)`. The returned `past_key_values` is the grown cache. `out.logits[:, -1]` is the next-token scores.
+- **Only the last logits.** In prefill, a 2,000-token prompt × 128,256 vocabulary entries is half a gigabyte of logits you do not need. Recent transformers accept `logits_to_keep=1` in the forward call; check your version.
+- **Finished.** A sequence is done when `len(out) == max_new`, or its last token is in `eos` and it is not `ignore_eos`. Its first token comes from prefill, so a `max_new` of 1 finishes in the admit step.
+- **Prefill and decode in separate steps.** This is the simple design from the Idea section: a step that admits newcomers does only their prefill, and running sequences wait one step. You will see the cost in Break It.
+- **Seats, not memory.** `max_batch` is your only admission limit. A memory-aware version would also check `sum of (len(prompt) + max_new)` against a KV budget; add it if you have time.
+- **Copies.** Every `merge` and `evict` copies the whole cache. Happens a few times per finished request, not every step, so it is fine for now. (HF's `DynamicCache` also grows each layer with `torch.cat` every step, which copies too. This is one of the things paged attention exists to stop.)
+
+</Task>
+
+<Task id="t4" title="Prove it: engine output equals generate, token for token" agent="ok">
+
+The engine is the kind of code that runs, produces fluent text, and is subtly wrong (a position off by one, a mask column missing). Fluent text is not evidence. This test is: feed requests in at different steps, with different prompt and output lengths, and require every sequence to match plain one-at-a-time greedy `generate` exactly.
+
+```python
+# test_engine.py: run on your Mac with the tiny model in fp32.
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from engine import Engine, Seq
+
+M = "HuggingFaceTB/SmolLM2-135M-Instruct"
+tok = AutoTokenizer.from_pretrained(M)
+model = AutoModelForCausalLM.from_pretrained(M, dtype=torch.float32).eval()
+eos = model.generation_config.eos_token_id
+eos = set(eos if isinstance(eos, list) else [eos])
+
+prompts = ["Write a haiku about memory bandwidth.", "What is 17 times 23?",
+           "Name three rivers in Europe and one fact about each.", "Explain batching to a child.",
+           "hi", "Tell me a long story about a dragon who learns to code and opens a bakery."]
+lens = [12, 30, 5, 40, 30, 12]
+ids = [tok.apply_chat_template([{"role": "user", "content": p}], add_generation_prompt=True,
+                               tokenize=True, return_dict=True)["input_ids"] for p in prompts]
+
+ref = []
+for p, n in zip(ids, lens):
+    o = model.generate(torch.tensor([p]), max_new_tokens=n, min_new_tokens=n, do_sample=False)
+    ref.append(o[0, len(p):].tolist())
+
+eng = Engine(model, eos, max_batch=3)        # 3 seats for 6 requests: forces queueing and reuse
+arrive = {0: [0, 1], 3: [2], 4: [3, 4], 20: [5]}
+done, t = {}, 0
+while len(done) < len(prompts):
+    for i in arrive.get(t, []):
+        eng.waiting.append(Seq(str(i), ids[i], lens[i], ignore_eos=True))
+    for s in eng.step():
+        if s.done:
+            done[s.rid] = s.out
+    t += 1
+
+for i in range(len(prompts)):
+    assert done[str(i)] == ref[i], (i, tok.decode(ref[i]), tok.decode(done[str(i)]))
+print(f"all {len(prompts)} match after {t} steps")
+```
+
+If your `step` reports finished sequences differently, adapt the collection loop. `ignore_eos=True` matters: `min_new_tokens` in the reference suppresses EOS, so your engine must too, or the two diverge at the first end-of-turn token. (That is exactly the mismatch this test caught while the lesson was being written.)
+
+Two things this test will not catch, so know them. In **bf16 on the GPU**, batched and unbatched runs can legitimately drift apart after a while: padding and batch size change the shapes of the matrix multiplies, which changes the order of floating-point additions, and a near-tie between two tokens can flip. Test exactness in fp32; in bf16, check the first few dozen tokens match and the rest are sensible. And it does not test streaming or threading; the harness does that.
+
+</Task>
+
+<Task id="t5" title="Put the engine behind the API" agent="review">
+
+`server_cb.py`: the same endpoint, with the engine running in its own thread.
+
+```python
+import queue, threading
+
+inbox: queue.Queue = queue.Queue()    # a thread-safe queue: the engine thread is not on the event loop
+eng = Engine(model, EOS, max_batch=int(os.environ.get("MAX_BATCH", 64)))
+
+def engine_loop():
+    while True:
+        # if nothing is running or waiting, block on inbox.get(): an idle server should sleep
+        # drain everything else from inbox (get_nowait until queue.Empty) into eng.waiting
+        # emitted = eng.step()
+        # for each emitted sequence: loop.call_soon_threadsafe(seq.q.put_nowait, (len(seq.out), seq.done))
+        ...
+
+threading.Thread(target=engine_loop, daemon=True).start()
+```
+
+The endpoint tokenizes the prompt with the chat template, builds a `Seq`, attaches `seq.q = asyncio.Queue()` and `seq.loop = asyncio.get_running_loop()`, puts it on `inbox`, and streams. Send the token *count* through the queue, not the token, and decode `seq.out[:n]` on the event loop side: the engine thread keeps appending to `seq.out`, and a count is a consistent snapshot.
+
+Why a thread and not an asyncio task? `eng.step()` blocks for a whole forward pass. On the event loop it would freeze every connection for 60-100 ms per step, forever (the lesson from [Waiting vs working](/lessons/waiting-vs-working/)). A thread lets the GPU work while the event loop keeps streaming; PyTorch releases the GIL inside its kernels, so the two really do overlap ([Processes, threads and the GIL](/lessons/processes-threads-gil/)).
+
+When it works, have an agent review it against this list: no blocking call on the event loop; no asyncio queue touched from the engine thread except through `call_soon_threadsafe`; an exception inside `step()` is logged and fails the affected requests instead of killing the thread silently; a client that disconnects has its sequence marked done so it stops using a seat (the bug you noted at the end of the baseline lesson).
+
+</Task>
+
+<Task id="t6" title="Mixed lengths and the plot" agent="ok">
+
+**Mixed lengths.** Your harness sends the same `max_tokens` for every request. Let a prompt line override it: in `bench.py`, where you build the body, use `p.get("max_tokens", args.max_tokens)`. Then make `prompts/mixed.jsonl`: the 50 short prompts again, each with a `max_tokens` drawn from a skewed mix (say 60% at 32, 30% at 256, 10% at 1,024; fix the random seed so it is the same file forever). That is the workload where static batching's tax 2 shows.
+
+**The plot.** One line per server, one point per concurrency level:
+
+```python
+# plot.py: throughput vs p99 TTFT, one line per results file.
+import json, sys
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(7, 4.5))
+for path in sys.argv[1:]:
+    run = json.load(open(path))
+    pts = sorted((l["summary"]["concurrency"], l["summary"]) for l in run["levels"])
+    xs = [s["ttft_p99"] for _, s in pts]
+    ys = [s["throughput_tps"] for _, s in pts]
+    ax.plot(xs, ys, marker="o", label=f'{run["meta"]["target"]}: {run["meta"]["change"]}')
+    for (c, s), x, y in zip(pts, xs, ys):
+        flag = "" if s["n_ok"] >= 100 else "*"
+        ax.annotate(f"c={c}{flag}", (x, y), textcoords="offset points", xytext=(4, 4), fontsize=8)
+ax.set_xscale("log")
+ax.axvline(1.0, linestyle="--", linewidth=1)
+ax.text(1.05, ax.get_ylim()[1] * 0.95, "SLO: p99 TTFT 1 s", fontsize=8)
+ax.set_xlabel("TTFT p99 (s, log scale)   * = fewer than 100 samples")
+ax.set_ylabel("throughput, all users (tok/s)")
+ax.legend(fontsize=8)
+fig.tight_layout()
+fig.savefig("results/throughput_vs_ttft.png", dpi=150)
+```
+
+Run it as `python plot.py results/<naive>.json results/<static>.json results/<cb>.json`.
+
+</Task>
+
+<Task id="t7" title="Run the matrix" agent="explain">
+
+Commit first, so every results file points at the code that made it. Then, on the Spark, one server at a time on port 8000:
+
+```bash
+# dynamic batching: batches of up to 16, 50 ms window
+MAX_BATCH=16 MAX_WAIT_MS=50 uvicorn server_static:app --host 0.0.0.0 --port 8000
+python bench.py --target spark --change "static batching, B=16, 50 ms window" \
+  --base-url http://localhost:8000/v1 --model meta-llama/Llama-3.1-8B-Instruct --precision bf16 \
+  --prompts prompts/short.jsonl --concurrency 1,4,16,64 --n 200 --max-tokens 256 --ignore-eos
+
+# continuous batching: up to 64 seats
+MAX_BATCH=64 uvicorn server_cb:app --host 0.0.0.0 --port 8000
+python bench.py --target spark --change "continuous batching, own loop, B<=64" ...same flags...
+
+# both again on the mixed-length workload, at c = 16 only
+python bench.py ... --prompts prompts/mixed.jsonl --concurrency 16 --n 200
+```
+
+Adjust the flags to whatever your `bench.py` takes. At c = 64, `--n 200` is only about three requests per worker, so if you can spare the time use `--n 512` there. Then append the scoreboard rows, and add c = 64 throughput to the notes column, because that is where continuous batching earns its keep:
+
+```markdown
+| date | spark | static batching, B=16, 50 ms window | ... | ... | ... | bf16, c=64 tput ... |
+| date | spark | continuous batching, own loop, B<=64 | ... | ... | ... | bf16, c=64 tput ... |
+```
+
+</Task>
+
+<DoneWhen>
+
+- `test_engine.py` passes: every sequence matches one-at-a-time `generate` exactly, with arrivals at different steps and more requests than seats.
+- Both servers stream correctly under `curl -N` and survive c = 64 from the harness with zero errors.
+- `results/` holds runs for both servers at c = 1, 4, 16, 64, plus the mixed-length runs at c = 16.
+- `SCOREBOARD.md` has two new rows, and `results/throughput_vs_ttft.png` shows three lines.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Copy the naive rows from your baseline results.
+
+| server | c | TTFT p50 | TTFT p99 | tok/s p50 (per stream) | max gap p99 | throughput |
+|---|---|---|---|---|---|---|
+| naive | 1 | | | | | |
+| naive | 16 | | | | | |
+| static B=16, 50 ms | 1 | | | | | |
+| static B=16, 50 ms | 4 | | | | | |
+| static B=16, 50 ms | 16 | | | | | |
+| static B=16, 50 ms | 64 | | | | | |
+| continuous | 1 | | | | | |
+| continuous | 4 | | | | | |
+| continuous | 16 | | | | | |
+| continuous | 64 | | | | | |
+| static, **mixed** | 16 | | | | | |
+| continuous, **mixed** | 16 | | | | | |
+
+What the shape should look like. These are expectations from the model in this lesson, not results; on a machine like the Spark, overheads you have not met yet can move them a lot.
+
+**c = 1.** All three servers should be within a few tok/s of each other: a batch of one is a batch of one. The static server's TTFT should be about one wait window (50 ms) worse than naive, which is the price of the window, paid even when nobody else is coming. The continuous server's tok/s may be a little lower than naive's: your Python loop does more bookkeeping per step than `generate`.
+
+<Predict id="c16-equal">
+
+At c = 16, short prompts, everyone wanting exactly 256 tokens: which wins on throughput, the static B=16 server or the continuous one? By how much?
+
+<Fragment slot="answer">
+
+Close to a tie, possibly with static slightly ahead. In a closed loop with equal lengths, all 16 workers send at once, the batch fills in a few milliseconds, all 16 finish together, and all 16 send their next request at once. That is the "equal lengths, all at once" case in Figure 003, where the policies are identical. Static uses HF's `generate`, which has less Python per step than your engine, so it can even win. The difference shows up in the mixed-length run and at c = 64.
+
+</Fragment>
+
+</Predict>
+
+**c = 16.** Both batching servers should show TTFT p50 dropping from minutes (naive) to well under a second, and throughput up by an order of magnitude over naive: Figure 001's ceiling at B = 16 is about 240 tok/s, and something like half of that or more is a reasonable first result. Per-stream tok/s should be a little below c = 1's.
+
+**c = 64.** This is where they split. The static server has only 16 seats, so 48 users queue behind whole batches: TTFT p50 jumps to tens of seconds (roughly one to three batch lifetimes of ~256 steps each) while throughput stays at its c = 16 value. The continuous server puts all 64 in the batch: TTFT should stay around a second or under, throughput should climb well past the c = 16 number (the ceiling is ~700-900 tok/s at these context lengths; a few hundred is a good result for a Python loop), and per-stream speed should drop, as Figure 001 says.
+
+**Max gap.** On the continuous server, look at `max_gap` p99 at c = 64. Every time a newcomer is admitted, everyone else skips a step for its prefill. With 64 requests of 256 tokens in rotation, someone finishes about every four steps, so some stream is stalled for a prefill roughly every fourth step. That cost is in your throughput too. It is the motivation for chunked prefill.
+
+**Mixed lengths at c = 16.** Now the continuous server should clearly beat static on both throughput and TTFT, because the static server's batches are dominated by their 1,024-token members while the 32-token ones sit in held seats. Compute the static server's wasted fraction from your own numbers: tokens it *computed* (each batch's longest × its size) versus tokens it *delivered*.
+
+**The plot.** Compare `throughput_vs_ttft.png` with Figure 005. Which points sit left of the 1-second line? The highest one there is your server's capacity at that SLO, which is the number you would put in a capacity plan.
+
+## Break It
+
+**Pure static, low load.** Start `server_static.py` with `MAX_WAIT_MS=inf` and `MAX_BATCH=16`, then run the harness at c = 4. It never returns. Then try c = 16: it gets most of the way and hangs on the last few requests, because the final batch never fills. (This happened, exactly so, while this lesson's code was being tested.) Lesson: every batcher needs a deadline, and a closed-loop benchmark is very good at finding the missing one.
+
+**Pad on the right.** Set `tokenizer.padding_side = "right"` in the static server and send two requests of very different prompt lengths at once. The short one's answer turns to nonsense or runs on oddly, because its new tokens are being appended after a run of pad tokens instead of after its prompt. Transformers prints a warning about right-padding for decoder-only models; you will now never ignore it. Lesson: for decoder models the newest token must be in the last column of every row.
+
+**Break the position ids.** In the engine's decode step, use the cache's column count (`mask.shape[1]`) as every row's position instead of each row's own count of real tokens. Run `test_engine.py`. When this was tried on the tiny model, two of the six sequences still matched and four drifted: rows that carried little or no padding were barely affected, padded rows were off. Drifted text can still read fine, which is why you need the test. Lesson: padding has to be invisible to *every* part of the model, and <Term w="RoPE">Rotary position embedding: Llama encodes each token's position by rotating its query and key vectors by an angle that depends on the position id. Wrong position ids mean wrong rotations.</Term> positions are part of the model.
+
+**Paste a novel.** With the continuous server running a steady c = 32 of short requests, send one request with a 4,000-token prompt (`prompts/long.jsonl` doubled). Look at `max_gap` for the other streams during that moment: every one of them stalls for the full prefill, probably most of a second. Then think about how you would split that prefill into 512-token chunks: each chunk is a forward pass over 512 new tokens attending to the cache built so far, which your `prefill` can almost do already if it accepts a starting cache. Lesson: the scheduler's job is not just who is in the batch, but how much work goes into each step.
+
+## Explain It Back
+
+Answer out loud, in plain words, before opening the answer.
+
+<details>
+<summary>1. Why does serving 64 users at once make each token cheaper, and why doesn't it make each user slower by 64×?</summary>
+
+A decode step is dominated by reading the weights from memory: 16 GB for an 8B model in bf16, about 59 ms on the Spark. That read is the same whether one user's token is in the step or 64 users' tokens are, because each weight, once it arrives, can be multiplied against all 64 token vectors. So the step gets only a bit longer (each user's KV cache is extra bytes, and there is a little more math), while it produces 64 tokens instead of one. The GPU-hour costs the same and makes about 40× more tokens, so each token costs about a fortieth. Each user's own speed drops only by the step-time increase, about 17 to 11 tok/s at 1K context.
+
+</details>
+
+<details>
+<summary>2. What's wrong with static batching for LLMs, and how does continuous batching fix it?</summary>
+
+Static batching runs a fixed group from start to end together. Three costs: short prompts get padded to the longest, which is wasted compute and memory; short answers keep their slot until the longest answer in the batch finishes; and a request that arrives just after a batch starts waits for the whole batch. Plus, without a time limit it can wait forever for a batch to fill. Dynamic batching adds a max wait window, which fixes the waiting-to-fill problem but not the others. Continuous batching makes the scheduling decision at every decode step instead of once per batch: a finished sequence leaves immediately, a new one joins at the next step, so seats are never held empty and nobody waits for someone else's long answer.
+
+</details>
+
+<details>
+<summary>3. How does this scale: how many users can your Spark serve with an 8B model at 10 tok/s per stream?</summary>
+
+10 tok/s per stream means a decode step must take at most 100 ms. Step time is about (16.06 GB + B × KV bytes per user) ÷ 273 GB/s. 100 ms × 273 GB/s = 27.3 GB per step, minus 16.06 GB of weights leaves 11.2 GB for KV caches. At 1K tokens of context each (0.134 GB), that is about 83 users; at 512 tokens, about 167. Those are spec-sheet ceilings. My server will hit fewer because of Python overhead and prefill steps, so I would measure it: run the harness at increasing c and find the highest c where per-stream tok/s p50 stays above 10 and TTFT p99 stays within its SLO. Memory is not the limit here (90 GB of KV pool holds hundreds of thousands of tokens); bandwidth is. On a 24 GB GPU it would be memory: only about 6 GB left for caches.
+
+</details>
+
+<details>
+<summary>4. A user pastes a 4,000-token document into a busy continuous-batching server. What happens to everyone else, and what is chunked prefill?</summary>
+
+The new prompt needs a prefill: all 4,000 tokens through the model, which is compute-bound and takes far longer than a decode step. If the server does that prefill as its own step, every other running stream gets no token during it, so their text visibly pauses. Even if prefill and decode are mixed in one forward pass, that pass is huge, so it is still a long step. Chunked prefill splits the prompt into pieces of a few hundred tokens and adds one piece to each step, next to everyone's single decode token, up to a fixed token budget. Every step stays about the same length, the other streams keep moving, and the newcomer's first token arrives a bit later. It also uses the idle compute in memory-bound decode steps for the prefill work.
+
+</details>
+
+<details>
+<summary>5. Throughput keeps rising as you add users. Why would you ever cap the batch size?</summary>
+
+Because users do not experience throughput; they experience time to first token and tokens per second. Bigger batches make each step slower, so every stream gets slower, and more newcomers means more prefill stalls. Past some point most requests miss their SLO. The right target is goodput: throughput counting only requests that met their latency targets. You cap the batch where goodput peaks, which is usually well below the batch size that maximizes raw throughput. Memory gives a second, hard cap: every sequence's KV cache must fit, and running out mid-answer means preempting someone.
+
+</details>
+
+## Go Deeper
+
+- **Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, Byung-Gon Chun, "Orca: A Distributed Serving System for Transformer-Based Generative Models", OSDI 2022.** The paper that introduced iteration-level scheduling and selective batching. Sections 2 and 3 are the clearest statement of why request-level batching fails for generation.
+- **Cade Daniel et al., "How continuous batching enables 23x throughput in LLM inference while reducing p50 latency", Anyscale blog, 2023.** The friendly version, with diagrams of exactly the static-vs-continuous picture in Figure 003 and benchmarks across real engines.
+- **Woosuk Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention", SOSP 2023.** The vLLM paper. Read it for why memory, not compute, limits the batch, and how paging the KV cache fixes the padded-cache waste you just built.
+- **Amey Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve", OSDI 2024** (and the earlier SARATHI paper on piggybacking decodes onto chunked prefills, 2023). Chunked prefill and stall-free scheduling, with careful measurements of the prefill-decode interference you saw in Break It.
+- **Yinmin Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving", OSDI 2024.** Defines goodput under TTFT and ITL SLOs, then takes the opposite approach to chunking: run prefill and decode on different GPUs.
+- **Daniel Crankshaw et al., "Clipper: A Low-Latency Online Prediction Serving System", NSDI 2017.** Pre-LLM model serving with adaptive batching under a latency SLO. Useful for seeing which ideas are old and which are new.
+- **NVIDIA Triton Inference Server documentation, "Dynamic Batcher".** The production version of your `MAX_BATCH` and `MAX_WAIT_MS` knobs (`max_queue_delay_microseconds`, preferred batch sizes).
+- **Horace He and Thinking Machines Lab, "Defeating Nondeterminism in LLM Inference", 2025.** Why the same prompt can give different tokens depending on what else is in the batch, and what "batch-invariant" kernels cost. Explains the bf16 caveat in t4.
+
+## Connections
+
+Built on: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (one weight read per step is the thing being shared), [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (the server, harness and scoreboard you just upgraded), [Waiting vs working](/lessons/waiting-vs-working/) (the event loop and Little's Law behind the c = 64 queue), [Processes, threads and the GIL](/lessons/processes-threads-gil/) (why the engine gets its own thread), and [memory math](/lessons/memory-math/) and [the KV cache](/lessons/kv-cache/) (what each seat costs).
+
+Next: [Paged attention and prefix caching](/lessons/prefix-caching/) replaces your padded cache with fixed-size blocks, so more sequences fit and shared prefixes are stored once. [Speculative decoding](/lessons/speculative-decoding/) is the other way to get more tokens per weight read, and it competes with batching for the same idle compute. [Inside vLLM and SGLang](/lessons/serving-engines/) is where you read real schedulers and see every idea from this lesson, done fast. For the queueing side of SLOs, see [tail latency](/lessons/tail-latency/) and [rate limits](/lessons/rate-limits/).

@@ -1,0 +1,52 @@
+---
+// Static: the same three sequences stored two ways.
+// Top: each sequence reserves a contiguous max-length slab (internal waste + external gap).
+// Bottom: paged into 16-token blocks scattered anywhere in the pool; waste is the tail of one block each.
+const W = 20; // px per block in the paged strip
+const X0 = 20;
+// which sequence owns each of the 30 blocks (0 = free); last block of each sequence is partly filled
+const owners = [1, 2, 2, 3, 1, 2, 3, 2, 1, 2, 3, 2, 3, 2, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+const lastIdx: Record<number, number> = {};
+owners.forEach((o, i) => { if (o) lastIdx[o] = i; });
+const fillFrac: Record<number, number> = { 1: 0.5, 2: 0.25, 3: 0.75 };
+---
+<svg viewBox="0 0 640 300" role="img" aria-label="Three sequences stored as contiguous max-length reservations versus as scattered fixed-size blocks">
+  <text x="20" y="22" class="strong">RESERVE MAX LENGTH PER SEQUENCE</text>
+  <rect x="20" y="34" width="600" height="40" class="fill-paper" stroke-width="1.2" />
+  <!-- seq 1 reservation -->
+  <rect x="20" y="34" width="60" height="40" class="fill-wash" stroke-width="1" />
+  <rect x="80" y="34" width="160" height="40" class="fill-paper dash" stroke-width="1" />
+  <text x="50" y="58" text-anchor="middle" class="strong">S1</text>
+  <!-- seq 2 reservation -->
+  <rect x="240" y="34" width="140" height="40" class="fill-wash" stroke-width="1" />
+  <rect x="380" y="34" width="80" height="40" class="fill-paper dash" stroke-width="1" />
+  <text x="310" y="58" text-anchor="middle" class="strong">S2</text>
+  <!-- gap -->
+  <text x="540" y="58" text-anchor="middle">FREE: 160</text>
+  <line x1="160" y1="74" x2="160" y2="98" class="ink" stroke-width="1" />
+  <text x="160" y="112" text-anchor="middle">RESERVED, NEVER USED</text>
+  <line x1="420" y1="74" x2="420" y2="98" class="ink" stroke-width="1" />
+  <text x="420" y="112" text-anchor="middle">RESERVED, NEVER USED</text>
+  <line x1="540" y1="74" x2="540" y2="98" class="blue" stroke-width="1" />
+  <text x="540" y="112" text-anchor="middle" class="blue-t">S3 NEEDS 220: WON'T FIT</text>
+  <text x="20" y="136">USED 200 OF 600 · S3 IS REFUSED EVEN THOUGH 400 ARE EMPTY</text>
+
+  <text x="20" y="182" class="strong">PAGED: 16-TOKEN BLOCKS, ANYWHERE</text>
+  {owners.map((o, i) => {
+    const x = X0 + i * W;
+    if (!o) return <rect x={x} y={194} width={W} height={40} class="fill-paper dash" stroke-width="1" />;
+    const isLast = lastIdx[o] === i;
+    return (
+      <g>
+        <rect x={x} y={194} width={W} height={40} class={isLast ? 'fill-paper' : 'fill-wash'} stroke-width="1" />
+        {isLast && <rect x={x} y={194} width={W * fillFrac[o]} height={40} class="fill-wash" stroke-width="0" />}
+        <text x={x + W / 2} y={218} text-anchor="middle" class="strong">{o}</text>
+      </g>
+    );
+  })}
+  <line x1={X0 + 15 * W + 10} y1="234" x2={X0 + 15 * W + 10} y2="256" class="ink" stroke-width="1" />
+  <text x={X0 + 15 * W + 10} y="270" text-anchor="middle">LAST BLOCK, PART FULL</text>
+  <line x1={X0 + 24 * W} y1="234" x2={X0 + 24 * W} y2="256" class="blue" stroke-width="1" />
+  <text x={X0 + 24 * W + 20} y="270" text-anchor="middle" class="blue-t">S3 FITS · 15 STILL FREE</text>
+  <text x="20" y="292">WASTE: UNDER ONE BLOCK PER SEQUENCE · ROOM FOR S3 AND MORE</text>
+</svg>

@@ -1,0 +1,59 @@
+---
+// Static figure: the benchmark harness pipeline. One client, two OpenAI-compatible targets.
+---
+<svg viewBox="0 0 720 250" role="img" aria-label="Harness pipeline: a fixed prompt set feeds c async workers, which stream from either the Spark server or Fireworks over the same API. An SSE parser timestamps each event, each request becomes a record, records go to a results JSON with run metadata, and a script appends one row to the scoreboard.">
+  <defs>
+    <marker id="bh-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+
+  <!-- top row -->
+  <rect x="10" y="40" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="58" text-anchor="middle" class="strong">PROMPTS</text>
+  <text x="70" y="73" text-anchor="middle">prompts.jsonl</text>
+
+  <rect x="170" y="40" width="150" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="245" y="58" text-anchor="middle" class="strong">c WORKERS</text>
+  <text x="245" y="73" text-anchor="middle">asyncio + httpx</text>
+
+  <rect x="400" y="8" width="310" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="555" y="26" text-anchor="middle" class="strong">SPARK · YOUR SERVER</text>
+  <text x="555" y="41" text-anchor="middle">http://spark:8000/v1</text>
+
+  <rect x="400" y="72" width="310" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="555" y="90" text-anchor="middle" class="strong">FIREWORKS</text>
+  <text x="555" y="105" text-anchor="middle">https://api.fireworks.ai/inference/v1</text>
+
+  <line x1="130" y1="62" x2="168" y2="62" class="blue" stroke-width="1.2" marker-end="url(#bh-arr)" />
+  <path d="M320,56 L360,56 L360,30 L398,30" class="blue" stroke-width="1.2" marker-end="url(#bh-arr)" />
+  <path d="M320,68 L360,68 L360,94 L398,94" class="blue" stroke-width="1.2" marker-end="url(#bh-arr)" />
+  <text x="360" y="64" text-anchor="middle" style="font-size:9px">same body</text>
+
+  <!-- return path -->
+  <path d="M555,116 L555,140 L85,140 L85,166" class="ink dash" stroke-width="1" marker-end="url(#bh-arr)" />
+  <text x="320" y="134" text-anchor="middle">data: &#123;"choices": [&#123;"delta": ...&#125;]&#125;   one SSE event at a time</text>
+
+  <!-- bottom row -->
+  <rect x="10" y="168" width="150" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="187" text-anchor="middle" class="strong">SSE PARSER</text>
+  <text x="85" y="203" text-anchor="middle">perf_counter() each</text>
+
+  <rect x="190" y="168" width="150" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="265" y="187" text-anchor="middle" class="strong">ONE RECORD</text>
+  <text x="265" y="203" text-anchor="middle">ttft, e2e, n, tok/s</text>
+
+  <rect x="370" y="168" width="160" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="450" y="187" text-anchor="middle" class="strong">results/*.json</text>
+  <text x="450" y="203" text-anchor="middle">+ sha, model, dtype</text>
+
+  <rect x="560" y="168" width="150" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="635" y="187" text-anchor="middle" class="strong">SCOREBOARD.md</text>
+  <text x="635" y="203" text-anchor="middle">one row per change</text>
+
+  <line x1="160" y1="193" x2="188" y2="193" class="blue" stroke-width="1.2" marker-end="url(#bh-arr)" />
+  <line x1="340" y1="193" x2="368" y2="193" class="blue" stroke-width="1.2" marker-end="url(#bh-arr)" />
+  <line x1="530" y1="193" x2="558" y2="193" class="blue" stroke-width="1.2" marker-end="url(#bh-arr)" />
+  <text x="545" y="240" text-anchor="middle">scoreboard.py</text>
+  <line x1="545" y1="230" x2="545" y2="200" class="ink" stroke-width="0.8" />
+</svg>

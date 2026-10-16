@@ -1,0 +1,109 @@
+---
+// Height calculator: how many levels a B+tree needs for N rows, given page size and key size.
+// Each level is one page read. Converts that into time using the latency-numbers rungs.
+---
+<div class="iht" data-fig="index-height">
+  <svg viewBox="0 0 640 210" role="img" aria-label="Stacked levels of a B+tree with page counts per level"></svg>
+  <div class="ctl">
+    <label>Rows <input type="range" min="3" max="10" step="0.5" value="6.7" data-k="rows" /> <output data-o="rows">5M</output></label>
+    <label>Key bytes <input type="range" min="0" max="6" step="1" value="1" data-k="key" /> <output data-o="key">8</output></label>
+  </div>
+  <div class="ctl">
+    <span>Page size</span>
+    <button class="btn" type="button" data-page="4096" aria-pressed="false">4 KB</button>
+    <button class="btn" type="button" data-page="8192" aria-pressed="true">8 KB</button>
+    <button class="btn" type="button" data-page="16384" aria-pressed="false">16 KB</button>
+  </div>
+  <p class="iht-read">
+    Fan-out <span class="readout" data-r="fan">-</span> entries/page ·
+    height <span class="readout" data-r="h">-</span> levels ·
+    index size <span class="readout" data-r="size">-</span>
+  </p>
+  <p class="iht-read">
+    One lookup, every level from SSD: <span class="readout" data-r="ssd">-</span> ·
+    with the top levels cached in RAM: <span class="readout" data-r="warm">-</span> ·
+    full scan of the table: <span class="readout" data-r="scan">-</span>
+  </p>
+</div>
+
+<style>
+  .iht-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const KEYS = [4, 8, 16, 32, 64, 128, 256];
+  const OVERHEAD = 12; // per entry: ~8 B tuple header incl. 6 B row pointer, + 4 B slot in the page (Postgres-like)
+  const FILL = 0.9;    // pages are built ~90% full
+  const SSD_US = 80;   // one random SSD page read, from the latency ladder (approximate)
+  const ROW_B = 100;   // assumed row size for the full-scan estimate
+  const SEQ_GBPS = 3;  // assumed sequential read speed of an NVMe SSD, GB/s
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const fmtN = (n: number) => n >= 1e9 ? (n / 1e9).toFixed(n >= 1e10 ? 0 : 1).replace(/\.0$/, '') + 'B' : n >= 1e6 ? (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'k' : String(Math.round(n));
+  const fmtB = (b: number) => b >= 1e12 ? (b / 1e12).toFixed(1) + ' TB' : b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(1) + ' MB' : (b / 1e3).toFixed(0) + ' KB';
+  const fmtT = (us: number) => us >= 1e6 ? (us / 1e6).toFixed(1) + ' s' : us >= 1e3 ? (us / 1e3).toFixed(1) + ' ms' : Math.round(us) + ' µs';
+
+  document.querySelectorAll<HTMLElement>('[data-fig="index-height"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const s = { rows: 6.7, key: 1, page: 8192 };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const pageBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-page]')];
+
+    function draw() {
+      const rows = Math.round(10 ** s.rows);
+      const keyB = KEYS[s.key];
+      const fan = Math.max(2, Math.floor((s.page - 40) * FILL / (keyB + OVERHEAD)));
+      const levels: number[] = [];
+      let n = Math.ceil(rows / fan);
+      levels.push(n);
+      while (n > 1) { n = Math.ceil(n / fan); levels.push(n); }
+      levels.reverse(); // root first
+      const h = levels.length;
+      const pages = levels.reduce((a, b) => a + b, 0);
+      const cachedLevels = levels.filter((p) => p * s.page <= 64 * 1024 * 1024).length; // levels small enough to stay in RAM
+      const coldReads = Math.max(1, h - cachedLevels);
+
+      svg.replaceChildren();
+      const top = 14, rowH = 30, gap = 8;
+      const H = top + h * (rowH + gap) + 10;
+      svg.setAttribute('viewBox', `0 0 640 ${H}`);
+      const maxLog = Math.log10(levels[h - 1] + 1);
+      levels.forEach((p, i) => {
+        const y = top + i * (rowH + gap);
+        const w = Math.max(14, 380 * (Math.log10(p + 1) / Math.max(maxLog, 0.01)));
+        const x = 250 - w / 2 + 40;
+        const inRam = p * s.page <= 64 * 1024 * 1024;
+        svg.append(el('rect', { x, y, width: w, height: rowH, class: inRam ? 'fill-wash' : 'fill-paper', 'stroke-width': 1.2 }));
+        const name = i === 0 ? 'ROOT' : i === h - 1 ? 'LEAVES' : `LEVEL ${i + 1}`;
+        svg.append(el('text', { x: 4, y: y + rowH / 2 + 4, class: 'strong' }, name));
+        svg.append(el('text', { x: 290, y: y + rowH / 2 + 4, 'text-anchor': 'middle', class: inRam ? 'blue-t' : '' }, `${fmtN(p)} page${p > 1 ? 's' : ''}`));
+        svg.append(el('text', { x: 636, y: y + rowH / 2 + 4, 'text-anchor': 'end' }, fmtB(p * s.page)));
+      });
+
+      r('fan').textContent = String(fan);
+      r('h').textContent = String(h);
+      r('size').textContent = fmtB(pages * s.page);
+      r('ssd').textContent = `${h} reads ≈ ${fmtT(h * SSD_US)}`;
+      r('warm').textContent = `${coldReads} read${coldReads > 1 ? 's' : ''} ≈ ${fmtT(coldReads * SSD_US)}`;
+      r('scan').textContent = `${fmtB(rows * ROW_B)} ≈ ${fmtT((rows * ROW_B) / (SEQ_GBPS * 1e3))}`;
+      root.querySelector<HTMLElement>('[data-o="rows"]')!.textContent = fmtN(rows);
+      root.querySelector<HTMLElement>('[data-o="key"]')!.textContent = String(keyB);
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => { (s as any)[inp.dataset.k!] = +inp.value; draw(); });
+    });
+    pageBtns.forEach((b) => b.addEventListener('click', () => {
+      s.page = Number(b.dataset.page);
+      pageBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    draw();
+  });
+</script>

@@ -1,0 +1,764 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import MemMathBudget from '../components/figures/MemMathBudget.astro';
+
+## Today
+
+- Say, within a gigabyte and without looking anything up, how much memory any model needs to serve N users at context L, and which of the four buckets (weights, KV cache, activations, overhead) dominates.
+- Count a model's parameters from its `config.json` by hand, matrix by matrix, and land on Llama 3.1 8B's 8,030,261,248 exactly.
+- Turn a weight format (BF16, FP8, Q8_0, AWQ, Q4_K_M) into bytes per parameter, including the hidden scales.
+- Read PyTorch's and the Spark's memory numbers and say why `memory_allocated`, `memory_reserved` and the operating system all disagree.
+- Predict the largest batch × context your Spark can hold before it runs out, then find the real edge and explain the gap.
+
+Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the KV-per-token formula and GQA), [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server and harness), and [What does the OS do with my memory?](/lessons/virtual-memory/) (unified memory, the page cache, the OOM killer). About one evening of arithmetic and one session on the Spark.
+
+## The Problem
+
+Here is the question from the diagnostic: *how much memory does an 8B model need?* The honest answer you gave was a shrug, and the common wrong answer is "8 GB, one byte per parameter". Neither will get you far.
+
+Now make it real. Your team wants to use the Spark as a shared assistant: Llama 3.1 8B, long chats, 32K tokens of context each. You start vLLM, it thinks for a minute, and prints a line like *maximum concurrency for 32,768 tokens per request: 24x*. Is that good? Is it right? Where did 24 come from? Then you start it again with a 70B model in 4 bits at 128K context and it prints something like *2x*. Then a colleague runs a notebook on the same box and something gets killed.
+
+Every one of those numbers comes from a few lines of arithmetic. By the end of this lesson you will do that arithmetic faster than vLLM boots.
+
+<Predict id="eight-b">
+
+Llama 3.1 8B, stored in bf16, serving one user with 8,192 tokens of context. How many GB of memory does it need in total? Then: on the Spark's 128 GB, how many such users fit at 32K context each?
+
+<Fragment slot="answer">
+
+About **17 to 18 GiB** for one user: 15 GiB of weights (8.03 billion × 2 bytes = 16.1 GB, which is 15.0 GiB), 1 GiB of KV cache (8,192 tokens × 128 KiB), and one to two GiB of runtime overhead and activations. The weights are the big fixed cost; one user's cache is small.
+
+At 32K context each user's cache is 4 GiB. After the operating system (call it 10 GiB, you will measure it), the weights and overhead, roughly 100 GiB is left, so **about 25 users**. Whether 25 users get a *usable speed* is a different question, and the [envelope lesson](/lessons/back-of-envelope/) showed that bandwidth runs out first on the Spark. Today is about the capacity half.
+
+</Fragment>
+
+</Predict>
+
+<Origin year="2019" title="One write-head is all you need">
+
+In 2019 Noam Shazeer, one of the authors of the original transformer paper, published a short note with a cheeky title: "Fast Transformer Decoding: One Write-Head is All You Need." His complaint was that during generation, the keys and values stored for every past token were eating memory and memory bandwidth, and that most of that cost came from every attention head keeping its own private copy. His fix, multi-query attention, let all the query heads share a single key head and a single value head. The cache shrank by the number of heads.
+
+It was too aggressive for some models (quality dropped), so in 2023 Joshua Ainslie and colleagues at Google proposed the middle ground, grouped-query attention: a few key/value heads, each shared by a group of query heads. Llama 2's 70B model adopted it that year, and by Llama 3 every size used it. When you count Llama 3.1 8B's parameters below, you will see this decision as a strange asymmetry in the attention matrices. When you size its KV cache, you will see it as a 4x discount. Memory was the reason the architecture changed.
+
+</Origin>
+
+## The Idea
+
+### Four buckets
+
+Think of a restaurant kitchen during service. There is equipment bolted to the floor: ovens, fridges, the walk-in. That is the same size whether you serve one table or forty. Then each table has an order ticket and a tray of their own food in progress, and that space grows with the number of tables and how long each one stays. While a dish is being plated there is a burst of counter space in use, gone a minute later. And there is the space you can never use: walkways, the fire-code clearance, the manager's desk.
+
+GPU memory during inference has exactly those four buckets.
+
+1. **Weights.** The model itself. Bolted to the floor: loaded once, shared by every user. Size = parameters × bytes per parameter.
+2. **KV cache.** Each user's private tray. Grows with every token of every conversation. Size = bytes per token × context length × users.
+3. **Activations.** The temporary numbers inside one forward pass: the vector flowing through a layer, the wide MLP intermediate, the scores at the end. Freed as soon as the layer is done. Small in decode, a short spike during prefill.
+4. **Overhead.** Memory that is in use but holds none of the above: the CUDA runtime's own setup, library scratch space, memory the allocator holds but isn't using, and on the Spark, the whole operating system.
+
+<Figure n="001" title="THE FOUR BUCKETS" caption="Llama 3.1 8B in bf16 on the Spark, eight users at 8K context. Only one bucket grows with users and context. Sizes are approximate; the OS share is an assumption you will replace with a measurement.">
+
+<svg viewBox="0 0 560 230" role="img" aria-label="A memory bar split into OS, weights, KV cache, overhead and free space, with labels saying what each one scales with">
+  <text x="10" y="18" class="strong">128 GiB · ONE POOL · CPU + GPU</text>
+  <rect x="10" y="40" width="540" height="34" class="fill-paper" stroke-width="1.2" />
+  <rect x="10" y="40" width="42" height="34" class="fill-paper dash" stroke-width="1" />
+  <text x="31" y="61" text-anchor="middle">OS</text>
+  <rect x="52" y="40" width="63" height="34" class="fill-blue" />
+  <text x="83" y="61" text-anchor="middle" class="strong" style="fill:var(--paper)">W 15</text>
+  <rect x="115" y="40" width="34" height="34" class="fill-wash" stroke-width="1" />
+  <text x="132" y="61" text-anchor="middle" class="blue-t">KV 8</text>
+  <rect x="149" y="40" width="10" height="34" class="fill-paper" stroke-width="1" />
+  <line x1="149" y1="74" x2="159" y2="40" class="ink" stroke-width="1" />
+  <text x="350" y="61" text-anchor="middle">FREE · ~93 GiB</text>
+
+  <line x1="31" y1="74" x2="31" y2="104" class="ink" stroke-width="1" />
+  <line x1="83" y1="74" x2="83" y2="134" class="ink" stroke-width="1" />
+  <line x1="132" y1="74" x2="132" y2="164" class="ink" stroke-width="1" />
+  <line x1="154" y1="74" x2="154" y2="194" class="ink" stroke-width="1" />
+
+  <text x="40" y="108" class="strong">OS + DESKTOP + CPU PROCESSES</text>
+  <text x="290" y="108">FIXED · SPARK ONLY (UNIFIED MEMORY)</text>
+  <text x="92" y="138" class="strong">WEIGHTS = PARAMS × BYTES/PARAM</text>
+  <text x="340" y="138">FIXED · SHARED BY ALL USERS</text>
+  <text x="141" y="168" class="strong blue-t">KV = BYTES/TOKEN × CONTEXT × USERS</text>
+  <text x="420" y="168" class="blue-t">GROWS</text>
+  <text x="163" y="198" class="strong">OVERHEAD + ACTIVATION PEAK</text>
+  <text x="370" y="198">FIXED-ISH · ~1-3 GiB</text>
+  <text x="10" y="224">FREE = WHERE MORE USERS, OR LONGER CONVERSATIONS, WOULD GO</text>
+</svg>
+
+</Figure>
+
+The whole lesson is one equation and the details that make it honest:
+
+```text
+users that fit  =  (memory − OS − weights − overhead − activation peak)  ÷  (KV bytes per token × context)
+```
+
+Weights and KV cache are pure arithmetic, so we start there.
+
+### Bytes, GB and GiB
+
+One unit trap first, because it will otherwise eat 7% of every answer. A <Term w="GB">A gigabyte: 1,000,000,000 bytes (10⁹). Used by disk makers, Hugging Face file sizes, and network speeds.</Term> is a billion bytes. A <Term w="GiB">A gibibyte: 2³⁰ = 1,073,741,824 bytes, about 7% more than a GB. Memory chips come in powers of two, so RAM and GPU memory are really sized in GiB, and PyTorch and `nvidia-smi` (which prints MiB) report in binary units.</Term> is 2³⁰ bytes. Llama 3.1 8B in bf16 is 16.06 GB *and* 14.96 GiB; both are right. Memory is built in powers of two, so when you compare against what a machine holds, work in GiB. The KV cache formula is naturally binary (128 KiB per token, so 8,192 tokens is exactly 1 GiB), which is one more reason to stay there.
+
+### Counting parameters from config.json
+
+Every model on Hugging Face ships a `config.json`. It is a dozen numbers that completely determine the shape of every weight matrix. Here are the ones that matter for Llama 3.1 8B:
+
+```json
+{
+  "vocab_size": 128256,
+  "hidden_size": 4096,
+  "intermediate_size": 14336,
+  "num_hidden_layers": 32,
+  "num_attention_heads": 32,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "tie_word_embeddings": false,
+  "torch_dtype": "bfloat16"
+}
+```
+
+You have written this model, so you know every piece. The job now is just to say how big each one is. Call `hidden_size` h, `vocab_size` V, `intermediate_size` I, heads n, KV heads k, `head_dim` d.
+
+**The embedding table.** One row of h numbers per vocabulary entry: V × h = 128,256 × 4,096 = **525,336,576**. That is half a billion parameters before you reach the first layer, which surprises everyone the first time.
+
+**Attention, per layer.** Four projection matrices. The query projection maps h inputs to n × d outputs. The key and value projections map h inputs to only k × d outputs, because with <Term w="GQA">Grouped-query attention: the model has fewer key/value heads than query heads, and each K/V head is shared by a group of query heads. Llama 3.1 8B has 32 query heads and 8 K/V heads, so groups of 4.</Term> there are only 8 key/value heads. The output projection maps n × d back to h.
+
+```text
+q_proj   4096 × (32 × 128) = 4096 × 4096 = 16,777,216
+k_proj   4096 × ( 8 × 128) = 4096 × 1024 =  4,194,304
+v_proj   4096 × ( 8 × 128) = 4096 × 1024 =  4,194,304
+o_proj   (32 × 128) × 4096 = 4096 × 4096 = 16,777,216
+                                   total  = 41,943,040
+```
+
+That asymmetry, K and V a quarter the size of Q, is Shazeer's idea from the box above, sitting in your parameter count.
+
+**The MLP, per layer.** Llama uses <Term w="SwiGLU">A feed-forward block with three matrices instead of two: a "gate" and an "up" projection run side by side, the gate goes through the SiLU function and multiplies the up output elementwise, then a "down" projection maps back. More expressive per parameter than the old two-matrix MLP.</Term>, so there are three matrices, not two: gate (h × I), up (h × I), down (I × h).
+
+```text
+3 × 4096 × 14336 = 176,160,768
+```
+
+The MLP is four times the attention block. Most of an LLM's parameters live here.
+
+**Norms.** Each layer has two <Term w="RMSNorm">A normalization that divides each vector by its root-mean-square and multiplies by a learned scale. The scale is one number per hidden dimension, so it has h parameters and no bias.</Term> layers (one before attention, one before the MLP), each with h = 4,096 learned scales: **8,192** per layer. One more after the last layer: 4,096. Rounding error, but count them; it is how you get an exact match.
+
+**The output head.** The `lm_head` maps h back to V scores, another 525,336,576. Unless `tie_word_embeddings` is true, in which case the model reuses the embedding table and this costs zero. Llama 3.1 8B: false, so it is a separate matrix. Llama 3.2 1B: true, so it is shared. The flag is worth 525 million parameters (1 GB in bf16); always read it.
+
+<Figure n="002" title="CONFIG.JSON → PARAMETERS" caption="Llama 3.1 8B, one matrix per row. Bars inside the layer box are to scale; the embedding and output head are each about nine MLP matrices' worth and are drawn as text. Total matches transformers' own count exactly.">
+
+<svg viewBox="0 0 560 380" role="img" aria-label="Every weight matrix in Llama 3.1 8B with its shape and parameter count, adding up to 8,030,261,248">
+  <text x="10" y="18" class="strong">MATRIX</text>
+  <text x="160" y="18" class="strong">SHAPE</text>
+  <text x="550" y="18" text-anchor="end" class="strong">PARAMS</text>
+  <line x1="10" y1="26" x2="550" y2="26" class="ink" stroke-width="1" />
+
+  <text x="10" y="46">embed_tokens</text>
+  <text x="160" y="46">V × h = 128,256 × 4,096</text>
+  <text x="550" y="46" text-anchor="end" class="strong">525.3M</text>
+
+  <rect x="10" y="60" width="540" height="246" class="fill-paper dash" stroke-width="1" />
+  <text x="20" y="78" class="blue-t strong">× 32 LAYERS</text>
+
+  <text x="20" y="100">input_layernorm</text><text x="160" y="100">h</text><text x="540" y="100" text-anchor="end">4,096</text>
+  <text x="20" y="122">q_proj</text><text x="160" y="122">4,096 × 4,096</text>
+  <rect x="290" y="112" width="57" height="12" class="fill-wash" stroke-width="1" /><text x="540" y="122" text-anchor="end">16.8M</text>
+  <text x="20" y="144">k_proj</text><text x="160" y="144">4,096 × 1,024</text>
+  <rect x="290" y="134" width="14" height="12" class="fill-wash" stroke-width="1" /><text x="312" y="144" class="blue-t">GQA: 8 KV HEADS</text><text x="540" y="144" text-anchor="end">4.2M</text>
+  <text x="20" y="166">v_proj</text><text x="160" y="166">4,096 × 1,024</text>
+  <rect x="290" y="156" width="14" height="12" class="fill-wash" stroke-width="1" /><text x="540" y="166" text-anchor="end">4.2M</text>
+  <text x="20" y="188">o_proj</text><text x="160" y="188">4,096 × 4,096</text>
+  <rect x="290" y="178" width="57" height="12" class="fill-wash" stroke-width="1" /><text x="540" y="188" text-anchor="end">16.8M</text>
+  <text x="20" y="210">post_attn_norm</text><text x="160" y="210">h</text><text x="540" y="210" text-anchor="end">4,096</text>
+  <text x="20" y="232">gate_proj</text><text x="160" y="232">4,096 × 14,336</text>
+  <rect x="290" y="222" width="200" height="12" class="fill-blue" /><text x="540" y="232" text-anchor="end">58.7M</text>
+  <text x="20" y="254">up_proj</text><text x="160" y="254">4,096 × 14,336</text>
+  <rect x="290" y="244" width="200" height="12" class="fill-blue" /><text x="540" y="254" text-anchor="end">58.7M</text>
+  <text x="20" y="276">down_proj</text><text x="160" y="276">14,336 × 4,096</text>
+  <rect x="290" y="266" width="200" height="12" class="fill-blue" /><text x="540" y="276" text-anchor="end">58.7M</text>
+  <text x="20" y="298" class="strong">per layer</text><text x="160" y="298">ATTN 41.9M + MLP 176.2M + NORMS</text><text x="540" y="298" text-anchor="end" class="strong">218.1M</text>
+
+  <text x="10" y="326">norm (final)</text><text x="160" y="326">h</text><text x="550" y="326" text-anchor="end">4,096</text>
+  <text x="10" y="346">lm_head</text><text x="160" y="346">h × V · tie_word_embeddings: false</text><text x="550" y="346" text-anchor="end" class="strong">525.3M</text>
+  <line x1="10" y1="356" x2="550" y2="356" class="ink" stroke-width="1" />
+  <text x="10" y="374" class="strong">TOTAL = 2 × 525.3M + 32 × 218.1M + 4,096</text>
+  <text x="550" y="374" text-anchor="end" class="strong blue-t">8,030,261,248</text>
+</svg>
+
+</Figure>
+
+Add it up:
+
+```text
+per layer      = 41,943,040 + 176,160,768 + 8,192         =   218,112,000
+32 layers      = 32 × 218,112,000                          = 6,979,584,000
+embed + head   = 2 × 525,336,576                           = 1,050,673,152
+final norm                                                 =         4,096
+total                                                      = 8,030,261,248
+```
+
+**8.03 billion.** I checked this against transformers itself: building the model from this config on PyTorch's `meta` device (which creates tensor shapes without allocating any memory) and summing `numel()` over its parameters gives 8,030,261,248, to the parameter. The same method gives 1,235,814,400 for Llama 3.2 1B (tied head) and 70,553,706,496 for Llama 3.1 70B. You will write the counter yourself in Build It.
+
+Two useful facts fall out of the breakdown. The MLP is 70% of the model, attention 17%, embedding and head 13%. And the shortcut for a quick estimate: per layer, attention is about 2h² + 2hkd and the MLP is 3hI, so for this family the layers come to roughly L × (2.5h² + 3hI). You can do that in your head in an interview: 32 × (2.5 × 16.8M + 176M) ≈ 7.0B, plus 1.05B of vocabulary matrices.
+
+<Predict id="qwen-count">
+
+Qwen2.5 7B's config: `vocab_size` 152,064, `hidden_size` 3,584, `intermediate_size` 18,944, 28 layers, 28 attention heads, 4 key/value heads, untied head. One difference from Llama: its q, k and v projections have a bias vector (one extra number per output). How many parameters?
+
+<Fragment slot="answer">
+
+head_dim = 3,584 / 28 = 128, and k = 4 KV heads, so k × d = 512.
+
+- Attention weights: q 3,584 × 3,584 = 12,845,056; k and v 3,584 × 512 = 1,835,008 each; o 12,845,056. Sum 29,360,128.
+- Attention biases: 3,584 + 512 + 512 = 4,608. Attention total 29,364,736.
+- MLP: 3 × 3,584 × 18,944 = 203,685,888. Norms: 2 × 3,584 = 7,168.
+- Per layer 233,057,792; × 28 layers = 6,525,618,176.
+- Embedding and head: 2 × 152,064 × 3,584 = 1,089,994,752. Final norm 3,584.
+
+**Total 7,615,616,512**, which matches transformers exactly. The biases are only 129,024 parameters in all. You would never notice them in "≈7.6B", and that is the point of counting exactly: if your counter is off by 129,024, you know precisely what you forgot.
+
+</Fragment>
+
+</Predict>
+
+### Bytes per parameter
+
+Weights in memory = parameters × bytes per parameter. The bytes depend on the format.
+
+- <Term w="FP32">32-bit floating point, 4 bytes per number. The default for training math in the old days; almost nobody serves in it now.</Term>: 4 bytes. 8B model: 32.1 GB.
+- **BF16 or FP16**: 2 bytes. 16.1 GB. This is what most checkpoints ship as (`torch_dtype` in the config). Why bf16 and not fp16 is the [number formats lesson](/lessons/number-formats/).
+- <Term w="FP8">An 8-bit floating point format, 1 byte per number, with a scale factor per tensor or per channel so the small range still covers the weights.</Term>: 1 byte for the layers. Popular FP8 checkpoints usually leave the embedding and `lm_head` in bf16, so an 8B FP8 file is about 9.1 GB, not 8.0.
+- **Integer formats with block scales.** You cannot just round a weight to one of 16 values (4 bits) without a sense of scale. So these formats chop each matrix into small blocks and store one or two scale numbers per block alongside the tiny integers. The scales are real bytes, and they are why "4-bit" is never 4.0 bits.
+
+The cleanest example is llama.cpp's <Term w="GGUF">The single-file model format used by llama.cpp. It holds the weights (in many possible quantized types), the tokenizer, and the config in one file.</Term> type Q8_0: blocks of 32 weights, each stored as a signed 8-bit integer, plus one 16-bit scale per block. 32 bytes + 2 bytes = 34 bytes per 32 weights = **8.5 bits per weight**.
+
+<Figure n="003" title="BITS PER WEIGHT" caption="Top: one Q8_0 block, 32 one-byte integers plus a 2-byte scale. Bottom: Llama 3.1 8B in each format. Effective bits include scales and any tensors left in 16-bit; GGUF and AWQ sizes are approximate and vary a little by file.">
+
+<svg viewBox="0 0 560 290" role="img" aria-label="A Q8_0 block of 32 int8 weights and one fp16 scale, and a bar chart of Llama 3.1 8B file sizes in six formats">
+  <text x="10" y="18" class="strong">ONE Q8_0 BLOCK</text>
+  <g>
+    <rect x="10" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="22" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="34" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="46" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="58" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="70" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="82" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="94" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="106" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="118" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="130" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="142" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="154" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="166" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="178" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="190" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="202" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="214" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="226" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="238" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="250" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="262" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="274" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="286" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="298" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="310" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="322" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="334" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="346" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="358" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="370" y="28" width="12" height="20" class="fill-wash" stroke-width="1" /><rect x="382" y="28" width="12" height="20" class="fill-wash" stroke-width="1" />
+    <rect x="398" y="28" width="24" height="20" class="fill-blue" />
+  </g>
+  <text x="10" y="64">32 × INT8 WEIGHTS = 32 BYTES</text>
+  <text x="422" y="64" text-anchor="end" class="blue-t">FP16 SCALE = 2 B</text>
+  <text x="550" y="44" text-anchor="end" class="strong">34 B / 32 = 8.5 BITS</text>
+  <text x="10" y="82">WEIGHT ≈ INT8 × SCALE · ONE SCALE PER 32 NEIGHBOURS</text>
+
+  <line x1="10" y1="96" x2="550" y2="96" class="ink" stroke-width="1" />
+  <text x="10" y="114" class="strong">LLAMA 3.1 8B</text>
+  <text x="110" y="114" class="strong">BITS/W</text>
+  <text x="550" y="114" text-anchor="end" class="strong">SIZE</text>
+
+  <text x="10" y="138">FP32</text><text x="110" y="138">32</text>
+  <rect x="170" y="128" width="320" height="13" class="fill-paper" stroke-width="1" /><text x="550" y="138" text-anchor="end">32.1 GB</text>
+  <text x="10" y="162">BF16</text><text x="110" y="162">16</text>
+  <rect x="170" y="152" width="160" height="13" class="fill-blue" /><text x="550" y="162" text-anchor="end" class="strong">16.1 GB</text>
+  <text x="10" y="186">FP8</text><text x="110" y="186">~9.0</text>
+  <rect x="170" y="176" width="91" height="13" class="fill-wash" stroke-width="1" /><text x="268" y="186">LAYERS 8 BIT, EMBED + HEAD 16</text><text x="550" y="186" text-anchor="end">~9.1 GB</text>
+  <text x="10" y="210">Q8_0</text><text x="110" y="210">8.5</text>
+  <rect x="170" y="200" width="85" height="13" class="fill-wash" stroke-width="1" /><text x="550" y="210" text-anchor="end">~8.5 GB</text>
+  <text x="10" y="234">AWQ INT4</text><text x="110" y="234">~5.7</text>
+  <rect x="170" y="224" width="57" height="13" class="fill-wash" stroke-width="1" /><text x="234" y="234">4 BIT + SCALES, EMBED + HEAD 16</text><text x="550" y="234" text-anchor="end">~5.7 GB</text>
+  <text x="10" y="258">Q4_K_M</text><text x="110" y="258">~4.9</text>
+  <rect x="170" y="248" width="49" height="13" class="fill-wash" stroke-width="1" /><text x="226" y="258">MIXED 4 + 6 BIT BLOCKS</text><text x="550" y="258" text-anchor="end">~4.9 GB</text>
+  <text x="10" y="284">SIZE = Σ (PARAMS IN TENSOR × ITS BITS) ÷ 8</text>
+</svg>
+
+</Figure>
+
+The other two 4-bit formats you will meet:
+
+- <Term w="AWQ">Activation-aware Weight Quantization (Lin et al., 2023). Stores layer weights as 4-bit integers in groups of 128, each group with a 16-bit scale and a 4-bit zero point, choosing the scales so the weights that matter most for real activations lose least.</Term> checkpoints quantize the transformer layers in groups of 128 weights. Each group adds a 16-bit scale and a 4-bit zero point: 20 extra bits per 128 weights, so about **4.16 bits** per layer weight. But the embedding and `lm_head` usually stay in 16-bit. For Llama 3.1 8B that is 1.05 billion parameters at 2 bytes (2.1 GB) plus 6.98 billion at 4.16 bits (3.6 GB): about **5.7 GB**, which is what published AWQ files of this model weigh. The "4-bit model" averages 5.7 bits per weight.
+- **Q4_K_M** in GGUF uses "K-quant" super-blocks of 256 weights, split into 8 sub-blocks of 32 with their own 6-bit scales and minimums. The basic 4-bit K type works out to 4.5 bits per weight. The "_M" mix keeps some of the most sensitive tensors (parts of the value and down projections, and the output head) in a 6-bit type. The average across the file lands around **4.8 to 4.9 bits**, so an 8B file is about 4.9 GB.
+
+The general rule: **file size on disk is a very good estimate of weight memory.** Almost every byte of a safetensors or GGUF file is weight. When you do not know a format's internals, `ls -l` the file and divide by the parameter count to get its true bits per weight.
+
+### The KV cache: per token, per request, per batch
+
+You met the formula in the [bandwidth lesson](/lessons/bandwidth-bound/). Here it is again, because now it is the main event:
+
+```text
+KV bytes per token  =  2 (K and V) × layers × kv_heads × head_dim × bytes per value
+
+Llama 3.1 8B, bf16:   2 × 32 × 8 × 128 × 2  =  131,072 B  =  128 KiB
+```
+
+Read each factor. The 2 is because every layer stores a key vector and a value vector for every past token. Layers multiply because each layer has its own attention. And only the *KV* heads count, not the query heads, because queries are recomputed from the current token every step and never stored. That last point is why GQA's 8-instead-of-32 heads is a 4x discount on memory.
+
+From the per-token number, everything else is multiplication:
+
+| | Llama 3.2 1B | Llama 3.1 8B | Qwen3 30B-A3B | Llama 3.1 70B |
+|---|---|---|---|---|
+| layers × kv_heads × head_dim | 16 × 8 × 64 | 32 × 8 × 128 | 48 × 4 × 128 | 80 × 8 × 128 |
+| KV per token (bf16) | 32 KiB | 128 KiB | 96 KiB | 320 KiB |
+| one request at 8K | 0.25 GiB | 1 GiB | 0.75 GiB | 2.5 GiB |
+| one request at 128K | 4 GiB | 16 GiB | 12 GiB | 40 GiB |
+| 32 requests at 8K | 8 GiB | 32 GiB | 24 GiB | 80 GiB |
+
+Notice the 70B's 32-user row: the KV cache alone would fill an H100. Notice the 8B at 128K: one user's cache weighs more than the whole model. And notice the MoE: 30 billion parameters but a smaller cache per token than the 8B, because it has only 4 KV heads. Cache size depends on the attention shape, not on the parameter count.
+
+Two practical modifiers. First, store the cache in FP8 and every number in that table halves; most serving engines offer it as one flag, with some accuracy cost you would measure. Second, "context" means the whole conversation so far, prompt *plus* everything generated. A request that allows 8K tokens grows toward that over its life; a serving engine has to decide whether to reserve the worst case up front or allocate as it goes. That decision is what [paged attention](/lessons/prefix-caching/) is about.
+
+<Predict id="seventy">
+
+Llama 3.1 70B in Q4_K_M (about 43 GB on disk) on the Spark. Ten users at 32K context each. Does it fit? If not, what is the cheapest fix?
+
+<Fragment slot="answer">
+
+Weights: 43 GB is about 40 GiB. KV per user: 32,768 × 320 KiB = 10 GiB. Ten users: 100 GiB. Total ≈ 40 + 100 + a couple of GiB overhead + ~10 GiB OS ≈ 152 GiB. **No**, it is about 24 GiB over.
+
+The cheapest fix is an FP8 KV cache: 5 GiB per user, 50 GiB for ten, total about 102 GiB, which fits. Alternatives: cut context to 16K (same effect), or serve seven users. Notice that shrinking the weights further barely helps here; at this context the cache is most of the memory.
+
+</Fragment>
+
+</Predict>
+
+### Activations: small, temporary, spiky
+
+During a forward pass, each layer produces temporary tensors: the normed input, q, k and v, the attention output, and the MLP's wide intermediates. Those are <Term w="activations">The intermediate values computed during a forward pass. In training you keep them for the backward pass; in inference you can throw each one away as soon as the next layer has used it.</Term>. At inference, nobody needs them after the next layer runs, so PyTorch frees them right away. Only one layer's worth is alive at a time.
+
+**In decode**, a step processes one new token per user. For Llama 3.1 8B the biggest temporaries are the gate and up projections, 14,336 numbers each. Per token, everything alive in one layer is roughly (4h + 3I) × 2 bytes ≈ 120 KB. Times 64 users is under 8 MB. Noise.
+
+**In prefill**, the step processes the whole prompt at once, so every temporary is N tokens tall. At N = 8,192 the MLP alone briefly holds about 8,192 × 3 × 14,336 × 2 bytes ≈ 0.7 GB, and the full set is about 1 GB. It lasts milliseconds, but it is the *peak* that has to fit, not the average. Two things make the peak much worse if you are careless:
+
+- **Computing logits for every position.** The output head turns each token's vector into 128,256 scores. If you run the model's forward on a 32K prompt and ask for logits at every position, that is 32,768 × 128,256 × 2 bytes ≈ 8.4 GB of scores, of which you need exactly one row (the last). Per token that is about 250 KB, *twice* the KV cache. Hugging Face's `generate` avoids this by asking for only the last position (it passes `logits_to_keep=1`; I checked this in the source of a current transformers 5 release); a bare `model(input_ids)` call does not.
+- **Naive attention.** Textbook attention builds an N × N score matrix per head. At 16K tokens with 32 heads in bf16 that is 32 × 16,384² × 2 bytes = 16 GiB, per layer, before softmax makes an fp32 copy. Fused kernels (PyTorch's SDPA, FlashAttention) never build that matrix, so their memory grows with N, not N². That is the [FlashAttention lesson](/lessons/flash-attention/).
+
+Real engines cap the activation peak on purpose. vLLM, for example, splits long prompts into chunks and never runs more than a set number of tokens through the model in one forward pass (its `max_num_batched_tokens` setting), so the spike has a known size no matter how long the prompt.
+
+### Overhead: the memory nobody asked for
+
+This is the bucket that makes careful predictions wrong by a gigabyte or three, so it is worth knowing its parts.
+
+**The CUDA context.** The first time a process touches the GPU, the CUDA driver sets up its state: loaded GPU code for every kernel library you link (PyTorch ships many), internal tables, scratch areas. That memory belongs to the driver, not to PyTorch, so PyTorch's own counters never show it. On discrete GPUs it is typically a few hundred MB to around 1 GB per process, depending on versions and on whether the driver loads kernel code lazily. Measure yours; it is per process, so two Python processes using the GPU pay it twice.
+
+**The caching allocator.** Asking the CUDA driver for memory (`cudaMalloc`) and giving it back is slow and forces the GPU to synchronize. So PyTorch keeps a <Term w="caching allocator">PyTorch's GPU memory manager. When a tensor is freed, it keeps the block for reuse instead of returning it to the driver, so the next allocation of a similar size is instant.</Term>: freed blocks stay in PyTorch's pool for the next tensor. That gives you two numbers:
+
+- `torch.cuda.memory_allocated()`: bytes currently held by live tensors.
+- `torch.cuda.memory_reserved()`: bytes PyTorch has taken from the driver, including cached free blocks. Always ≥ allocated.
+
+The gap between them is memory that is free *to PyTorch* but not to anyone else. If the pool's free blocks are the wrong sizes for a new request (a 300 MB tensor needs 300 contiguous MB within a block, and the pool has ten 100 MB holes), PyTorch has to ask the driver for more. That waste is <Term w="fragmentation">Free memory broken into pieces too small or oddly placed to satisfy a request. The total free is enough; no single piece is.</Term>, and it is why "out of memory" can happen when the numbers say there should be room. A tensor that grows by concatenation is the worst case: Hugging Face's default `DynamicCache` appends each new token's keys and values with `torch.cat`, which allocates a slightly bigger tensor and frees the old one, every step, in every layer.
+
+I watched the caching behaviour on my Mac's GPU backend, which has the same design: allocating a 256 MiB tensor made the driver hold 1,024 MiB (it reserves in big chunks); after `del`, live tensors were 0 MiB while the driver still held 1,024 MiB; only `torch.mps.empty_cache()` gave it back. On CUDA, `torch.cuda.empty_cache()` does the same job. You will see the CUDA version of this on the Spark.
+
+**Everything else.** cuBLAS scratch space, NCCL buffers if you use several GPUs, and in serving engines, memory captured by CUDA graphs (pre-recorded sequences of kernel launches that cut Python overhead, each with its own fixed buffers). Budget about 1 to 3 GiB in total for a single-GPU server and then measure.
+
+<Figure n="004" title="ONE REQUEST, AS POOLS SEE IT" caption="Llama 3.1 8B bf16, one 32K-token prompt, then decoding. Illustrative shape, not a measurement: the solid line is live tensors, the dashed line is what PyTorch holds. After the prefill spike, reserved never comes back down on its own.">
+
+<svg viewBox="0 0 560 270" role="img" aria-label="Line chart of allocated and reserved GPU memory over the life of one request, with a spike at prefill and reserved memory staying high after it">
+  <line x1="60" y1="210" x2="545" y2="210" class="ink" stroke-width="1" />
+  <line x1="60" y1="30" x2="60" y2="210" class="ink" stroke-width="1" />
+  <text x="52" y="214" text-anchor="end">0</text>
+  <text x="52" y="103" text-anchor="end">15</text>
+  <text x="52" y="54" text-anchor="end">22</text>
+  <text x="14" y="120" text-anchor="middle" transform="rotate(-90 14 120)">GiB</text>
+  <line x1="60" y1="99" x2="545" y2="99" style="stroke:var(--rule)" stroke-width="1" />
+
+  <rect x="60" y="205" width="485" height="5" class="fill-wash" stroke-width="0.5" />
+  <text x="70" y="226">CUDA CONTEXT · OUTSIDE PYTORCH'S COUNTERS</text>
+
+  <polyline points="60,210 100,210 190,99 240,99 250,51 262,51 266,70 440,64 450,99 545,99" class="blue" stroke-width="2" />
+  <polyline points="60,210 100,210 190,97 240,97 250,49 545,49" class="ink dash" stroke-width="1.2" />
+
+  <text x="145" y="128" text-anchor="middle">LOAD</text>
+  <text x="145" y="142" text-anchor="middle">WEIGHTS</text>
+  <text x="256" y="40" text-anchor="middle" class="strong">PREFILL PEAK</text>
+  <text x="272" y="86">+4 GiB KV KEPT · +128 KiB/TOKEN</text>
+  <text x="497" y="122" text-anchor="middle">CACHE FREED</text>
+  <text x="497" y="136" text-anchor="middle">RESERVED STAYS</text>
+
+  <line x1="80" y1="250" x2="100" y2="250" class="blue" stroke-width="2" />
+  <text x="106" y="254">memory_allocated()</text>
+  <line x1="280" y1="250" x2="300" y2="250" class="ink dash" stroke-width="1.2" />
+  <text x="306" y="254">memory_reserved()</text>
+</svg>
+
+</Figure>
+
+### The Spark: one pool, shared with everything
+
+On an H100 or a 4090, the GPU's memory is its own. The operating system, your browser, your Python process's CPU-side objects all live in separate system RAM. The 80 GB is yours.
+
+The Spark has no separate GPU memory. As you saw in the [virtual memory lesson](/lessons/virtual-memory/), its 128 GB is one pool shared by the CPU and GPU. So the budget has a new line at the top: **the OS, the desktop if one is running, every CPU process, and the page cache all come out of the same 128 GB**. Some of that is reclaimable (the kernel will drop cached file pages under pressure); some is not. And the failure mode is different: on a discrete card, running out gives you a polite Python exception. On the Spark, the pressure lands on the whole machine, and you may meet the kernel's OOM killer instead, or a frozen desktop while the system thrashes.
+
+Two consequences for measuring. Tools built for discrete GPUs may not know what to report: on unified-memory systems `nvidia-smi`'s memory columns can read "Not Supported" or show something other than what you expect, so check what yours prints and do not trust it blindly. And the honest "how much can I still use?" number comes from Linux: `free -h`'s *available* column, or `MemAvailable` in `/proc/meminfo`. PyTorch's `torch.cuda.mem_get_info()` asks the CUDA driver the same question; compare the two on your machine, because on unified memory the driver's idea of "free" may not count file cache the kernel would happily drop.
+
+### Serving engines take it all up front
+
+A serving engine cannot allocate KV cache memory one request at a time with `torch.cat` and hope; it would fragment, and it would discover it was out of memory in the middle of a user's answer. So engines like vLLM grab the cache's memory once, at startup, and hand out fixed-size pieces of it.
+
+vLLM's version, roughly (the details move between versions; check the docs for yours):
+
+1. You set <Term w="gpu_memory_utilization">A vLLM setting (default 0.9): the fraction of the GPU's total memory this vLLM instance is allowed to use for everything, weights and cache included.</Term> (default 0.9). That is the instance's budget: 0.9 × total memory.
+2. It loads the weights.
+3. It runs a fake forward pass at the largest size it will ever run (`max_num_batched_tokens` tokens) and records the peak activation memory, plus whatever non-PyTorch memory has appeared.
+4. Whatever is left of the budget becomes the KV cache pool, divided into blocks of a few tokens each. It logs the pool's size in tokens, and the "maximum concurrency" it implies: pool tokens ÷ `max_model_len`.
+
+<Figure n="005" title="HOW VLLM CARVES THE BUDGET" caption="Llama 3.1 8B bf16 at the default gpu_memory_utilization of 0.9. On an H100 the leftover 10% sits unused. On the Spark the same setting leaves 10% of one shared pool for the OS and everything else you run. Activation and overhead sizes are approximate.">
+
+<svg viewBox="0 0 560 220" role="img" aria-label="Two bars showing vLLM's memory budget on an H100 and on the DGX Spark: weights, activation peak, overhead, KV cache pool, and the unclaimed remainder">
+  <text x="10" y="18" class="strong">H100 · 80 GB</text>
+  <rect x="10" y="28" width="540" height="30" class="fill-paper" stroke-width="1.2" />
+  <rect x="10" y="28" width="101" height="30" class="fill-blue" />
+  <text x="60" y="47" text-anchor="middle" class="strong" style="fill:var(--paper)">W 15</text>
+  <rect x="111" y="28" width="17" height="30" class="fill-paper" stroke-width="1" />
+  <rect x="128" y="28" width="368" height="30" class="fill-wash" stroke-width="1" />
+  <text x="312" y="47" text-anchor="middle" class="blue-t strong">KV POOL ≈ 54 GiB ≈ 440K TOKENS</text>
+  <text x="523" y="47" text-anchor="middle">10%</text>
+  <line x1="496" y1="22" x2="496" y2="64" class="ink" stroke-width="2" />
+  <text x="496" y="78" text-anchor="middle">0.9 × TOTAL</text>
+  <text x="119" y="78" text-anchor="middle">ACT + RUNTIME</text>
+  <text x="10" y="96">≈ 54 USERS AT 8K · ≈ 13 AT 32K</text>
+
+  <text x="10" y="128" class="strong">DGX SPARK · 128 GiB UNIFIED</text>
+  <rect x="10" y="138" width="540" height="30" class="fill-paper" stroke-width="1.2" />
+  <rect x="10" y="138" width="63" height="30" class="fill-blue" />
+  <text x="41" y="157" text-anchor="middle" class="strong" style="fill:var(--paper)">W 15</text>
+  <rect x="73" y="138" width="11" height="30" class="fill-paper" stroke-width="1" />
+  <rect x="84" y="138" width="412" height="30" class="fill-wash" stroke-width="1" />
+  <text x="290" y="157" text-anchor="middle" class="blue-t strong">KV POOL ≈ 98 GiB</text>
+  <rect x="496" y="138" width="54" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="523" y="157" text-anchor="middle">OS</text>
+  <line x1="496" y1="132" x2="496" y2="174" class="ink" stroke-width="2" />
+  <text x="496" y="188" text-anchor="middle">0.9 × TOTAL</text>
+  <text x="10" y="210">THE LAST ~13 GiB MUST HOLD THE OS, YOUR SHELL, YOUR NOTEBOOK, AND THE PAGE CACHE</text>
+</svg>
+
+</Figure>
+
+This explains the opening scene. vLLM is not guessing when it says "maximum concurrency 24x"; it is dividing the pool it carved by the context you allowed. It also explains the colleague's notebook. On the Spark, `gpu_memory_utilization` is not "how much of the GPU", it is "how much of the whole computer". NVIDIA's DGX Spark playbooks show the settings they test with; look there before choosing yours, and leave real headroom. Newer vLLM versions also let you give the KV cache size directly in bytes instead of a fraction; check `vllm serve --help` for what your version supports.
+
+### Putting it together
+
+Now play with all of it. Each bar is drawn to its own machine's capacity. The Spark's first segment is the operating system and everything else that lives in its shared pool; it is set to 10 GiB as an assumption until you measure it. Overhead is 1.5 GiB of runtime plus a computed activation peak for an 8K-token prefill chunk.
+
+<Figure n="006" title="THE MEMORY BUDGET" caption="Weights, KV cache and overhead for one model on three machines. 'Max users' is (capacity − reserve − weights − overhead) ÷ KV per user. Effective bits per format and the overhead figures are approximations; the arithmetic is exact." wide>
+
+<MemMathBudget />
+
+</Figure>
+
+Things to try:
+
+- **Defaults (8B, BF16, 8K, 8 users).** The Spark and the H100 have room to spare: about 100 and 62 users at this context. The 4090 misses by about 1.4 GiB; it tops out at 6. A 24 GB card is a weights-plus-a-few-chats machine.
+- **Drag context to 128K.** The 4090 cannot hold even one user. The H100 holds 3. One user's cache is now bigger than the model.
+- **Now flip the KV cache to FP8.** Every "max users" number roughly doubles. This is the cheapest capacity win there is, which is why every engine offers it.
+- **Llama 3.1 70B, BF16.** 131 GiB of weights. Nothing here holds it, including the Spark. Switch to Q4_K_M: now the Spark and the H100 can hold it (the 4090 still cannot), and at 32K context the Spark fits about 7 users, the H100 about 3.
+- **Qwen3 30B-A3B, BF16.** 57 GiB of weights, which the H100 can hold with room for about 27 users at 8K, but the 4090 can't load at all. As the [bandwidth lesson](/lessons/bandwidth-bound/) showed, it *decodes* like a 3B model. Big-but-sparse on a big-but-slow memory is the Spark's niche.
+
+One thing this figure deliberately ignores: speed. A user who fits is not a user who is served well. On the Spark, 100 users at 8K means every decode step reads 15 GiB of weights plus 100 GiB of caches through 273 GB/s, about 0.45 seconds per step, or about 2 tokens per second each. The [envelope lesson](/lessons/back-of-envelope/) did that half. Capacity tells you who can be in the room; bandwidth tells you how fast the room moves.
+
+## Build It
+
+Everything goes in `inference/memory/` next to last lesson's server and harness. The first three tasks run anywhere (do them on your Mac); the last three need the Spark.
+
+<Task id="t1" title="Fetch real configs" agent="ok">
+
+You need only the small JSON files, not the weights. `huggingface_hub` downloads single files. Llama models are gated: accept the license on each model page first, and log in with the Hugging Face CLI (check its docs for the current login command).
+
+```python
+# fetch_configs.py
+import json, pathlib
+from huggingface_hub import hf_hub_download
+
+REPOS = [
+    "meta-llama/Llama-3.2-1B",
+    "meta-llama/Llama-3.1-8B",
+    "meta-llama/Llama-3.1-70B",
+    "Qwen/Qwen2.5-7B",
+    "Qwen/Qwen3-8B",
+    "Qwen/Qwen3-30B-A3B",
+]
+out = pathlib.Path("configs")
+out.mkdir(exist_ok=True)
+for repo in REPOS:
+    name = repo.split("/")[1]
+    cfg = json.load(open(hf_hub_download(repo, "config.json")))
+    (out / f"{name}.json").write_text(json.dumps(cfg, indent=2))
+    try:  # sharded safetensors checkpoints have an index whose metadata gives total bytes
+        idx = json.load(open(hf_hub_download(repo, "model.safetensors.index.json")))
+        cfg_total = idx.get("metadata", {}).get("total_size")
+        print(f"{name:20s} total_size={cfg_total}")
+    except Exception as e:
+        print(f"{name:20s} no index ({type(e).__name__})")
+```
+
+The `total_size` in the index is the checkpoint's weight bytes. For a bf16 checkpoint, divide by 2 and you have the official parameter count to test against. For Llama 3.1 8B it should be 16,060,522,496, which is exactly 2 × 8,030,261,248.
+
+</Task>
+
+<Task id="t2" title="Write the parameter counter" agent="hands">
+
+Write `params.py` with one function that takes a config dict and returns a breakdown. No transformers, no torch: just the arithmetic from Figure 002.
+
+```python
+def count_params(cfg: dict) -> dict[str, int]:
+    """Return {'embed': ..., 'attn': ..., 'mlp': ..., 'norms': ..., 'lm_head': ..., 'total': ...}
+    summed over all layers. Dense Llama/Qwen-style decoders only (MoE is a stretch goal)."""
+    ...
+```
+
+Then a check that must pass:
+
+```python
+EXPECTED = {
+    "Llama-3.2-1B": 1_235_814_400,
+    "Llama-3.1-8B": 8_030_261_248,
+    "Llama-3.1-70B": 70_553_706_496,
+    "Qwen2.5-7B": 7_615_616_512,
+    "Qwen3-8B": 8_190_735_360,
+}
+```
+
+Hints, in the order you will need them:
+
+- `head_dim` is not always in the config. When it is missing, it is `hidden_size // num_attention_heads`. When it is present, use it: Qwen3 sets it explicitly, and n × d need not equal h in general.
+- `tie_word_embeddings` decides whether `lm_head` costs anything. Treat a missing key as false for these models, but print a warning; it is the single most expensive line in the config.
+- Qwen2.5 has biases on q, k and v (not o). Look for `attention_bias` in the config, and if it is absent, know your model family. Count each bias once.
+- Qwen3 adds two small RMSNorms inside attention, on the queries and keys, each of size `head_dim`, per layer. If you are 9,216 short on Qwen3-8B (36 layers × 2 × 128), that is them.
+- Print your breakdown as percentages. The MLP share should be about 70% for Llama 3.1 8B.
+- Stretch: Qwen3-30B-A3B is a mixture of experts. Its config has `num_experts`, `num_experts_per_tok` and `moe_intermediate_size`, and each layer has a small router matrix (hidden × experts). Return total and *active* parameters separately; you should get about 30.5B and 3.3B.
+
+</Task>
+
+<Task id="t3" title="Write the memory calculator" agent="hands">
+
+Build on `count_params`. Same file or `plan.py`:
+
+```python
+GiB = 2**30
+
+FORMATS = {  # effective bits per weight: (layers, embedding + lm_head)
+    "bf16": (16, 16), "fp8": (8, 16), "q8_0": (8.5, 8.5), "awq": (4.16, 16), "q4_k_m": (4.9, 4.9),
+}
+
+def weight_bytes(cfg: dict, fmt: str) -> float: ...
+def kv_bytes_per_token(cfg: dict, kv_bytes: int = 2) -> int: ...
+def plan(cfg, fmt, ctx, users, capacity_gib, reserve_gib=0.0, overhead_gib=1.5, kv_bytes=2) -> dict:
+    """Return each bucket in GiB, the total, whether it fits, and max_users at this ctx."""
+    ...
+```
+
+Then print a table for each model in `configs/`, for the Spark (capacity 128, reserve: your measured number from t4, use 10 until then), an H100 (80) and a 4090 (24), at 8K and 32K. Check a few rows against Figure 006; they should agree to within rounding.
+
+Hints: `max_users` is a floor, not a round. The activation peak depends on how many tokens you push through at once; start with a flat overhead, and replace it with your t5 measurement. Do the arithmetic in bytes and convert to GiB only when printing.
+
+</Task>
+
+<Task id="t4" title="Read the real numbers on the Spark" agent="explain">
+
+Before you can check a prediction you need a reliable way to read memory. Here is the probe; it is plumbing, so take it. Run it inside the same PyTorch container as last lesson.
+
+```python
+# probe.py: one line of every memory number we care about.
+import os, time, torch
+
+GiB = 2**30
+
+def meminfo_available() -> float:
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) * 1024 / GiB  # value is in KiB
+    return float("nan")
+
+def rss() -> float:
+    with open(f"/proc/{os.getpid()}/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) * 1024 / GiB
+    return float("nan")
+
+def snap(label: str) -> dict:
+    if torch.cuda.is_initialized():
+        torch.cuda.synchronize()
+        free, total = torch.cuda.mem_get_info()
+        alloc, resv, peak = (torch.cuda.memory_allocated(), torch.cuda.memory_reserved(),
+                             torch.cuda.max_memory_allocated())
+    else:
+        free = total = alloc = resv = peak = float("nan")
+    row = dict(label=label, t=time.time(), alloc=alloc / GiB, reserved=resv / GiB, peak=peak / GiB,
+               cuda_free=free / GiB, cuda_total=total / GiB, os_available=meminfo_available(), rss=rss())
+    print(" ".join(f"{k}={v:.2f}" if isinstance(v, float) else f"{k}={v}" for k, v in row.items()))
+    return row
+```
+
+Now write the experiment, in this order, calling `snap()` after each step:
+
+1. Python started, `import torch` only. (Don't touch CUDA yet.)
+2. `torch.zeros(1, device="cuda")`: the CUDA context is now created. The drop in `os_available` and `cuda_free` with almost no change in `alloc` *is* the context.
+3. Load Llama 3.1 8B in bf16 straight to the GPU (`device_map="cuda"` in `from_pretrained`, so you never hold a CPU copy; see the virtual-memory lesson for why). `alloc` should be within a few MB of 14.96 GiB. If it is 29.9, something is in fp32.
+4. Run `generate` with a 1K prompt and 1 new token. Then 4K, 16K, 32K (use `attn_implementation="sdpa"`). Before each, call `torch.cuda.reset_peak_memory_stats()`. Record steady `alloc` while you still hold the returned cache (pass `return_dict_in_generate=True` and keep `past_key_values`) and `peak`.
+5. Delete the cache, then `torch.cuda.empty_cache()`, and snap again.
+
+In another terminal, run `free -h` and `nvidia-smi` at the same moments and write down what each says. Ask an agent to explain any number that confuses you; don't let it write the experiment.
+
+Safety: on the Spark, running out of memory can take down more than your script. Run these experiments in a container with a memory limit (Docker's `--memory`, or a cgroup as in the virtual-memory lesson) set below what the machine has, so the explosion stays in the box.
+
+</Task>
+
+<Task id="t5" title="Grow context until it breaks" agent="hands">
+
+Write `edge.py`. Your calculator predicts the largest number of sequences B at context L that fit. Find the real edge.
+
+```python
+def fits(model, batch: int, ctx: int) -> bool:
+    """Prefill `batch` random prompts of length ctx, decode 8 tokens, keep the cache.
+    Return False on torch.cuda.OutOfMemoryError (clean up: del, gc.collect(), empty_cache())."""
+    ...
+
+def find_edge(model, ctx: int, lo: int, hi: int) -> int:
+    """Binary search for the largest batch that fits at ctx."""
+    ...
+```
+
+For each L in 4K, 16K, 32K: predict B from `plan()` first, write it down, then search. Use random token ids (`torch.randint(0, vocab, (B, L))`) so you don't need real text. Log `peak` and `reserved` for the largest B that fit.
+
+Hints: a failed allocation leaves the allocator in a messy state; free everything and `empty_cache()` before the next try. Prefilling a large batch at once has a huge activation spike; that spike, not the cache, may be what fails first. That is a finding, not a bug. Record which one it was by comparing `peak` to steady `alloc`. On the Spark, the container's memory limit or the OOM killer may end the process instead of raising an exception; run each trial in a subprocess so the search survives.
+
+</Task>
+
+<Task id="t6" title="Check vLLM's arithmetic" agent="explain">
+
+Start vLLM with Llama 3.1 8B in bf16 inside NVIDIA's container for the Spark (follow the DGX Spark playbook for the image and the flags they test with). Set `--max-model-len 32768` and a `--gpu-memory-utilization` you have chosen on purpose, with your measured OS reserve in mind. Do not use 0.9 blindly on this machine.
+
+Before it finishes starting, predict from your calculator: KV pool in GiB, pool in tokens (÷ 128 KiB), and maximum concurrency at 32K. Then read the startup log. Look for the lines that report the KV cache size in tokens and the maximum concurrency (wording differs between versions). Compare.
+
+Then point last lesson's `bench.py` at it with `--concurrency` just above the predicted maximum and long prompts that fill the context. Watch what vLLM does with the request that does not fit: does it queue it, or start it and later preempt someone? Its logs and metrics will tell you. That behaviour is the [batching lesson](/lessons/batching/)'s subject; for now, just record that the limit you computed is a real wall.
+
+</Task>
+
+<DoneWhen>
+
+- `count_params` matches all five expected counts exactly, and you can say from memory roughly what fraction of Llama 3.1 8B is MLP.
+- `plan()` prints a table for six models on three machines, and agrees with Figure 006.
+- You have a probe log on the Spark from cold start through a 32K prefill, with the CUDA context size, the weights, and the KV growth each identified.
+- You have found the real max batch at three context lengths and know, for each, whether the cache or the prefill spike was what failed.
+- vLLM's reported KV pool is within a few percent of your prediction, or you can explain the difference.
+
+</DoneWhen>
+
+## Measure
+
+Fill these in. Predictions go in before you run anything.
+
+**Parameter counts** (your counter vs the checkpoint's `total_size` ÷ bytes per param):
+
+| Model | Your count | Official | Off by |
+|---|---|---|---|
+| Llama 3.2 1B | | 1,235,814,400 | |
+| Llama 3.1 8B | | 8,030,261,248 | |
+| Llama 3.1 70B | | 70,553,706,496 | |
+| Qwen2.5 7B | | 7,615,616,512 | |
+| Qwen3 8B | | 8,190,735,360 | |
+
+**The probe on the Spark**, Llama 3.1 8B bf16:
+
+| Stage | Predicted alloc | alloc | reserved | peak | os_available drop | cuda_free drop |
+|---|---|---|---|---|---|---|
+| import torch | 0 | | | | | |
+| CUDA context | 0 | | | | | |
+| weights loaded | 14.96 GiB | | | | | |
+| + 1K prefill | +0.125 | | | | | |
+| + 4K prefill | +0.5 | | | | | |
+| + 16K prefill | +2 | | | | | |
+| + 32K prefill | +4 | | | | | |
+| cache freed + empty_cache | 14.96 | | | | | |
+
+**The edge**:
+
+| Context | Predicted max batch | Measured max batch | What failed first (cache or spike) |
+|---|---|---|---|
+| 4K | | | |
+| 16K | | | |
+| 32K | | | |
+
+**vLLM**: predicted KV pool ___ GiB / ___ tokens; logged ___ tokens; max concurrency predicted ___, logged ___.
+
+What the numbers should look like, and why. These are expectations to check, not results.
+
+- **Weights** should be the most boring number on the page: within a few MB of 8,030,261,248 × 2 bytes. The few MB are small buffers that are not parameters (rotary embedding frequencies, for example). If yours is off by a whole GiB or more, a tensor got upcast or duplicated.
+- **The CUDA context** shows up as memory gone from the OS with nothing allocated in PyTorch. Somewhere from a few hundred MB to a GB or so is normal on discrete GPUs; I don't know the Spark's number, which is why it is the first row you measure. Run two Python processes that each touch CUDA and watch it double.
+- **KV growth** should be very close to L × 128 KiB per sequence, because `DynamicCache` holds exactly the keys and values and nothing else. The *peak* during each prefill will sit well above the steady value: that is the activation spike, plus the brief double copy when the cache is concatenated. Expect `reserved` to climb to the largest peak and stay there.
+- **After `del` and `empty_cache()`**, `alloc` returns to the weights and `reserved` drops close to it. If `os_available` does not come back fully, part of the gap is the context, which only goes away when the process exits.
+- **The edge** should land a little below your prediction, not above it. The common reasons: fragmentation (`reserved` well above `alloc` at failure), the prefill spike at large B × L (push prompts through in chunks to remove it), and the OS reserve being larger than you assumed (a desktop session, a browser, a forgotten notebook). If you measure *more* than predicted, check whether something in your stack is quantizing the cache.
+- **vLLM's pool** should match your prediction within a few percent if you used the same overhead and activation numbers vLLM profiled. The log tells you how much it set aside for activations; plug that in and the match should tighten.
+
+## Break It
+
+**Ask for every logit.** Replace `generate` with a plain `model(input_ids)` on a 32K prompt. Predict first: 32,768 × 128,256 × 2 bytes. Watch `peak`. The fix is one argument: request logits only for the last position (`logits_to_keep=1` in current transformers; check the model's `forward` signature in your version). Lesson: a single tensor nobody needed can be bigger than the whole KV cache.
+
+**Use textbook attention.** Load the model with `attn_implementation="eager"` and prefill 8K, then 16K tokens. Predict the score matrix: heads × N² × 2 bytes per layer, plus an fp32 softmax copy. At 16K that is tens of GiB for a single layer's temporaries; it will fail where SDPA sailed through. Lesson: the activation peak depends on the algorithm, not just the model, which is the whole reason FlashAttention exists.
+
+**Run two at once.** Start two vLLM instances on the Spark, each with the default `gpu_memory_utilization`. The second one will fail at startup, or, worse, the first one's budget plus the OS will leave nothing for the second and the machine will start reclaiming and swapping. Then try a notebook that loads a model while one vLLM instance is running. Lesson: on unified memory, a serving engine's budget is a claim on the whole machine. Write the reserve you need into your launch script.
+
+**Fragment the pool.** Generate 4,000 tokens one at a time at batch 8 with `DynamicCache`, snapping every 250 tokens, and plot `reserved − alloc`. Then repeat with a pre-sized cache (transformers' `StaticCache`, which allocates the full length once; check the docs for how to pass it to `generate`) and compare. Try also with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`, which lets the allocator grow a segment in place instead of making new ones. Lesson: allocating once and slicing beats growing, which is exactly what serving engines do.
+
+## Explain It Back
+
+Answer each out loud before opening it.
+
+<details>
+<summary>1. How much memory does Llama 3.1 8B need to serve one user, and where does it go?</summary>
+
+About 17 to 18 GiB at 8K context in bf16. The weights are 8.03 billion parameters × 2 bytes, 16.1 GB or 15 GiB, loaded once. The KV cache is 128 KiB per token (2 for K and V, × 32 layers × 8 KV heads × 128 dims × 2 bytes), so 1 GiB at 8K. Then one to two GiB of overhead: the CUDA context, library workspaces, and the activation peak during prefill. In 4-bit the weights drop to about 5 GB, but the cache and overhead don't change. The answer people usually give, "8 GB", assumes one byte per parameter and forgets the cache.
+
+</details>
+
+<details>
+<summary>2. Count a model's parameters from its config, in under a minute.</summary>
+
+Embedding is vocab × hidden. Each layer has attention, which is q (hidden × heads × head_dim), k and v (hidden × kv_heads × head_dim each, smaller with GQA) and o (the same size as q), plus an MLP of three hidden × intermediate matrices for SwiGLU, plus two norms of size hidden. Multiply by the number of layers. Add a final norm and, if embeddings are not tied, an output head the same size as the embedding. For Llama 3.1 8B: 2 × 525M + 32 × 218M + 4K = 8,030,261,248. Check for biases, extra norms, or experts in other families, and check the result against the checkpoint's total bytes.
+
+</details>
+
+<details>
+<summary>3. How does memory scale with context, users, and model size? Which one bites first?</summary>
+
+Weights scale with parameters and bytes per parameter and are paid once, no matter how many users. The KV cache scales linearly with context × users × (layers × KV heads × head_dim), so doubling either context or users doubles it. Activations scale with how many tokens you push through at once and are capped by chunking. For short chats and one user, the weights dominate. For many users or long contexts, the cache overtakes them quickly: at 128K context one user of an 8B model needs more cache than the whole model. So on a server, users × context is what you are really buying memory for, and FP8 KV caches, GQA and paging are the levers. On the Spark there is a second wall: everything you fit also has to be read every step, so bandwidth limits users before capacity does.
+
+</details>
+
+<details>
+<summary>4. Why does vLLM grab 90% of GPU memory at startup, before any request?</summary>
+
+So it never has to allocate during a request. At startup it loads the weights, runs a fake forward pass at its largest batch to measure the activation peak, and turns the rest of its budget (gpu_memory_utilization × total) into a pool of fixed-size KV blocks. Requests get blocks from the pool and give them back; there is no fragmentation and no surprise out-of-memory halfway through an answer. The cost is that the memory looks used even when idle. On a dedicated GPU that is fine. On the Spark, where the pool is the whole computer, the setting has to leave room for the operating system and everything else.
+
+</details>
+
+<details>
+<summary>5. memory_allocated says 15 GiB, but the system says 17 GiB are gone. Where are the other 2?</summary>
+
+memory_allocated counts only live tensors. memory_reserved adds the blocks PyTorch's caching allocator is holding for reuse, which after a prefill spike can be gigabytes. Below that, the CUDA context and library code belong to the driver, invisible to PyTorch's counters. Other processes using the GPU add their own. And on the Spark, the OS, CPU-side Python objects and the page cache share the same pool, so free -h sees all of it. To account for it: compare alloc, reserved, the drop in the driver's free memory, and the drop in MemAvailable, step by step from a cold start.
+
+</details>
+
+## Go Deeper
+
+- **"Transformer Inference Arithmetic"**, kipply (Carol Chen), 2022. The calculations in this lesson (parameters, KV cache, FLOPs, batch size) worked through for real models. Read the memory sections alongside your calculator.
+- **"Efficient Memory Management for Large Language Model Serving with PagedAttention"**, Woosuk Kwon et al., SOSP 2023. The vLLM paper. Its opening measurements of how much KV cache memory earlier servers wasted to fragmentation and over-reservation are this lesson's overhead section, at scale.
+- **"Fast Transformer Decoding: One Write-Head is All You Need"**, Noam Shazeer, 2019. Multi-query attention, and the clearest early statement that KV memory is the decoding problem.
+- **"GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"**, Joshua Ainslie et al., EMNLP 2023. Why Llama 3's attention looks the way it does in your parameter count.
+- **"AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration"**, Ji Lin et al., MLSys 2024. Where the group-of-128 scales come from, and why some weights deserve more care.
+- **PyTorch docs, "CUDA semantics" (memory management section) and "Understanding CUDA Memory Usage"**. The caching allocator, `memory_reserved`, `PYTORCH_CUDA_ALLOC_CONF`, and the memory snapshot tool that shows every allocation on a timeline. Use the snapshot when t5's numbers don't add up.
+- **vLLM docs, engine arguments and the memory/optimization pages**. The current meaning of `gpu_memory_utilization`, `max_num_batched_tokens`, `kv_cache_dtype` and friends. These move between versions; this is where to check.
+- **The GGUF and quantization type descriptions in the ggml / llama.cpp repositories.** The exact block layouts of Q8_0 and the K-quants, if you want to compute bits per weight from first principles instead of from file sizes.
+
+## Connections
+
+Built on: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the KV formula and GQA), [Back-of-the-envelope](/lessons/back-of-envelope/) (users per GPU, and why bandwidth is the Spark's first wall), and [virtual memory](/lessons/virtual-memory/) (unified memory, the page cache, and the OOM killer you will meet if you skip the container limit).
+
+Next: [The KV cache, by hand](/lessons/kv-cache/), where you build the cache this lesson only measured and watch your own GPT-2 speed up. Then [batching](/lessons/batching/), where "max users" turns into throughput, and [paged attention](/lessons/prefix-caching/), where the pool vLLM carved gets split into blocks and shared. [Quantization](/lessons/quantization/) is the other side of the weights bucket: you now know what a 4-bit file costs in bytes; that lesson measures what it costs in quality. And when you are ready for the bigger version of this lesson, [Why training needs so much memory](/lessons/training-memory/) adds gradients, optimizer states and the activations that inference gets to throw away.

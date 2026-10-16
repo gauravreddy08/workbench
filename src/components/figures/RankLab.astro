@@ -1,0 +1,260 @@
+---
+// Ranking metric lab: 10 results for one query. Drag rows (or focus a handle and use the
+// arrow keys) to reorder; click a grade to cycle 0 -> 1 -> 2 -> 3. P@k, R@k, RR, AP, DCG@k,
+// IDCG@k and NDCG@k update live, and the chart shows gain x discount per position.
+// Assumption shown in the figure: every relevant document for this query is in these 10.
+const docs = [
+  ['A', 'Py 3.14 docs: free threading', 3],
+  ['B', 'Monty Python cast list', 0],
+  ['C', 'PEP 703 summary post', 2],
+  ['D', 'Python 2.7 download page', 0],
+  ['E', '2016 Gilectomy talk', 1],
+  ['F', 'Snake species: python', 0],
+  ['G', 'GIL meme thread', 0],
+  ['H', 'Free-threaded build HOWTO', 2],
+  ['I', 'Gill (fish anatomy)', 0],
+  ['J', 'SEO spam: python tips', 0],
+] as const;
+---
+<div class="rlab" data-fig="rank-lab">
+  <p class="rlab-q"><span class="label">Query</span> <span class="rlab-qt">is the python gil gone</span></p>
+  <ol class="rlab-list">
+    {docs.map(([id, title, g]) => (
+      <li class="rlab-row" data-id={id} data-g={g}>
+        <button class="rlab-handle" type="button" aria-label={`Move ${title}. Use arrow keys.`}>⋮⋮</button>
+        <span class="rlab-pos"></span>
+        <span class="rlab-title">{title}</span>
+        <button class="rlab-grade" type="button" aria-label={`Relevance grade for ${title}`}></button>
+      </li>
+    ))}
+  </ol>
+  <div class="ctl">
+    <label>k <input type="range" min="1" max="10" value="5" data-k /> <output data-ko>5</output></label>
+    <span>Gain</span>
+    <button class="btn" type="button" data-gain="lin" aria-pressed="true">g</button>
+    <button class="btn" type="button" data-gain="exp" aria-pressed="false">2^g − 1</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="ideal">Sort ideal</button>
+    <button class="btn" type="button" data-act="worst">Reverse</button>
+    <button class="btn" type="button" data-act="shuffle">Shuffle</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+  </div>
+  <div class="rlab-grid">
+    <div><span class="label">P@k</span><span class="readout" data-r="p"></span></div>
+    <div><span class="label">R@k</span><span class="readout" data-r="r"></span></div>
+    <div><span class="label">RR</span><span class="readout" data-r="rr"></span></div>
+    <div><span class="label">AP</span><span class="readout" data-r="ap"></span></div>
+    <div><span class="label">DCG@k</span><span class="readout" data-r="dcg"></span></div>
+    <div><span class="label">IDCG@k</span><span class="readout" data-r="idcg"></span></div>
+    <div><span class="label">NDCG@k</span><span class="readout" data-r="ndcg"></span></div>
+  </div>
+  <svg viewBox="0 0 640 230" role="img" aria-label="Per-position gain, discount curve, and discounted gain"></svg>
+  <p class="rlab-note" data-r="why"></p>
+</div>
+
+<style>
+  .rlab-q { margin: 0 0 10px; font-family: var(--mono); font-size: 13px; }
+  .rlab-qt { color: var(--ink); }
+  .rlab-list { list-style: none; margin: 0; padding: 0; border-top: 1px solid var(--rule); }
+  .rlab-row {
+    display: grid; grid-template-columns: 34px 26px minmax(0, 1fr) auto; align-items: center; gap: 6px;
+    padding: 4px 6px 4px 0; border-bottom: 1px solid var(--rule); background: var(--paper);
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+  }
+  .rlab-row.dragging { background: var(--blue-fill); outline: 1px solid var(--blue); position: relative; z-index: 1; }
+  .rlab-row.out { opacity: 0.55; }
+  .rlab-handle {
+    touch-action: none; cursor: grab; background: none; border: 0; color: var(--ink-3);
+    font-family: var(--mono); font-size: 14px; padding: 6px 8px; letter-spacing: -2px;
+  }
+  .rlab-handle:focus-visible { outline: 2px solid var(--blue); color: var(--blue); }
+  .rlab-row.dragging .rlab-handle { cursor: grabbing; color: var(--blue); }
+  .rlab-pos { color: var(--ink-3); text-align: right; }
+  .rlab-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rlab-grade {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; cursor: pointer;
+    border: 1px solid var(--blue); background: var(--paper); color: var(--blue); padding: 4px 6px; min-width: 74px; text-align: left;
+  }
+  .rlab-grade[data-g='0'] { border-color: var(--rule); color: var(--ink-3); }
+  .rlab-grade[data-g='3'] { background: var(--blue); color: var(--paper); }
+  .rlab-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 8px; margin: 16px 0 6px; }
+  .rlab-grid > div { border: 1px solid var(--rule); background: var(--paper); padding: 6px 8px; display: flex; flex-direction: column; gap: 2px; }
+  .rlab-grid .label { font-size: 10px; }
+  .rlab-grid .readout { font-size: 15px; }
+  .rlab svg { margin-top: 10px !important; }
+  .rlab-note { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 8px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const NAMES = ['NOT REL', 'RELATED', 'RELEVANT', 'PERFECT'];
+  const disc = (i: number) => 1 / Math.log2(i + 2); // i is 0-based position
+  const f3 = (x: number) => (Number.isFinite(x) ? x.toFixed(3) : '-');
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="rank-lab"]').forEach((root) => {
+    const list = root.querySelector<HTMLOListElement>('.rlab-list')!;
+    const svg = root.querySelector('svg')!;
+    const kIn = root.querySelector<HTMLInputElement>('[data-k]')!;
+    const kOut = root.querySelector<HTMLOutputElement>('[data-ko]')!;
+    const gainBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-gain]')];
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const rows = () => [...list.querySelectorAll<HTMLLIElement>('.rlab-row')];
+    const initial = rows().map((li) => ({ id: li.dataset.id!, g: li.dataset.g! }));
+    let gainMode: 'lin' | 'exp' = 'lin';
+    const gain = (g: number) => (gainMode === 'lin' ? g : 2 ** g - 1);
+
+    function update() {
+      const k = +kIn.value;
+      kOut.textContent = String(k);
+      const rs = rows();
+      const grades = rs.map((li) => +li.dataset.g!);
+      rs.forEach((li, i) => {
+        li.querySelector('.rlab-pos')!.textContent = String(i + 1);
+        const b = li.querySelector<HTMLButtonElement>('.rlab-grade')!;
+        const g = +li.dataset.g!;
+        b.dataset.g = String(g);
+        b.textContent = `${g} ${NAMES[g]}`;
+        li.classList.toggle('out', i >= k);
+      });
+      const hits = grades.map((g) => (g > 0 ? 1 : 0));
+      const R = hits.reduce((a, b) => a + b, 0);
+      const hk = hits.slice(0, k).reduce((a, b) => a + b, 0);
+      const first = hits.indexOf(1);
+      let ap = 0, n = 0;
+      hits.forEach((h, i) => { if (h) { n++; ap += n / (i + 1); } });
+      ap = R ? ap / R : NaN;
+      const dcgAt = (gs: number[]) => gs.slice(0, k).reduce((s, g, i) => s + gain(g) * disc(i), 0);
+      const ideal = [...grades].sort((a, b) => b - a);
+      const dcg = dcgAt(grades), idcg = dcgAt(ideal);
+      r('p').textContent = f3(hk / k);
+      r('r').textContent = R ? f3(hk / R) : '-';
+      r('rr').textContent = first >= 0 ? f3(1 / (first + 1)) : '0.000';
+      r('ap').textContent = R ? f3(ap) : '-';
+      r('dcg').textContent = f3(dcg);
+      r('idcg').textContent = f3(idcg);
+      r('ndcg').textContent = idcg > 0 ? f3(dcg / idcg) : '-';
+      let why = `R = ${R} relevant docs (grade ≥ 1), assumed all in this list. `;
+      why += first >= 0 ? `First relevant at rank ${first + 1}, so RR = 1/${first + 1}. ` : 'No relevant doc, RR = 0. ';
+      why += `P@k and R@k ignore order inside the top ${k}; AP and NDCG do not.`;
+      r('why').textContent = why;
+      draw(grades, k, idcg);
+    }
+
+    function draw(grades: number[], k: number, idcg: number) {
+      svg.replaceChildren();
+      const X0 = 46, X1 = 630, TOP = 26, BOT = 180;
+      const maxG = gain(3);
+      const bw = (X1 - X0) / 10;
+      const y = (v: number) => BOT - (v / maxG) * (BOT - TOP);
+      svg.append(el('text', { x: X0, y: 14, class: 'strong' }, 'GAIN (OUTLINE) × DISCOUNT = WHAT COUNTS (FILL)'));
+      svg.append(el('line', { x1: X0, y1: BOT, x2: X1, y2: BOT, class: 'ink', 'stroke-width': 1 }));
+      for (let t = 0; t <= 3; t++) {
+        const v = gain(t);
+        svg.append(el('line', { x1: X0 - 4, y1: y(v), x2: X0, y2: y(v), class: 'ink', 'stroke-width': 1 }));
+        svg.append(el('text', { x: X0 - 8, y: y(v) + 4, 'text-anchor': 'end' }, String(v)));
+      }
+      grades.forEach((g, i) => {
+        const x = X0 + i * bw + 6, w = bw - 12, gv = gain(g), dv = gv * disc(i);
+        if (gv > 0) svg.append(el('rect', { x, y: y(gv), width: w, height: BOT - y(gv), class: 'blue dash', 'stroke-width': 1 }));
+        if (dv > 0) svg.append(el('rect', { x, y: y(dv), width: w, height: BOT - y(dv), class: i < k ? 'fill-blue' : 'fill-wash', 'stroke-width': 1 }));
+        svg.append(el('text', { x: x + w / 2, y: BOT + 16, 'text-anchor': 'middle' }, String(i + 1)));
+        if (dv > 0) svg.append(el('text', { x: x + w / 2, y: y(Math.max(gv, dv)) - 4, 'text-anchor': 'middle', class: 'blue-t' }, dv.toFixed(2)));
+      });
+      // discount curve, scaled so 1.0 sits at the top tick
+      const pts = Array.from({ length: 10 }, (_, i) => `${i ? 'L' : 'M'}${(X0 + i * bw + bw / 2).toFixed(1)} ${y(disc(i) * maxG).toFixed(1)}`).join(' ');
+      svg.append(el('path', { d: pts, class: 'ink', 'stroke-width': 1.2 }));
+      for (let i = 0; i < 10; i++) svg.append(el('circle', { cx: X0 + i * bw + bw / 2, cy: y(disc(i) * maxG), r: 2.2, class: 'fill-paper', 'stroke-width': 1 }));
+      svg.append(el('text', { x: X1, y: y(disc(9) * maxG) - 34, 'text-anchor': 'end' }, 'DISCOUNT 1/log2(rank+1)'));
+      const kx = X0 + k * bw;
+      svg.append(el('line', { x1: kx, y1: TOP - 6, x2: kx, y2: BOT + 4, class: 'ink dash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: kx - 4, y: TOP + 4, 'text-anchor': 'end', class: 'strong' }, `CUT @${k}`));
+      svg.append(el('text', { x: X0, y: BOT + 36 }, 'RANK →'));
+      svg.append(el('text', { x: X1, y: BOT + 36, 'text-anchor': 'end' }, `IDEAL DCG@${k} = ${idcg.toFixed(3)}`));
+    }
+
+    // grade toggles
+    list.addEventListener('click', (e) => {
+      const b = (e.target as HTMLElement).closest<HTMLButtonElement>('.rlab-grade');
+      if (!b) return;
+      const li = b.closest<HTMLLIElement>('.rlab-row')!;
+      li.dataset.g = String((+li.dataset.g! + 1) % 4);
+      update();
+    });
+
+    // drag to reorder (pointer events: mouse, touch, pen)
+    let dragging: HTMLLIElement | null = null;
+    list.addEventListener('pointerdown', (e) => {
+      const h = (e.target as HTMLElement).closest<HTMLButtonElement>('.rlab-handle');
+      if (!h) return;
+      dragging = h.closest<HTMLLIElement>('.rlab-row');
+      dragging!.classList.add('dragging');
+      h.setPointerCapture(e.pointerId);
+      e.preventDefault();
+    });
+    list.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const others = rows().filter((li) => li !== dragging);
+      const before = others.find((li) => {
+        const b = li.getBoundingClientRect();
+        return e.clientY < b.top + b.height / 2;
+      });
+      if (before) { if (dragging.nextElementSibling !== before) list.insertBefore(dragging, before); }
+      else if (list.lastElementChild !== dragging) list.append(dragging);
+      update();
+    });
+    const end = () => { if (dragging) { dragging.classList.remove('dragging'); dragging = null; update(); } };
+    list.addEventListener('pointerup', end);
+    list.addEventListener('pointercancel', end);
+
+    // keyboard reorder on a focused handle
+    list.addEventListener('keydown', (e) => {
+      const h = (e.target as HTMLElement).closest<HTMLButtonElement>('.rlab-handle');
+      if (!h || (e.key !== 'ArrowUp' && e.key !== 'ArrowDown')) return;
+      e.preventDefault();
+      const li = h.closest<HTMLLIElement>('.rlab-row')!;
+      if (e.key === 'ArrowUp' && li.previousElementSibling) list.insertBefore(li, li.previousElementSibling);
+      if (e.key === 'ArrowDown' && li.nextElementSibling) list.insertBefore(li.nextElementSibling, li);
+      h.focus();
+      update();
+    });
+
+    function setOrder(fn: (a: HTMLLIElement[]) => HTMLLIElement[]) {
+      fn(rows()).forEach((li) => list.append(li));
+      update();
+    }
+    root.querySelectorAll<HTMLButtonElement>('[data-act]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const act = b.dataset.act;
+        if (act === 'ideal') setOrder((a) => a.sort((x, y) => +y.dataset.g! - +x.dataset.g!));
+        if (act === 'worst') setOrder((a) => a.sort((x, y) => +x.dataset.g! - +y.dataset.g!));
+        if (act === 'shuffle') setOrder((a) => {
+          for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; }
+          return a;
+        });
+        if (act === 'reset') {
+          const byId = new Map(rows().map((li) => [li.dataset.id!, li]));
+          initial.forEach(({ id, g }) => { const li = byId.get(id)!; li.dataset.g = g; list.append(li); });
+          update();
+        }
+      }),
+    );
+
+    kIn.addEventListener('input', update);
+    gainBtns.forEach((b) =>
+      b.addEventListener('click', () => {
+        gainMode = b.dataset.gain as 'lin' | 'exp';
+        gainBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        update();
+      }),
+    );
+    update();
+  });
+</script>

@@ -1,0 +1,165 @@
+---
+// Step one SSE token from a server to your laptop. Down the server's stack (each layer adds a
+// header), across two routers (each one throws away the link-layer frame, decrements TTL and builds
+// a new frame; the home router also rewrites the destination for NAT), then up your laptop's stack.
+---
+<div class="pj" data-fig="packet-journey">
+  <svg viewBox="0 0 640 96" role="img" aria-label="Server, ISP router, home router and laptop in a row, with a marker showing where the message is">
+    <line x1="80" y1="40" x2="560" y2="40" class="ink" stroke-width="1" />
+    <text x="160" y="30" text-anchor="middle">ETHERNET</text>
+    <text x="320" y="30" text-anchor="middle">ISP FIBER</text>
+    <text x="480" y="30" text-anchor="middle">WI-FI</text>
+    <g data-node="0"><rect x="20" y="22" width="120" height="36" class="fill-paper" stroke-width="1.2" /><text x="80" y="44" text-anchor="middle" class="strong">SERVER</text></g>
+    <g data-node="1"><rect x="200" y="22" width="80" height="36" class="fill-paper" stroke-width="1.2" /><text x="240" y="44" text-anchor="middle" class="strong">ISP RTR</text></g>
+    <g data-node="2"><rect x="360" y="22" width="80" height="36" class="fill-paper" stroke-width="1.2" /><text x="400" y="44" text-anchor="middle" class="strong">HOME RTR</text></g>
+    <g data-node="3"><rect x="500" y="22" width="120" height="36" class="fill-paper" stroke-width="1.2" /><text x="560" y="44" text-anchor="middle" class="strong">LAPTOP</text></g>
+    <text x="80" y="76" text-anchor="middle">203.0.113.10</text>
+    <text x="400" y="76" text-anchor="middle">198.51.100.7</text>
+    <text x="400" y="90" text-anchor="middle">192.168.86.1</text>
+    <text x="560" y="76" text-anchor="middle">192.168.86.87</text>
+    <rect data-marker x="-8" y="6" width="16" height="10" class="fill-blue" />
+  </svg>
+  <div class="pj-env" data-env aria-live="polite"></div>
+  <p class="pj-msg" data-msg></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-prev>Back</button>
+    <button class="btn" type="button" data-next>Next</button>
+    <button class="btn" type="button" data-play>Play</button>
+    <button class="btn" type="button" data-reset>Reset</button>
+    <span>step <span class="readout" data-step>1</span> / <span data-total></span></span>
+  </div>
+</div>
+
+<style>
+  .pj svg { margin-bottom: 6px; }
+  .pj [data-node].here rect { fill: var(--blue-fill); stroke: var(--blue); }
+  .pj [data-marker] { transition: transform 0.35s ease; }
+  @media (prefers-reduced-motion: reduce) { .pj [data-marker] { transition: none; } }
+  .pj-env { min-height: 190px; font-family: var(--mono); font-size: 11.5px; }
+  .pj-box { border: 1px solid var(--ink-3); background: var(--paper); padding: 4px 6px 6px; margin-top: 4px; }
+  .pj-box > .pj-h { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; color: var(--ink-2); line-height: 1.5; }
+  .pj-box > .pj-h b { color: var(--ink); font-weight: 600; letter-spacing: 0.06em; }
+  .pj-box.l-link { border-color: var(--ink); }
+  .pj-box.l-ip { border-color: var(--blue); background: var(--blue-wash); }
+  .pj-box.l-tcp { border-style: dashed; border-color: var(--blue); }
+  .pj-box.l-http { border-color: var(--rule); }
+  .pj-box.l-data { border-color: var(--blue); background: var(--blue-fill); color: var(--ink); word-break: break-all; }
+  .pj-box.new { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .pj .chg { color: var(--paper); background: var(--blue); padding: 0 3px; }
+  .pj .gone { color: var(--ink-3); text-decoration: line-through; }
+  .pj-msg { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 12px 0 0; line-height: 1.6; min-height: 5em; }
+  @media (max-width: 520px) { .pj-env { min-height: 230px; } .pj-msg { min-height: 8em; } }
+</style>
+
+<script>
+  type Layer = 'link' | 'ip' | 'tcp' | 'http' | 'data';
+  type Field = string | [string, 'chg'];
+  type Step = { at: number; layers: Partial<Record<Layer, Field[]>>; fresh?: Layer; msg: string };
+
+  const SRV_MAC = '0c:42:a1:00:00:01';
+  const ISP_A = '3c:fd:fe:00:00:02';
+  const ISP_B = '3c:fd:fe:00:00:03';
+  const HOME_WAN = 'f0:9f:c2:00:00:04';
+  const HOME_LAN = 'f0:9f:c2:ab:cd:ef';
+  const LAPTOP = 'a4:83:e7:12:34:56';
+  const DATA: Field[] = ['data: {"token":" Hello"}\\n\\n'];
+  const HTTP: Field[] = ['HTTP', 'chunk "1a\\r\\n" ... "\\r\\n"', '+6 B'];
+  const TCP: Field[] = ['TCP', 'port 80 → 40112', 'seq 7241', '+32 B'];
+  const ip = (ttl: Field, dst: Field): Field[] => ['IPv4', '203.0.113.10 →', dst, ttl, 'proto 6 (TCP)', '+20 B'];
+  const link = (kind: string, src: Field, dst: Field): Field[] => [kind, src, '→', dst, 'type IPv4', '+14 B'];
+  const c = (s: string): Field => [s, 'chg'];
+
+  const STEPS: Step[] = [
+    { at: 0, layers: { data: DATA }, fresh: 'data',
+      msg: 'The server\'s app has one token to send: 26 bytes of SSE text. That\'s the letter. Every layer below will put it in another envelope.' },
+    { at: 0, layers: { http: HTTP, data: DATA }, fresh: 'http',
+      msg: 'HTTP: this event is part of a long-running response body. HTTP/1.1 chunked encoding wraps it with a length (0x1a = 26) and a CRLF.' },
+    { at: 0, layers: { tcp: TCP, http: HTTP, data: DATA }, fresh: 'tcp',
+      msg: 'TCP: which program on each machine (ports), and where these bytes sit in the stream (sequence number) so the other side can put them in order and ask again if any go missing.' },
+    { at: 0, layers: { ip: ip('TTL 64', '198.51.100.7'), tcp: TCP, http: HTTP, data: DATA }, fresh: 'ip',
+      msg: 'IP: which machine on Earth. The destination is your router\'s public address, because that\'s the only address of yours the server has ever seen. TTL starts at 64.' },
+    { at: 0, layers: { link: link('ETHERNET', SRV_MAC, ISP_A), ip: ip('TTL 64', '198.51.100.7'), tcp: TCP, http: HTTP, data: DATA }, fresh: 'link',
+      msg: 'Link layer: which box on this one wire. The destination MAC is the next router, not your laptop. The server has no idea what your laptop\'s MAC is and never will.' },
+    { at: 0.5, layers: { link: link('ETHERNET', SRV_MAC, ISP_A), ip: ip('TTL 64', '198.51.100.7'), tcp: TCP, http: HTTP, data: DATA },
+      msg: 'Out the wire as light or voltage. Every box on the way only needs to read the outer envelopes.' },
+    { at: 1, layers: { link: [c('frame removed')], ip: ip(c('TTL 63'), '198.51.100.7'), tcp: TCP, http: HTTP, data: DATA },
+      msg: 'ISP router: the frame was addressed to it, so it unwraps it and throws it away. It reads only the IP destination, looks up 198.51.100.7 in its table, and subtracts 1 from TTL (and fixes the header checksum).' },
+    { at: 1, layers: { link: link('ETHERNET', c(ISP_B), c(HOME_WAN)), ip: ip('TTL 63', '198.51.100.7'), tcp: TCP, http: HTTP, data: DATA }, fresh: 'link',
+      msg: 'It builds a brand-new frame for the next link, addressed to your home router\'s WAN side. The IP packet inside is the same one, minus one TTL.' },
+    { at: 1.5, layers: { link: link('ETHERNET', ISP_B, HOME_WAN), ip: ip('TTL 63', '198.51.100.7'), tcp: TCP, http: HTTP, data: DATA },
+      msg: 'Across the ISP\'s fiber. In real life this is 5 to 25 routers, each repeating exactly the step you just saw.' },
+    { at: 2, layers: { link: [c('frame removed')], ip: ip(c('TTL 62'), c('192.168.86.87')), tcp: ['TCP', 'port 80 →', c('52814'), 'seq 7241', '+32 B'], http: HTTP, data: DATA },
+      msg: 'Home router: unwrap the frame, TTL 63 → 62. Then NAT: it looks up port 40112 in its translation table, finds "that\'s 192.168.86.87 port 52814", and rewrites the destination address and port. The only time anything above IP gets touched.' },
+    { at: 2, layers: { link: link('WI-FI', c(HOME_LAN), c(LAPTOP)), ip: ip('TTL 62', '192.168.86.87'), tcp: ['TCP', 'port 80 → 52814', 'seq 7241', '+32 B'], http: HTTP, data: DATA }, fresh: 'link',
+      msg: 'A new frame again, this time Wi-Fi, addressed to your laptop\'s MAC (it learned that with ARP). Out over the radio.' },
+    { at: 3, layers: { ip: ip('TTL 62', '192.168.86.87'), tcp: ['TCP', 'port 80 → 52814', 'seq 7241', '+32 B'], http: HTTP, data: DATA },
+      msg: 'Laptop, link layer: the destination MAC is mine, so keep it. The type field says IPv4, so hand the inside to the IP code. Frame gone.' },
+    { at: 3, layers: { tcp: ['TCP', 'port 80 → 52814', 'seq 7241', '+32 B'], http: HTTP, data: DATA },
+      msg: 'IP: the destination address is mine, protocol 6 means TCP. Hand it up. (Received TTL 62 means it crossed 2 routers: 64 − 62.)' },
+    { at: 3, layers: { http: HTTP, data: DATA },
+      msg: 'TCP: port 52814 belongs to curl\'s socket. Sequence number 7241 is the next byte expected, so these bytes go straight into the socket buffer, and TCP sends back an ACK.' },
+    { at: 3, layers: { data: DATA },
+      msg: 'Your HTTP client strips the chunk framing and your SSE parser sees "data: ...\\n\\n": one event. Token " Hello" printed. Total on the wire: 26 bytes of message, 98 bytes of frame.' },
+  ];
+
+  const ORDER: Layer[] = ['link', 'ip', 'tcp', 'http', 'data'];
+  const X = [80, 240, 400, 560];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="packet-journey"]').forEach((root) => {
+    const env = root.querySelector<HTMLElement>('[data-env]')!;
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const marker = root.querySelector<SVGRectElement>('[data-marker]')!;
+    const stepEl = root.querySelector<HTMLElement>('[data-step]')!;
+    root.querySelector<HTMLElement>('[data-total]')!.textContent = String(STEPS.length);
+    const nodes = [...root.querySelectorAll<SVGGElement>('[data-node]')];
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-play]')!;
+    let i = 0;
+    let timer: number | undefined;
+
+    function render() {
+      const s = STEPS[i];
+      let parent: HTMLElement = env;
+      env.replaceChildren();
+      for (const L of ORDER) {
+        const fields = s.layers[L];
+        if (!fields) continue;
+        const box = document.createElement('div');
+        box.className = `pj-box l-${L}` + (s.fresh === L ? ' new' : '');
+        const h = document.createElement('div');
+        h.className = 'pj-h';
+        fields.forEach((f, k) => {
+          const el = document.createElement(k === 0 && L !== 'data' ? 'b' : 'span');
+          if (Array.isArray(f)) {
+            el.textContent = f[0];
+            el.className = f[0] === 'frame removed' ? 'gone' : 'chg';
+          } else el.textContent = f;
+          h.appendChild(el);
+        });
+        box.appendChild(h);
+        parent.appendChild(box);
+        if (!(fields.length === 1 && Array.isArray(fields[0]))) parent = box;
+      }
+      const x = s.at % 1 === 0 ? X[s.at] : (X[Math.floor(s.at)] + X[Math.ceil(s.at)]) / 2;
+      marker.style.transform = `translateX(${x}px)`;
+      nodes.forEach((n, k) => n.classList.toggle('here', s.at === k));
+      msg.textContent = s.msg;
+      stepEl.textContent = String(i + 1);
+    }
+
+    const go = (d: number) => { i = Math.max(0, Math.min(STEPS.length - 1, i + d)); render(); };
+    const stop = () => { if (timer) clearInterval(timer); timer = undefined; playBtn.setAttribute('aria-pressed', 'false'); playBtn.textContent = 'Play'; };
+    root.querySelector('[data-next]')!.addEventListener('click', () => { stop(); go(1); });
+    root.querySelector('[data-prev]')!.addEventListener('click', () => { stop(); go(-1); });
+    root.querySelector('[data-reset]')!.addEventListener('click', () => { stop(); i = 0; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer) { stop(); return; }
+      if (i === STEPS.length - 1) i = 0;
+      const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce) { i = STEPS.length - 1; render(); return; }
+      playBtn.setAttribute('aria-pressed', 'true'); playBtn.textContent = 'Pause';
+      render();
+      timer = window.setInterval(() => { if (i >= STEPS.length - 1) stop(); else go(1); }, 2600);
+    });
+    render();
+  });
+</script>

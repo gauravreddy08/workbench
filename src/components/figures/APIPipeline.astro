@@ -1,0 +1,162 @@
+---
+// Interactive: the life of one request inside the inference server.
+// Click a stage to see what it does and which status codes it can return.
+// Or pick a request; it travels the pipeline and stops at the stage that answers it.
+---
+<div class="apl" data-fig="api-pipeline">
+  <div class="ctl apl-reqs" role="group" aria-label="Send a request">
+    <span>Send</span>
+    <button class="btn" type="button" data-req="ok">Good request</button>
+    <button class="btn" type="button" data-req="nokey">No API key</button>
+    <button class="btn" type="button" data-req="json">Broken JSON</button>
+    <button class="btn" type="button" data-req="limit">Over the limit</button>
+    <button class="btn" type="button" data-req="dup">Retry, same key</button>
+    <button class="btn" type="button" data-req="bad">messages: []</button>
+    <button class="btn" type="button" data-req="crash">Model OOM</button>
+  </div>
+  <ol class="apl-stages"></ol>
+  <div class="apl-detail" aria-live="polite">
+    <div class="apl-dh"><span class="label" data-d="n"></span><span class="label" data-d="layer"></span></div>
+    <p class="apl-dt" data-d="title"></p>
+    <p data-d="what"></p>
+    <p class="apl-codes" data-d="codes"></p>
+    <p class="apl-res" data-d="res" hidden></p>
+  </div>
+</div>
+
+<style>
+  .apl-stages { list-style: none; margin: 14px 0 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 8px; counter-reset: st; }
+  .apl-stages li { margin: 0; }
+  .apl-stages button {
+    width: 100%; min-height: 54px; text-align: left; cursor: pointer;
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em; text-transform: uppercase; line-height: 1.3;
+    background: var(--paper); color: var(--ink); border: 1px solid var(--ink); padding: 7px 9px;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .apl-stages button .k { color: var(--ink-3); font-size: 10px; }
+  .apl-stages button:hover { border-color: var(--blue); color: var(--blue); }
+  .apl-stages button[aria-pressed='true'] { background: var(--blue-fill); border-color: var(--blue); color: var(--blue); }
+  .apl-stages button.passed { border-color: var(--blue); }
+  .apl-stages button.passed .k::after { content: ' · pass'; color: var(--blue); }
+  .apl-stages button.stopped { background: var(--blue); color: var(--paper); border-color: var(--blue); }
+  .apl-stages button.stopped .k { color: var(--paper); }
+  .apl-stages button.dim { opacity: 0.45; }
+  .apl-detail { margin-top: 14px; border-top: 1px solid var(--rule); padding-top: 10px; font-size: 15.5px; line-height: 1.5; }
+  .apl-detail p { margin: 6px 0 0; }
+  .apl-dh { display: flex; justify-content: space-between; gap: 10px; }
+  .apl-dt { font-family: var(--mono); font-size: 13px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; color: var(--blue); }
+  .apl-codes { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .apl-res { font-family: var(--mono); font-size: 12px; color: var(--ink); background: var(--paper-2); border: 1px solid var(--rule); padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
+</style>
+
+<script>
+  type Stage = { id: string; name: string; layer: string; what: string; codes: string };
+  const STAGES: Stage[] = [
+    { id: 'tls', name: 'TLS termination', layer: 'proxy (Caddy / Tailscale)',
+      what: 'Decrypts HTTPS and forwards plain HTTP to your app on localhost. Your Python never sees a certificate. The proxy also owns connection limits and upstream timeouts.',
+      codes: 'No status if the handshake fails (the connection just dies). 502 if your app is down, 504 if it is too slow to answer.' },
+    { id: 'log', name: 'Request ID + log', layer: 'outer middleware',
+      what: 'Stamps an x-request-id, starts a timer, and on the way out writes one structured log line: route, key name, status, latency. This is where per-endpoint metrics come from.',
+      codes: 'None. It never says no; it watches.' },
+    { id: 'route', name: 'Routing', layer: 'framework',
+      what: 'Matches method + path to a handler: POST /v1/chat/completions. The version in the URL picks the v1 or v2 adapter here.',
+      codes: '404 no such path, 405 wrong method (a GET on a POST-only route), 410 a retired version.' },
+    { id: 'parse', name: 'Read + parse body', layer: 'framework',
+      what: 'Reads the body (with a size cap) and parses JSON. In FastAPI this happens after routing but before your dependencies run, so broken JSON is rejected before auth even looks at the key.',
+      codes: '413 body too large, 415 not JSON, 400 malformed JSON (FastAPI default: 422).' },
+    { id: 'auth', name: 'Authentication', layer: 'dependency',
+      what: 'Reads Authorization: Bearer ..., hashes the key, looks the hash up. Attaches "who is this" to the request so every later stage can use it.',
+      codes: '401 missing or unknown key. 403 a real key that is not allowed to do this (wrong scope, disabled model).' },
+    { id: 'rate', name: 'Rate limit', layer: 'dependency',
+      what: 'One token bucket per key. Takes a token or refuses. Runs after auth because it needs to know whose bucket to use.',
+      codes: '429 with Retry-After and x-ratelimit-* headers.' },
+    { id: 'valid', name: 'Validation', layer: 'framework (pydantic)',
+      what: 'Checks the parsed JSON against the schema: required fields, types, ranges. Rewritten by your error handler into the OpenAI error shape.',
+      codes: '400 invalid_request_error with param naming the bad field (FastAPI default: 422 with a detail list).' },
+    { id: 'idem', name: 'Idempotency', layer: 'dependency',
+      what: 'If the request carries an Idempotency-Key: claim it in the store, or find it already there. Already done: replay the saved answer without touching the GPU. It runs after validation, so a request that was never valid never gets a stored answer.',
+      codes: '200 replayed, 409 same key still running, 422 same key with a different body.' },
+    { id: 'handler', name: 'Handler', layer: 'your code',
+      what: 'The part you actually care about: chat template, the GPU lock, generate. Everything before this exists so that this only sees well-formed, authorised, paid-for work.',
+      codes: '200, or 500 on a bug, 503 when overloaded (queue full), 504 if you enforce a deadline.' },
+    { id: 'ser', name: 'Serialize', layer: 'framework',
+      what: 'Turns the result into JSON (or SSE events) and, with a response model, checks your own output against the contract before it leaves.',
+      codes: '500 if your response does not match your own schema. Better you than the client.' },
+    { id: 'out', name: 'Response', layer: 'outer middleware',
+      what: 'Adds headers on the way out: x-request-id, rate-limit headers, Deprecation and Sunset on v1. The log line is written now, with the final status.',
+      codes: 'Whatever the inner stages decided.' },
+  ];
+
+  const REQS: Record<string, { stop: string; res: string }> = {
+    ok: { stop: 'out', res: '200 OK\n{"id":"chatcmpl-...","object":"chat.completion","choices":[...],"usage":{...}}' },
+    nokey: { stop: 'auth', res: '401\n{"error":{"message":"Missing API key.","type":"authentication_error","param":null,"code":"missing_api_key"}}' },
+    json: { stop: 'parse', res: '400\n{"error":{"message":"Could not parse JSON body.","type":"invalid_request_error","param":null,"code":"invalid_json"}}\n(Note: no key was checked. FastAPI parses first.)' },
+    limit: { stop: 'rate', res: '429  Retry-After: 2\n{"error":{"message":"Rate limit exceeded.","type":"rate_limit_error","param":null,"code":"rate_limit_exceeded"}}' },
+    dup: { stop: 'idem', res: '200  Idempotent-Replayed: true\n(the saved response from the first attempt; the GPU did nothing)' },
+    bad: { stop: 'valid', res: '400\n{"error":{"message":"List should have at least 1 item after validation, not 0","type":"invalid_request_error","param":"messages","code":"invalid_value"}}' },
+    crash: { stop: 'handler', res: '500\n{"error":{"message":"Internal error. Request id req_7f3a.","type":"server_error","param":null,"code":null}}\n(the stack trace goes to your log, not to the client)' },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="api-pipeline"]').forEach((root) => {
+    const list = root.querySelector('.apl-stages')!;
+    const d = (k: string) => root.querySelector<HTMLElement>(`[data-d="${k}"]`)!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let timer = 0;
+
+    const btns = STAGES.map((st, i) => {
+      const li = document.createElement('li');
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.setAttribute('aria-pressed', 'false');
+      b.innerHTML = `<span class="k">${String(i + 1).padStart(2, '0')}</span><span></span>`;
+      (b.lastElementChild as HTMLElement).textContent = st.name;
+      b.addEventListener('click', () => show(i));
+      li.append(b);
+      list.append(li);
+      return b;
+    });
+
+    function show(i: number, res?: string) {
+      const st = STAGES[i];
+      btns.forEach((b, j) => b.setAttribute('aria-pressed', String(j === i)));
+      d('n').textContent = `Stage ${String(i + 1).padStart(2, '0')} of ${STAGES.length}`;
+      d('layer').textContent = st.layer;
+      d('title').textContent = st.name;
+      d('what').textContent = st.what;
+      d('codes').textContent = 'Can return: ' + st.codes;
+      const rr = d('res');
+      if (res) { rr.hidden = false; rr.textContent = res; } else { rr.hidden = true; }
+    }
+
+    function clearTrace() {
+      window.clearTimeout(timer);
+      btns.forEach((b) => b.classList.remove('passed', 'stopped', 'dim'));
+    }
+
+    function send(key: string) {
+      clearTrace();
+      const { stop, res } = REQS[key];
+      const end = STAGES.findIndex((s) => s.id === stop);
+      const finish = () => {
+        btns.forEach((b, j) => {
+          b.classList.toggle('passed', j < end);
+          b.classList.toggle('stopped', j === end);
+          b.classList.toggle('dim', j > end && j < btns.length - 1);
+          if (j === btns.length - 1 && j !== end) b.classList.add('passed');
+        });
+        show(end, res);
+      };
+      if (reduce) { finish(); return; }
+      let i = 0;
+      const step = () => {
+        btns.forEach((b, j) => b.classList.toggle('passed', j < i));
+        btns.forEach((b, j) => b.classList.toggle('stopped', j === i));
+        if (i < end) { i++; timer = window.setTimeout(step, 140); } else finish();
+      };
+      step();
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-req]').forEach((b) => b.addEventListener('click', () => send(b.dataset.req!)));
+    show(0);
+  });
+</script>

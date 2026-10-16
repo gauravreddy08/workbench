@@ -1,0 +1,749 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import KVStepper from '../components/figures/KVStepper.astro';
+import KVHeads from '../components/figures/KVHeads.astro';
+
+## Today
+
+- Say exactly what the KV cache stores: which tensors, what shape, per layer, and why it holds keys and values but never queries.
+- Explain why the causal mask is the thing that makes caching legal, and why an encoder like BERT cannot do it.
+- Count the work a generation loop does with and without a cache, and say how per-token cost and total cost scale with length.
+- Add a KV cache to your own GPT-2 by hand, prove it gives bit-for-bit the same tokens, and plot latency and memory against position.
+- Explain the designs that shrink the cache (MQA, GQA, sliding windows, quantized caches) and compute what each one saves.
+
+Prerequisites: you have built GPT-2 or Llama from scratch, so you know a forward pass. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) for prefill vs decode and the roofline, and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) for the server and harness you will poke at the end. About one evening on your laptop and an hour on the Spark.
+
+## The Problem
+
+Here is the generation loop almost everyone writes the first time they finish their GPT-2. It is short, it is obviously correct, and you may well have written exactly this:
+
+```python
+@torch.no_grad()
+def generate(model, idx, n_new):
+    for _ in range(n_new):
+        logits = model(idx)                          # run the WHOLE sequence
+        nxt = logits[:, -1].argmax(-1, keepdim=True) # keep only the last position
+        idx = torch.cat([idx, nxt], dim=1)
+    return idx
+```
+
+On a MacBook (an M4 Pro, CPU only, GPT-2 small in fp32) that loop takes about **170 seconds** to write 1,000 tokens. The first token takes 17 milliseconds. Token 500 takes about 160. Token 1,000 takes about 360. The model did not get bigger. The text did not get harder. Each step just got slower, in a straight line, until it was twenty times slower than the first.
+
+Then you change about twenty lines, and the same 1,000 tokens take **12 seconds**. Every token is the same token as before. Token 1,000 costs about what token 1 did.
+
+<Predict id="step-500">
+At step 500 of that loop, the model runs a full forward pass over 512 tokens (a 12-token prompt plus 500 generated so far). You keep one row of the output. What fraction of the numbers computed in that step had already been computed, exactly, in step 499?
+
+<Fragment slot="answer">
+
+Almost all of them: 511 of the 512 positions. Every key, value, query, MLP activation and layer-norm output for positions 0 to 510 comes out bit-for-bit what it was one step earlier, because of the causal mask (you will see why in a minute). The only genuinely new work is the one new position. Over a whole generation of n tokens the loop does about n²/2 positions of work when it needed n. For 1,000 tokens that is roughly 500 times more matrix work than necessary. The measured slowdown is "only" 14x on a laptop CPU because many fixed costs per step do not shrink, which is its own lesson, coming up.
+
+</Fragment>
+</Predict>
+
+You already know the fix by name, the <Term w="KV cache">Memory that holds the key and value vectors of every past token, in every layer, so a generation step only has to compute them for the newest token.</Term>, and your description in the diagnostic was right: store the keys and values for past tokens instead of recomputing them. This lesson goes one level down. Why exactly keys and values, and not queries? What makes it legal to reuse them? What shape is the thing, how big does it get, and what are all the tricks people use to make it smaller? Then you build it into your own GPT-2 and measure it.
+
+<Origin year="2019" title="One write-head is all you need">
+
+The idea of caching keys and values is as old as the Transformer itself. "Attention Is All You Need" came out in 2017, and the Google code that trained it (the tensor2tensor library) already had a fast decoding path that kept each layer's past keys and values around instead of recomputing them. For a model that generates one token at a time, it is the obvious move once you see the waste.
+
+What took longer to notice was the bill. In 2019 Noam Shazeer, one of the Transformer's authors, published a short paper with a playful title: "Fast Transformer Decoding: One Write-Head is All You Need." His point: once you cache keys and values, the decode step is no longer slow because of math. It is slow because, at every step, the hardware has to read the whole cache back out of memory, and the cache is big. His fix was to let all the attention heads share a single set of keys and values, which shrinks the cache by the number of heads. It is called multi-query attention.
+
+That started a line of work that is still going: grouped-query attention (2023) as a middle ground, sliding windows, quantized caches, and DeepSeek's latent attention (2024). The cache stopped being a trick and became the thing modern model architectures are designed around.
+
+</Origin>
+
+## The Idea
+
+### A lazy librarian
+
+Picture a librarian answering a stream of questions about a growing pile of notes. Each time a new note arrives, she writes an index card for it: a short label (what this note is about) and a summary (what it says). To answer a question, she compares it with every label, picks the relevant cards, and blends their summaries.
+
+The no-cache loop is a librarian who, every time one new note arrives, throws away all her index cards and rewrites every one from scratch, then answers one question. The cards come out identical every time, because the notes have not changed. A sensible librarian keeps the cards in a box and writes one new card per note.
+
+In attention, the labels are <Term w="keys">For each token, a vector that says "here is what I contain", used to decide how much attention it gets. Computed as k = W_k · h from that token's hidden state h.</Term> and the summaries are <Term w="values">For each token, a vector holding the information it hands over when attended to. Computed as v = W_v · h. The attention output is a weighted average of values.</Term>. The question is the new token's <Term w="query">For each token, a vector that says "here is what I am looking for". Its dot product with each key gives a score; softmax of the scores gives the attention weights.</Term>. The box of cards is the KV cache. The rest of this section is about why the cards really do never change, and why nobody bothers to keep the old questions.
+
+### What one new token needs
+
+Take one attention head in one layer. Write the hidden state of position i as h_i. The head computes q_i = W_q h_i, k_i = W_k h_i and v_i = W_v h_i for every position, then for each position t:
+
+```text
+score(t, i) = q_t · k_i / sqrt(d_head)        for i = 0 .. t    (the causal mask hides i > t)
+a(t, i)     = softmax over i of score(t, i)
+out_t       = sum over i of a(t, i) · v_i
+```
+
+Now ask what you need in order to produce the output for the newest position t, and nothing else.
+
+<Predict id="what-is-needed">
+To compute out_t for the newest token only, which of these do you need: the queries of past tokens (q_0 ... q_t−1), the keys of past tokens (k_0 ... k_t−1), the values of past tokens (v_0 ... v_t−1)?
+
+<Fragment slot="answer">
+
+Keys and values of the past: yes, all of them. Queries of the past: no, never. Look at the formula: out_t uses q_t (the new one) against every k_i, then mixes every v_i. A past query q_i only ever appears in score(i, ·), which was needed to compute out_i, the output of an old position. That output has already been computed and has already moved on to the next layer. Nobody will ask for it again. So past queries are dead the moment they are used; past keys and values are read at every future step. That is the whole reason it is a "KV" cache and not a "QKV" cache.
+
+</Fragment>
+</Predict>
+
+<Figure n="001" title="WHAT A NEW TOKEN READS" caption="The attention scores form a lower triangle (row = query position, column = key position). A decode step only adds the bottom row. That row needs the one new query, every key, and every value. Old queries only fed old rows, which are finished.">
+
+<svg viewBox="0 0 560 270" role="img" aria-label="Lower-triangular attention score matrix with the bottom row highlighted; only the newest query is needed, but every key and value is">
+  <text x="200" y="18" class="strong">KEYS, ALL READ</text>
+  <rect x="200" y="28" width="24" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="228" y="28" width="24" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="256" y="28" width="24" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="284" y="28" width="24" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="312" y="28" width="24" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="340" y="28" width="24" height="20" class="fill-blue" />
+  <text x="212" y="42" text-anchor="middle" class="blue-t">k0</text>
+  <text x="240" y="42" text-anchor="middle" class="blue-t">k1</text>
+  <text x="268" y="42" text-anchor="middle" class="blue-t">k2</text>
+  <text x="296" y="42" text-anchor="middle" class="blue-t">k3</text>
+  <text x="324" y="42" text-anchor="middle" class="blue-t">k4</text>
+
+  <text x="10" y="70" class="strong">QUERIES</text>
+  <text x="10" y="86">ONLY THE NEW</text>
+  <text x="10" y="100">ONE IS NEEDED</text>
+  <rect x="160" y="60" width="28" height="24" class="fill-paper dash" stroke-width="1" />
+  <rect x="160" y="88" width="28" height="24" class="fill-paper dash" stroke-width="1" />
+  <rect x="160" y="116" width="28" height="24" class="fill-paper dash" stroke-width="1" />
+  <rect x="160" y="144" width="28" height="24" class="fill-paper dash" stroke-width="1" />
+  <rect x="160" y="172" width="28" height="24" class="fill-paper dash" stroke-width="1" />
+  <rect x="160" y="200" width="28" height="24" class="fill-blue" />
+  <text x="174" y="76" text-anchor="middle">q0</text>
+  <text x="174" y="104" text-anchor="middle">q1</text>
+  <text x="174" y="132" text-anchor="middle">q2</text>
+  <text x="174" y="160" text-anchor="middle">q3</text>
+  <text x="174" y="188" text-anchor="middle">q4</text>
+
+  <rect x="200" y="60" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="200" y="88" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="228" y="88" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="200" y="116" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="228" y="116" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="256" y="116" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="200" y="144" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="228" y="144" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="256" y="144" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="284" y="144" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="200" y="172" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="228" y="172" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="256" y="172" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="284" y="172" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="312" y="172" width="24" height="24" class="fill-paper" stroke-width="1" />
+  <rect x="200" y="200" width="24" height="24" class="fill-blue" />
+  <rect x="228" y="200" width="24" height="24" class="fill-blue" />
+  <rect x="256" y="200" width="24" height="24" class="fill-blue" />
+  <rect x="284" y="200" width="24" height="24" class="fill-blue" />
+  <rect x="312" y="200" width="24" height="24" class="fill-blue" />
+  <rect x="340" y="200" width="24" height="24" class="fill-blue" />
+  <text x="300" y="96" class="blue-t">MASKED:</text>
+  <text x="300" y="110" class="blue-t">THE FUTURE</text>
+  <text x="200" y="246">ROWS 0-4: FINISHED LAST STEPS</text>
+  <text x="200" y="262" class="strong">ROW 5: THE ONLY NEW WORK</text>
+
+  <text x="420" y="70" class="strong">VALUES</text>
+  <text x="420" y="86">ALL READ</text>
+  <rect x="420" y="100" width="20" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="420" y="120" width="20" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="420" y="140" width="20" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="420" y="160" width="20" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="420" y="180" width="20" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="420" y="200" width="20" height="18" class="fill-blue" />
+  <line x1="368" y1="212" x2="414" y2="212" class="blue" stroke-width="1.2" />
+  <polygon points="414,208 420,212 414,216" class="fill-blue" />
+  <text x="450" y="214" class="strong">out5 =</text>
+  <text x="450" y="230">Σ a(5,i) · vi</text>
+</svg>
+
+</Figure>
+
+### Why the old cards never change
+
+Keeping old keys and values is only allowed if they are truly the same numbers every step. Are they? In a decoder like GPT-2, yes, and the reason is the <Term w="causal mask">The rule in a decoder's attention that position t may only look at positions 0 to t, never later ones. Implemented by setting the scores for later positions to minus infinity before the softmax.</Term>.
+
+Follow one position i up through the model:
+
+1. **Layer 0 input.** h_i is the embedding of token i plus the position embedding for slot i. It depends only on token i and the number i.
+2. **Attention.** The output at position i mixes values from positions 0 to i. Nothing later. So it depends only on tokens 0 to i.
+3. **Everything else.** Layer norm, the MLP and the residual add all work on one position at a time. They never mix positions.
+4. **Next layer.** So the next layer's h_i also depends only on tokens 0 to i. Repeat for every layer.
+
+By induction, every hidden state at position i, in every layer, is a function of tokens 0 to i and nothing else. Appending token 501 cannot reach back and change it. So k_i = W_k h_i and v_i = W_v h_i in every layer are frozen the moment they are first computed. They are <Term w="immutable">Never changes after it is created. Here: once position i's keys and values exist, no later token can alter them.</Term>.
+
+Two conditions are hiding in that argument, and each one breaks a cache if you violate it. The mask has to be causal (an encoder like BERT lets every position see every other, so adding a word changes every hidden state, and there is nothing to cache). And a position's encoding has to depend only on its own index. GPT-2's learned position table and Llama's <Term w="RoPE">Rotary position embedding: positions are encoded by rotating each query and key vector by an angle that depends on its position. Llama applies it to q and k before attention, so the cached keys are already rotated.</Term> both qualify. Note that with RoPE you cache the keys *after* rotation, which is what Hugging Face's Llama does.
+
+One more thing falls out of step 2. The cache is per layer, and it has to be. Layer 5's keys are computed from layer 5's input, which is layer 4's output. There is no single "key of token i"; there are 12 of them in GPT-2 small (one per layer), each in 12 heads.
+
+### Prefill fills it, decode appends to it
+
+With a cache, generation has the same two phases you met in [the bandwidth lesson](/lessons/bandwidth-bound/), and now you can say precisely what each does to the cache.
+
+**Prefill.** Run the whole prompt through the model in one forward pass, exactly like training (causal mask and all). As a side effect, every layer computes K and V for every prompt position. Keep them. The cache now holds P rows per layer. The output at the last position gives the first new token.
+
+**Decode.** Feed only the newest token, as a sequence of length 1, telling the model its position is P (then P+1, and so on). In each layer, compute its q, k, v. Append k and v to that layer's cache. Score the one query against every cached key, softmax, mix every cached value. One row out, through the MLP, on to the next layer. At the top, one row of logits, one token.
+
+The shape of each layer's cache is the shape you already use inside attention:
+
+```text
+K cache, one layer:  (batch, n_kv_heads, seq_len, head_dim)
+V cache, one layer:  (batch, n_kv_heads, seq_len, head_dim)
+
+GPT-2 small:         (1, 12, T, 64)   for each of 12 layers, K and V
+Llama 3.1 8B:        (1,  8, T, 128)  for each of 32 layers, K and V
+```
+
+Prefill writes T = P rows in one go. Each decode step grows T by exactly one, along dimension 2. Nothing else ever changes size.
+
+<Figure n="002" title="ONE LAYER'S CACHE, FILLING UP" caption="Each layer keeps a K tensor and a V tensor of shape (batch, heads, seq, head_dim). Prefill writes all prompt rows in one pass. Each decode step appends one row per head, per layer, for K and for V.">
+
+<svg viewBox="0 0 560 250" role="img" aria-label="Stacked per-head key tensors with prompt rows filled in one block by prefill and one row appended per decode step">
+  <text x="10" y="16" class="strong">K CACHE · ONE LAYER · BATCH 1</text>
+  <rect x="58" y="38" width="128" height="176" class="fill-paper" stroke-width="1" />
+  <rect x="48" y="46" width="128" height="176" class="fill-paper" stroke-width="1" />
+  <rect x="38" y="54" width="128" height="176" class="fill-paper" stroke-width="1.2" />
+  <rect x="38" y="54" width="128" height="72" class="fill-wash" stroke-width="1" />
+  <line x1="38" y1="72" x2="166" y2="72" class="blue" stroke-width="0.6" />
+  <line x1="38" y1="90" x2="166" y2="90" class="blue" stroke-width="0.6" />
+  <line x1="38" y1="108" x2="166" y2="108" class="blue" stroke-width="0.6" />
+  <rect x="38" y="126" width="128" height="18" class="fill-blue" />
+  <rect x="38" y="146" width="128" height="18" class="fill-paper dash" stroke-width="1" />
+  <rect x="38" y="166" width="128" height="18" class="fill-paper dash" stroke-width="1" />
+  <text x="102" y="246" text-anchor="middle">HEAD_DIM = 64 →</text>
+  <text x="10" y="94" text-anchor="start">SEQ</text>
+  <text x="10" y="108">↓</text>
+  <text x="196" y="44">← 12 HEADS DEEP</text>
+
+  <line x1="172" y1="90" x2="230" y2="90" class="ink" stroke-width="1" />
+  <text x="238" y="86" class="strong">PREFILL</text>
+  <text x="238" y="102">4 PROMPT ROWS, ONE PASS</text>
+  <line x1="172" y1="135" x2="230" y2="135" class="ink" stroke-width="1" />
+  <text x="238" y="131" class="strong blue-t">DECODE STEP 1</text>
+  <text x="238" y="147">APPEND 1 ROW (THE NEW k)</text>
+  <line x1="172" y1="165" x2="230" y2="165" class="ink dash" stroke-width="1" />
+  <text x="238" y="170">STEPS 2, 3, ...: ONE ROW EACH</text>
+
+  <rect x="400" y="60" width="150" height="128" class="fill-paper" stroke-width="1" />
+  <text x="410" y="80" class="strong">THE WHOLE CACHE</text>
+  <text x="410" y="100">K AND V · × 2</text>
+  <text x="410" y="116">12 LAYERS · × 12</text>
+  <text x="410" y="132">12 HEADS · × 12</text>
+  <text x="410" y="148">64 DIMS · × 64</text>
+  <text x="410" y="164">FP32 · × 4 BYTES</text>
+  <text x="410" y="182" class="blue-t">= 72 KIB PER TOKEN</text>
+</svg>
+
+</Figure>
+
+Two small details in that decode step are where everyone's first implementation goes wrong, so name them now.
+
+- **The position.** The new token is at position P + (steps so far), not position 0. Your forward pass usually builds positions with `torch.arange(T)`. With T = 1 that gives 0, every step. You need `arange(past_len, past_len + T)`.
+- **The mask.** A single new query is allowed to see every cached key, so it needs no mask at all. But if you ever feed more than one new token on top of a cache (a second chunk of prompt, or checking several draft tokens in [speculative decoding](/lessons/speculative-decoding/)), the mask is no longer square. Query j of the new chunk sits at absolute position past_len + j and may see keys 0 to past_len + j. In PyTorch that is `torch.ones(T, S).tril(diagonal=S - T)`, where S is the total key length. Plain `tril()` on a T×S matrix is wrong by exactly past_len columns.
+
+### Step through it
+
+Here is one head of one layer, generating a 12-token sequence from a 4-token prompt. Step through it with the cache on. Then reset, switch the cache off, and step again. Watch the counter of wasted vectors, and watch the attention triangle on the right.
+
+<Figure n="003" title="GENERATION, STEP BY STEP" caption="One head in one layer. With the cache, each decode step computes one K, one V, one Q and one row of scores. Without it, every step recomputes everything to the left, identically, and the whole triangle of scores, to get the same one row. Multiply by 12 heads and 12 layers for GPT-2 small.">
+
+<KVStepper />
+
+</Figure>
+
+Three things to notice. First, prefill is the same picture either way: a cache does not speed up the prompt, it speeds up everything after it. Second, with the cache off, the amount of waste per step grows with the length, so the total grows with the square of the length. Third, look at the Q row with the cache on: past queries go blank after their step. Nobody keeps them, because nobody needs them.
+
+### Counting the work
+
+Now put numbers on it. Let n be the current sequence length and N_p the number of parameters in the model's matrices (about 124 million for GPT-2 small, counting the output projection). A matrix-vector multiply costs about 2 FLOPs per weight per token, so:
+
+```text
+                    linear layers per step     attention per step (all layers)
+no cache, step n    2 · N_p · n                ~ 4 · L · d · n²   (whole triangle)
+with cache, step n  2 · N_p                    ~ 4 · L · d · n    (one row)
+
+L = layers, d = model width (768 for GPT-2 small)
+```
+
+So without a cache, step n costs about n times a cached step in the linear layers, and attention is worse still. Add it up over a generation of n tokens: the no-cache loop does about n²/2 token-passes through the weights where the cached loop does n. Per step, cost goes from growing like n (and n² inside attention) to roughly constant plus a small term that grows like n. Total cost goes from about n² to about n.
+
+That small growing term with the cache is real, and worth seeing. At 1,000 tokens in GPT-2 small, the cached step's attention is about 4 × 12 × 768 × 1,000 ≈ 37 million FLOPs, against about 250 million for the matrices. Small, but it grows, and at long context it wins. In bytes it is the same story you saw at the end of the bandwidth lesson: every decode step has to *read* the entire cache, every layer, every head. For Llama 3.1 8B at 128K context that read is bigger than the weights.
+
+### Why the measured speedup is not 500x
+
+The FLOP count says a no-cache loop at 1,000 tokens does around 500 times too much matrix work. The laptop measured 14x in total time. Where did the rest go?
+
+Back to the roofline. A step with no cache at length n is a prefill of n tokens: one read of the weights, n tokens of math on it. While n is small, that is still far below the machine's <Term w="ridge point">Peak FLOP/s divided by memory bandwidth. Work with fewer FLOPs per byte than this is limited by memory; more, by math. From the bandwidth lesson.</Term>, so the step is bound by reading the weights (and by fixed per-step overhead), not by math. Doing 10 tokens of math instead of 1 is nearly free, because the math units were idle anyway. Only when n gets big enough to make the math the bottleneck does the no-cache step start growing.
+
+Here is what that looks like on real hardware, GPT-2 small in fp32, greedy, 1,000 new tokens after a 12-token prompt:
+
+<Figure n="004" title="PER-TOKEN LATENCY VS POSITION, MEASURED" caption="Measured on an M4 Pro MacBook, PyTorch 2.14, fp32, batch 1; medians over 50-token windows. CPU: the no-cache step grows almost from the start. GPU (Apple MPS): it stays flat until about 100 tokens, then grows linearly. With the cache both stay at 8-16 ms. Your Spark will draw its own version of this.">
+
+<svg viewBox="0 0 560 250" role="img" aria-label="Line chart of milliseconds per token against tokens generated, for no-cache and cached generation on CPU and GPU">
+  <line x1="60" y1="200" x2="540" y2="200" class="ink" stroke-width="1" />
+  <line x1="60" y1="30" x2="60" y2="200" class="ink" stroke-width="1" />
+  <line x1="60" y1="152.8" x2="540" y2="152.8" class="ink dash" stroke-width="0.5" />
+  <line x1="60" y1="105.6" x2="540" y2="105.6" class="ink dash" stroke-width="0.5" />
+  <line x1="60" y1="58.3" x2="540" y2="58.3" class="ink dash" stroke-width="0.5" />
+  <text x="52" y="204" text-anchor="end">0</text>
+  <text x="52" y="157" text-anchor="end">100</text>
+  <text x="52" y="110" text-anchor="end">200</text>
+  <text x="52" y="62" text-anchor="end">300</text>
+  <text x="10" y="20" class="strong">MS PER TOKEN</text>
+  <text x="60" y="216" text-anchor="middle">0</text>
+  <text x="300" y="216" text-anchor="middle">500</text>
+  <text x="540" y="216" text-anchor="end">1,000</text>
+  <text x="300" y="236" text-anchor="middle">TOKENS GENERATED SO FAR</text>
+
+  <polyline points="60,192.0 108,185.8 156,178.0 204,149.2 252,138.0 300,123.7 348,106.9 396,94.7 444,81.0 492,55.3 540,30.8" class="ink" fill="none" stroke-width="2" />
+  <polyline points="60,191.6 108,191.6 156,188.9 204,186.2 252,183.5 300,180.1 348,176.6 396,172.2 444,168.8 492,164.2 540,161.8" class="blue dash" fill="none" stroke-width="2" />
+  <polyline points="60,196.2 108,195.5 156,195.4 204,195.3 252,194.8 300,194.9 348,194.9 396,194.6 444,194.5 492,193.2 540,192.3" class="blue" fill="none" stroke-width="2" />
+  <polyline points="60,194.9 108,194.6 156,194.6 204,195.6 252,195.2 300,195.8 348,195.3 396,195.3 444,195.7 492,195.8 540,195.6" class="blue" fill="none" stroke-width="2" />
+
+  <text x="380" y="70" class="strong">NO CACHE · CPU</text>
+  <text x="380" y="84">358 MS AT 1,000</text>
+  <text x="400" y="150" class="blue-t">NO CACHE · GPU (MPS)</text>
+  <text x="400" y="164" class="blue-t">81 MS AT 1,000</text>
+  <text x="80" y="184" class="blue-t">WITH CACHE · BOTH · 8-16 MS</text>
+</svg>
+
+</Figure>
+
+| GPT-2 small, 1,000 new tokens | no cache | with cache | tokens identical? |
+|---|---|---|---|
+| M4 Pro CPU, fp32 | 170 s | 12.0 s | yes, all 1,000 |
+| M4 Pro GPU (MPS), fp32 | 52 s | 12.3 s | yes, all 1,000 |
+
+Notice the cached GPU run is no faster than the cached CPU run. At 124 million parameters, a decode step on this GPU is dominated by fixed costs (launching dozens of small kernels from Python, about 10 ms worth) rather than by bytes or math. That is the "overhead-bound" corner of the roofline, and it is why the cache's speedup looks modest on a tiny model and short text and becomes enormous on a big model with long text.
+
+<Predict id="spark-knee">
+On the Spark, with Llama 3.1 8B in bf16 (16 GB of weights, so about 59 ms per step just to read them), you run Hugging Face `generate` with the cache turned off. Sketch the per-token latency against position. Roughly where does the curve bend upward, and what number from the bandwidth lesson predicts it?
+
+<Fragment slot="answer">
+
+It should be close to flat at first, near the cached speed, then bend upward and climb in a straight line. A no-cache step at length n is a prefill of n tokens, whose arithmetic intensity is about n FLOPs per byte (2 FLOPs per weight per token, 2 bytes per weight). It stays memory-bound, and so costs about one weight read, until n reaches the ridge point. So the bend should land near your **measured ridge point in FLOP/byte, read as a number of tokens**: a few hundred if the Spark's real bf16 rate is near the estimate, lower if it is not. Past the bend, each extra token of length adds about 2 × 8 × 10⁹ FLOPs ÷ (your measured FLOP/s) to every step. This is a prediction for you to check, not something measured here. Expect Python and attention overhead to blur the corner.
+
+</Fragment>
+</Predict>
+
+### The price: memory
+
+The cache trades compute for memory. Its size has a formula you can do in your head, and you saw a version of it in the last lessons:
+
+```text
+KV bytes per token = 2 (K and V) × layers × kv_heads × head_dim × bytes per number
+KV bytes total     = that × tokens in context × sequences in the batch
+```
+
+| model | layers × kv heads × head dim | per token | 1 sequence, full context |
+|---|---|---|---|
+| GPT-2 small, fp32 | 12 × 12 × 64 | 72 KiB | 72 MiB at 1,024 |
+| GPT-2 XL, fp32 | 48 × 25 × 64 | 600 KiB | 600 MiB at 1,024 |
+| Llama 2 7B, bf16 (no GQA) | 32 × 32 × 128 | 512 KiB | 2 GiB at 4,096 |
+| Llama 3.1 8B, bf16 (GQA) | 32 × 8 × 128 | 128 KiB | 16 GiB at 128K |
+| Llama 3.1 70B, bf16 (GQA) | 80 × 8 × 128 | 320 KiB | 40 GiB at 128K |
+
+The GPT-2 small row is not just arithmetic: the cache in the run above held exactly 73,728 bytes per position (1011 positions, 74.5 MB).
+
+It grows linearly: one more token, one more row in every layer. Weights are a fixed cost; the cache is a per-token, per-user cost. That makes it the thing that decides how many users and how much context fit on a machine, which is the whole subject of [memory math](/lessons/memory-math/). And because each step reads the whole cache, it is also bytes per token on the bandwidth side of the ledger. So every trick for making the cache smaller buys you two things at once: more users or context in memory, and faster steps.
+
+### Shrinking the cache: share the keys
+
+The formula has four knobs: layers, KV heads, head size, and bytes per number. Layers and head size are mostly about model quality. The other two are where the clever designs live.
+
+In the original Transformer, <Term w="multi-head attention">Attention split into several heads, each with its own query, key and value projections, so each head can look for different things. "MHA" when every head has its own keys and values.</Term> gives every head its own queries, keys and values. With 32 heads, that is 32 sets of keys and values per layer to cache.
+
+Shazeer's 2019 idea, <Term w="MQA">Multi-query attention: every query head shares one single key head and one value head. Cuts the cache by the number of heads. Some loss in quality.</Term>, keeps 32 query heads (so the model can still ask 32 different questions) but gives them a single shared key head and value head. The cache shrinks 32-fold. The catch is quality: one set of keys has to serve every kind of question, and models trained this way tend to lose a little accuracy. Several big models used it anyway (Google's PaLM and TII's Falcon 7B, for example).
+
+<Term w="GQA">Grouped-query attention: query heads are split into groups, and each group shares one key head and one value head. Llama 3.1 8B has 32 query heads in 8 groups of 4.</Term>, from Joshua Ainslie and colleagues at Google in 2023, is the middle ground: split the query heads into groups and give each group its own key and value head. With 8 groups, the cache is 4x smaller than MHA, and the paper reports quality close to full MHA with speed close to MQA. Llama 2 used it only for the 70B model; every Llama 3 model and most new open models use it. In code it is a small change: the K and V projections output n_kv_heads × head_dim instead of n_heads × head_dim, and before attention each KV head is repeated (or broadcast) to line up with its group of query heads. The cache stores the small, unrepeated version. That is why the Llama shape above has 8 in the heads dimension, not 32.
+
+<Figure n="005" title="WHO SHARES KEYS, AND WHAT IT COSTS" caption="A Llama-3.1-8B-shaped model: 32 layers, 32 query heads of 128 dimensions, 16 GB of bf16 weights. Spec-sheet Spark numbers (128 GB, 273 GB/s). The ceiling assumes all users decode together and each step reads the weights once plus every user's cache. INT4 ignores the small extra for scale factors." wide>
+
+<KVHeads />
+
+</Figure>
+
+Things to try: start at GQA-8, 8K context, 1 user. The cache is a sliver next to the weights. Switch to MHA: Llama 2 7B's design, at 512 KiB per token. Now drag users to 16. With MHA the caches outweigh the model; with GQA they fit comfortably; with MQA they barely register. Then push context to 128K with 8 users and watch the memory bar run out.
+
+DeepSeek went further in 2024 with <Term w="MLA">Multi-head latent attention, from DeepSeek-V2: instead of caching full keys and values, cache one small compressed vector per token per layer and expand it back into per-head keys and values when needed.</Term>: cache one small compressed vector per token per layer and reconstruct keys and values from it with a learned matrix. Same goal, different bargain: a bit more math per step for many fewer bytes, a good trade on a bandwidth-bound machine.
+
+### Shrinking the cache: forget the distant past
+
+Another knob is "tokens in context". What if a layer only attends to the last W tokens? Then it only needs to cache the last W tokens, and the cache stops growing at W. That is <Term w="sliding-window attention">Each position attends only to the previous W positions instead of all of them. The cache for that layer never holds more than W tokens.</Term>. The idea was popularized for long documents by Longformer (2020); Mistral 7B (2023) used it in every layer with W = 4,096.
+
+The cache becomes a ring buffer, which Mistral's paper calls a rolling buffer: token i goes into slot i mod W, overwriting the token from W steps ago. Memory per sequence is capped no matter how long the conversation runs. (For Mistral 7B, with 8 KV heads of 128 in 32 layers, that cap is 128 KiB × 4,096 = 512 MiB per sequence in bf16.)
+
+Is information older than W tokens simply lost? Not entirely. Layer 2's view of position t includes positions back to t − W, but each of those already absorbed positions back another W in layer 1. Stack L layers and information can in principle travel back about L × W positions, in the way a rumor travels down a line of people. In practice it is lossy, so newer models mix the two: Google's Gemma 2 alternates sliding-window and full-attention layers, and per its technical report Gemma 3 uses five local layers (window 1,024) for every global one. Only the global layers pay for the full context.
+
+### Shrinking the cache: fewer bits
+
+The last knob is bytes per number. Store keys and values in 8 bits instead of 16 and the cache halves, in memory and in bytes read per step. FP8 KV caches are a standard option in serving engines (vLLM exposes it as a cache dtype setting; check its docs for the current name and supported formats). Going lower is an active research area. The KIVI paper (Liu et al., 2024) found that keys have a few channels with huge values, so it quantizes keys per channel and values per token, and gets down to about 2 bits with small accuracy loss. The cost is a little error in every attention score and a little extra work to unpack. The [quantization lesson](/lessons/quantization/) does the same trade for weights, with measurements.
+
+### How real code stores it
+
+Your build will grow the cache with `torch.cat`, which is the simplest thing that works and also slightly wasteful: each cat allocates a new tensor and copies the whole old cache into it. That is a second full pass over the cache's bytes, every step, every layer. Real implementations avoid it in one of three ways:
+
+- **Preallocate.** Allocate (batch, heads, max_len, head_dim) once and write row t into slot t. Hugging Face calls this a static cache; it also lets the model be compiled, since shapes never change.
+- **Grow in chunks.** Reserve room for many tokens at a time, like a Python list does.
+- **Pages.** vLLM's <Term w="PagedAttention">Store the KV cache in fixed-size blocks (say 16 tokens each) scattered in memory, with a per-sequence table of which blocks it owns, like virtual memory pages. No wasted reservation, and blocks can be shared.</Term> splits every sequence's cache into small fixed blocks, borrowed from the operating system's [virtual memory](/lessons/virtual-memory/) idea. That is the next lesson but one: [paged attention and prefix caching](/lessons/prefix-caching/).
+
+## Build It
+
+You will work on your laptop first (any machine with PyTorch; CPU is fine for GPT-2 small), then on the Spark.
+
+```text
+kvcache/
+  gpt2.py          # your model (or the boilerplate below)
+  generate.py      # no-cache and cached generation, the equality check
+  bench_pos.py     # latency vs position, memory vs position
+  plot.py
+  results/
+```
+
+<Task id="t1" title="Get a GPT-2 that loads real weights" agent="ok">
+
+If your from-scratch GPT-2 is handy and can load Hugging Face's `gpt2` weights, use it: the point is to put the cache into code you understand. If not, here is a minimal nanoGPT-style model. It is boilerplate; take it as is.
+
+```bash
+python3 -m venv .venv && . .venv/bin/activate
+pip install torch transformers matplotlib
+```
+
+```python
+# gpt2.py: a minimal GPT-2 that loads Hugging Face's weights. No cache yet.
+import math
+from dataclasses import dataclass
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+@dataclass
+class Config:
+    n_layer: int = 12
+    n_head: int = 12
+    n_embd: int = 768
+    block_size: int = 1024
+    vocab_size: int = 50257
+
+
+class Attention(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.n_head, self.head_dim = cfg.n_head, cfg.n_embd // cfg.n_head
+        self.c_attn = nn.Linear(cfg.n_embd, 3 * cfg.n_embd)  # x -> q, k, v in one matmul
+        self.c_proj = nn.Linear(cfg.n_embd, cfg.n_embd)
+
+    def forward(self, x):
+        B, T, C = x.shape
+        q, k, v = self.c_attn(x).split(C, dim=2)
+        # (B, T, C) -> (B, n_head, T, head_dim)
+        q, k, v = (t.view(B, T, self.n_head, self.head_dim).transpose(1, 2) for t in (q, k, v))
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)          # (B, H, T, T)
+        mask = torch.ones(T, T, dtype=torch.bool, device=x.device).tril()
+        att = att.masked_fill(~mask, float("-inf")).softmax(dim=-1)
+        y = (att @ v).transpose(1, 2).contiguous().view(B, T, C)
+        return self.c_proj(y)
+
+
+class MLP(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.c_fc = nn.Linear(cfg.n_embd, 4 * cfg.n_embd)
+        self.c_proj = nn.Linear(4 * cfg.n_embd, cfg.n_embd)
+
+    def forward(self, x):
+        return self.c_proj(F.gelu(self.c_fc(x), approximate="tanh"))
+
+
+class Block(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.ln_1, self.attn = nn.LayerNorm(cfg.n_embd), Attention(cfg)
+        self.ln_2, self.mlp = nn.LayerNorm(cfg.n_embd), MLP(cfg)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        return x + self.mlp(self.ln_2(x))
+
+
+class GPT(nn.Module):
+    def __init__(self, cfg: Config):
+        super().__init__()
+        self.cfg = cfg
+        self.wte = nn.Embedding(cfg.vocab_size, cfg.n_embd)
+        self.wpe = nn.Embedding(cfg.block_size, cfg.n_embd)
+        self.h = nn.ModuleList(Block(cfg) for _ in range(cfg.n_layer))
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
+        self.lm_head.weight = self.wte.weight  # GPT-2 ties input and output embeddings
+
+    def forward(self, idx):
+        B, T = idx.shape
+        pos = torch.arange(T, device=idx.device)
+        x = self.wte(idx) + self.wpe(pos)
+        for block in self.h:
+            x = block(x)
+        return self.lm_head(self.ln_f(x))                                 # (B, T, vocab)
+
+    @classmethod
+    def from_pretrained(cls, name: str = "gpt2"):
+        from transformers import GPT2LMHeadModel
+        sizes = {"gpt2": (12, 12, 768), "gpt2-medium": (24, 16, 1024),
+                 "gpt2-large": (36, 20, 1280), "gpt2-xl": (48, 25, 1600)}
+        L, H, C = sizes[name]
+        model = cls(Config(n_layer=L, n_head=H, n_embd=C))
+        hf = GPT2LMHeadModel.from_pretrained(name).state_dict()
+        sd = model.state_dict()
+        for k in sd:
+            src = hf["transformer." + k if not k.startswith("lm_head") else k]
+            # HF stores these four as Conv1D, i.e. transposed relative to nn.Linear
+            if k.endswith(("c_attn.weight", "c_proj.weight", "c_fc.weight")):
+                src = src.t()
+            assert src.shape == sd[k].shape, k
+            sd[k].copy_(src)
+        return model.eval()
+```
+
+Sanity check: run the same prompt through this model and through `GPT2LMHeadModel` and compare logits. On the Mac this printed a max absolute difference of about 9e-5 in fp32, which is just a different order of floating-point additions. If you see something large, a transpose is missing. (Written against transformers 5.x; if the state-dict key names have moved in your version, print `hf.keys()` and adjust.)
+
+</Task>
+
+<Task id="t2" title="Add the cache to attention, block and model" agent="hands">
+
+Change three forward methods so the cache flows through them. The shape to aim for:
+
+```python
+class Attention(nn.Module):
+    def forward(self, x, past=None):
+        """x: (B, T, C), the NEW positions only.
+        past: None, or (k_past, v_past), each (B, n_head, P, head_dim).
+        Returns (y, (k_all, v_all)) where k_all, v_all are (B, n_head, P + T, head_dim)."""
+
+
+class Block(nn.Module):
+    def forward(self, x, past=None):
+        """Returns (x_out, present) where present is this layer's (k_all, v_all)."""
+
+
+class GPT(nn.Module):
+    def forward(self, idx, past=None):
+        """idx: (B, T) new token ids. past: None, or a list of n_layer (k, v) pairs.
+        Returns (logits, presents): logits (B, T, vocab), presents a list of n_layer (k, v)."""
+```
+
+Hints, in the order people trip on them:
+
+- **Positions.** P = length already in the cache (read it off `past[0][0].shape[2]`). The new positions are `arange(P, P + T)`. Get this wrong and the output is fluent nonsense.
+- **Concatenate along the sequence dimension**, which is dim 2 after the transpose. Not dim 1, which is heads.
+- **The mask is T×S, not T×T**, where S = P + T. Use `tril(diagonal=S - T)`. It reduces to the old mask when P = 0, and to "no mask" when T = 1, so one line covers prefill, decode and chunks.
+- **Only K and V go in the cache.** If you find yourself keeping q, re-read Figure 001.
+- Keep the old no-cache behavior reachable: calling `model(idx)` with no `past` should give exactly what it did before.
+
+</Task>
+
+<Task id="t3" title="Prove the cache changes nothing" agent="hands">
+
+In `generate.py`, write two greedy loops and compare them:
+
+```python
+@torch.no_grad()
+def generate_nocache(model, idx, n_new) -> torch.Tensor: ...
+    # the loop from The Problem: full sequence every step
+
+@torch.no_grad()
+def generate_cache(model, idx, n_new) -> tuple[torch.Tensor, list]: ...
+    # prefill: logits, past = model(idx)
+    # then n_new steps: pick the token from logits[:, -1], feed ONLY it with past
+```
+
+Then the check:
+
+```python
+a = generate_nocache(model, prompt, 500)
+b, past = generate_cache(model, prompt, 500)
+assert torch.equal(a, b), first_mismatch(a, b)
+```
+
+Exact token equality under greedy decoding is the right bar, and in fp32 you should hit it: on the Mac all 1,000 tokens matched, on CPU and on the GPU. Also compare the *logits* at a few steps (`(la - lb).abs().max()`). They will not be bit-identical, because a matrix multiply over 1 row and over 500 rows can add numbers in a different order, so expect differences around 1e-5 or below in fp32. That is also the honest caveat on "identical": if two candidate tokens are nearly tied, a tiny difference can flip the argmax, and in bf16 the differences are much bigger. If you ever see a mismatch, print the top-2 logits at that step before assuming a bug: a near-tie is a rounding story, a big gap is your bug.
+
+</Task>
+
+<Task id="t4" title="Latency vs position, with and without" agent="hands">
+
+In `bench_pos.py`, time every step of both loops for 1,000 new tokens (GPT-2's limit is 1,024 positions in total) and save the per-step times to JSON. Then plot ms per token against position, both curves on one axis.
+
+```python
+def timed_steps(step_fn, n_new, device) -> list[float]:
+    """Run step_fn() n_new times; return seconds per step."""
+    # synchronize before reading the clock if on a GPU:
+    #   torch.cuda.synchronize() on the Spark, torch.mps.synchronize() on a Mac
+    ...
+```
+
+Hints: throw away the first few steps (the first MPS steps on the Mac took up to 850 ms each while kernels warmed up, which would wreck the plot). Plot medians over a sliding window of 20-50 steps; single steps are noisy. Run the device you have, and if you can, both CPU and GPU, because the difference between the two curves is the roofline talking.
+
+</Task>
+
+<Task id="t5" title="Watch memory grow" agent="hands">
+
+Two measurements, one from the tensors and one from the allocator.
+
+```python
+def cache_bytes(past) -> int:
+    """Sum of nbytes over every K and V tensor in the cache."""
+    ...
+```
+
+Record `cache_bytes(past)` every 100 steps and check it against the formula: 2 × layers × heads × head_dim × 4 bytes × positions. They should agree to the byte. Then on the Spark (or any CUDA GPU) record `torch.cuda.memory_allocated()` at the same points. It will grow by about the same amount, plus temporary buffers. Repeat with `gpt2-xl` (600 KiB per token in fp32) and with a batch of 8 copies of the prompt, and predict each line's slope before you run it.
+
+</Task>
+
+<Task id="t6" title="Find the cache in Hugging Face and in your server" agent="explain">
+
+On the Spark, in the container from [the baseline lesson](/lessons/baseline-vs-fireworks/), load Llama 3.1 8B Instruct in bf16 and look at the cache it makes:
+
+```python
+out = model(**inputs, use_cache=True)
+pkv = out.past_key_values
+print(type(pkv).__name__)          # a Cache object, e.g. DynamicCache, in recent versions
+# transformers 5.x: pkv.layers[0].keys.shape. Older versions: pkv.key_cache[0] or pkv[0][0].
+```
+
+You should see (1, 8, prompt_len, 128): 8 KV heads, not 32. That is GQA, sitting in memory. The cache API has changed several times across transformers versions, so check the docs page on caching for yours rather than trusting the line above.
+
+Then confirm your server uses it. `generate` caches by default (on transformers 5.20 on the Mac, `model.config.use_cache` was True and `generation_config.use_cache` was unset, which falls back to the config). For Llama, measure `generate` with `use_cache=True` and `use_cache=False` at 64, 256 and 1,024 new tokens (`min_new_tokens` equal to `max_new_tokens`, greedy), and record per-token times by passing a streamer or by timing separate runs. On the Mac, Hugging Face's own GPT-2 took 3.1 s with the cache and 14.8 s without for 300 tokens, with identical output.
+
+Finally, add an environment flag to `server_naive.py` that passes `use_cache=False`, run your harness at c = 1 on short prompts, and add a row to `SCOREBOARD.md` labeled as an ablation. It is the only row in the track that is supposed to go backwards.
+
+</Task>
+
+<Task id="t7" title="Replace torch.cat with a preallocated cache" agent="review">
+
+Allocate the cache once per layer as (B, H, max_len, head_dim) and keep a write pointer. Each step writes one row at the pointer and attends over `[:, :, :pointer + 1]`. Check t3 still passes, then rerun t4. On a small model you may see little change, since the step is dominated by overhead; at gpt2-xl, long context and a batch of 8 the copy is easier to see. Then let an agent review it for off-by-one errors in the pointer and the mask.
+
+</Task>
+
+<DoneWhen>
+
+- `generate_cache` and `generate_nocache` produce identical tokens for 1,000 greedy steps, and you can explain why the logits still differ in the fifth decimal place.
+- You have a plot of ms per token against position for both loops, on at least one device, and can point to where the no-cache curve bends and say why it bends there.
+- `cache_bytes` matches the formula exactly at every checkpoint, for gpt2 and gpt2-xl.
+- You have the Hugging Face cache shape for Llama 3.1 8B, `use_cache` timings on the Spark, and an ablation row in `SCOREBOARD.md`.
+
+</DoneWhen>
+
+## Measure
+
+Fill these in. The Mac column is what this lesson measured, so you have something to compare against; the rest is yours.
+
+**Correctness**
+
+| run | tokens | identical? | max logit diff |
+|---|---|---|---|
+| your GPT-2, fp32, laptop | 1,000 | Mac: yes | |
+| your GPT-2, fp32, Spark | 1,000 | | |
+| your GPT-2, bf16, Spark | 1,000 | | |
+
+**Latency per token (ms), GPT-2 small**
+
+| position | no cache, Mac CPU | with cache, Mac CPU | no cache, Spark | with cache, Spark |
+|---|---|---|---|---|
+| 1 | ~17 | ~8 | | |
+| 100 | ~30 | ~10 | | |
+| 500 | ~160 | ~11 | | |
+| 1,000 | ~360 | ~16 | | |
+| total, 1,000 tokens | 170 s | 12 s | | |
+
+**Memory**
+
+| model | batch | per token (formula) | at 1,000 positions (measured) |
+|---|---|---|---|
+| gpt2, fp32 | 1 | 72 KiB | Mac: 74.5 MB at 1,011 |
+| gpt2-xl, fp32 | 1 | 600 KiB | |
+| gpt2-xl, fp32 | 8 | 4.7 MiB | |
+
+**Llama 3.1 8B on the Spark, Hugging Face generate**
+
+| new tokens | use_cache=True | use_cache=False | ratio |
+|---|---|---|---|
+| 64 | | | |
+| 256 | | | |
+| 1,024 | | | |
+
+What to expect, and why:
+
+- **The no-cache curve on the Spark should be a hockey stick, not a straight line.** On the Mac CPU, whose ridge point is low, recomputing more tokens costs more almost immediately. The Mac GPU stayed flat for the first hundred-odd tokens. The Spark has far more compute per byte than either, so with GPT-2 small expect a long flat stretch before the bend, maybe hundreds of tokens; with an 8B model, expect the bend near your measured ridge point (see the prediction above).
+- **The cached curve is "flat-ish", not flat.** It creeps up because each step reads a longer cache and computes a longer score row. On the Mac CPU it went from about 8 ms to 16 ms over 1,000 tokens. With `torch.cat` part of that creep is copying; t7 tells you how much.
+- **For Llama at short lengths, `use_cache=False` may barely hurt.** At 64 new tokens, each no-cache step is a tiny prefill and the step is still dominated by reading 16 GB of weights. The ratio should grow with length, and by 1,024 tokens it should be large. If you want a number to beat: if the bend is near 200 tokens, the no-cache run of 1,024 tokens should take a couple of times longer than the cached one, and the gap keeps widening the longer you go. Work it out from your measured FLOP/s and bandwidth before you run it.
+- **Memory should be a perfectly straight line** from `cache_bytes`, and a slightly noisier one from the allocator. The slope is the formula. If the allocator line jumps in steps, that is PyTorch's caching allocator reserving memory in blocks, from the [stack and heap](/lessons/stack-and-heap/) story.
+
+## Break It
+
+**Forget the position offset.** Use `arange(T)` instead of `arange(P, P + T)` in the cached path. Every new token now thinks it is at position 0. The output stays grammatical for a few words, then wanders, and t3 fails within the first couple of steps. This is the most common KV-cache bug in the wild, and it hides well, because the text still looks like English.
+
+**Remove the causal mask.** Delete the mask in both paths and run t3 again. The two generations diverge almost immediately. Without the mask, position 3's hidden state depends on tokens that arrive later, so the keys you cached at step 3 are stale by step 4. This is exactly why encoder models like BERT have no KV cache. Then put the mask back and break it subtly instead: use plain `tril()` for a T×S mask, and feed the prompt in two chunks (prefill the first half, then the second half on top of the cache). Single-token decode still works, because one query needs no mask at all; the two-chunk prefill silently produces different logits. That is the bug that bites later, in chunked prefill and in speculative decoding.
+
+**Cache too much.** Keep the query vectors too, and the hidden states. Everything still works. Measure memory: you have more than doubled the cache to store things nobody reads. A good way to feel why the cache holds K and V and nothing else.
+
+**Run it in bf16.** Cast the model to bf16 on the Spark (`model.to("cuda", torch.bfloat16)`) and rerun t3 for 1,000 tokens. There is a good chance the two loops eventually disagree on a token, and after the first disagreement they write different text. Nothing is wrong with your cache: bf16 keeps only about 3 significant digits, the cached and uncached paths add numbers in different orders, and somewhere a near-tie between two tokens tips the other way. Print the gap between the top two logits at the first mismatch to prove it to yourself. The lesson: "identical" is a statement about exact math; in low precision the right test is "same tokens until a near-tie, and tiny logit differences everywhere".
+
+## Explain It Back
+
+Answer each out loud, as if in an interview, before opening the answer.
+
+<details>
+<summary>1. What exactly is in the KV cache, and why not the queries?</summary>
+
+For every layer, two tensors, K and V, of shape (batch, number of KV heads, sequence length, head dimension): the key and value vector of every past token, in every head. To produce the next token, each layer needs the new token's query compared against every past key and used to mix every past value. Past queries were only used to compute outputs for past positions, which are already finished and have moved on to the next layer, so they are never needed again. Past keys and values are needed at every future step. So you store those.
+
+</details>
+
+<details>
+<summary>2. Why is it valid to reuse cached keys and values? When would it not be?</summary>
+
+Because of the causal mask. A token's hidden state at layer 0 depends only on that token and its position. Attention at position i only mixes positions up to i, and everything else works per position. So by induction, a position's hidden state in every layer depends only on tokens up to that position, and appending tokens later cannot change it. Its keys and values are frozen. It breaks if attention is bidirectional (an encoder like BERT, where adding a token changes everyone), or if a position's encoding depends on something that changes as the text grows. It also needs care with sliding windows, where old entries get evicted, and when anything about the past changes, like editing earlier text, which invalidates the cache from that point on.
+
+</details>
+
+<details>
+<summary>3. How does the cost of generating n tokens scale with and without a cache?</summary>
+
+Without a cache, step t re-runs the whole model over t tokens, so the matrix work per step grows linearly with t and attention grows like t squared. Summed over n steps, the matrix work is about n squared over 2 token-passes and attention is about n cubed. With a cache, each step runs the model over one token, a constant amount of matrix work, plus an attention row whose length is t, so total matrix work is linear in n and attention is quadratic. On real hardware the measured gap is smaller than the FLOP ratio while the recompute is still memory- or overhead-bound: recomputing a short prefix is almost free on a GPU until the length crosses the ridge point. At long lengths the gap is enormous.
+
+</details>
+
+<details>
+<summary>4. How many users at 8K context fit on your Spark for Llama 3.1 8B, and what would MHA have done to that?</summary>
+
+The cache is 2 × 32 layers × 8 KV heads × 128 × 2 bytes = 128 KiB per token, so 8,192 tokens is 1 GiB per user. 128 GB minus about 16 GB of weights leaves around 100 GiB, call it 90 after activations and overhead, so roughly 90 users, and fewer if the GPU cannot use all the unified memory. With full multi-head attention (32 KV heads) the cache is 4x bigger, 4 GiB per user, so about 22 users. And because every step reads every user's cache, the step time grows with the total cache too: at 90 users, 90 GiB of cache per step is several times the weights, so per-user speed drops a lot long before memory runs out. That is why GQA, quantized caches and paging are the levers servers care about.
+
+</details>
+
+<details>
+<summary>5. Compare MQA, GQA and sliding-window attention as ways to shrink the cache.</summary>
+
+MQA and GQA shrink the cache per token by sharing keys and values across query heads: MQA uses one KV head for all query heads (the most savings, some quality loss), GQA uses one KV head per group (for example 8 groups of 4 in Llama 3.1 8B, a 4x saving with quality close to full attention). Sliding-window attention shrinks the number of tokens kept: each layer only attends to the last W, so the cache stops growing at W, and it is stored as a ring buffer. It saves the most on very long contexts, at the cost of losing direct access to far-away tokens, so newer models mix windowed layers with some full-attention ones. Both stack with the third lever, storing the cache in fewer bits (FP8 halves it).
+
+</details>
+
+## Go Deeper
+
+- **"Attention Is All You Need"**, Ashish Vaswani et al., 2017. The decoder, the causal mask and multi-head attention, in the original. Re-read the decoder section with the cache in mind.
+- **"Fast Transformer Decoding: One Write-Head is All You Need"**, Noam Shazeer, 2019. Short, and the first clear statement that cached decoding is bound by reading keys and values from memory. Introduces MQA.
+- **"GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"**, Joshua Ainslie et al., 2023. The middle ground every Llama 3 model uses, and how to convert an existing MHA model to it.
+- **"Efficiently Scaling Transformer Inference"**, Reiner Pope et al. (Google), 2022. The KV cache as the memory cost that limits batch size and context, worked through with real numbers, including why MQA matters at scale.
+- **"Mistral 7B"**, Albert Jiang et al., 2023. Sliding-window attention and the rolling buffer cache, in about two pages.
+- **"Efficient Memory Management for Large Language Model Serving with PagedAttention"**, Woosuk Kwon et al., SOSP 2023. The vLLM paper: what goes wrong when you store caches as contiguous tensors at scale, and the paging fix. Sets up the prefix caching lesson.
+- **"KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache"**, Zirui Liu et al., 2024. Why keys and values want different quantization, with the plots that show the outlier channels.
+- **Andrej Karpathy, nanoGPT** (github.com/karpathy/nanoGPT) and the Hugging Face transformers documentation on caching (the "KV cache strategies" page). The first is the model you just extended; the second shows the dynamic, static and quantized caches that real code uses, and the current API.
+
+## Connections
+
+Built on: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (prefill vs decode, the roofline, and the cache as bytes read per step) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (the server and scoreboard you just ran an ablation on).
+
+Next: [How much memory does a model need?](/lessons/memory-math/) turns the cache formula into a capacity plan. [Batching](/lessons/batching/) puts many users' caches into one step, which is where the per-user cache becomes the limit. [Paged attention and prefix caching](/lessons/prefix-caching/) stores caches in pages and shares them between requests with the same prompt. [Speculative decoding](/lessons/speculative-decoding/) feeds several tokens on top of a cache at once, which is where the T×S mask from this lesson earns its keep. And [FlashAttention](/lessons/flash-attention/) speeds up the attention that reads all of this.

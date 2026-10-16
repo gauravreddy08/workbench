@@ -1,0 +1,131 @@
+---
+// Draft vs target distributions on a toy 8-token vocabulary, at one step.
+// A "distill" slider moves the draft's logits toward the target's (q_t ∝ q0^(1-t) · p^t).
+// Shows α = Σ min(p, q) = 1 − TV, the KL, and what α does to tokens per round and speedup
+// (Leviathan et al. formula, independent acceptances). Illustrative numbers, one context.
+// Usage: <DraftOverlap />
+---
+<div class="dov" data-fig="draft-overlap">
+  <svg viewBox="0 0 560 300" role="img" aria-label="Overlapping bar charts of the target distribution p and the draft distribution q over eight tokens; the shared part min(p, q) is solid blue">
+    <g data-layer="plot"></g>
+  </svg>
+
+  <div class="ctl">
+    <label>distill <input type="range" min="0" max="1" step="0.05" value="0" data-in="t" /> <output data-out="t">0.00</output></label>
+    <label>K <input type="range" min="1" max="8" step="1" value="3" data-in="k" /> <output data-out="k">3</output></label>
+    <label>c draft cost <input type="range" min="0" max="0.5" step="0.01" value="0.3" data-in="c" /> <output data-out="c">0.30</output></label>
+  </div>
+
+  <dl class="dov-out">
+    <div><dt class="label">α = Σ min(p,q)</dt><dd><span class="readout big" data-out="a">-</span></dd></div>
+    <div><dt class="label">TV = ½ Σ |p − q|</dt><dd><span class="readout" data-out="tv">-</span></dd></div>
+    <div><dt class="label">KL(p ‖ q) nats</dt><dd><span class="readout" data-out="kl">-</span></dd></div>
+    <div><dt class="label">Tokens per round</dt><dd><span class="readout big" data-out="e">-</span></dd></div>
+    <div><dt class="label">Speedup at this K</dt><dd><span class="readout big" data-out="s">-</span></dd></div>
+    <div><dt class="label">Undistilled, same K, c</dt><dd><span class="readout" data-out="s0">-</span></dd></div>
+  </dl>
+  <p class="dov-note" aria-live="polite"></p>
+</div>
+
+<style>
+  .dov svg { width: 100%; }
+  .dov-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 18px; margin: 14px 0 0; }
+  .dov-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .dov-out dt { font-size: 10.5px; }
+  .dov-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 13px; color: var(--ink-2); }
+  .dov-out .big { font-size: 20px; }
+  .dov-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const TOK = ['MATH', 'R', '3', 'PI', '(', 'NONE', '0', 'SELF'];
+  const P = [0.46, 0.14, 0.1, 0.08, 0.07, 0.06, 0.05, 0.04];
+  const Q0 = [0.2, 0.05, 0.08, 0.1, 0.14, 0.2, 0.07, 0.16];
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const mix = (t: number) => {
+    const w = P.map((p, i) => Math.exp((1 - t) * Math.log(Q0[i]) + t * Math.log(p)));
+    const z = w.reduce((s, x) => s + x, 0);
+    return w.map((x) => x / z);
+  };
+  const alphaOf = (q: number[]) => P.reduce((s, p, i) => s + Math.min(p, q[i]), 0);
+  const E = (a: number, K: number) => (a >= 0.9999 ? K + 1 : (1 - a ** (K + 1)) / (1 - a));
+  const S = (a: number, K: number, c: number) => E(a, K) / (1 + K * c);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="draft-overlap"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const inp = (k: string) => q<HTMLInputElement>(`[data-in="${k}"]`);
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const G = q<SVGGElement>('[data-layer="plot"]');
+    const note = q<HTMLElement>('.dov-note');
+
+    const render = () => {
+      const t = Number(inp('t').value), K = Number(inp('k').value), c = Number(inp('c').value);
+      out('t').textContent = t.toFixed(2);
+      out('k').textContent = String(K);
+      out('c').textContent = c.toFixed(2);
+      const Q = mix(t);
+      const a = alphaOf(Q);
+      const a0 = alphaOf(Q0);
+
+      const x0 = 40, x1 = 548, y0 = 46, y1 = 236, yMax = 0.5;
+      const colW = (x1 - x0) / TOK.length;
+      const bw = colW * 0.62;
+      const Y = (v: number) => y1 - (v / yMax) * (y1 - y0);
+      G.replaceChildren();
+
+      // legend
+      G.appendChild(mk('rect', { x: 40, y: 10, width: 14, height: 10, class: 'fill-blue' }));
+      G.appendChild(mk('text', { x: 60, y: 19 }, 'SHARED min(p,q)'));
+      G.appendChild(mk('rect', { x: 190, y: 10, width: 14, height: 10, class: 'fill-wash', 'stroke-width': 1 }));
+      G.appendChild(mk('text', { x: 210, y: 19 }, 'q EXTRA'));
+      G.appendChild(mk('rect', { x: 290, y: 10, width: 14, height: 10, class: 'ink dash', 'stroke-width': 1 }));
+      G.appendChild(mk('text', { x: 310, y: 19 }, 'p MISSING FROM q'));
+
+      // axis
+      G.appendChild(mk('line', { x1: x0, y1: y1, x2: x1, y2: y1, class: 'ink', 'stroke-width': 1 }));
+      for (const v of [0, 0.25, 0.5]) {
+        G.appendChild(mk('text', { x: x0 - 6, y: Y(v) + 4, 'text-anchor': 'end' }, v.toFixed(2)));
+        if (v > 0) G.appendChild(mk('line', { x1: x0, y1: Y(v), x2: x1, y2: Y(v), class: 'blue dash', 'stroke-width': 0.4 }));
+      }
+
+      TOK.forEach((name, i) => {
+        const cx = x0 + colW * (i + 0.5);
+        const bx = cx - bw / 2;
+        const p = P[i], qq = Q[i], m = Math.min(p, qq);
+        if (qq > m) G.appendChild(mk('rect', { x: bx, y: Y(qq), width: bw, height: Y(m) - Y(qq), class: 'fill-wash', 'stroke-width': 1 }));
+        if (p > m) G.appendChild(mk('rect', { x: bx, y: Y(p), width: bw, height: Y(m) - Y(p), class: 'ink dash', 'stroke-width': 1 }));
+        G.appendChild(mk('rect', { x: bx, y: Y(m), width: bw, height: y1 - Y(m), class: 'fill-blue' }));
+        // p tick
+        G.appendChild(mk('line', { x1: bx - 4, y1: Y(p), x2: bx + bw + 4, y2: Y(p), class: 'ink', 'stroke-width': 1.5 }));
+        G.appendChild(mk('text', { x: cx, y: y1 + 16, 'text-anchor': 'middle', class: 'strong' }, name));
+        G.appendChild(mk('text', { x: cx, y: y1 + 30, 'text-anchor': 'middle' }, qq.toFixed(2)));
+      });
+      G.appendChild(mk('text', { x: x0 - 6, y: y1 + 30, 'text-anchor': 'end' }, 'q'));
+      G.appendChild(mk('text', { x: x1, y: 40, 'text-anchor': 'end', class: 'blue-t' }, `α = ${a.toFixed(3)}   BLACK TICK = TARGET p`));
+      G.appendChild(mk('text', { x: x0, y: y1 + 52 }, 'NEXT TOKEN AFTER "def area(r): return"'));
+
+      let tv = 0, kl = 0;
+      P.forEach((p, i) => { tv += Math.abs(p - Q[i]) / 2; kl += p * Math.log(p / Q[i]); });
+      const e = E(a, K), s = S(a, K, c), s0 = S(a0, K, c);
+      out('a').textContent = a.toFixed(3);
+      out('tv').textContent = `${tv.toFixed(3)} (1 − α = ${(1 - a).toFixed(3)})`;
+      out('kl').textContent = kl.toFixed(3);
+      out('e').textContent = e.toFixed(2);
+      out('s').textContent = `${s.toFixed(2)}×`;
+      out('s0').textContent = `${s0.toFixed(2)}× at α = ${a0.toFixed(2)}`;
+
+      if (t === 0) note.textContent = 'An off-the-shelf small model. It agrees with the target on most of MATH and on the small tokens, but it over-proposes NONE and SELF and under-proposes MATH. Every unit of solid blue is a draft that gets kept. Drag "distill".';
+      else if (a < 0.9) note.textContent = `Distilling moves q's probability out of the wash (where the draft over-proposes) into the dashed gaps (where it under-proposes). Note KL falls fast while α climbs: they measure the same mismatch in different units. The draft did not get "smarter"; it got more like the target.`;
+      else if (a < 0.999) note.textContent = `α = ${a.toFixed(2)}. Now push K up: with a draft this close, long runs survive, and the best K grows. Then raise c to see how much of the gain a slow draft eats.`;
+      else note.textContent = 'q = p: every draft is kept, a round always yields K + 1 tokens, and the only limit left is c. No real draft gets here; a smaller model cannot match a bigger one everywhere.';
+    };
+    root.querySelectorAll('input').forEach((i) => i.addEventListener('input', render));
+    render();
+  });
+</script>

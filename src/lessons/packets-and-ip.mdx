@@ -1,0 +1,782 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import PacketJourney from '../components/figures/PacketJourney.astro';
+import PacketSubnet from '../components/figures/PacketSubnet.astro';
+
+## Today
+
+- Draw the stack from memory: an SSE event inside HTTP, inside TCP, inside IP, inside a Wi-Fi frame, and say what each layer's address (MAC, IP, port) is for.
+- Follow one packet hop by hop: what each router reads, what it rewrites (the link-layer frame, the TTL), and what it never touches.
+- Read an IP address with a prefix like `192.168.86.0/24`, tell private from public, and explain what NAT in your home router is doing and why nobody on the internet can connect to your laptop directly.
+- Explain TTL, MTU, ARP, and why the internet is "best effort", each in a sentence.
+- Trace the route to servers on three continents, capture your own packets, and decode an IPv4 and TCP header byte by byte with a parser you wrote.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the round-trip numbers and the speed of light in fiber). No networking background needed: this is the first lesson of the Wire track. Rough time: one evening, plus `sudo` on your Mac for the capture.
+
+## The Problem
+
+You call a model API. Tokens stream back over <Term w="SSE">Server-Sent Events. A server keeps one HTTP response open and writes small text events into it ("data: ...", blank line) whenever it has something new.</Term>. You know how that works: one long HTTP response that the server keeps writing into. You know polling is "ask again every second" and WebSockets are "a two-way pipe". You can wire all of them up.
+
+Now ask what actually leaves your laptop. Your Mac's Wi-Fi radio doesn't know what HTTP is. It sends frames of bits to your router, a box two meters away. Your router doesn't know where Fireworks' servers are either; it hands everything to your ISP. Somewhere between there and a data center, about ten machines you've never heard of each make a decision about your bytes, in a few microseconds, without asking anyone. And when the answer comes back, it's addressed to your *router's* address, not your laptop's, yet it still finds your laptop and not your phone.
+
+Some things you can already see but probably can't explain:
+
+- `ipconfig getifaddr en0` says your laptop is `192.168.86.87`. A "what's my IP" site says something completely different. Your Spark over Tailscale is something like `100.x.y.z`. Which one is "your IP"?
+- `ping 1.1.1.1` comes back in 4 ms. A server in Berlin takes about 140 ms. Who decides which way the bytes go?
+- You can SSH into the Spark from the couch. From a coffee shop, without Tailscale, you can't. Why not?
+
+The answers all come from one design decision made in the 1960s and 70s: chop everything into small, self-addressed envelopes, and let every box on the way forward each one on its own.
+
+<Origin year="1964–1974" title="Packets, and a protocol for joining networks">
+
+The phone network of the 1960s was **circuit switched**. When you dialed, switches along the way connected a dedicated path of wire for you, end to end, and held it for the whole call, even while nobody spoke. That's great for voice and wasteful for computers, which talk in bursts: a few kilobytes, then silence for minutes.
+
+Two people, independently, proposed something else. Paul Baran at RAND, studying how a communications network could survive a nuclear attack, wrote *On Distributed Communications* (1964): a mesh of nodes, no center, with messages cut into small "message blocks" that each find their own way and route around damage. Donald Davies at Britain's National Physical Laboratory reached the same design in 1965 for a different reason (sharing expensive computers efficiently) and gave the blocks the name that stuck: **packets**.
+
+ARPANET, funded by the US Defense Department, used packet switching. Its first message, on 29 October 1969, went from UCLA to SRI. The operator typed "LO" of "LOGIN" and the system crashed. By the early 1970s there were several packet networks (ARPANET, packet radio, satellite links) that couldn't talk to each other. In May 1974 Vint Cerf and Bob Kahn published "A Protocol for Packet Network Intercommunication": a common envelope format and addressing scheme that any network could carry, with gateways (we'd say routers) between networks. That protocol was later split in two, IP for addressing and forwarding, TCP for reliable delivery, and on 1 January 1983 ARPANET switched over to TCP/IP for good. It's what you're using to read this.
+
+</Origin>
+
+## The Idea
+
+### Circuits vs packets
+
+Start with the difference that drove everything.
+
+<Figure n="001" title="CIRCUIT VS PACKET SWITCHING" caption="Left: a circuit reserves one path for the whole conversation, idle or not. Right: the message is cut into packets that each carry the full destination address, share links with everyone else's packets, may take different paths, and can arrive out of order.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Circuit switching reserves one path; packet switching sends numbered packets over shared links by different routes">
+  <text x="150" y="20" text-anchor="middle" class="strong">CIRCUIT</text>
+  <text x="480" y="20" text-anchor="middle" class="strong">PACKET</text>
+  <line x1="315" y1="10" x2="315" y2="240" class="ink dash" stroke-width="1" />
+  <rect x="10" y="100" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="30" y="120" text-anchor="middle" class="strong">A</text>
+  <rect x="250" y="100" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="270" y="120" text-anchor="middle" class="strong">B</text>
+  <circle cx="100" cy="70" r="12" class="fill-paper" stroke-width="1.2" />
+  <circle cx="150" cy="160" r="12" class="fill-paper" stroke-width="1.2" />
+  <circle cx="200" cy="70" r="12" class="fill-paper" stroke-width="1.2" />
+  <line x1="50" y1="115" x2="88" y2="76" class="blue" stroke-width="4" />
+  <line x1="112" y1="70" x2="188" y2="70" class="blue" stroke-width="4" />
+  <line x1="212" y1="76" x2="250" y2="115" class="blue" stroke-width="4" />
+  <line x1="50" y1="118" x2="138" y2="156" class="ink" stroke-width="1" />
+  <line x1="162" y1="156" x2="250" y2="118" class="ink" stroke-width="1" />
+  <line x1="106" y1="81" x2="144" y2="149" class="ink" stroke-width="1" />
+  <text x="150" y="50" text-anchor="middle" class="blue-t">RESERVED PATH</text>
+  <text x="150" y="205" text-anchor="middle">HELD FOR THE WHOLE CALL,</text>
+  <text x="150" y="220" text-anchor="middle">EVEN DURING SILENCE</text>
+  <rect x="340" y="100" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="360" y="120" text-anchor="middle" class="strong">A</text>
+  <rect x="590" y="100" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="610" y="120" text-anchor="middle" class="strong">B</text>
+  <circle cx="430" cy="70" r="12" class="fill-paper" stroke-width="1.2" />
+  <circle cx="480" cy="160" r="12" class="fill-paper" stroke-width="1.2" />
+  <circle cx="530" cy="70" r="12" class="fill-paper" stroke-width="1.2" />
+  <line x1="380" y1="115" x2="418" y2="76" class="ink" stroke-width="1" />
+  <line x1="442" y1="70" x2="518" y2="70" class="ink" stroke-width="1" />
+  <line x1="542" y1="76" x2="590" y2="115" class="ink" stroke-width="1" />
+  <line x1="380" y1="118" x2="468" y2="156" class="ink" stroke-width="1" />
+  <line x1="492" y1="156" x2="590" y2="118" class="ink" stroke-width="1" />
+  <line x1="436" y1="81" x2="474" y2="149" class="ink" stroke-width="1" />
+  <rect x="465" y="58" width="18" height="12" class="fill-blue" />
+  <text x="474" y="54" text-anchor="middle" class="blue-t">1</text>
+  <rect x="560" y="84" width="18" height="12" class="fill-blue" />
+  <text x="569" y="80" text-anchor="middle" class="blue-t">3</text>
+  <rect x="418" y="138" width="18" height="12" class="fill-blue" />
+  <text x="412" y="160" text-anchor="middle" class="blue-t">2</text>
+  <rect x="505" y="76" width="18" height="12" class="fill-wash" stroke-width="1" />
+  <rect x="520" y="140" width="18" height="12" class="fill-wash" stroke-width="1" />
+  <text x="480" y="205" text-anchor="middle">EACH PACKET CARRIES THE ADDRESS.</text>
+  <text x="480" y="220" text-anchor="middle">LINKS ARE SHARED WITH OTHERS (PALE)</text>
+</svg>
+</Figure>
+
+With circuits, the network does the hard work once (set up the path) and then each bit is trivial to forward. With packets, every packet carries its own destination and every box on the way looks it up, every time. That sounds more expensive, and per packet it is. But it buys three huge things.
+
+- **Sharing.** A link isn't reserved for anyone. When you're silent, your share of the link carries someone else's packets. This is called <Term w="statistical multiplexing">Sharing a link among many senders on the bet that they won't all be busy at once. Uses capacity far better than reserving a fixed slice for each.</Term>, and it's why one fiber can serve a whole neighborhood.
+- **No setup.** You can send a packet to any address on Earth without asking anyone first.
+- **Survival.** If a link dies, the next packet takes another path. Nothing in the middle holds state about your conversation, so nothing in the middle can lose it.
+
+The price is that nobody promises anything. A router whose queue is full just drops your packet. Two packets can take different paths and arrive out of order. The network makes a sincere effort and no guarantees, and that has a name: <Term w="best effort">The IP network's only promise: it will try to deliver each packet. It may drop, delay, duplicate or reorder them, and it won't tell you.</Term>. Everything reliable you've ever used on the internet is built *on top of* this unreliable thing, at the edges, by the two computers talking. Hold onto that; it's the reason TCP exists.
+
+### Envelopes inside envelopes
+
+Here is the single most useful picture in networking. Your SSE event doesn't get "sent". It gets put in an envelope, which gets put in a bigger envelope, which gets put in a bigger one. Each envelope is written by a different piece of software, answers a different question, and is read by different machines on the way.
+
+Each envelope is a <Term w="header">A block of fields stuck on the front of some data, describing it: where it's going, how long it is, what's inside. The data it describes is called the payload.</Term> stuck on the front of whatever is inside. The rulebook for one kind of header, and how the two ends use it, is a <Term w="protocol">An agreed format and set of rules two machines follow to talk. HTTP, TCP, IP and Ethernet are each one protocol.</Term>. Wrapping is called <Term w="encapsulation">Putting a whole message, unchanged, as the payload inside the next layer's message. Unwrapping on the other side is decapsulation.</Term>. From the inside out:
+
+1. **Application: HTTP (and SSE inside it).** The letter itself. SSE is just a text format for the *body* of an HTTP response: lines starting with `data:`, separated by blank lines. HTTP is the format for requests and responses (`GET /v1/chat`, headers, body). Neither knows anything about the network.
+2. **Transport: TCP.** Answers "which *program* on each machine, and in what order". Its address is a <Term w="port">A 16-bit number (0-65535) that picks out one program's socket on a machine. Servers listen on well-known ones (80 for HTTP, 443 for HTTPS, 22 for SSH); clients get a random high one.</Term>. TCP turns the bytes your program writes into numbered chunks called <Term w="segment">One TCP chunk: a TCP header plus a slice of the byte stream. Each carries the position of its first byte in the stream (the sequence number).</Term>s, so the other side can reassemble them in order and ask for missing ones again. The other transport is UDP: ports and nothing else, no ordering, no retries. That's the next lesson.
+3. **Network: IP.** Answers "which *machine*, anywhere on Earth". Its address is an <Term w="IP address">A number naming one network interface on the internet. IPv4 addresses are 32 bits, written as four bytes in decimal: 192.168.86.87.</Term>. The envelope is a <Term w="packet">One IP envelope: an IP header (source and destination address, TTL, protocol) plus a payload, usually a TCP or UDP segment.</Term>. This is the layer routers read.
+4. **Link: Ethernet or Wi-Fi.** Answers "which box on *this one wire or radio*". Its address is a <Term w="MAC address">A 48-bit hardware address for a network interface, like a4:83:e7:12:34:56. Only meaningful on the local link; routers never forward it.</Term>. The envelope is a <Term w="frame">One link-layer envelope: link header (destination and source MAC, type) plus a payload, usually an IP packet, plus a checksum at the end.</Term>. It only lives for one hop.
+
+Below that is the physical layer: voltages on copper, light in glass, radio. We won't open that box.
+
+<Figure n="002" title="ONE TOKEN, FIVE ENVELOPES" caption="One SSE event carrying the token ' Hello', as it sits on the wire. Each row is what one layer sees: its own header, then everything else as an opaque payload. Widths are to scale. 26 bytes of event ride in a 98-byte Ethernet frame (Wi-Fi headers are bigger still, and real HTTPS adds a TLS envelope between HTTP and TCP).">
+<svg viewBox="0 0 640 262" role="img" aria-label="A 98 byte frame: 14 byte Ethernet header, 20 byte IP header, 32 byte TCP header, 6 bytes of HTTP chunk framing, 26 byte SSE event">
+  <text x="10" y="36" class="strong">FRAME</text>
+  <text x="10" y="50">MAC ADDRS</text>
+  <rect x="130" y="24" width="70" height="30" class="fill-wash" stroke-width="1" />
+  <text x="165" y="43" text-anchor="middle">ETH 14</text>
+  <rect x="200" y="24" width="420" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="410" y="43" text-anchor="middle">PAYLOAD: AN IP PACKET</text>
+  <text x="10" y="78" class="strong">PACKET</text>
+  <text x="10" y="92">IP ADDRS</text>
+  <rect x="200" y="66" width="100" height="30" class="fill-wash" stroke-width="1" />
+  <text x="250" y="85" text-anchor="middle">IP 20</text>
+  <rect x="300" y="66" width="320" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="460" y="85" text-anchor="middle">PAYLOAD: A TCP SEGMENT</text>
+  <text x="10" y="120" class="strong">SEGMENT</text>
+  <text x="10" y="134">PORTS, SEQ</text>
+  <rect x="300" y="108" width="160" height="30" class="fill-wash" stroke-width="1" />
+  <text x="380" y="127" text-anchor="middle">TCP 20 + 12 OPTS</text>
+  <rect x="460" y="108" width="160" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="540" y="127" text-anchor="middle">STREAM BYTES</text>
+  <text x="10" y="162" class="strong">HTTP</text>
+  <text x="10" y="176">BODY CHUNK</text>
+  <rect x="460" y="150" width="30" height="30" class="fill-wash" stroke-width="1" />
+  <text x="475" y="169" text-anchor="middle">6</text>
+  <rect x="490" y="150" width="130" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="555" y="169" text-anchor="middle">BODY</text>
+  <text x="10" y="204" class="strong">SSE EVENT</text>
+  <text x="10" y="218">YOUR TOKEN</text>
+  <rect x="490" y="192" width="130" height="30" class="fill-blue" />
+  <text x="555" y="211" text-anchor="middle" style="fill:var(--paper)">data: 26 B</text>
+  <line x1="130" y1="236" x2="620" y2="236" class="ink" stroke-width="1" />
+  <line x1="130" y1="232" x2="130" y2="240" class="ink" stroke-width="1" />
+  <line x1="200" y1="232" x2="200" y2="240" class="ink" stroke-width="1" />
+  <line x1="300" y1="232" x2="300" y2="240" class="ink" stroke-width="1" />
+  <line x1="460" y1="232" x2="460" y2="240" class="ink" stroke-width="1" />
+  <line x1="620" y1="232" x2="620" y2="240" class="ink" stroke-width="1" />
+  <text x="130" y="254" text-anchor="middle">0</text>
+  <text x="200" y="254" text-anchor="middle">14</text>
+  <text x="300" y="254" text-anchor="middle">34</text>
+  <text x="460" y="254" text-anchor="middle">66</text>
+  <text x="620" y="254" text-anchor="middle">98 B</text>
+</svg>
+</Figure>
+
+So here's the direct answer to "how are SSE, HTTP, polling, TCP and IP connected":
+
+- **Polling, SSE and WebSockets are all ways of using HTTP** (WebSockets start as an HTTP request and then switch formats on the same connection). They differ in *how often you open a request and who talks when*.
+- **HTTP is text (or, in HTTP/2, binary frames) written into a TCP connection.** To HTTP, TCP looks like a file you can write bytes into and read bytes out of, reliably and in order.
+- **TCP cuts that byte stream into segments, and each segment rides inside one IP packet.** TCP is what makes the unreliable, out-of-order packet network look like a clean pipe.
+- **Each IP packet rides inside a link-layer frame for one hop at a time.** Wi-Fi from your laptop to your router, then fiber or Ethernet frames between routers, a new frame on each link.
+
+Polling makes many short HTTP requests, each maybe a new TCP connection. SSE makes one HTTP request whose response never ends. The layers below don't care. A TCP connection carrying SSE is just a TCP connection where data trickles in.
+
+You'll hear people name layers by number, from a 1980s reference model called <Term w="OSI model">A seven-layer reference model of networking from the ISO. Only some numbers stuck in everyday speech: L2 is link (Ethernet, MAC), L3 is network (IP), L4 is transport (TCP/UDP), L7 is application (HTTP).</Term>. You only need four numbers: **L2** is the link layer, **L3** is IP, **L4** is TCP/UDP, **L7** is HTTP. "An L4 load balancer" forwards TCP connections without reading them; "an L7 load balancer" reads the HTTP. That's the split from [Load balancers and state](/lessons/load-balancing/).
+
+<Predict id="overhead">
+In Figure 002, the actual token text is `" Hello"`: 6 bytes. What fraction of the 98-byte frame is the token? Now a real LLM API sends each token as a JSON event with an id, model name and so on, about 200 bytes, inside TLS. Roughly what fraction is the token then, and does it matter?
+<Fragment slot="answer">
+
+About 6 / 98 ≈ 6% in the lean version. With a ~200-byte JSON event, plus TLS's per-record overhead (about 22 bytes in TLS 1.3: a 5-byte record header, a 16-byte authentication tag, 1 byte of type), plus the 6 bytes of chunk framing, plus 32 + 20 + 14 bytes of TCP, IP and Ethernet headers, the frame is around 300 bytes for 6 bytes of token: 2%.
+
+Does it matter? Per user, no: 50 tokens a second × 300 bytes is 15 KB/s, nothing. At a provider serving 100,000 concurrent streams, it's 5 million packets per second and about 1.5 GB/s, nearly all of it envelope. That's why servers batch several tokens into one write when they can, and why "packets per second" is a capacity number network engineers care about as much as bytes per second.
+
+</Fragment>
+</Predict>
+
+### The journey
+
+Now send that envelope across the internet. Step through it. Watch what each box reads, what it rewrites, and what it never looks at.
+
+<Figure n="003" title="ONE TOKEN, SERVER TO LAPTOP" caption="Step the SSE event down the server's stack, across two routers, and up your laptop's stack. Highlighted fields are the ones that just changed. The link-layer frame is thrown away and rebuilt at every hop. The IP packet survives the whole trip, with TTL going down by one per router. TCP and everything above it are only read at the two ends (NAT at the home router is the one exception)." wide>
+
+<PacketJourney />
+
+</Figure>
+
+Three things to take away.
+
+**The frame is local, the packet is global.** MAC addresses only mean something on one link. Each router strips the incoming frame, decides where the packet goes next, and wraps it in a new frame for the next link, with new source and destination MACs. The server never learns your laptop's MAC address. Your laptop never learns the server's.
+
+**Routers only read the IP header.** A router doesn't know there's TCP inside, let alone HTTP. It reads the destination address, looks it up in a table, decrements the TTL, recomputes the IP header checksum, and sends it on. That's the whole job, done billions of times a second in the core of the internet.
+
+**The ends do everything else.** Ordering, retransmission, ports, encryption, meaning: all of it happens in the two computers at the ends. This is a deliberate design principle, the <Term w="end-to-end principle">The idea (Saltzer, Reed and Clark, 1984) that features like reliability belong in the end hosts, because only the ends can check them properly. Keep the middle of the network simple and fast.</Term>. It's why the internet could grow from four nodes to billions without redesigning the routers each time someone invented a new app.
+
+### IP addresses, and the part that means "network"
+
+An IPv4 address is 32 bits. People write it as four bytes in decimal separated by dots, because `192.168.86.87` is easier to read than `11000000101010000101011001010111`.
+
+<Predict id="ipv4-count">
+How many IPv4 addresses exist? There are about 8 billion people and probably 20-30 billion connected devices. How can that possibly work?
+<Fragment slot="answer">
+
+2³² = 4,294,967,296, about 4.3 billion, and a few hundred million of those are reserved for special uses. That's fewer than one per human, let alone per device. The central registry handed out its last free blocks in 2011, and the regional registries ran dry over the following decade. It works because of two tricks you're about to see: most devices use **private** addresses that are reused in millions of homes at once, and a router doing **NAT** shares one public address among all of them. (The long-term fix, IPv6, has 2¹²⁸ addresses.)
+
+</Fragment>
+</Predict>
+
+An address isn't just a name, it's a location. The first part of it names a **network**, the rest names a **machine on that network**, like a street name and a house number. Where the split falls is written after a slash: `192.168.86.0/24` means "the first 24 bits are the network". This notation is <Term w="CIDR">Classless Inter-Domain Routing (1993). Writing a block of addresses as a starting address plus how many leading bits are fixed: 10.0.0.0/8 is every address starting with 10.</Term>, and the number after the slash is the <Term w="prefix length">How many leading bits of an address are the network part. /24 fixes 24 bits and leaves 8 for machines: 256 addresses. Each bit fewer doubles the block.</Term>. An older way to write the same thing is the <Term w="subnet mask">The prefix written as an address: 24 one-bits then 8 zero-bits is 255.255.255.0. AND an address with it and you get the network part.</Term>: `/24` is `255.255.255.0`, which is exactly what your Mac printed as `netmask 0xffffff00`.
+
+A block of addresses that sit on one local link together is a <Term w="subnet">One network: a block of addresses (like 192.168.86.0/24) whose machines can reach each other directly over the link layer, without a router.</Term>. Slide the prefix and watch the block grow and shrink.
+
+<Figure n="004" title="WHERE THE NETWORK PART ENDS" caption="The 32 bits of an address, with the network part in blue. Each bit you move the slider left doubles the block. The last row is the decision your laptop makes for every single packet: is the destination on my own subnet (deliver it directly) or not (send it to the router)?">
+
+<PacketSubnet />
+
+</Figure>
+
+That last row is the real use of all this. Every time your laptop sends a packet, it does one AND: is the destination inside my subnet? If yes, it can reach it directly on the local link. If no, it hands the packet to the <Term w="default gateway">The router your machine sends every packet to when the destination isn't on its own subnet. On a home network, your Wi-Fi router.</Term>. That's your laptop's entire routing table, basically. Here is yours, from `netstat -rn`:
+
+```text
+Destination        Gateway            Flags               Netif
+default            192.168.86.1       UGScg                 en0
+127                127.0.0.1          UCS                   lo0
+169.254            link#14            UCS                   en0
+192.168.86         link#14            UCS                   en0
+```
+
+Read it as: "192.168.86.anything is right here on `en0`, deliver directly. Everything else (`default`), give to 192.168.86.1." (The `169.254` line is the self-assigned range a machine uses when nobody hands it an address.)
+
+### ARP: from IP address to MAC address
+
+But "deliver directly" needs a MAC address, and all your laptop knows is an IP address. So it asks. It broadcasts a frame to every device on the link: "Who has 192.168.86.1? Tell 192.168.86.87." The router answers: "192.168.86.1 is at 3c:fd:fe:...". That's the <Term w="ARP">Address Resolution Protocol (1982). Broadcasts "who has this IP?" on the local link; the owner replies with its MAC. Answers are cached for a few minutes.</Term>, and the answers are cached. Your Mac's cache, from `arp -a`:
+
+```text
+? (192.168.86.1) at 3c:fd:fe:00:00:01 on en0 ifscope [ethernet]
+iphone.lan (192.168.86.84) at 3c:fd:fe:00:00:84 on en0 ifscope [ethernet]
+ipad.lan (192.168.86.88) at 3c:fd:fe:00:00:88 on en0 ifscope [ethernet]
+```
+
+Notice what's *not* in there: 1.1.1.1, or any server. Your laptop never ARPs for an internet address. For anything off the subnet it only ever needs one MAC, the router's, and the IP header carries the real destination.
+
+### Private addresses and NAT
+
+Look at the first two bytes of your laptop's address: `192.168`. That block, along with `10.0.0.0/8` and `172.16.0.0/12`, was set aside in 1996 (RFC 1918) as <Term w="private address">An address from 10/8, 172.16/12 or 192.168/16. Anyone can use them inside their own network; internet routers refuse to carry packets addressed to them.</Term> space. Millions of homes use exactly `192.168.86.87` at the same moment. That's fine, because no router on the internet will deliver a packet addressed to it. The address only means something inside your home.
+
+So how does a reply from a server find you? Your router has two sides. Inside, it's `192.168.86.1`. Outside, your ISP gave it one <Term w="public address">An address that is unique on the whole internet and that internet routers will deliver packets to.</Term>. When your laptop's packet leaves for the internet, the router rewrites the source, and writes down what it did. That's <Term w="NAT">Network Address Translation. A router rewrites addresses (and usually ports) in packets passing through, keeping a table so replies can be rewritten back. Lets a whole home share one public address.</Term>.
+
+<Figure n="005" title="NAT AT YOUR HOME ROUTER" caption="Outbound packets get their private source rewritten to the router's public address and a fresh port, and the router remembers the pair. Replies to that port get rewritten back. A packet that arrives from outside with no matching entry has nowhere to go and is dropped, which is why nothing on the internet can start a connection to your laptop. Addresses are illustrative: 198.51.100.0/24 and 203.0.113.0/24 are reserved for documentation." wide>
+<svg viewBox="0 0 640 300" role="img" aria-label="Home LAN with laptop and Spark, router rewriting source addresses in a NAT table, internet server, and an unsolicited inbound packet dropped">
+  <rect x="10" y="20" width="190" height="170" class="fill-paper dash" stroke-width="1" />
+  <text x="20" y="38" class="strong">HOME · 192.168.86.0/24</text>
+  <rect x="24" y="52" width="160" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="104" y="68" text-anchor="middle" class="strong">LAPTOP</text>
+  <text x="104" y="84" text-anchor="middle">192.168.86.87</text>
+  <rect x="24" y="108" width="160" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="104" y="124" text-anchor="middle" class="strong">SPARK</text>
+  <text x="104" y="140" text-anchor="middle">192.168.86.50</text>
+  <text x="104" y="176" text-anchor="middle">PRIVATE: MEANINGLESS OUTSIDE</text>
+  <rect x="250" y="40" width="130" height="110" class="fill-wash" stroke-width="1.2" />
+  <text x="315" y="62" text-anchor="middle" class="strong">HOME ROUTER</text>
+  <text x="315" y="84" text-anchor="middle">LAN 192.168.86.1</text>
+  <text x="315" y="104" text-anchor="middle">WAN 198.51.100.7</text>
+  <text x="315" y="130" text-anchor="middle" class="blue-t">REWRITES + REMEMBERS</text>
+  <rect x="490" y="60" width="140" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="560" y="80" text-anchor="middle" class="strong">SERVER</text>
+  <text x="560" y="98" text-anchor="middle">203.0.113.10:80</text>
+  <line x1="184" y1="66" x2="248" y2="66" class="blue" stroke-width="1.2" />
+  <line x1="380" y1="72" x2="488" y2="72" class="blue" stroke-width="1.2" />
+  <line x1="488" y1="96" x2="380" y2="96" class="ink" stroke-width="1" />
+  <line x1="248" y1="80" x2="184" y2="80" class="ink" stroke-width="1" />
+  <text x="434" y="66" text-anchor="middle" class="blue-t">SRC :40112</text>
+  <text x="434" y="112" text-anchor="middle">DST :40112</text>
+  <text x="216" y="60" text-anchor="middle" class="blue-t">:52814</text>
+  <rect x="250" y="190" width="380" height="72" class="fill-paper" stroke-width="1.2" />
+  <text x="262" y="208" class="strong">NAT TABLE</text>
+  <text x="262" y="226">192.168.86.87:52814 ↔ 198.51.100.7:40112 → 203.0.113.10:80</text>
+  <text x="262" y="244">192.168.86.50:41006 ↔ 198.51.100.7:40113 → 140.82.112.3:443</text>
+  <line x1="315" y1="150" x2="315" y2="190" class="ink dash" stroke-width="1" />
+  <line x1="600" y1="150" x2="388" y2="132" class="ink dash" stroke-width="1" />
+  <text x="600" y="164" text-anchor="end">STRANGER → 198.51.100.7:22</text>
+  <text x="600" y="180" text-anchor="end" class="blue-t">NO ENTRY: DROPPED</text>
+  <text x="10" y="286">INSIDE STARTS, OUTSIDE ANSWERS. OUTSIDE CAN'T START.</text>
+</svg>
+</Figure>
+
+Outbound, the router changes the source from `192.168.86.87:52814` to `198.51.100.7:40112` and adds a row to its table. When the reply comes back to port 40112, it looks up the row, rewrites the destination back to `192.168.86.87:52814`, and forwards it inside. Rows expire after a while with no traffic (anywhere from tens of seconds for UDP to hours for TCP, depending on the router).
+
+The side effect is the important part. **A packet from the internet that doesn't match a row has nowhere to go.** Someone trying to SSH to `198.51.100.7:22` reaches your router, and your router has no idea which of your devices they mean. It drops it. NAT was invented to save addresses, but it quietly became the reason home machines are unreachable from outside. Getting around that, either with port forwarding or with the much cleverer trick Tailscale uses (both sides send packets out at the same time so each router creates a row that lets the other in), is the core of [Your home server, explained](/lessons/ssh-and-tailscale/). Tailscale's own addresses, the `100.x.y.z` ones, come from yet another reserved block, `100.64.0.0/10`, originally set aside for ISPs doing NAT on top of your NAT (<Term w="CGNAT">Carrier-grade NAT. An ISP puts many customers behind one public address, so your router's "public" address is itself private, and you're behind two NATs.</Term>). Try `100.101.102.103` in Figure 004.
+
+A traceroute from your Mac, run while writing this lesson, showed something nice here. Hop 2 was `198.51.100.1`, a public address (whois says it's your ISP), so your router has a real public address and you're behind only one NAT. Hops 3 to 5 were `10.20.x.x`: private addresses, *inside your ISP*. ISPs use private space for their internal links too, since those routers never need to be addressed from the internet.
+
+### Routing: one hop at a time
+
+Nobody on the internet knows the whole path to anywhere. Each router knows only: for this destination, which neighbor is next?
+
+It keeps a <Term w="forwarding table">A router's list of address blocks and, for each, which neighbor (next hop) to send matching packets to. Your laptop's routing table is a tiny one.</Term> of prefixes. A core router's table has around a million IPv4 prefixes in it. When a packet arrives, the router finds every prefix that contains the destination and picks the **most specific** one (the longest prefix): if it has routes for `203.0.0.0/8` and `203.0.113.0/24`, a packet for `203.0.113.10` follows the `/24`. That rule is <Term w="longest prefix match">When several routes contain a destination, use the one with the longest prefix, because it's the most specific. Done in hardware in nanoseconds on big routers.</Term>, and big routers do it in dedicated hardware in a few nanoseconds per packet.
+
+Where do the tables come from? Inside one organization, routers tell each other about their links automatically. Between organizations (your ISP, Arelion, Zayo, a German research network), routes are exchanged with <Term w="BGP">Border Gateway Protocol. How the roughly 75,000 independent networks on the internet tell each other which address blocks they can reach. Policy and business deals, not just shortest paths.</Term>, where each network announces "I can reach these prefixes", and neighbors choose what to accept based on business relationships as much as distance. Each independent network is an <Term w="autonomous system">One network under one administration (an ISP, a cloud, a university) with its own number (ASN), that speaks BGP to its neighbors.</Term>. The internet is literally a network of networks, joined where they meet at <Term w="internet exchange">A building (and a big switch) where many networks plug in to hand each other traffic directly. DE-CIX in Frankfurt is one of the largest.</Term>s and private links.
+
+### TTL, and how traceroute sees the path
+
+A routing mistake could send a packet in a circle forever. So every IP packet carries a <Term w="TTL">Time To Live. An 8-bit counter in the IP header. Each router subtracts 1; a router that would make it 0 drops the packet and sends an ICMP "time exceeded" error back to the sender.</Term>. The sender sets it (macOS and Linux use 64, Windows 128), each router subtracts one, and at zero the packet is dropped. Originally it was meant to be seconds; in practice it's a hop count.
+
+When a router drops a packet for TTL, it sends a small error message back to the sender using <Term w="ICMP">Internet Control Message Protocol. IP's own error and diagnostic messages: "time exceeded", "destination unreachable", "packet too big", and the echo request/reply that ping uses.</Term>, and that error comes *from the router's own address*. Van Jacobson noticed in 1987 that you can abuse this: send a packet with TTL 1, and the first router tells you who it is. TTL 2, the second router. Keep going until you reach the destination. That's `traceroute`. You can do it by hand with ping. Here's your Mac:
+
+```text
+$ ping -c 1 -m 3 1.1.1.1
+PING 1.1.1.1 (1.1.1.1): 56 data bytes
+36 bytes from 10.20.30.6: Time to live exceeded
+Vr HL TOS  Len   ID Flg  off TTL Pro  cks      Src      Dst
+ 4  5  00 5400 b1e3   0 0000  01  01 eec4 192.168.86.87  1.1.1.1
+```
+
+Hop 3 is `10.20.30.6`, and it sent back a copy of the header it dropped. Look at that header's `Src`: `192.168.86.87`, your *private* address. The router saw your public address; your home router un-NATed the error on the way back in. NAT, caught in the act.
+
+<Predict id="berlin">
+From your home (say, the US West Coast), roughly 9,100 km from Berlin, what's the fastest a round trip *could* be? Light in fiber does about 200 km per millisecond. What will `traceroute` actually show, and how many hops?
+<Fragment slot="answer">
+
+Floor: 2 × 9,100 km ÷ 200 km/ms ≈ **91 ms**. Measured from your Mac to `www.tu-berlin.de`: about **141-150 ms over 25 hops**. Your own run:
+
+```text
+ 1  192.168.86.1     5.6 ms    your router
+ 2  198.51.100.1      9.0 ms    your ISP
+ 3  10.20.30.6     5.1 ms    inside the ISP
+ 6  203.0.113.33     4.5 ms    backbone, still on the West Coast
+ 7-14  *                       no reply
+15  64.125.20.125  140.7 ms    Zayo, now in Europe
+16  80.81.192.222  140.8 ms    DE-CIX Frankfurt exchange
+17  188.1.145.198  145.5 ms    DFN, German research network
+25  130.149.127.38 150.7 ms    TU Berlin
+```
+
+The whole ocean is in one jump, from 4.5 ms to 140 ms between hop 6 and hop 15. The eight silent hops in between are routers inside Zayo's backbone that don't answer TTL probes (or are hidden by a tunneling technique called MPLS). Real cables don't follow great circles and 150 ms is about 1.6× the light floor, which is normal for intercontinental paths.
+
+</Fragment>
+</Predict>
+
+Two traps when reading traceroute. **Stars** (`*`) mean that hop didn't answer in time, not that packets are being lost: plenty of routers are set to ignore or rate-limit ICMP. And **a slow middle hop isn't a slow path**. Your Tokyo trace had hop 3 at 287 ms and hop 4 back at 4 ms. Routers forward packets in fast hardware but generate ICMP errors in a slow, low-priority CPU path. If the latency spike doesn't carry forward to every later hop, it's the router being lazy about replying, not your packets being slow.
+
+### MTU and fragmentation
+
+Each link has a maximum frame size. The biggest IP packet that fits is the <Term w="MTU">Maximum Transmission Unit. The largest IP packet a link can carry in one frame. 1500 bytes on standard Ethernet and most Wi-Fi.</Term>: 1500 bytes for Ethernet and nearly all home networks. Your Mac printed `mtu 1500` for `en0`. Subtract a 20-byte IP header and a 20-byte TCP header and you get the most data one TCP segment can carry, the <Term w="MSS">Maximum Segment Size. The biggest payload TCP will put in one segment, announced by each side in the handshake. MTU minus IP and TCP headers: 1460 on Ethernet.</Term>, 1460 bytes. (With the 12-byte timestamp option macOS and Linux normally use, it's 1448 per segment.) So downloading a 16 GB model file is about 11 million packets, each forwarded and acknowledged individually.
+
+What if a packet is bigger than the next link's MTU? Old answer: the router chops it into pieces, <Term w="fragmentation">Splitting one IP packet into several smaller ones that each fit the next link. The destination reassembles them. If any one fragment is lost, the whole packet is lost.</Term>, and the receiver glues them back together. That turned out to be slow and fragile (lose one fragment and the whole packet is gone). Modern TCP sets the IP header's <Term w="DF bit">Don't Fragment. A flag in the IPv4 header telling routers: drop this packet rather than split it, and send back an ICMP "fragmentation needed" error with the right size.</Term> and instead learns the smallest MTU on the path from the errors routers send back (<Term w="path MTU discovery">Sending packets with DF set and shrinking them when a router replies "too big", to find the largest size that fits the whole path without fragmentation.</Term>). IPv6 routers never fragment at all.
+
+You can feel the 1500-byte limit directly. `ping -D` sets the DF bit, and an ICMP echo has 28 bytes of headers (20 IP + 8 ICMP), so a 1472-byte payload is exactly a 1500-byte packet:
+
+```text
+$ ping -D -c 2 -s 1472 1.1.1.1
+2 packets transmitted, 2 packets received, 0.0% packet loss
+$ ping -D -c 1 -s 1473 1.1.1.1
+ping: sendto: Message too long
+```
+
+One byte more and your own Mac refuses to send it. Tunnels make this matter: a VPN wraps your packet inside another packet, so the inside has less room. Tailscale's interface uses an MTU of 1280 for that reason (check `ifconfig` for the `utun` interface; you'll test it in Break It).
+
+### Loss, and why "best effort" is a feature
+
+Every router has a queue in front of each outgoing link. If packets arrive faster than the link can send them, the queue fills, and then the router drops whatever arrives next. Wi-Fi drops frames to interference and retries a few times before giving up. A bit flipped in a header fails a checksum, and the packet is thrown away.
+
+IP doesn't retry and doesn't tell anyone. From [How slow is slow?](/lessons/latency-numbers/), think about why that's right: the router in Frankfurt is handling millions of packets per second for millions of conversations. If it kept a copy of each to resend, it would need to remember state for every conversation crossing it, which is exactly the circuit-switching cost packets were invented to avoid. Instead, loss is detected at the ends: TCP notices a gap in sequence numbers, or a missing acknowledgment, and resends. And TCP treats loss as a signal that a queue somewhere is full, so it slows down. Loss is how the internet says "too much". [TCP and UDP](/lessons/tcp-vs-udp/) builds that machinery by hand.
+
+### IPv6, briefly
+
+<Term w="IPv6">The successor to IPv4, standardized in the late 1990s. 128-bit addresses written in hex groups (2606:4700:4700::1111), no fragmentation by routers, no need for NAT.</Term> has 128-bit addresses: 2¹²⁸ ≈ 3.4 × 10³⁸, enough to give every device a globally unique address with no NAT at all. The header is simpler (fixed 40 bytes, no checksum, routers never fragment), and the ideas in this lesson carry over unchanged: prefixes, routing, hop limit instead of TTL, a neighbor-discovery protocol instead of ARP. Somewhere around 45-50% of Google's users reach it over IPv6 today (Google publishes the live number; check it). Yours don't: your Mac has only a `fe80::` link-local address and an `fd..` private one, and `ping6 2606:4700:4700::1111` says `No route to host`. Your ISP or router isn't handing out global IPv6, so for you, it's IPv4 and NAT all the way.
+
+### Reading a header
+
+Here's the payoff. Everything above is fields in a header, and headers are just bytes in a fixed layout. This is the first packet of a TCP connection (the <Term w="SYN">The first packet of a TCP connection: "I want to connect, my byte numbering starts here." The server replies SYN-ACK, the client replies ACK: the three-way handshake.</Term>), in the shape you'll capture yourself in a few minutes (with made-up MAC addresses, and a documentation address, 203.0.113.10, standing in for the server):
+
+```text
+0000  f0 9f c2 ab cd ef a4 83 e7 12 34 56 08 00 45 00
+0010  00 40 7c 1d 40 00 40 06 6b 90 c0 a8 56 57 cb 00
+0020  71 0a ce 4e 00 50 9c 2b 7d 11 00 00 00 00 b0 02
+0030  ff ff b5 d4 00 00 02 04 05 b4 01 03 03 06 01 01
+0040  08 0a 3a 1f 0c 22 00 00 00 00 04 02 00 00
+```
+
+Seventy-eight bytes. Network protocols write multi-byte numbers <Term w="big-endian">Most significant byte first, the way you write numbers on paper: 0x0050 is 00 then 50. Also called network byte order. Your Mac's CPU is little-endian, so parsers must convert.</Term>, so `00 50` is 0x0050 = 80.
+
+<Predict id="decode">
+Before looking at Figure 006, decode by hand: the first 14 bytes are Ethernet (destination MAC, source MAC, 2-byte type). Then IPv4 starts with `45`. Find the TTL, the protocol, the source and destination IP addresses, and the TCP destination port. Hint: IP addresses are 4 bytes each, starting 12 bytes into the IP header.
+<Fragment slot="answer">
+
+- Bytes 0-5 `f0:9f:c2:ab:cd:ef`: destination MAC (the router). Bytes 6-11 `a4:83:e7:12:34:56`: source MAC (the laptop). Bytes 12-13 `08 00`: type 0x0800 = IPv4.
+- `45`: version 4, header length 5 × 4 = 20 bytes. `00`: type of service. `00 40`: total length 64 (20 IP + 44 TCP, no data in a SYN). `7c 1d`: identification. `40 00`: flags, DF set, fragment offset 0.
+- `40`: **TTL 64**, fresh from your Mac. `06`: **protocol 6 = TCP**. `6b 90`: header checksum.
+- `c0 a8 56 57`: **source 192.168.86.87**. `cb 00 71 0a`: **destination 203.0.113.10**.
+- TCP: `ce 4e` source port 52814 (random, picked by the OS), `00 50` **destination port 80**. Then a 4-byte sequence number `9c 2b 7d 11`, a zero ack, `b0` (data offset 11 × 4 = 44 bytes), `02` flags = SYN. The rest is the window and options (MSS 1460, window scaling, timestamps, SACK).
+
+</Fragment>
+</Predict>
+
+<Figure n="006" title="IPV4 + TCP HEADERS, 32 BITS PER ROW" caption="The layout every IP packet and TCP segment follows, with the values from the SYN above. Ruler numbers are bit positions within each 32-bit row. Shaded rows are the IP header (20 bytes with no options), white rows the TCP header (20 bytes plus options). Your parser reads exactly these offsets.">
+<svg viewBox="0 0 640 438" role="img" aria-label="IPv4 header and TCP header laid out 32 bits per row, with the values from the example SYN packet">
+  <text x="57" y="22" text-anchor="middle">0</text>
+  <text x="201" y="22" text-anchor="middle">8</text>
+  <text x="345" y="22" text-anchor="middle">16</text>
+  <text x="489" y="22" text-anchor="middle">24</text>
+  <text x="615" y="22" text-anchor="middle">31</text>
+  <text x="40" y="55" text-anchor="end" class="strong">IPv4</text>
+  <rect x="48" y="34" width="72" height="34" class="fill-wash" stroke-width="1" />
+  <text x="84" y="48" text-anchor="middle" class="strong">VER</text>
+  <text x="84" y="61" text-anchor="middle" class="blue-t">4</text>
+  <rect x="120" y="34" width="72" height="34" class="fill-wash" stroke-width="1" />
+  <text x="156" y="48" text-anchor="middle" class="strong">IHL</text>
+  <text x="156" y="61" text-anchor="middle" class="blue-t">5</text>
+  <rect x="192" y="34" width="144" height="34" class="fill-wash" stroke-width="1" />
+  <text x="264" y="48" text-anchor="middle" class="strong">TOS</text>
+  <text x="264" y="61" text-anchor="middle" class="blue-t">00</text>
+  <rect x="336" y="34" width="288" height="34" class="fill-wash" stroke-width="1" />
+  <text x="480" y="48" text-anchor="middle" class="strong">TOTAL LENGTH</text>
+  <text x="480" y="61" text-anchor="middle" class="blue-t">0040 = 64</text>
+  <rect x="48" y="68" width="288" height="34" class="fill-wash" stroke-width="1" />
+  <text x="192" y="82" text-anchor="middle" class="strong">IDENTIFICATION</text>
+  <text x="192" y="95" text-anchor="middle" class="blue-t">7c1d</text>
+  <rect x="336" y="68" width="54" height="34" class="fill-wash" stroke-width="1" />
+  <text x="363" y="82" text-anchor="middle" class="strong">FLG</text>
+  <text x="363" y="95" text-anchor="middle" class="blue-t">DF</text>
+  <rect x="390" y="68" width="234" height="34" class="fill-wash" stroke-width="1" />
+  <text x="507" y="82" text-anchor="middle" class="strong">FRAGMENT OFFSET</text>
+  <text x="507" y="95" text-anchor="middle" class="blue-t">0</text>
+  <rect x="48" y="102" width="144" height="34" class="fill-wash" stroke-width="1" />
+  <text x="120" y="116" text-anchor="middle" class="strong">TTL</text>
+  <text x="120" y="129" text-anchor="middle" class="blue-t">40 = 64</text>
+  <rect x="192" y="102" width="144" height="34" class="fill-wash" stroke-width="1" />
+  <text x="264" y="116" text-anchor="middle" class="strong">PROTOCOL</text>
+  <text x="264" y="129" text-anchor="middle" class="blue-t">06 = TCP</text>
+  <rect x="336" y="102" width="288" height="34" class="fill-wash" stroke-width="1" />
+  <text x="480" y="116" text-anchor="middle" class="strong">HEADER CHECKSUM</text>
+  <text x="480" y="129" text-anchor="middle" class="blue-t">6b90</text>
+  <rect x="48" y="136" width="576" height="34" class="fill-wash" stroke-width="1" />
+  <text x="336" y="150" text-anchor="middle" class="strong">SOURCE ADDRESS</text>
+  <text x="336" y="163" text-anchor="middle" class="blue-t">c0 a8 56 57 = 192.168.86.87</text>
+  <rect x="48" y="170" width="576" height="34" class="fill-wash" stroke-width="1" />
+  <text x="336" y="184" text-anchor="middle" class="strong">DESTINATION ADDRESS</text>
+  <text x="336" y="197" text-anchor="middle" class="blue-t">cb 00 71 0a = 203.0.113.10</text>
+  <text x="40" y="233" text-anchor="end" class="strong">TCP</text>
+  <rect x="48" y="212" width="288" height="34" class="fill-paper" stroke-width="1" />
+  <text x="192" y="226" text-anchor="middle" class="strong">SOURCE PORT</text>
+  <text x="192" y="239" text-anchor="middle" class="blue-t">ce4e = 52814</text>
+  <rect x="336" y="212" width="288" height="34" class="fill-paper" stroke-width="1" />
+  <text x="480" y="226" text-anchor="middle" class="strong">DEST PORT</text>
+  <text x="480" y="239" text-anchor="middle" class="blue-t">0050 = 80</text>
+  <rect x="48" y="246" width="576" height="34" class="fill-paper" stroke-width="1" />
+  <text x="336" y="260" text-anchor="middle" class="strong">SEQUENCE NUMBER</text>
+  <text x="336" y="273" text-anchor="middle" class="blue-t">9c2b7d11 = 2620095761</text>
+  <rect x="48" y="280" width="576" height="34" class="fill-paper" stroke-width="1" />
+  <text x="336" y="294" text-anchor="middle" class="strong">ACK NUMBER</text>
+  <text x="336" y="307" text-anchor="middle" class="blue-t">00000000 (none yet)</text>
+  <rect x="48" y="314" width="72" height="34" class="fill-paper" stroke-width="1" />
+  <text x="84" y="328" text-anchor="middle" class="strong">OFF</text>
+  <text x="84" y="341" text-anchor="middle" class="blue-t">b=11</text>
+  <rect x="120" y="314" width="72" height="34" class="fill-paper" stroke-width="1" />
+  <text x="156" y="328" text-anchor="middle" class="strong">RSV</text>
+  <text x="156" y="341" text-anchor="middle" class="blue-t">0</text>
+  <rect x="192" y="314" width="144" height="34" class="fill-paper" stroke-width="1" />
+  <text x="264" y="328" text-anchor="middle" class="strong">FLAGS</text>
+  <text x="264" y="341" text-anchor="middle" class="blue-t">02 SYN</text>
+  <rect x="336" y="314" width="288" height="34" class="fill-paper" stroke-width="1" />
+  <text x="480" y="328" text-anchor="middle" class="strong">WINDOW</text>
+  <text x="480" y="341" text-anchor="middle" class="blue-t">ffff = 65535</text>
+  <rect x="48" y="348" width="288" height="34" class="fill-paper" stroke-width="1" />
+  <text x="192" y="362" text-anchor="middle" class="strong">CHECKSUM</text>
+  <text x="192" y="375" text-anchor="middle" class="blue-t">b5d4</text>
+  <rect x="336" y="348" width="288" height="34" class="fill-paper" stroke-width="1" />
+  <text x="480" y="362" text-anchor="middle" class="strong">URGENT POINTER</text>
+  <text x="480" y="375" text-anchor="middle" class="blue-t">0000</text>
+  <rect x="48" y="382" width="576" height="34" class="fill-paper" stroke-width="1" />
+  <text x="336" y="396" text-anchor="middle" class="strong">OPTIONS (24 B HERE)</text>
+  <text x="336" y="409" text-anchor="middle" class="blue-t">MSS 1460 · WSCALE 6 · TIMESTAMPS · SACK OK</text>
+  <text x="48" y="434">20 BYTES IP + 44 BYTES TCP = 64 = TOTAL LENGTH</text>
+</svg>
+</Figure>
+
+Two fields deserve a closer look because you'll verify them in your parser.
+
+**Header checksum.** IPv4 checks its own header (only the header) with the <Term w="internet checksum">Add up the header as 16-bit numbers, fold any carry back into the low 16 bits, and flip all the bits. A receiver summing the header including the checksum gets 0xffff, i.e. the check passes when the flipped result is 0.</Term>. Add the ten 16-bit words with the checksum field set to zero: `4500 + 0040 + 7c1d + 4000 + 4006 + 0000 + c0a8 + 5657 + cb00 + 710a = 0x3946c`. Fold the carry: `0x946c + 0x3 = 0x946f`. Flip the bits: `0x6b90`. That's what's in bytes 24-25. It's cheap enough that every router redoes it after decrementing TTL. TCP's checksum uses the same arithmetic over the whole segment plus a "pseudo-header" of the IP addresses, so it catches a packet delivered to the wrong machine.
+
+**TTL.** A packet arriving at your Mac with TTL 54 started at 64 (if from Linux) and crossed 10 routers. You'll use that to cross-check traceroute.
+
+## Build It
+
+Make a folder, say `~/workbench/packets/`. Everything here runs on your Mac; the Spark gets a cameo for comparison. The capture needs `sudo`. Everything you capture is your own traffic on your own machine.
+
+<Task id="t0" title="Find your addresses, routes and neighbors" agent="ok">
+
+Run each and write the answer in a notes file. Mac and Spark (Linux) versions:
+
+| What | Mac | Spark (Linux) |
+| --- | --- | --- |
+| Your private IP | `ipconfig getifaddr en0` | `ip -4 addr` |
+| Subnet mask, MTU, MAC | `ifconfig en0` | `ip link`, `ip addr` |
+| Default gateway | `route -n get default` | `ip route` |
+| Routing table | `netstat -rn -f inet` | `ip route show` |
+| ARP cache | `arp -a` | `ip neigh` |
+| DNS server | `scutil --dns \| grep nameserver` | `resolvectl status` |
+| Public IP (as the world sees you) | `curl -4 https://ifconfig.me` | same |
+| Tailscale address and MTU | `tailscale ip -4`, `ifconfig` (find the `utun` with a 100.x address) | `ip addr show tailscale0` |
+
+Install `mtr` if you want it (`brew install mtr`; on macOS it needs `sudo`). `traceroute` and `tcpdump` ship with macOS. Wireshark is optional (`brew install --cask wireshark`) and lovely for checking your parser's output.
+
+Answer: Is your public IP your router's WAN address, or is it inside `100.64.0.0/10` (meaning your ISP adds a second NAT)? Your own traceroute suggests a real public address, but check.
+
+</Task>
+
+<Task id="t1" title="Trace three continents and put the hops on a map" agent="hands">
+
+Pick four targets: something near (`1.1.1.1`), US East Coast (a university, say `www.mit.edu`, though it may be on a CDN), Europe (`www.tu-berlin.de`) and Asia (`www.u-tokyo.ac.jp`). Run each with:
+
+```bash
+traceroute -n -q 3 -w 2 -m 30 www.tu-berlin.de > berlin.txt
+```
+
+`-n` skips reverse DNS (faster, and you'll look names up yourself), `-q 3` sends three probes per hop so you see the spread. Then write `hops.py`, which parses a traceroute output file and prints, per hop: address, best RTT, the jump from the previous answering hop, and a flag on any jump over 20 ms.
+
+```python
+# hops.py
+import re, subprocess, sys
+
+def parse(path: str) -> list[tuple[int, str | None, float | None]]:
+    """Return (hop, address or None, best RTT in ms or None) for each hop line."""
+    ...
+
+def owner(ip: str) -> str:
+    """Return a short owner name from `whois ip` (OrgName, org-name, netname or descr)."""
+    ...
+
+def light_floor_ms(km: float) -> float:
+    """Round-trip time for light in fiber over this one-way distance (~200 km per ms)."""
+    ...
+
+if __name__ == "__main__":
+    ...
+```
+
+Hints: hop lines look like ` 7  62.115.137.177  94.802 ms  95.1 ms  94.9 ms` or ` 8  * * *`; a regex for the hop number, an IPv4 address, and every `([\d.]+) ms` covers it. Call `whois` with `subprocess.run(["whois", ip], capture_output=True, text=True, timeout=10)`. Skip private addresses for whois (use `ipaddress.ip_address(ip).is_private`).
+
+Then, for each big jump, say what happened physically: which ocean or continent, and how close it is to the light floor for that distance. Reverse DNS (`dig -x <ip> +short`) often has airport or city codes in router names (`fra`, `lhr`, `sjc`, `nrt`).
+
+</Task>
+
+<Task id="t2" title="Capture your own curl" agent="ok">
+
+Use plain HTTP (not HTTPS) so the payload is readable. Pick a site that still answers on port 80, for example `example.com`. In one terminal:
+
+```bash
+# find the server's address first so you can filter on it
+dig +short example.com
+sudo tcpdump -i en0 -n -s 0 -w curl.pcap host <that address> and tcp port 80
+```
+
+In another:
+
+```bash
+curl -s -o /dev/null -v http://example.com/
+```
+
+Stop tcpdump with Ctrl-C. You should have a dozen or so packets: the three-way handshake, the request, the response, the ACKs and the close. Look at them two ways:
+
+```bash
+tcpdump -n -r curl.pcap                 # one line per packet
+tcpdump -n -r curl.pcap -X -c 1         # first packet in hex + ASCII
+```
+
+Notes: `-s 0` captures whole packets. On macOS, Wi-Fi traffic shows up as ordinary Ethernet frames (the driver converts them), so the first 14 bytes are an Ethernet header even though you're on Wi-Fi. `tcpdump -w` normally writes classic pcap; if the first four bytes of your file are `0a 0d 0d 0a`, it's the newer pcapng format, so re-capture with an explicit pcap option (check `man tcpdump` on your version) or convert it with Wireshark's `editcap -F pcap`.
+
+</Task>
+
+<Task id="t3" title="Write a pcap + IPv4 + TCP parser" agent="hands">
+
+This is the heart of the lesson. Parse `curl.pcap` with nothing but the standard library and print one line per packet. Do it first on paper for the SYN from the Predict above, then in code.
+
+A classic pcap file is a 24-byte global header, then for each packet a 16-byte record header followed by the packet bytes. The file header's magic number `a1 b2 c3 d4` (written in the machine's byte order; on your Mac you'll read it with little-endian `<`) tells you the byte order of the file headers. Packet bytes themselves are network byte order (`!` in `struct`).
+
+```python
+# parse.py
+import struct, sys
+
+def checksum(data: bytes) -> int:
+    """Internet checksum: sum 16-bit big-endian words (pad odd length with a zero byte),
+    fold carries back in until it fits in 16 bits, return the ones' complement (& 0xffff)."""
+    ...
+
+def read_pcap(path: str):
+    """Yield (timestamp_seconds: float, frame: bytes) for each record.
+    Global header: '<IHHiIII' (magic, major, minor, tz, sigfigs, snaplen, linktype).
+    Record header: '<IIII' (ts_sec, ts_usec, incl_len, orig_len)."""
+    ...
+
+def ethernet(frame: bytes) -> tuple[str, str, int, bytes]:
+    """Return (dst_mac, src_mac, ethertype, payload). MACs as 'aa:bb:cc:dd:ee:ff'."""
+    ...
+
+def ipv4(pkt: bytes) -> dict:
+    """Return version, ihl (bytes), total_length, ident, df, ttl, proto, src, dst,
+    checksum_ok, and payload (sliced by total_length, NOT to the end of the frame)."""
+    ...
+
+def tcp(seg: bytes, src: str, dst: str) -> dict:
+    """Return sport, dport, seq, ack, header_len, flags (list like ['SYN','ACK']),
+    window, checksum_ok (needs the pseudo-header), payload."""
+    ...
+
+if __name__ == "__main__":
+    for ts, frame in read_pcap(sys.argv[1]):
+        ...  # print time, src:port -> dst:port, flags, seq/ack, ttl, payload length
+```
+
+Hints, not answers:
+
+- IHL is the low 4 bits of the first byte, in 4-byte words. TCP's data offset is the *high* 4 bits of byte 12, also in 4-byte words. Use them; never assume 20.
+- Flag bits in TCP byte 13, from bit 0 up: FIN, SYN, RST, PSH, ACK, URG, ECE, CWR.
+- TCP's pseudo-header is `src_ip(4) + dst_ip(4) + b'\x00' + bytes([6]) + struct.pack('!H', len(segment))`, prepended to the segment for the checksum.
+- Slice the IP payload with `total_length`: short frames are padded to Ethernet's 60-byte minimum, and that padding isn't TCP data.
+- Print the first 60 bytes of any payload with `.decode('latin-1')` and you'll see `GET / HTTP/1.1` in the clear.
+
+Check your output against `tcpdump -n -r curl.pcap -v`, which prints TTL, IP id, length and flags for each packet.
+
+</Task>
+
+<Task id="t4" title="Read the conversation out of your parser's output" agent="explain">
+
+With your parser's output in front of you, answer:
+
+1. Find the three-way handshake (SYN, SYN-ACK, ACK). The server's SYN-ACK has an ack number equal to your SYN's sequence number plus one. Check it.
+2. What TTL did the server's packets arrive with? Guess its starting TTL (64, 128 or 255) and from that, how many routers are between you. Compare with `traceroute -n` to the same address.
+3. Find the packet with `GET / HTTP/1.1`. How many bytes of HTTP were there, and how many bytes in the whole frame? What fraction was envelope?
+4. Find the response's largest segment. Is its TCP payload 1448 or 1460 bytes? Why (look for the timestamp option, kind 8)?
+
+If any number doesn't make sense, ask an agent to explain the field, not to fix your parser.
+
+</Task>
+
+<Task id="t5" title="See NAT and the Tailscale tunnel from the outside" agent="review">
+
+Three short experiments. Write a paragraph for each explaining what you saw.
+
+1. **The unreachable laptop.** Run `python3 -m http.server 9000` on your Mac. From the Spark (same home network), `curl http://192.168.86.87:9000/` works. Now turn off Wi-Fi on your phone and, over cellular, open `http://<your public IP>:9000/`. It fails, because your router has no NAT row for it. Then open it over Tailscale (`http://<mac's 100.x address>:9000/`) from the phone with Tailscale on. It works. Stop the server afterwards.
+2. **Your NAT's mapping.** Run `tailscale netcheck`. It reports your public IPv4 address and port as seen by Tailscale's servers, and whether that mapping changes depending on which server you talk to (`MappingVariesByDestIP`). That's your router's NAT table entry, observed from outside. Write down what it says; it matters in the Tailscale lesson.
+3. **Inside the tunnel.** `sudo tcpdump -i en0 -n udp port 41641` while you `ping` the Spark's Tailscale address (41641 is Tailscale's default UDP port; if you see nothing, the traffic may be relayed or using a different port, so try `udp` alone and look for the Spark's address). You'll see UDP packets between your Mac and the Spark's *real* address with encrypted payloads: your ping is an envelope inside an envelope. Then capture on the `utun` interface instead and you'll see the plain ICMP inside.
+
+Have an agent review your three paragraphs for anything you got backwards.
+
+</Task>
+
+<DoneWhen>
+
+- You have traceroutes to four places, with each big latency jump explained physically and compared with the light floor.
+- `parse.py` reads your own capture and prints every packet with ports, flags, seq/ack, TTL and correct (or explainably wrong) checksums, matching `tcpdump -v`.
+- You decoded one packet by hand on paper before running the parser.
+- You can say your private IP, your public IP, your gateway's MAC, and why a stranger can't reach your laptop.
+
+</DoneWhen>
+
+## Measure
+
+Fill these in.
+
+| Target | Hops (answering / total) | Best RTT | Distance (one way) | Light floor RTT | RTT ÷ floor |
+| --- | --- | --- | --- | --- | --- |
+| Your router | | | ~0 | ~0 | — |
+| 1.1.1.1 | | | ? (a CDN, nearby) | | |
+| US East Coast | | | | | |
+| Berlin | | | | | |
+| Tokyo | | | | | |
+
+For reference, from your Mac on your home Wi-Fi, when this was written:
+
+| Target | Hops | Best RTT | Notes |
+| --- | --- | --- | --- |
+| Router (`ping 192.168.86.1`) | 1 | ~3 ms | Wi-Fi alone. Wired would be well under 1 ms. |
+| 1.1.1.1 | 9 / 9 | ~4.5 ms | Cloudflare has a server in your metro area. "Anycast": the same address is announced from hundreds of cities, and BGP sends you to the nearest. |
+| www.tu-berlin.de | 11 / 25 | ~141-150 ms | Floor ~91 ms (9,100 km). Ratio ~1.6. Through DE-CIX Frankfurt. |
+| www.u-tokyo.ac.jp | 13 / 25 (never reached) | ~122-128 ms at the last answering hop | Floor ~83 ms (8,300 km). The jump to ~95 ms at hop 7 is the Pacific crossing on Arelion. |
+
+What you should see and why:
+
+**Your first hop is the most expensive-per-meter link in the whole path.** 3-5 ms to a box two meters away is all Wi-Fi: the radio waits for a quiet moment to transmit, and frames get acknowledged and sometimes retried. Plug in a cable and it drops to a fraction of a millisecond.
+
+**Most of a long path is just distance.** Divide each RTT by its light floor. Intercontinental paths usually land between 1.3 and 2×: cables follow coastlines and seabeds, not great circles, and routes follow business deals (BGP), not geography. If you see 4×, something odd is happening (a detour through another continent, or a CDN that isn't where you think).
+
+**Nearby is surprisingly near.** 1.1.1.1 at ~4 ms means the "server" is in your city. Most big services do this. When you measure "latency to an API", you're often measuring latency to the nearest edge server, and the real work happens elsewhere behind it.
+
+**Packet overhead.** From your capture:
+
+| Packet | Frame bytes | Payload bytes | Overhead |
+| --- | --- | --- | --- |
+| SYN | | 0 | 100% |
+| GET request | | | |
+| Largest response segment | | | |
+| Pure ACK | | 0 | 100% |
+
+A SYN from macOS is 78 bytes on the wire (as in the example). A pure ACK with timestamps is 66. A full data segment is 1514 (1500 + 14), about 96% data. Small messages are mostly envelope, big transfers are mostly data, which is the latency-versus-bandwidth split again.
+
+**MTU.** Record the largest `ping -D -s N` that works to `1.1.1.1` (should be 1472) and to the Spark's Tailscale address (predict it first: 1280 − 28).
+
+## Break It
+
+**1. Run out of TTL.** Send real TCP with a tiny TTL and watch it die in the network:
+
+```python
+import socket
+s = socket.socket()
+s.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, 3)
+s.settimeout(5)
+s.connect(("1.1.1.1", 80))   # fails: router 3 drops the SYN
+```
+
+Run `sudo tcpdump -n -i en0 'icmp or host 1.1.1.1'` alongside. You'll see your SYN go out and an ICMP "time exceeded" come back from hop 3, and Python gives up with an `OSError` (a timeout, or "host unreachable" if the OS passes the ICMP error up). On your Mac, TTL 8 still failed and TTL 9 connected: 1.1.1.1 is 9 hops away, so it takes 9. You just ran traceroute with TCP, which is how `tcptraceroute` gets through firewalls that block the UDP probes normal traceroute uses.
+
+**2. Too big for the tunnel.** `ping -D -s 1472 <Spark's Tailscale IP>` and then smaller sizes until it works. Did the boundary land at 1252 (1280 − 28)? Now think about what happens to a protocol that sets DF and never hears the ICMP "too big" error because a firewall eats it: large packets vanish silently while small ones (handshakes, short requests) work fine. That's a <Term w="PMTU black hole">When "packet too big" errors are blocked, so a sender keeps sending packets that are too large and they're silently dropped. Symptom: connections open, then hang on the first big transfer.</Term>, and "SSH connects but hangs when I run `ls` in a big directory" is the classic symptom.
+
+**3. Corrupt a byte.** In Python, flip one bit in the IP header of a packet from your capture (say, the TTL) and rerun your checksum: it fails. Flip a bit in the TCP payload: the IP checksum still passes (it only covers the header) but the TCP checksum fails. Now look at your *outgoing* packets in the original capture: on many Macs and Linux boxes, their TCP checksums are wrong, while incoming ones are right. That's not corruption. The OS hands the network card an unfinished checksum and the card fills it in after tcpdump made its copy, called checksum offload. Wireshark has a setting to stop complaining about it. If your parser flags only outbound packets, this is why.
+
+**4. Forget your neighbor.** `sudo arp -d 192.168.86.1`, then in another terminal `sudo tcpdump -n -i en0 arp`, then `ping -c 1 1.1.1.1`. Before the ping can go anywhere, you'll see your Mac broadcast "who-has 192.168.86.1 tell 192.168.86.87" and the router reply. Notice the ping was to 1.1.1.1, but the ARP was for the router: proof that off-subnet traffic only ever needs the gateway's MAC.
+
+## Explain It Back
+
+Answer out loud, in plain words. Then check.
+
+<details>
+<summary>1. You call a model API that streams tokens with SSE. What are all the layers, and what does each one add?</summary>
+
+Each token is written by the server as an SSE event, `data: ...` and a blank line, which is just text in the body of a long-lived HTTP response. HTTP (with HTTPS, after TLS encrypts it into records) is written into a TCP connection; TCP adds ports to pick the program on each end, and sequence numbers and acknowledgments so the bytes arrive complete and in order. Each TCP segment goes inside an IP packet, which adds the source and destination machine addresses and a TTL, and is what routers read to forward it. Each IP packet goes inside a link-layer frame (Ethernet, fiber, Wi-Fi) with MAC addresses for the one hop it's on, rebuilt at every router. Polling, SSE and WebSockets differ only at the top; the bottom three layers don't care.
+
+</details>
+
+<details>
+<summary>2. A packet crosses ten routers. What changes along the way, and what doesn't?</summary>
+
+The link-layer frame is replaced at every hop: new source and destination MACs, possibly a different link type. In the IP header, the TTL drops by one per router and the header checksum is recomputed to match. Everything else in the IP header, the TCP header, and the payload arrive unchanged, unless a NAT device rewrites addresses and ports (and then fixes the checksums). Routers never read TCP or HTTP; only the ends do.
+
+</details>
+
+<details>
+<summary>3. Why can you open a connection from your laptop to any server, but nobody can open one to your laptop?</summary>
+
+Your laptop has a private address (192.168.86.87), which internet routers won't carry packets to; it's reused in millions of homes. Your router has the one public address and does NAT: when you send out, it rewrites the source to its public address and a port, and records the mapping so the reply can be rewritten back to you. A connection started from outside arrives at the router's public address with no matching row, so the router can't know which inside device it's for and drops it. The workarounds are port forwarding (a permanent row you configure), or what Tailscale does: both sides send outward at the same time so each router creates a row the other side's packets can match.
+
+</details>
+
+<details>
+<summary>4. How does traceroute work, and why do some hops show stars or huge latencies that later hops don't?</summary>
+
+It sends probes with TTL 1, 2, 3 and so on. Each router decrements TTL, and the one that would make it zero drops the probe and sends back an ICMP "time exceeded" from its own address, so you learn the address and round-trip time of each hop in turn. Stars mean a router didn't send that error in time: many rate-limit or ignore ICMP, or are hidden inside tunnels like MPLS. A huge latency at one hop that doesn't carry forward is the router being slow to *generate* the ICMP reply in its low-priority CPU path; it forwards real traffic in fast hardware. Only latency that persists to all later hops is real path latency.
+
+</details>
+
+<details>
+<summary>5. How does this scale? A provider streams to 100,000 users at 50 tokens per second, one token per SSE event. What's the packet rate and the bandwidth, and what would you change?</summary>
+
+One token per event and one event per write is roughly one packet per token: 100,000 × 50 = 5 million packets per second out, plus up to that many ACKs coming back (TCP usually acks every second packet, so maybe 2.5 million). At around 300 bytes per frame with a JSON event inside TLS, that's 1.5 GB/s, or about 12 Gb/s, and almost all of it is headers and JSON, not tokens. The bottleneck is per-packet work (system calls, interrupts, encryption per record, packet processing in load balancers), not bytes. The fixes are to send fewer, bigger packets: batch several tokens per event or per write when latency allows (flushing every 100 ms at 50 tokens a second puts about 5 tokens in each write: 5x fewer packets for at most 100 ms of extra delay), trim the JSON, and use HTTP/2 or HTTP/3 to share connections. And physically: each user's time-to-first-token includes at least one round trip, so serving from an edge near them cuts 50-150 ms that no code change can.
+
+</details>
+
+## Go Deeper
+
+- **Vinton G. Cerf and Robert E. Kahn, "A Protocol for Packet Network Intercommunication"**, IEEE Transactions on Communications, May 1974. The paper that defined internetworking. Short, readable, and you'll recognize most of today's design in it, including the idea of gateways that know nothing about the conversations they carry.
+- **Paul Baran, _On Distributed Communications_**, RAND memorandum series, 1964 (free on rand.org). Volume I is the argument for distributed, packet-switched networks, with the famous diagrams of centralized vs decentralized vs distributed networks.
+- **J. H. Saltzer, D. P. Reed and D. D. Clark, "End-to-End Arguments in System Design"**, ACM Transactions on Computer Systems, 1984. Why reliability lives at the edges and the middle stays dumb. One of the most influential short papers in systems.
+- **Larry Peterson and Bruce Davie, _Computer Networks: A Systems Approach_**, free online at [book.systemsapproach.org](https://book.systemsapproach.org/). Chapters on internetworking (IP, subnets, routing) are the clearest textbook treatment, written by people who built the systems.
+- **James Kurose and Keith Ross, _Computer Networking: A Top-Down Approach_**. The standard course book; chapter 4 (network layer) and the Wireshark labs on its companion site match this lesson's Build closely.
+- **[RFC 791: Internet Protocol](https://www.rfc-editor.org/rfc/rfc791)** (1981). The IPv4 spec. Section 3.1 has the header diagram you just parsed, as ASCII art, and it's still exactly right. Also **[RFC 1918](https://www.rfc-editor.org/rfc/rfc1918)** for private address space.
+- **David Anderson, ["How NAT traversal works"](https://tailscale.com/blog/how-nat-traversal-works)**, Tailscale blog, 2020. The best explanation of NAT behavior anywhere, and the bridge to the Tailscale lesson.
+- **Julia Evans' networking zines and posts** (jvns.ca, wizardzines.com), for example "Networking! ACK!" and her posts on tcpdump. Friendly, accurate, and very good at showing you which command to run to see a thing.
+
+## Connections
+
+This lesson puts physical reasons under the network rungs of [How slow is slow?](/lessons/latency-numbers/): the round trip to Europe is the light floor plus cables that don't run straight, and the first meter of Wi-Fi costs more than a hundred kilometers of fiber.
+
+It opens the whole Wire track. [TCP and UDP](/lessons/tcp-vs-udp/) builds the reliability layer you saw only as "ports and sequence numbers" here, on top of the best-effort packets from this lesson. [What happens when you hit enter?](/lessons/what-happens-url/) adds DNS and the connection timeline. [How does HTTPS keep secrets?](/lessons/tls/) adds the TLS envelope Figure 002 left out. [Polling, SSE and WebSockets](/lessons/streaming/) is the top layer, and [Your home server, explained](/lessons/ssh-and-tailscale/) is where NAT, MTU and the `100.64.0.0/10` addresses come back as the actual problem Tailscale solves.
+
+And when you get to [Load balancers and state](/lessons/load-balancing/) (or go back to it), "L4 vs L7" now means something exact: which envelope the load balancer opens.

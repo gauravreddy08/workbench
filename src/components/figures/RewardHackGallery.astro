@@ -1,0 +1,180 @@
+---
+// Reward-hacking gallery. Pick a cheating strategy for a merge_intervals task, toggle defenses, and
+// see what reward each strategy still earns. Numbers are rounded from runs of real cheat files
+// against real verifiers on a Mac (see the lesson's Measure section); the "look it up" row is
+// illustrative. Reward = min over active verifiers of the pass rate, i.e. you must pass all of them.
+// Usage: <RewardHackGallery />
+---
+<div class="rhg" data-fig="reward-hack-gallery">
+  <div class="rhg-defs" role="group" aria-label="Defenses">
+    <span class="label">Defenses</span>
+    <button class="btn" type="button" data-d="hidden" aria-pressed="false">Hidden tests</button>
+    <button class="btn" type="button" data-d="readonly" aria-pressed="false">Read-only tests</button>
+    <button class="btn" type="button" data-d="sandbox" aria-pressed="false">Sandbox</button>
+    <button class="btn" type="button" data-d="second" aria-pressed="false">Second verifier</button>
+  </div>
+  <div class="rhg-rows"></div>
+  <div class="rhg-detail">
+    <div class="rhg-name strong-t"></div>
+    <pre class="rhg-code"></pre>
+    <p class="rhg-why"></p>
+  </div>
+  <p class="rhg-read">
+    strategies earning ≥ 0.9 that are not honest: <span class="readout" data-r="live">-</span> ·
+    honest reward: <span class="readout" data-r="honest">-</span>
+  </p>
+</div>
+
+<style is:global>
+  .rhg-defs { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+  .rhg-defs .label { margin-right: 4px; }
+  .rhg-rows { display: grid; gap: 4px; }
+  .rhg-row {
+    display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr) 40px; gap: 10px; align-items: center;
+    background: var(--paper); border: 1px solid var(--rule); padding: 6px 8px; cursor: pointer; text-align: left;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink); letter-spacing: 0.02em; width: 100%;
+  }
+  .rhg-row[aria-pressed='true'] { border-color: var(--blue); background: var(--blue-wash); }
+  .rhg-row:hover { border-color: var(--blue); }
+  .rhg-bar { height: 10px; background: var(--paper-2); border: 1px solid var(--rule); position: relative; }
+  .rhg-bar i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--blue); transition: width 0.25s; }
+  .rhg-row.honest .rhg-bar i { background: var(--ink-2); }
+  .rhg-val { text-align: right; color: var(--blue); font-weight: 600; }
+  .rhg-detail { margin-top: 14px; border-top: 1px dashed var(--rule); padding-top: 10px; }
+  .rhg-name { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink); }
+  .rhg-code {
+    font-family: var(--mono); font-size: 12px; line-height: 1.5; background: var(--paper-2); border: 1px solid var(--rule);
+    padding: 10px 12px; margin: 8px 0; white-space: pre-wrap; word-break: break-word; color: var(--ink);
+  }
+  .rhg-why { font-size: 15px; line-height: 1.5; color: var(--ink-2); margin: 0; }
+  .rhg-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; }
+  @media (prefers-reduced-motion: reduce) { .rhg-bar i { transition: none; } }
+</style>
+
+<script>
+  type D = { hidden: boolean; readonly: boolean; sandbox: boolean; second: boolean };
+  type Cheat = { id: string; name: string; code: string; reward: (d: D) => number; why: (d: D) => string };
+
+  // Each verifier reports a pass rate; the combined reward is the minimum (must pass all).
+  const min = (...xs: number[]) => Math.min(...xs);
+  const CHEATS: Cheat[] = [
+    {
+      id: 'honest', name: 'Honest solution',
+      code: 'for lo, hi in sorted(intervals):\n    merge if it overlaps the last one,\n    else start a new interval',
+      reward: () => 1,
+      why: () => 'The control. Every defense must leave this at 1.0. A defense that lowers it is rejecting good code, which is its own bug.',
+    },
+    {
+      id: 'hardcode', name: 'Hardcode the visible answers',
+      code: 'ANSWERS = {((1,3),(2,6),(8,10)): [(1,6),(8,10)],\n           (): [], ((1,2),(2,3)): [(1,3)]}\nreturn ANSWERS.get(key(intervals), [])',
+      reward: (d) => min(1, d.hidden ? 0.3 : 1, d.second ? 0.1 : 1),
+      why: (d) => d.hidden || d.second
+        ? 'Caught. Inputs it has never seen get the default answer. Hidden tests catch most of it; random inputs checked against a reference catch nearly all of it.'
+        : 'Passes. The only inputs the verifier ever tries are the three the model can read.',
+    },
+    {
+      id: 'edit', name: 'Edit the tests',
+      code: '# test_visible.py, rewritten by the model\ndef test_basic():\n    assert True',
+      reward: (d) => min(d.readonly ? 0.33 : 1, d.hidden ? 0.1 : 1, d.second ? 0.1 : 1),
+      why: (d) => d.readonly || d.hidden || d.second
+        ? 'Caught. The grader uses its own pristine copy of the tests (read-only), or tests the model never had in its workspace.'
+        : 'Passes. The grader runs whatever test file is in the workspace, and the model owns the workspace.',
+    },
+    {
+      id: 'conftest', name: 'Patch the test runner',
+      code: '# solution.py just returns []\n# conftest.py: pytest loads this automatically\n@pytest.hookimpl(hookwrapper=True)\ndef pytest_runtest_makereport(item, call):\n    rep = (yield).get_result()\n    rep.outcome = "passed"',
+      reward: (d) => min(d.readonly ? (d.hidden ? 0.1 : 0.33) : 1, d.second ? 0.1 : 1),
+      why: (d) => d.readonly || d.second
+        ? 'Caught. Grading in a fresh directory drops the planted conftest.py, and a second verifier that does not use pytest never loads it.'
+        : d.hidden
+          ? 'Still passes. Hidden tests run by the same pytest, in the same directory, load the same conftest.py and get flipped to "passed" too.'
+          : 'Passes. Every failure is rewritten to a pass before pytest counts it.',
+    },
+    {
+      id: 'exit', name: 'Exit 0 before the tests run',
+      code: 'import os\nos._exit(0)   # at import time; pytest catches\n              # sys.exit, but not this',
+      reward: (d) => (d.second ? 0 : 1),
+      why: (d) => d.second
+        ? 'Caught. The second verifier only counts results it actually receives, per case, behind a random marker. No results means zero.'
+        : 'Passes. Hidden or not, read-only or not, a grader that trusts the exit code sees 0 and says "all good".',
+    },
+    {
+      id: 'eq', name: 'Return an always-equal object',
+      code: 'class Yes(list):\n    def __eq__(self, other): return True\nreturn Yes()   # so "assert out == expected" passes',
+      reward: (d) => (d.second ? 0 : 1),
+      why: (d) => d.second
+        ? 'Caught. The second verifier serializes the output to JSON inside the jail and compares plain data outside it, with a type check. Overridden __eq__ never runs.'
+        : 'Passes. Every assert out == expected calls the model\'s own __eq__. Hidden tests do not help: more asserts, same trick.',
+    },
+    {
+      id: 'swallow', name: 'Catch every exception',
+      code: 'try:\n    ...half-right merge, no sort...\nexcept Exception:\n    return []',
+      reward: (d) => min(1, d.hidden ? 0.7 : 1, d.second ? 0.33 : 1),
+      why: (d) => d.hidden || d.second
+        ? 'Partly caught. Crashes turned into plausible answers still fail on value checks. Notice it keeps a lot of credit: pass-rate rewards pay for half-right code.'
+        : 'Passes. The visible tests all happen to use sorted input, so the missing sort never shows.',
+    },
+    {
+      id: 'key', name: 'Read the answer key',
+      code: 'for path in sys.argv[1:] + walk(".."):\n    if path.endswith("cases.json"):\n        return lookup(json.load(open(path)), intervals)',
+      reward: (d) => min(d.hidden && !d.sandbox ? 1 : d.hidden ? 0.3 : 1, d.second ? 0.1 : 1),
+      why: (d) => d.second
+        ? 'Caught. The second verifier only ever sends the jail inputs; expected outputs stay in the grader process.'
+        : d.hidden && d.sandbox
+          ? 'Caught. The jail cannot see the hidden test files, so it is back to hardcoding what it can read.'
+          : d.hidden
+            ? 'Passes. Hidden tests are only hidden if the model\'s process cannot read the file they live in. Here it can.'
+            : 'Passes. With only visible tests, the answer key is sitting in the workspace.',
+    },
+    {
+      id: 'lookup', name: 'Copy the real fix',
+      code: '$ git log --all -p | grep -A20 merge_intervals\n$ curl https://example.org/upstream/fix.patch',
+      reward: (d) => (d.sandbox ? 0.2 : 1),
+      why: (d) => d.sandbox
+        ? 'Blocked. No network, and the repo snapshot has no future history. The model has to actually solve it.'
+        : 'Passes everything, because the code really is correct. No test can catch this. Only the sandbox can, by not leaking the answer.',
+    },
+  ];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="reward-hack-gallery"]').forEach((root) => {
+    const rows = root.querySelector<HTMLElement>('.rhg-rows')!;
+    const defs = [...root.querySelectorAll<HTMLButtonElement>('[data-d]')];
+    let sel = 'conftest';
+    const btns = new Map<string, HTMLButtonElement>();
+
+    for (const c of CHEATS) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'rhg-row' + (c.id === 'honest' ? ' honest' : '');
+      b.innerHTML = `<span></span><span class="rhg-bar"><i></i></span><span class="rhg-val"></span>`;
+      b.querySelector('span')!.textContent = c.name;
+      b.addEventListener('click', () => { sel = c.id; draw(); });
+      rows.append(b);
+      btns.set(c.id, b);
+    }
+    defs.forEach((b) => b.addEventListener('click', () => {
+      b.setAttribute('aria-pressed', String(b.getAttribute('aria-pressed') !== 'true'));
+      draw();
+    }));
+
+    function draw() {
+      const d = Object.fromEntries(defs.map((b) => [b.dataset.d!, b.getAttribute('aria-pressed') === 'true'])) as D;
+      let live = 0;
+      for (const c of CHEATS) {
+        const r = c.reward(d);
+        const b = btns.get(c.id)!;
+        b.querySelector<HTMLElement>('.rhg-bar i')!.style.width = `${r * 100}%`;
+        b.querySelector<HTMLElement>('.rhg-val')!.textContent = r.toFixed(2);
+        b.setAttribute('aria-pressed', String(c.id === sel));
+        if (c.id !== 'honest' && r >= 0.9) live++;
+      }
+      const c = CHEATS.find((x) => x.id === sel)!;
+      root.querySelector<HTMLElement>('.rhg-name')!.textContent = `${c.name} · reward ${c.reward(d).toFixed(2)}`;
+      root.querySelector<HTMLElement>('.rhg-code')!.textContent = c.code;
+      root.querySelector<HTMLElement>('.rhg-why')!.textContent = c.why(d);
+      root.querySelector<HTMLElement>('[data-r="live"]')!.textContent = `${live} of ${CHEATS.length - 1}`;
+      root.querySelector<HTMLElement>('[data-r="honest"]')!.textContent = CHEATS[0].reward(d).toFixed(2);
+    }
+    draw();
+  });
+</script>

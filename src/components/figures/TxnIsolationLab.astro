@@ -1,0 +1,440 @@
+---
+// Two transactions side by side against a tiny MVCC engine that copies Postgres's rules:
+// row versions with xmin/xmax, snapshots per statement (READ COMMITTED) or per transaction
+// (REPEATABLE READ, SERIALIZABLE), row locks on write, first-updater-wins, and a simplified
+// SSI check at commit for SERIALIZABLE. Pick a scenario and a level, then step T1 and T2.
+---
+<div class="txl" data-fig="txn-lab">
+  <div class="ctl txl-top">
+    <label>Scenario
+      <select data-scn>
+        <option value="lost">Lost update (read, then write)</option>
+        <option value="atomic">Atomic UPDATE</option>
+        <option value="dirty">Dirty read</option>
+        <option value="nonrep">Non-repeatable read</option>
+        <option value="phantom">Phantom</option>
+        <option value="skew">Write skew (doctors on call)</option>
+      </select>
+    </label>
+  </div>
+  <div class="txl-levels" role="group" aria-label="Isolation level">
+    <button class="btn" type="button" data-lvl="RU">No isolation*</button>
+    <button class="btn" type="button" data-lvl="RC" aria-pressed="true">Read committed</button>
+    <button class="btn" type="button" data-lvl="RR">Repeatable read</button>
+    <button class="btn" type="button" data-lvl="SER">Serializable</button>
+  </div>
+  <div class="txl-grid">
+    <div class="txl-th" data-th="0">
+      <div class="txl-th-head"><span class="label">T1</span><span class="label" data-status>idle</span></div>
+      <ol class="txl-prog"></ol>
+      <div class="txl-sees">sees: <span class="readout" data-sees>-</span></div>
+      <button class="btn" type="button" data-step="0">Step T1</button>
+    </div>
+    <div class="txl-db">
+      <div class="label">Rows (every version)</div>
+      <div class="txl-rows" data-rows></div>
+      <div class="txl-legend label">xmin = made by · xmax = replaced by</div>
+    </div>
+    <div class="txl-th" data-th="1">
+      <div class="txl-th-head"><span class="label">T2</span><span class="label" data-status>idle</span></div>
+      <ol class="txl-prog"></ol>
+      <div class="txl-sees">sees: <span class="readout" data-sees>-</span></div>
+      <button class="btn" type="button" data-step="1">Step T2</button>
+    </div>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-bad>Play the bad order</button>
+    <button class="btn" type="button" data-reset>Reset</button>
+  </div>
+  <p class="txl-verdict" data-verdict></p>
+  <ol class="txl-log" data-log></ol>
+  <p class="txl-foot">* Textbook READ UNCOMMITTED. Postgres accepts the name but runs it as READ COMMITTED, so you can never get a dirty read from Postgres.</p>
+</div>
+
+<style>
+  .txl select { font-family: var(--mono); font-size: 12px; background: var(--paper); color: var(--ink); border: 1px solid var(--rule); padding: 5px 6px; max-width: 100%; }
+  .txl-top label { flex-wrap: wrap; }
+  .txl-levels { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0 14px; }
+  .txl-levels .btn { padding: 6px 9px; font-size: 10.5px; }
+  .txl-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.05fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+  .txl-th { border: 1px solid var(--rule); background: var(--paper); padding: 10px 10px 12px; min-width: 0; }
+  .txl-th-head { display: flex; justify-content: space-between; gap: 6px; }
+  .txl-th-head [data-status] { color: var(--blue); }
+  .txl-th.aborted .txl-th-head [data-status] { color: var(--warn); }
+  .txl-prog { list-style: none; margin: 8px 0; padding: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.4; }
+  .txl-prog li { padding: 3px 6px; color: var(--ink-3); border-left: 2px solid transparent; overflow-wrap: anywhere; }
+  .txl-prog li + li { margin-top: 2px; }
+  .txl-prog li.done { color: var(--ink-2); }
+  .txl-prog li.done::before { content: '✓ '; color: var(--blue); }
+  .txl-prog li.next { color: var(--blue); border-left-color: var(--blue); background: var(--blue-wash); }
+  .txl-prog li.blocked { color: var(--warn); border-left-color: var(--warn); }
+  .txl-prog li.skipped { color: var(--ink-3); text-decoration: line-through; }
+  .txl-sees { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); margin-bottom: 8px; overflow-wrap: anywhere; }
+  .txl-db { border: 1px solid var(--blue); background: var(--blue-wash); padding: 10px; min-width: 0; }
+  .txl-rows { margin: 8px 0; font-family: var(--mono); font-size: 11.5px; }
+  .txl-row + .txl-row { margin-top: 8px; }
+  .txl-row .k { color: var(--ink); font-weight: 600; }
+  .txl-vers { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 3px; }
+  .txl-v { border: 1px solid var(--ink-3); background: var(--paper); padding: 1px 5px; color: var(--ink-2); white-space: nowrap; }
+  .txl-v.live { border-color: var(--blue); color: var(--ink); }
+  .txl-v.dead { color: var(--ink-3); text-decoration: line-through; }
+  .txl-v.pending { border-style: dashed; border-color: var(--blue); color: var(--blue); }
+  .txl-v.aborted { color: var(--ink-3); border-style: dotted; text-decoration: line-through; }
+  .txl-legend { font-size: 9.5px; }
+  .txl-verdict { font-family: var(--mono); font-size: 12.5px; color: var(--ink); margin: 14px 0 0; line-height: 1.55; min-height: 1.5em; }
+  .txl-verdict.bad { color: var(--warn); }
+  .txl-verdict.good { color: var(--ok); }
+  .txl-log { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); margin: 8px 0 0; padding-left: 1.6em; line-height: 1.5; }
+  .txl-log li.err { color: var(--warn); }
+  .txl-foot { font-size: 13px; color: var(--ink-3); margin: 12px 0 0; line-height: 1.45; }
+  .txl .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  @media (max-width: 620px) {
+    .txl-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .txl-db { grid-column: 1 / 3; grid-row: 1; }
+  }
+</style>
+
+<script>
+  type Val = number | boolean;
+  type Locals = Record<string, Val>;
+  type Lvl = 'RU' | 'RC' | 'RR' | 'SER';
+  type Ver = { val: Val; xmin: number; xmax: number | null };
+  type Row = { key: string; table: string; vers: Ver[] };
+  type Op =
+    | { t: 'read'; key: string; into: string; label: string }
+    | { t: 'count'; table: string; where: (v: Val) => boolean; into: string; label: string }
+    | { t: 'write'; key: string; f: (L: Locals, cur: Val) => Val; guard?: (L: Locals) => boolean; label: string }
+    | { t: 'insert'; key: string; table: string; val: Val; label: string }
+    | { t: 'commit'; label: string }
+    | { t: 'rollback'; label: string };
+  type Txn = {
+    id: number; pc: number; status: 'idle' | 'active' | 'committed' | 'aborted';
+    blocked: number | null; snap: Set<number> | null; L: Locals;
+    reads: Set<string>; writes: Set<string>; skipped: Set<number>;
+  };
+  type Scn = {
+    rows: { key: string; table: string; val: Val }[];
+    progs: [Op[], Op[]];
+    bad: number[];
+    verdict: (final: Record<string, Val>, T: Txn[]) => [boolean, string];
+  };
+
+  const C = 'COMMIT';
+  const SCN: Record<string, Scn> = {
+    lost: {
+      rows: [{ key: 'balance', table: 'wallet', val: 100 }],
+      progs: [
+        [{ t: 'read', key: 'balance', into: 'b', label: 'b = SELECT balance' }, { t: 'write', key: 'balance', f: (L) => (L.b as number) - 10, label: 'UPDATE balance = b - 10' }, { t: 'commit', label: C }],
+        [{ t: 'read', key: 'balance', into: 'b', label: 'b = SELECT balance' }, { t: 'write', key: 'balance', f: (L) => (L.b as number) - 25, label: 'UPDATE balance = b - 25' }, { t: 'commit', label: C }],
+      ],
+      bad: [0, 1, 0, 1, 0, 1],
+      verdict: (F, T) => chargeVerdict(F, T),
+    },
+    atomic: {
+      rows: [{ key: 'balance', table: 'wallet', val: 100 }],
+      progs: [
+        [{ t: 'write', key: 'balance', f: (_L, cur) => (cur as number) - 10, label: 'UPDATE balance = balance - 10' }, { t: 'commit', label: C }],
+        [{ t: 'write', key: 'balance', f: (_L, cur) => (cur as number) - 25, label: 'UPDATE balance = balance - 25' }, { t: 'commit', label: C }],
+      ],
+      bad: [0, 1, 0, 1],
+      verdict: (F, T) => chargeVerdict(F, T),
+    },
+    dirty: {
+      rows: [{ key: 'balance', table: 'wallet', val: 100 }],
+      progs: [
+        [{ t: 'write', key: 'balance', f: (_L, cur) => (cur as number) - 100, label: 'UPDATE balance = balance - 100' }, { t: 'rollback', label: 'ROLLBACK (card declined)' }],
+        [{ t: 'read', key: 'balance', into: 'b', label: 'b = SELECT balance' }, { t: 'commit', label: C }],
+      ],
+      bad: [0, 1, 0, 1],
+      verdict: (_F, T) => T[1].L.b === undefined ? [true, ''] : T[1].L.b === 0
+        ? [false, 'Dirty read. T2 saw balance = 0, a value that was never committed: T1 rolled back. If T2 had blocked the user for "no credits", that block was based on fiction.']
+        : [true, `No dirty read. T2 saw ${T[1].L.b}, the last committed value. T1's uncommitted change was invisible to it.`],
+    },
+    nonrep: {
+      rows: [{ key: 'balance', table: 'wallet', val: 100 }],
+      progs: [
+        [{ t: 'read', key: 'balance', into: 'b1', label: 'b1 = SELECT balance' }, { t: 'read', key: 'balance', into: 'b2', label: 'b2 = SELECT balance' }, { t: 'commit', label: C }],
+        [{ t: 'write', key: 'balance', f: (_L, cur) => (cur as number) - 10, label: 'UPDATE balance = balance - 10' }, { t: 'commit', label: C }],
+      ],
+      bad: [0, 1, 1, 0, 0],
+      verdict: (_F, T) => T[0].L.b2 === undefined ? [true, ''] : T[0].L.b1 !== T[0].L.b2
+        ? [false, `Non-repeatable read. T1 asked the same question twice and got ${T[0].L.b1}, then ${T[0].L.b2}. A report that sums both would be wrong.`]
+        : [true, `Repeatable. T1 got ${T[0].L.b1} both times: it reads from one snapshot, frozen at its first statement.`],
+    },
+    phantom: {
+      rows: [{ key: 'run#1', table: 'runs', val: true }, { key: 'run#2', table: 'runs', val: true }],
+      progs: [
+        [{ t: 'count', table: 'runs', where: () => true, into: 'n1', label: 'n1 = SELECT count(*) FROM runs' }, { t: 'count', table: 'runs', where: () => true, into: 'n2', label: 'n2 = SELECT count(*) FROM runs' }, { t: 'commit', label: C }],
+        [{ t: 'insert', key: 'run#3', table: 'runs', val: true, label: 'INSERT INTO runs (run#3)' }, { t: 'commit', label: C }],
+      ],
+      bad: [0, 1, 1, 0, 0],
+      verdict: (_F, T) => T[0].L.n2 === undefined ? [true, ''] : T[0].L.n1 !== T[0].L.n2
+        ? [false, `Phantom. Same query, ${T[0].L.n1} rows then ${T[0].L.n2}: a row appeared that matches T1's condition. Row locks can't stop this, because the row didn't exist to lock.`]
+        : [true, `No phantom. T1 counted ${T[0].L.n1} both times. (Postgres's REPEATABLE READ prevents phantoms too, which the SQL standard doesn't require.)`],
+    },
+    skew: {
+      rows: [{ key: 'alice', table: 'doctors', val: true }, { key: 'bob', table: 'doctors', val: true }],
+      progs: [
+        [{ t: 'count', table: 'doctors', where: (v) => v === true, into: 'n', label: 'n = count(on call)' }, { t: 'write', key: 'alice', f: () => false, guard: (L) => (L.n as number) >= 2, label: 'IF n ≥ 2: alice off call' }, { t: 'commit', label: C }],
+        [{ t: 'count', table: 'doctors', where: (v) => v === true, into: 'n', label: 'n = count(on call)' }, { t: 'write', key: 'bob', f: () => false, guard: (L) => (L.n as number) >= 2, label: 'IF n ≥ 2: bob off call' }, { t: 'commit', label: C }],
+      ],
+      bad: [0, 1, 0, 1, 0, 1],
+      verdict: (F) => {
+        const on = [F.alice, F.bob].filter((v) => v === true).length;
+        return on === 0
+          ? [false, 'Write skew. Nobody is on call. Each transaction checked "at least 2 on call", saw 2, and took one away. They wrote different rows, so no lock ever collided.']
+          : [true, `${on} doctor on call. The rule "at least one on call" survived.`];
+      },
+    },
+  };
+
+  function chargeVerdict(F: Record<string, Val>, T: Txn[]): [boolean, string] {
+    const charged = (T[0].status === 'committed' ? 10 : 0) + (T[1].status === 'committed' ? 25 : 0);
+    const want = 100 - charged;
+    const ab = T.map((t, i) => (t.status === 'aborted' ? `T${i + 1}` : '')).filter(Boolean);
+    if (F.balance !== want) return [false, `Lost update. Committed charges add up to ${charged}, so the balance should be ${want}. It is ${F.balance}. One write erased the other.`];
+    return [true, `Correct: balance ${F.balance} matches the committed charges.${ab.length ? ` ${ab.join(', ')} got a serialization error and rolled back. The app must retry it.` : ''}`];
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="txn-lab"]').forEach((root) => {
+    const thEls = [...root.querySelectorAll<HTMLElement>('.txl-th')];
+    const rowsEl = root.querySelector<HTMLElement>('[data-rows]')!;
+    const logEl = root.querySelector<HTMLElement>('[data-log]')!;
+    const verdictEl = root.querySelector<HTMLElement>('[data-verdict]')!;
+    const scnSel = root.querySelector<HTMLSelectElement>('[data-scn]')!;
+    const lvlBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-lvl]')];
+    let lvl: Lvl = 'RC';
+    let scn: Scn = SCN.lost;
+    let rows: Row[] = [];
+    let T: Txn[] = [];
+    let timer: number | undefined;
+
+    const name = (id: number) => (id === 0 ? 'T0' : `T${id}`);
+    const st = (id: number) => (id === 0 ? 'committed' : T[id - 1].status);
+    const committedNow = () => new Set([0, ...T.filter((t) => t.status === 'committed').map((t) => t.id)]);
+    const log = (s: string, err = false) => {
+      const li = document.createElement('li');
+      li.textContent = s;
+      if (err) li.className = 'err';
+      logEl.append(li);
+    };
+
+    function snapFor(t: Txn): Set<number> {
+      if (lvl === 'RR' || lvl === 'SER') {
+        if (!t.snap) t.snap = committedNow();
+        return t.snap;
+      }
+      return committedNow();
+    }
+    function visible(v: Ver, t: Txn, snap: Set<number>): boolean {
+      if (lvl === 'RU') {
+        const made = v.xmin === t.id || st(v.xmin) !== 'aborted';
+        const gone = v.xmax !== null && (v.xmax === t.id || st(v.xmax) !== 'aborted');
+        return made && !gone;
+      }
+      const made = v.xmin === t.id || snap.has(v.xmin);
+      const gone = v.xmax !== null && (v.xmax === t.id || snap.has(v.xmax));
+      return made && !gone;
+    }
+    const seen = (r: Row, t: Txn, snap: Set<number>) => r.vers.find((v) => visible(v, t, snap));
+
+    function reset() {
+      if (timer) clearTimeout(timer);
+      rows = scn.rows.map((r) => ({ key: r.key, table: r.table, vers: [{ val: r.val, xmin: 0, xmax: null }] }));
+      T = [1, 2].map((id) => ({ id, pc: 0, status: 'idle', blocked: null, snap: null, L: {}, reads: new Set(), writes: new Set(), skipped: new Set() }));
+      logEl.replaceChildren();
+      verdictEl.textContent = 'Step T1 and T2 in any order, or play the bad order.';
+      verdictEl.className = 'txl-verdict';
+      render();
+    }
+
+    function finish(t: Txn) {
+      for (const o of T) {
+        if (o.blocked === t.id) {
+          o.blocked = null;
+          log(`${name(o.id)} was waiting for ${name(t.id)}'s row lock. It wakes up and retries its UPDATE.`);
+          step(o.id - 1);
+        }
+      }
+    }
+    function abort(t: Txn, msg: string) {
+      t.status = 'aborted';
+      t.pc = Infinity;
+      log(`${name(t.id)} ERROR: ${msg}`, true);
+      finish(t);
+    }
+
+    function step(i: number) {
+      const t = T[i];
+      const prog = scn.progs[i];
+      if (t.pc >= prog.length || t.blocked !== null || t.status === 'aborted') return;
+      const op = prog[t.pc];
+      if (t.status === 'idle') t.status = 'active';
+      const who = name(t.id);
+      // RR/SER take their snapshot at the first statement, even if that statement then waits on a lock.
+      if (op.t !== 'commit' && op.t !== 'rollback') snapFor(t);
+
+      if (op.t === 'read') {
+        const r = rows.find((x) => x.key === op.key)!;
+        const v = seen(r, t, snapFor(t));
+        t.L[op.into] = v ? v.val : NaN;
+        t.reads.add(op.key);
+        log(`${who} reads ${op.key} = ${t.L[op.into]}${v && v.xmin !== 0 && v.xmin !== t.id && st(v.xmin) === 'active' ? ' (uncommitted!)' : ''}.`);
+      } else if (op.t === 'count') {
+        const snap = snapFor(t);
+        let n = 0;
+        for (const r of rows.filter((x) => x.table === op.table)) {
+          const v = seen(r, t, snap);
+          t.reads.add(r.key);
+          if (v && op.where(v.val)) n++;
+        }
+        t.reads.add('pred:' + op.table);
+        t.L[op.into] = n;
+        log(`${who} counts ${n}.`);
+      } else if (op.t === 'insert') {
+        snapFor(t);
+        rows.push({ key: op.key, table: op.table, vers: [{ val: op.val, xmin: t.id, xmax: null }] });
+        t.writes.add(op.key);
+        t.writes.add('pred:' + op.table);
+        log(`${who} inserts ${op.key} (not committed yet).`);
+      } else if (op.t === 'write') {
+        if (op.guard && !op.guard(t.L)) {
+          t.skipped.add(t.pc);
+          log(`${who} checks the rule: it fails, so it skips the UPDATE.`);
+          t.pc++;
+          render(); check();
+          return;
+        }
+        const r = rows.find((x) => x.key === op.key)!;
+        const live = r.vers.filter((v) => st(v.xmin) !== 'aborted');
+        const lv = live[live.length - 1];
+        if (lv.xmax !== null && st(lv.xmax) === 'aborted') lv.xmax = null;
+        const holder = lv.xmin !== t.id && st(lv.xmin) === 'active' ? lv.xmin
+          : lv.xmax !== null && lv.xmax !== t.id && st(lv.xmax) === 'active' ? lv.xmax : null;
+        if (holder !== null) {
+          t.blocked = holder;
+          log(`${who} wants to UPDATE ${op.key}, but ${name(holder)} holds its row lock. ${who} waits.`);
+          render();
+          return;
+        }
+        const snap = snapFor(t);
+        if ((lvl === 'RR' || lvl === 'SER') && lv.xmin !== t.id && !snap.has(lv.xmin)) {
+          abort(t, `could not serialize access due to concurrent update (${op.key} changed after ${who}'s snapshot)`);
+          render(); check();
+          return;
+        }
+        const nv = op.f(t.L, lv.val);
+        if (lv.xmin === t.id) lv.val = nv;
+        else { lv.xmax = t.id; r.vers.push({ val: nv, xmin: t.id, xmax: null }); }
+        t.writes.add(op.key);
+        log(`${who} writes ${op.key} = ${fmt(nv)} as a new row version and holds its row lock until it ends.`);
+      } else if (op.t === 'commit') {
+        if (lvl === 'SER') {
+          const o = T[1 - i];
+          const hits = (a: Txn, b: Txn) => [...a.reads].some((k) => b.writes.has(k));
+          if (o.status === 'committed' && !(t.snap?.has(o.id)) && hits(t, o) && hits(o, t)) {
+            abort(t, 'could not serialize access due to read/write dependencies among transactions');
+            render(); check();
+            return;
+          }
+        }
+        t.status = 'committed';
+        t.pc = Infinity;
+        log(`${who} commits.`);
+        finish(t);
+        render(); check();
+        return;
+      } else if (op.t === 'rollback') {
+        t.status = 'aborted';
+        t.pc = Infinity;
+        log(`${who} rolls back. Its row versions become invisible forever.`);
+        finish(t);
+        render(); check();
+        return;
+      }
+      t.pc++;
+      render(); check();
+    }
+
+    function check() {
+      const done = T.every((t, i) => t.pc >= scn.progs[i].length);
+      if (!done) return;
+      const final: Record<string, Val> = {};
+      const snap = committedNow();
+      const ghost: Txn = { id: 99, pc: 0, status: 'active', blocked: null, snap, L: {}, reads: new Set(), writes: new Set(), skipped: new Set() };
+      const save = lvl;
+      if (lvl === 'RU') lvl = 'RC';
+      for (const r of rows) { const v = seen(r, ghost, snap); if (v) final[r.key] = v.val; }
+      lvl = save;
+      const [ok, msg] = scn.verdict(final, T);
+      verdictEl.textContent = msg;
+      verdictEl.className = 'txl-verdict ' + (ok ? 'good' : 'bad');
+    }
+
+    function fmt(v: Val) { return typeof v === 'boolean' ? (v ? 'on' : 'off') : String(v); }
+
+    function render() {
+      thEls.forEach((el, i) => {
+        const t = T[i];
+        const prog = scn.progs[i];
+        const ol = el.querySelector('ol')!;
+        ol.replaceChildren(...prog.map((op, k) => {
+          const li = document.createElement('li');
+          li.textContent = op.label;
+          const doneUpTo = t.status === 'committed' ? prog.length : t.pc;
+          if (t.skipped.has(k)) li.className = 'skipped';
+          else if (t.status === 'aborted') li.className = '';
+          else if (k < doneUpTo) li.className = 'done';
+          else if (k === t.pc) li.className = t.blocked !== null ? 'blocked' : 'next';
+          return li;
+        }));
+        const entries = Object.entries(t.L).map(([k, v]) => `${k}=${fmt(v)}`);
+        el.querySelector<HTMLElement>('[data-sees]')!.textContent = entries.length ? entries.join(', ') : '-';
+        const status = t.blocked !== null ? `waiting on ${name(t.blocked)}` : t.status;
+        el.querySelector<HTMLElement>('[data-status]')!.textContent = status;
+        el.classList.toggle('aborted', t.status === 'aborted');
+        const b = el.querySelector<HTMLButtonElement>('[data-step]')!;
+        b.disabled = t.pc >= prog.length || t.blocked !== null;
+      });
+      rowsEl.replaceChildren(...rows.map((r) => {
+        const d = document.createElement('div');
+        d.className = 'txl-row';
+        const k = document.createElement('div');
+        k.className = 'k';
+        k.textContent = `${r.table}.${r.key}`;
+        const vs = document.createElement('div');
+        vs.className = 'txl-vers';
+        for (const v of r.vers) {
+          const s = document.createElement('span');
+          const made = st(v.xmin);
+          const xm = v.xmax !== null && st(v.xmax) !== 'aborted' ? v.xmax : null;
+          s.className = 'txl-v ' + (made === 'aborted' ? 'aborted' : made === 'active' ? 'pending' : xm !== null && st(xm) === 'committed' ? 'dead' : 'live');
+          s.textContent = `${fmt(v.val)} · ${name(v.xmin)}${xm !== null ? '→' + name(xm) : ''}`;
+          s.title = `xmin ${name(v.xmin)} (${made})${xm !== null ? `, xmax ${name(xm)} (${st(xm)})` : ''}`;
+          vs.append(s);
+        }
+        d.append(k, vs);
+        return d;
+      }));
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-step]').forEach((b) => b.addEventListener('click', () => step(+b.dataset.step!)));
+    root.querySelector('[data-reset]')!.addEventListener('click', reset);
+    scnSel.addEventListener('change', () => { scn = SCN[scnSel.value]; reset(); });
+    lvlBtns.forEach((b) => b.addEventListener('click', () => {
+      lvl = b.dataset.lvl as Lvl;
+      lvlBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      reset();
+    }));
+    root.querySelector('[data-bad]')!.addEventListener('click', () => {
+      reset();
+      const order = scn.bad.slice();
+      const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce) { order.forEach((i) => step(i)); return; }
+      let k = 0;
+      const tick = () => { if (k < order.length) { step(order[k++]); timer = window.setTimeout(tick, 600); } };
+      tick();
+    });
+    reset();
+  });
+</script>

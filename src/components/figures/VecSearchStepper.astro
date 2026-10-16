@@ -1,0 +1,290 @@
+---
+// A 2D point cloud. Click anywhere to place a query, then step through an approximate nearest
+// neighbour search and count the distance computations against brute force.
+// HNSW mode: greedy hops on sparse upper layers ("highways"), then a beam search of width ef on
+// the full bottom layer ("local roads"). IVF mode: compare to every cell centre, then scan the
+// nprobe nearest cells.
+// Usage: <VecSearchStepper />
+---
+<div class="vss" data-fig="vec-search">
+  <div class="ctl vss-top">
+    <span>index</span>
+    <button class="btn" type="button" data-mode="hnsw" aria-pressed="true">HNSW</button>
+    <button class="btn" type="button" data-mode="ivf" aria-pressed="false">IVF</button>
+    <label data-for="hnsw">ef <input type="range" min="5" max="40" step="1" value="8" data-k="ef" /><output data-o="ef">8</output></label>
+    <label data-for="ivf" hidden>nprobe <input type="range" min="1" max="8" step="1" value="1" data-k="nprobe" /><output data-o="nprobe">1</output></label>
+  </div>
+  <svg viewBox="0 0 480 320" role="img" aria-label="A cloud of 600 points. Click to place a query and step through a nearest neighbour search.">
+    <rect x="0" y="0" width="480" height="320" class="vss-hit" />
+    <g data-layer="cells"></g>
+    <g data-layer="edges"></g>
+    <g data-layer="pts"></g>
+    <g data-layer="path"></g>
+    <g data-layer="marks"></g>
+    <text x="8" y="16" class="strong" data-el="layer"></text>
+  </svg>
+  <p class="vss-note" aria-live="polite"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="step">Step →</button>
+    <button class="btn" type="button" data-act="run">Run to end</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <button class="btn" type="button" data-act="rand">New query</button>
+  </div>
+  <div class="ctl">
+    <span>distances computed <span class="readout" data-out="cnt">0</span></span>
+    <span>brute force <span class="readout" data-out="bf">600</span></span>
+    <span>found <span class="readout" data-out="rec">–</span> of the true top 5</span>
+  </div>
+</div>
+
+<style>
+  .vss svg { width: 100%; max-width: 640px; cursor: crosshair; touch-action: manipulation; }
+  .vss-hit { fill: transparent; stroke: none; }
+  .vss-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 4.5em; }
+  .vss-top { margin-top: 0; margin-bottom: 10px; }
+  .vss label[hidden] { display: none; }
+  .vss .ctl input[type='range'] { width: 120px; }
+</style>
+
+<script>
+  const N = 600, K = 5, W = 480, H = 320;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  const reduce = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---------- deterministic data ----------
+  let seed = 7;
+  const rnd = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const gauss = () => Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd());
+  const X: number[] = [], Y: number[] = [];
+  const blobs = Array.from({ length: 9 }, () => [40 + rnd() * 400, 40 + rnd() * 250, 14 + rnd() * 26]);
+  for (let i = 0; i < N; i++) {
+    let x: number, y: number;
+    if (rnd() < 0.2) { x = 10 + rnd() * 460; y = 26 + rnd() * 286; }
+    else { const b = blobs[Math.floor(rnd() * blobs.length)]; x = b[0] + gauss() * b[2]; y = b[1] + gauss() * b[2]; }
+    X.push(Math.min(472, Math.max(8, x))); Y.push(Math.min(314, Math.max(24, y)));
+  }
+  const d2 = (i: number, x: number, y: number) => (X[i] - x) ** 2 + (Y[i] - y) ** 2;
+  const dij = (i: number, j: number) => (X[i] - X[j]) ** 2 + (Y[i] - Y[j]) ** 2;
+
+  // ---------- HNSW, built the simple way (offline, full knowledge) ----------
+  // level ~ geometric: P(level >= l) = 4^-l, capped at 3. Same distribution HNSW uses with mL = 1/ln(M) for M = 4.
+  const level = X.map(() => Math.min(3, Math.floor(-Math.log(rnd() + 1e-12) / Math.log(4))));
+  const MAXL = Math.max(...level);
+  const entry = level.indexOf(MAXL);
+  const adj: number[][][] = []; // adj[l][i] = neighbours of i at layer l
+  for (let l = 0; l <= MAXL; l++) {
+    const nodes = level.map((lv, i) => (lv >= l ? i : -1)).filter((i) => i >= 0);
+    const M = l === 0 ? 6 : 3;
+    const nb: number[][] = Array.from({ length: N }, () => []);
+    for (const i of nodes) {
+      const cand = nodes.filter((j) => j !== i).sort((a, b) => dij(i, a) - dij(i, b));
+      const keep: number[] = [];
+      // HNSW's neighbour heuristic: keep c only if it is closer to i than to anything already kept.
+      // This keeps a few long links towards other clusters instead of M near-duplicates.
+      for (const c of cand) {
+        if (keep.length >= M) break;
+        if (keep.every((k) => dij(i, c) < dij(k, c))) keep.push(c);
+      }
+      nb[i] = keep;
+    }
+    for (const i of nodes) for (const j of nb[i]) if (!nb[j].includes(i)) nb[j].push(i);
+    adj.push(nb);
+  }
+
+  // ---------- IVF: k-means with 12 cells ----------
+  const C = 12;
+  let cx: number[] = [], cy: number[] = [];
+  for (let c = 0; c < C; c++) { const i = Math.floor((c + 0.5) * N / C); cx.push(X[i]); cy.push(Y[i]); }
+  let assign = new Array(N).fill(0);
+  for (let it = 0; it < 20; it++) {
+    for (let i = 0; i < N; i++) { let b = 0, bd = Infinity; for (let c = 0; c < C; c++) { const dd = d2(i, cx[c], cy[c]); if (dd < bd) { bd = dd; b = c; } } assign[i] = b; }
+    const sx = new Array(C).fill(0), sy = new Array(C).fill(0), n = new Array(C).fill(0);
+    for (let i = 0; i < N; i++) { sx[assign[i]] += X[i]; sy[assign[i]] += Y[i]; n[assign[i]]++; }
+    for (let c = 0; c < C; c++) if (n[c]) { cx[c] = sx[c] / n[c]; cy[c] = sy[c] / n[c]; }
+  }
+  const cells: number[][] = Array.from({ length: C }, () => []);
+  for (let i = 0; i < N; i++) cells[assign[i]].push(i);
+  const nearestCell = (x: number, y: number) => { let b = 0, bd = Infinity; for (let c = 0; c < C; c++) { const dd = (cx[c] - x) ** 2 + (cy[c] - y) ** 2; if (dd < bd) { bd = dd; b = c; } } return b; };
+  // Voronoi borders as a dotted raster
+  const borders: [number, number][] = [];
+  const G = 6;
+  for (let gx = 0; gx < W; gx += G) for (let gy = 22; gy < H; gy += G) {
+    const a = nearestCell(gx, gy);
+    if (nearestCell(gx + G, gy) !== a || nearestCell(gx, gy + G) !== a) borders.push([gx + G / 2, gy + G / 2]);
+  }
+
+  // ---------- search traces ----------
+  type Ev = { layer: number; cur: number; evals: number[]; path: number[]; best: number[]; note: string; cells?: number[]; done?: boolean };
+  const topK = (ids: Iterable<number>, x: number, y: number, k: number) => [...ids].sort((a, b) => d2(a, x, y) - d2(b, x, y)).slice(0, k);
+
+  const traceHNSW = (qx: number, qy: number, ef: number): Ev[] => {
+    const evs: Ev[] = [];
+    let cur = entry; const path = [cur];
+    const seen = new Set<number>([cur]);
+    evs.push({ layer: MAXL, cur, evals: [cur], path: [...path], best: [cur], note: `Start at the entry point, the one node that reaches the top layer (${MAXL}). One distance computed.` });
+    for (let l = MAXL; l >= 1; l--) {
+      for (;;) {
+        const nb = adj[l][cur];
+        nb.forEach((j) => seen.add(j));
+        const best = nb.reduce((b, j) => (d2(j, qx, qy) < d2(b, qx, qy) ? j : b), cur);
+        if (best === cur) {
+          evs.push({ layer: l, cur, evals: nb, path: [...path], best: [cur], note: `Layer ${l}: none of the ${nb.length} neighbours is closer to the query. This is as close as the highway gets. Drop down to layer ${l - 1}, starting from the same node.` });
+          break;
+        }
+        cur = best; path.push(cur);
+        evs.push({ layer: l, cur, evals: nb, path: [...path], best: [cur], note: `Layer ${l}: measure the ${nb.length} neighbours of the current node, jump to the closest. Long links up here cross the map in a few hops.` });
+      }
+    }
+    // layer 0: beam search with width ef (fresh visited set, as in HNSW: each layer searches on its own)
+    seen.clear(); seen.add(cur);
+    const cand = [cur];
+    const res = [cur];
+    const far = () => res.reduce((m, j) => Math.max(m, d2(j, qx, qy)), 0);
+    for (;;) {
+      cand.sort((a, b) => d2(a, qx, qy) - d2(b, qx, qy));
+      const c = cand.shift();
+      if (c === undefined) break;
+      if (res.length >= ef && d2(c, qx, qy) > far()) {
+        evs.push({ layer: 0, cur: c, evals: [], path: [...path], best: topK(res, qx, qy, K), note: `Stop: the closest unexplored node is farther than the worst of the ${ef} best found so far. Return the top ${K}.`, done: true });
+        break;
+      }
+      const fresh = adj[0][c].filter((j) => !seen.has(j));
+      fresh.forEach((j) => { seen.add(j); const f = far(); if (res.length < ef || d2(j, qx, qy) < f) { cand.push(j); res.push(j); if (res.length > ef) { res.sort((a, b) => d2(a, qx, qy) - d2(b, qx, qy)); res.pop(); } } });
+      if (c !== cur) path.push(c);
+      evs.push({ layer: 0, cur: c, evals: fresh, path: [...path], best: topK(res, qx, qy, K), note: `Layer 0, the local roads: expand the closest unexplored node and measure its ${fresh.length} unseen neighbours. Keep the best ${ef} (that is ef) as a running list.` });
+      if (evs.length > 400) break;
+    }
+    if (!evs[evs.length - 1].done) evs.push({ layer: 0, cur, evals: [], path: [...path], best: topK(res, qx, qy, K), note: 'Nothing left to explore. Return the top 5.', done: true });
+    return evs;
+  };
+
+  const traceIVF = (qx: number, qy: number, nprobe: number): Ev[] => {
+    const order = [...Array(C).keys()].sort((a, b) => (cx[a] - qx) ** 2 + (cy[a] - qy) ** 2 - ((cx[b] - qx) ** 2 + (cy[b] - qy) ** 2));
+    const evs: Ev[] = [{ layer: -1, cur: -1, evals: [], path: [], best: [], cells: [], note: `Step 1 is always the same: measure the query against all ${C} cell centres (squares) and rank them. ${C} distances.` }];
+    const scanned: number[] = [];
+    for (let p = 0; p < nprobe; p++) {
+      const c = order[p];
+      scanned.push(...cells[c]);
+      evs.push({ layer: -1, cur: -1, evals: cells[c], path: [], best: topK(scanned, qx, qy, K), cells: order.slice(0, p + 1), note: `Probe cell ${p + 1} of ${nprobe}: scan every one of its ${cells[c].length} vectors exactly. ${p + 1 === nprobe ? 'Done. Return the best 5 seen.' : ''}`, done: p + 1 === nprobe });
+    }
+    return evs;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="vec-search"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const svg = q<SVGSVGElement>('svg');
+    const L = (k: string) => q<SVGGElement>(`[data-layer="${k}"]`);
+    const note = q<HTMLElement>('.vss-note');
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    let mode: 'hnsw' | 'ivf' = 'hnsw';
+    let ef = 8, nprobe = 1;
+    let qx = 360, qy = 230;
+    let evs: Ev[] = [];
+    let step = -1;
+    let timer: number | undefined;
+
+    const truth = () => topK(Array.from({ length: N }, (_, i) => i), qx, qy, K);
+    const rebuild = () => { evs = mode === 'hnsw' ? traceHNSW(qx, qy, ef) : traceIVF(qx, qy, nprobe); step = -1; };
+    const countUpTo = (s: number) => {
+      let n = 0;
+      for (let i = 0; i <= s; i++) n += evs[i].evals.length;
+      if (mode === 'ivf' && s >= 0) n += C;
+      return n;
+    };
+
+    const render = () => {
+      for (const k of ['cells', 'edges', 'pts', 'path', 'marks']) L(k).replaceChildren();
+      const ev = step >= 0 ? evs[step] : undefined;
+      const layer = mode === 'hnsw' ? (ev ? ev.layer : MAXL) : -1;
+      const evaluated = new Set<number>();
+      for (let i = 0; i <= step; i++) evs[i].evals.forEach((j) => evaluated.add(j));
+      const nowEval = new Set(ev ? ev.evals : []);
+      const best = new Set(ev ? ev.best : []);
+
+      if (mode === 'ivf') {
+        for (const [bx, by] of borders) L('cells').appendChild(mk('rect', { x: bx - 0.6, y: by - 0.6, width: 1.2, height: 1.2, style: 'fill:var(--ink-3)' }));
+        const probed = new Set(ev?.cells ?? []);
+        for (let c = 0; c < C; c++) L('marks').appendChild(mk('rect', { x: cx[c] - 4, y: cy[c] - 4, width: 8, height: 8, class: probed.has(c) ? 'fill-blue' : 'fill-paper', 'stroke-width': 1.2 }));
+      } else {
+        // draw this layer's edges
+        const nb = adj[Math.max(layer, 0)];
+        for (let i = 0; i < N; i++) for (const j of nb[i]) if (j > i) L('edges').appendChild(mk('line', { x1: X[i], y1: Y[i], x2: X[j], y2: Y[j], style: `stroke:var(${layer > 0 ? '--ink-2' : '--rule'})`, 'stroke-width': layer > 0 ? 0.9 : 0.7 }));
+      }
+      for (let i = 0; i < N; i++) {
+        const onLayer = mode === 'hnsw' && level[i] >= Math.max(layer, 0) && layer > 0;
+        const r = onLayer ? 3.6 : 2;
+        let style = 'fill:var(--ink-3)';
+        if (onLayer) style = 'fill:var(--ink)';
+        if (evaluated.has(i)) style = 'fill:var(--blue-2)';
+        if (nowEval.has(i)) style = 'fill:var(--blue)';
+        L('pts').appendChild(mk('circle', { cx: X[i], cy: Y[i], r: nowEval.has(i) ? r + 1 : r, style }));
+      }
+      if (ev && mode === 'hnsw' && ev.path.length > 1) {
+        L('path').appendChild(mk('polyline', { points: ev.path.map((i) => `${X[i]},${Y[i]}`).join(' '), class: 'blue', 'stroke-width': 2, fill: 'none' }));
+      }
+      if (ev && mode === 'hnsw' && ev.cur >= 0) L('marks').appendChild(mk('circle', { cx: X[ev.cur], cy: Y[ev.cur], r: 7, class: 'blue', 'stroke-width': 1.5 }));
+      for (const i of best) L('marks').appendChild(mk('rect', { x: X[i] - 4.5, y: Y[i] - 4.5, width: 9, height: 9, class: 'blue', 'stroke-width': 1.3 }));
+      if (ev?.done) for (const i of truth()) L('marks').appendChild(mk('circle', { cx: X[i], cy: Y[i], r: 6, class: 'ink dash', 'stroke-width': 1 }));
+      // query crosshair
+      L('marks').appendChild(mk('line', { x1: qx - 9, y1: qy, x2: qx + 9, y2: qy, class: 'ink', 'stroke-width': 1.5 }));
+      L('marks').appendChild(mk('line', { x1: qx, y1: qy - 9, x2: qx, y2: qy + 9, class: 'ink', 'stroke-width': 1.5 }));
+      L('marks').appendChild(mk('text', { x: Math.min(qx + 10, 440), y: qy - 8, class: 'strong' }, 'QUERY'));
+
+      const lt = q<SVGTextElement>('[data-el="layer"]');
+      if (mode === 'hnsw') {
+        const nodes = level.filter((lv) => lv >= Math.max(layer, 0)).length;
+        lt.textContent = `HNSW · LAYER ${Math.max(layer, 0)} · ${nodes} NODES${layer > 0 ? ' · HIGHWAY' : ' · LOCAL ROADS'}`;
+      } else lt.textContent = `IVF · ${C} CELLS · NPROBE ${nprobe}`;
+
+      const cnt = step >= 0 ? countUpTo(step) : 0;
+      out('cnt').textContent = String(cnt);
+      out('bf').textContent = String(N);
+      if (ev?.done) {
+        const t = new Set(truth());
+        out('rec').textContent = String(ev.best.filter((i) => t.has(i)).length);
+      } else out('rec').textContent = '–';
+      if (!ev) note.textContent = mode === 'hnsw'
+        ? 'Click anywhere to move the query, then Step. Big dark dots are the nodes on the current layer. Brute force would measure all 600 points.'
+        : 'Click anywhere to move the query, then Step. Dotted lines are the cell borders k-means drew. Brute force would measure all 600 points.';
+      else note.textContent = ev.done ? `${ev.note} Dashed rings are the true top 5 from brute force; blue squares are what the index returned. ${cnt} distances instead of ${N}.` : ev.note;
+    };
+
+    const stop = () => { if (timer) clearInterval(timer); timer = undefined; };
+    const stepOnce = () => { if (step < evs.length - 1) step++; else stop(); render(); };
+    q('[data-act="step"]').addEventListener('click', () => { stop(); stepOnce(); });
+    q('[data-act="run"]').addEventListener('click', () => {
+      stop();
+      if (step >= evs.length - 1) step = -1;
+      if (reduce) { step = evs.length - 1; render(); return; }
+      timer = window.setInterval(stepOnce, 260);
+    });
+    q('[data-act="reset"]').addEventListener('click', () => { stop(); step = -1; render(); });
+    q('[data-act="rand"]').addEventListener('click', () => { stop(); qx = 20 + Math.random() * 440; qy = 34 + Math.random() * 270; rebuild(); render(); });
+    svg.addEventListener('click', (e) => {
+      const m = svg.getScreenCTM(); if (!m) return;
+      const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(m.inverse());
+      stop(); qx = Math.max(6, Math.min(474, p.x)); qy = Math.max(24, Math.min(316, p.y)); rebuild(); render();
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.addEventListener('click', () => {
+      stop();
+      mode = b.dataset.mode as 'hnsw' | 'ivf';
+      root.querySelectorAll('[data-mode]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      root.querySelectorAll<HTMLElement>('label[data-for]').forEach((l) => (l.hidden = l.dataset.for !== mode));
+      rebuild(); render();
+    }));
+    root.querySelectorAll<HTMLInputElement>('input[data-k]').forEach((inp) => inp.addEventListener('input', () => {
+      stop();
+      const v = Number(inp.value);
+      if (inp.dataset.k === 'ef') ef = v; else nprobe = v;
+      q<HTMLOutputElement>(`[data-o="${inp.dataset.k}"]`).textContent = String(v);
+      rebuild(); render();
+    }));
+    rebuild(); render();
+  });
+</script>

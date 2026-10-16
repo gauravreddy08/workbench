@@ -1,0 +1,225 @@
+---
+// Scaling calculator for a cross-encoder ranking service. Set traffic, candidates, tokens, model and
+// hardware; see how full each resource of ONE node would be, which saturates first, and how many
+// nodes (and dollars) the load needs. Usage: <EnvelopeCalculator />
+---
+<div class="ec" data-fig="envelope-calculator">
+  <div class="ec-row">
+    <span class="label">Model</span>
+    <div class="ec-btns" data-group="model">
+      <button class="btn" type="button" data-v="minilm">MiniLM-L6 · 22M</button>
+      <button class="btn" type="button" data-v="base" aria-pressed="true">BERT-base · 110M</button>
+      <button class="btn" type="button" data-v="large">BERT-large · 335M</button>
+      <button class="btn" type="button" data-v="qwen">Qwen3 0.6B</button>
+    </div>
+  </div>
+  <div class="ec-row">
+    <span class="label">Node</span>
+    <div class="ec-btns" data-group="hw">
+      <button class="btn" type="button" data-v="cpu">32-core CPU box</button>
+      <button class="btn" type="button" data-v="spark" aria-pressed="true">DGX Spark</button>
+      <button class="btn" type="button" data-v="h100">1× H100</button>
+    </div>
+  </div>
+  <div class="ctl ec-ctl">
+    <label>queries / day <input type="range" min="0" max="14" step="1" value="8" data-in="qpd" /> <output data-out="qpd">10M</output></label>
+    <label>peak ÷ avg <input type="range" min="0" max="4" step="1" value="2" data-in="peak" /> <output data-out="peak">3×</output></label>
+    <label>candidates <input type="range" min="0" max="6" step="1" value="3" data-in="cand" /> <output data-out="cand">100</output></label>
+    <label>tokens / pair <input type="range" min="0" max="4" step="1" value="2" data-in="tok" /> <output data-out="tok">256</output></label>
+    <label>% of peak achieved <input type="range" min="10" max="80" step="5" value="40" data-in="eff" /> <output data-out="eff">40%</output></label>
+  </div>
+
+  <div class="ec-chain mono" data-out="chain"></div>
+
+  <div class="ec-bars" role="img" aria-label="Bars showing how full each resource of one node would be at this load, on a log scale">
+    <div class="ec-axis" aria-hidden="true">
+      <span style="left:0%">0.1%</span><span style="left:25%">1%</span><span style="left:50%">10%</span><span style="left:75%">100%</span><span style="left:100%">1000%+</span>
+    </div>
+    <div class="ec-bar" data-r="flops"><span class="ec-name">Compute</span><div class="ec-track"><i></i><b class="ec-full"></b></div><span class="readout" data-pct></span></div>
+    <div class="ec-bar" data-r="bw"><span class="ec-name">Mem bandwidth</span><div class="ec-track"><i></i><b class="ec-full"></b></div><span class="readout" data-pct></span></div>
+    <div class="ec-bar" data-r="mem"><span class="ec-name">Memory size</span><div class="ec-track"><i></i><b class="ec-full"></b></div><span class="readout" data-pct></span></div>
+    <div class="ec-bar" data-r="net"><span class="ec-name">Network</span><div class="ec-track"><i></i><b class="ec-full"></b></div><span class="readout" data-pct></span></div>
+    <div class="ec-bar" data-r="cpu"><span class="ec-name">CPU cores</span><div class="ec-track"><i></i><b class="ec-full"></b></div><span class="readout" data-pct></span></div>
+    <div class="ec-legend label" aria-hidden="true">Each bar: this load ÷ what ONE node can do. The line at 100% is one node, full.</div>
+  </div>
+
+  <dl class="ec-out">
+    <div><dt class="label">Breaks first</dt><dd><span class="readout big" data-out="bneck">-</span></dd></div>
+    <div><dt class="label">Nodes @ 70% busy</dt><dd><span class="readout big" data-out="nodes">-</span></dd></div>
+    <div><dt class="label">One query, alone</dt><dd><span class="readout" data-out="lat">-</span></dd></div>
+    <div><dt class="label">Rough cost / month</dt><dd><span class="readout" data-out="cost">-</span></dd></div>
+  </dl>
+  <p class="ec-note" data-out="note"></p>
+</div>
+
+<style>
+  .ec-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+  .ec-row > .label { width: 54px; flex: none; font-size: 10.5px; }
+  .ec-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ec-btns .btn { padding: 5px 9px; font-size: 10.5px; }
+  .ec-ctl label { flex-wrap: wrap; }
+  .ec-ctl input[type='range'] { width: 150px; }
+  .ec-chain { margin: 16px 0 6px; font-size: 11.5px; line-height: 1.7; color: var(--ink-2); text-transform: none; letter-spacing: 0.02em; overflow-wrap: anywhere; }
+  .ec-chain b { color: var(--blue); font-weight: 600; }
+  .ec-bars { margin-top: 12px; }
+  .ec-axis { position: relative; height: 16px; margin-left: 112px; margin-right: 62px; font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); }
+  .ec-axis span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+  .ec-axis span:first-child { transform: none; }
+  .ec-axis span:last-child { transform: translateX(-100%); }
+  .ec-bar { display: grid; grid-template-columns: 104px minmax(0, 1fr) 54px; gap: 8px; align-items: center; margin: 7px 0; }
+  .ec-name { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); }
+  .ec-bar.hot .ec-name { color: var(--blue); font-weight: 600; }
+  .ec-track { position: relative; height: 16px; border: 1px solid var(--ink); background: var(--paper); }
+  .ec-track i { position: absolute; left: 0; top: 0; bottom: 0; width: 0; background: var(--blue-fill); border-right: 1px solid var(--blue); }
+  .ec-bar.hot .ec-track i { background: var(--blue); }
+  .ec-bar.over .ec-track i { background: var(--warn); border-right-color: var(--warn); }
+  .ec-full { position: absolute; left: 75%; top: -4px; bottom: -4px; border-left: 1.5px dashed var(--ink); }
+  .ec-bar .readout { font-size: 11.5px; text-align: right; }
+  .ec-bar.over .readout { color: var(--warn); }
+  .ec-legend { font-size: 9.5px; margin-top: 8px; text-transform: none; letter-spacing: 0.03em; }
+  @media (prefers-reduced-motion: no-preference) { .ec-track i { transition: width 0.18s ease-out; } }
+  .ec-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 18px; margin: 16px 0 0; }
+  .ec-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .ec-out dt { font-size: 10px; }
+  .ec-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+  .ec-out .big { font-size: 19px; }
+  .ec-note { margin: 14px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+  @media (max-width: 480px) {
+    .ec-bar { grid-template-columns: 78px minmax(0, 1fr) 50px; gap: 6px; }
+    .ec-name { font-size: 9px; letter-spacing: 0.02em; }
+    .ec-axis { margin-left: 84px; margin-right: 56px; }
+    .ec-axis span:nth-child(2), .ec-axis span:nth-child(4) { display: none; }
+  }
+</style>
+
+<script>
+  type Model = { name: string; total: number; nonEmb: number; layers: number; d: number };
+  // Public configs. Non-embedding params do the per-token math; embeddings are a table lookup.
+  const MODELS: Record<string, Model> = {
+    minilm: { name: 'MiniLM-L6', total: 22.7e6, nonEmb: 11e6, layers: 6, d: 384 },
+    base: { name: 'BERT-base', total: 110e6, nonEmb: 86e6, layers: 12, d: 768 },
+    large: { name: 'BERT-large', total: 335e6, nonEmb: 303e6, layers: 24, d: 1024 },
+    qwen: { name: 'Qwen3 0.6B', total: 0.6e9, nonEmb: 0.44e9, layers: 28, d: 1024 },
+  };
+  type HW = { name: string; peak: number; bw: number; mem: number; cores: number; nic: number; perHour: number; bpw: number; cpuMath: boolean };
+  // Approximate spec-sheet numbers. peak = dense BF16 (CPU: fp32 vector units). nic in bytes/s.
+  // Spark peak is the same upper bound the bandwidth lesson derives; measure your own.
+  const HWS: Record<string, HW> = {
+    cpu: { name: '32-core CPU box', peak: 3e12, bw: 200e9, mem: 256e9, cores: 32, nic: 25e9 / 8, perHour: 1.4, bpw: 4, cpuMath: true },
+    spark: { name: 'DGX Spark', peak: 125e12, bw: 273e9, mem: 128e9, cores: 20, nic: 10e9 / 8, perHour: 0.15, bpw: 2, cpuMath: false },
+    h100: { name: 'H100', peak: 989e12, bw: 3350e9, mem: 80e9, cores: 16, nic: 25e9 / 8, perHour: 2.5, bpw: 2, cpuMath: false },
+  };
+  const QPD = [1e3, 3e3, 1e4, 3e4, 1e5, 3e5, 1e6, 3e6, 1e7, 3e7, 1e8, 3e8, 1e9, 3e9, 1e10];
+  const PEAK = [1, 2, 3, 5, 10];
+  const CAND = [10, 20, 50, 100, 200, 500, 1000];
+  const TOK = [64, 128, 256, 512, 1024];
+  const TOK_PER_CORE = 1e6; // tokenizer throughput per core, tokens/s (rough; measure yours)
+  const CPU_PER_QUERY = 0.5e-3; // seconds of CPU per request for parsing, batching, serializing
+  const BYTES_PER_TOKEN_TEXT = 4; // ~4 bytes of UTF-8 text per token
+  const LATENCY_BUDGET = 0.1; // seconds a query may spend in the service (for Little's law)
+
+  const si = (x: number) => {
+    const u: [number, string][] = [[1e15, 'P'], [1e12, 'T'], [1e9, 'G'], [1e6, 'M'], [1e3, 'k']];
+    for (const [v, s] of u) if (x >= v) { const y = x / v; return `${y >= 100 ? y.toFixed(0) : y >= 10 ? y.toFixed(0) : y.toFixed(1)}${s}`; }
+    return x >= 10 ? x.toFixed(0) : x >= 1 ? x.toFixed(1) : x.toPrecision(2);
+  };
+  const pct = (u: number) => (u >= 10 ? `${si(u * 100)}%` : u >= 0.1 ? `${(u * 100).toFixed(0)}%` : u >= 0.001 ? `${(u * 100).toFixed(1)}%` : '<0.1%');
+  // log position: 0.1% -> 0, 1000% -> 1  (4 decades); 100% sits at 0.75
+  const pos = (u: number) => Math.max(0, Math.min(1, (Math.log10(Math.max(u, 1e-6)) + 3) / 4));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="envelope-calculator"]').forEach((root) => {
+    const s = { model: 'base', hw: 'spark', qpd: 8, peak: 2, cand: 3, tok: 2, eff: 40 };
+    const q = <T extends Element>(sel: string) => root.querySelector<T>(sel)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+
+    const render = () => {
+      const m = MODELS[s.model];
+      const hw = HWS[s.hw];
+      const qpd = QPD[s.qpd], pk = PEAK[s.peak], C = CAND[s.cand], T = TOK[s.tok], eff = s.eff / 100;
+      const qps = (qpd / 86400) * pk;
+      const tokS = qps * C * T;
+      const flopsPerTok = 2 * m.nonEmb + 4 * m.layers * m.d * T; // weights + attention (QK and AV)
+      const flopsQ = C * T * flopsPerTok;
+      const weightBytes = m.total * hw.bpw;
+      const actTrafficPerTok = m.layers * m.d * hw.bpw * 12; // rough: activations read+written per layer
+      const actLivePerQ = C * T * m.d * hw.bpw * 13; // rough: one layer's live activations for the batch
+      const inflight = Math.max(1, qps * LATENCY_BUDGET); // Little's law: L = lambda x W
+
+      const util: Record<string, number> = {
+        flops: (qps * flopsQ) / (hw.peak * eff),
+        bw: (qps * (weightBytes + C * T * actTrafficPerTok)) / hw.bw,
+        mem: (weightBytes + inflight * actLivePerQ) / hw.mem,
+        net: (qps * (C * T * BYTES_PER_TOKEN_TEXT + C * 8 + 1000)) / hw.nic,
+        cpu: (tokS / TOK_PER_CORE + qps * CPU_PER_QUERY) / hw.cores,
+      };
+      if (hw.cpuMath) util.cpu += util.flops; // on a CPU box the model math runs on the same cores
+
+      const names: Record<string, string> = { flops: 'COMPUTE', bw: 'MEM BANDWIDTH', mem: 'MEMORY SIZE', net: 'NETWORK', cpu: 'CPU CORES' };
+      let worst = 'flops';
+      for (const k of Object.keys(util)) if (util[k] > util[worst]) worst = k;
+
+      root.querySelectorAll<HTMLElement>('.ec-bar').forEach((row) => {
+        const k = row.dataset.r!;
+        const u = util[k];
+        row.querySelector<HTMLElement>('i')!.style.width = `${pos(u) * 100}%`;
+        row.querySelector<HTMLElement>('[data-pct]')!.textContent = pct(u);
+        row.classList.toggle('hot', k === worst);
+        row.classList.toggle('over', u > 1);
+      });
+
+      const nodes = Math.max(1, Math.ceil(util[worst] / 0.7));
+      const lat = flopsQ / (hw.peak * eff);
+      out('bneck').textContent = names[worst];
+      out('nodes').textContent = nodes.toLocaleString('en-US');
+      out('lat').textContent = lat >= 1 ? `${lat.toFixed(1)} s` : lat >= 0.001 ? `${(lat * 1e3).toFixed(lat < 0.01 ? 1 : 0)} ms` : `${(lat * 1e6).toFixed(0)} µs`;
+      out('lat').style.color = lat > LATENCY_BUDGET ? 'var(--warn)' : '';
+      const cost = nodes * hw.perHour * 730;
+      out('cost').textContent = `$${si(cost)}${s.hw === 'spark' ? ' (bought, amortized)' : ''}`;
+
+      out('chain').innerHTML =
+        `${si(qpd)}/day ÷ 86,400 × ${pk} = <b>${si(qps)} QPS</b> peak · × ${C} cand × ${T} tok = <b>${si(tokS)} tok/s</b> · × ${si(flopsPerTok)} FLOP/tok = <b>${si(qps * flopsQ)}FLOP/s</b> · ÷ ${si(hw.peak * eff)} per node`;
+
+      let note: string;
+      if (lat > LATENCY_BUDGET)
+        note = `A single query needs ${si(flopsQ)} FLOPs, which takes ${(lat * 1e3).toFixed(0)} ms on one ${hw.name} even with nothing else running. More nodes add throughput, not speed: cut candidates, shrink the model, or split one query across devices.`;
+      else if (util[worst] < 0.05)
+        note = `Nothing is close to full. At this traffic one ${hw.name} is idle ${(100 - util[worst] * 100).toFixed(0)}% of the time. The honest answer to "how does it scale?" here is "it doesn't need to yet".`;
+      else if (worst === 'flops')
+        note = `Compute-bound, as a cross-encoder should be: ${C * T} tokens per query share every weight read, so the math units are the wall. Every lever is a multiplier in the chain above: fewer candidates, shorter pairs, a smaller model.`;
+      else if (worst === 'bw')
+        note = `Bandwidth is the wall: a small model with few tokens per batch does too little math per byte. Batch several queries into one forward pass so they share the weight reads.`;
+      else if (worst === 'mem')
+        note = `Memory size runs out first: ${inflight.toFixed(0)} queries in flight (Little's law: ${si(qps)} QPS × ${LATENCY_BUDGET * 1000} ms) each holding ${(actLivePerQ / 1e9).toFixed(2)} GB of activations. Shorter pairs or a tighter latency budget shrink it.`;
+      else if (worst === 'cpu')
+        note = hw.cpuMath
+          ? `On a CPU box the model math and the tokenizer share the same ${hw.cores} cores, and the math wins the fight for them. Fine at low traffic; past that, this is what a GPU buys you.`
+          : `The GPU is coasting and the CPU is drowning: tokenizing ${si(tokS)} tokens/s and handling ${si(qps)} requests/s. Real systems hit this. Tokenize on more cores, or upstream.`;
+      else note = `The network card fills first: ${si(C * T * BYTES_PER_TOKEN_TEXT)}B of document text per query. Send document IDs and keep the text near the GPU.`;
+      out('note').textContent = note;
+
+      out('qpd').textContent = si(qpd);
+      out('peak').textContent = `${pk}×`;
+      out('cand').textContent = String(C);
+      out('tok').textContent = String(T);
+      out('eff').textContent = `${s.eff}%`;
+    };
+
+    root.querySelectorAll<HTMLElement>('[data-group]').forEach((grp) => {
+      const key = grp.dataset.group as 'model' | 'hw';
+      grp.querySelectorAll<HTMLButtonElement>('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          grp.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+          s[key] = btn.dataset.v!;
+          render();
+        });
+      });
+    });
+    (['qpd', 'peak', 'cand', 'tok', 'eff'] as const).forEach((k) => {
+      q<HTMLInputElement>(`[data-in="${k}"]`).addEventListener('input', (e) => {
+        s[k] = Number((e.target as HTMLInputElement).value);
+        render();
+      });
+    });
+    render();
+  });
+</script>

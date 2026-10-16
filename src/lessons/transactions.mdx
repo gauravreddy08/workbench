@@ -1,0 +1,735 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import TxnIsolationLab from '../components/figures/TxnIsolationLab.astro';
+
+## Today
+
+- Say in plain words what a transaction promises, letter by letter (A, C, I, D), and name the failure each letter prevents.
+- Make a credits service lose money under concurrent load, prove it with totals, then fix it four different ways and know when to pick each.
+- Name the five classic concurrency anomalies (dirty read, lost update, non-repeatable read, phantom, write skew) and say which isolation level stops which, in Postgres specifically.
+- Explain how Postgres gives every transaction its own view of the data without making readers wait for writers (MVCC: row versions and snapshots).
+- Cause a deadlock on purpose, read the error, and explain why people avoid transactions that span two databases, and what they do instead.
+
+Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) (the lost-update race on a counter; this lesson is the same bug, one floor down) and [What happens when you save a file?](/lessons/files-and-disks/) (what `fsync` promises). You need Postgres on your Mac or the Spark; Task 0 has three ways to get it. Rough time: one evening.
+
+## The Problem
+
+Every TinyFish agent run spends credits. Picture the simplest possible version of the code that charges for one step of a run:
+
+```python
+def charge(conn, wallet_id, cost):
+    balance = conn.execute(
+        "SELECT balance FROM wallets WHERE id = %s", (wallet_id,)
+    ).fetchone()[0]
+    if balance < cost:
+        raise InsufficientCredits()
+    conn.execute("UPDATE wallets SET balance = %s WHERE id = %s", (balance - cost, wallet_id))
+    conn.execute("INSERT INTO ledger (wallet_id, amount) VALUES (%s, %s)", (wallet_id, -cost))
+    conn.commit()
+```
+
+Read the balance, check it, write the new balance, record the charge. It is correct. Every test passes. Then a customer launches a batch of agent runs, and eight workers start charging the same wallet at once.
+
+I ran exactly this against Postgres 16 on an M4 Pro: one wallet starting at 100,000 credits, 8 threads, 500 charges of 1 credit each. The ledger ended up with 4,000 rows, one per charge, as it should. The balance went from 100,000 to 99,428. It should have been 96,000. **3,428 of the 4,000 charges never came off the balance.** Run it again and you get a slightly different number (99,491 on my second run), never the right one.
+
+Nothing crashed. No error was logged. The service just gave away 86% of the usage for free, and the only way you would ever notice is by adding up the ledger and comparing it to the balance.
+
+Now a second, different way to lose money. A customer moves 500 credits from their personal wallet to their team wallet. That is two writes: subtract 500 here, add 500 there. The process dies between them (a deploy, an OOM kill, a power cut). 500 credits have left one wallet and arrived nowhere.
+
+These are the two problems transactions exist to solve. One is **crashing halfway**. The other is **two pieces of work interleaving**. If you remember nothing else, remember that a transaction is the database's answer to both.
+
+<Origin year="1981" title="The transaction concept">
+
+In the 1970s, IBM's System R team was building one of the first relational databases, and its customers were banks and airlines: thousands of terminals updating the same accounts and seat maps at once, on machines that crashed. Jim Gray, who worked on System R, wrote the idea down in 1981 in "The Transaction Concept: Virtues and Limitations". He borrowed from contract law: a transaction is like a contract, where either every party's obligations happen or none do, and once it is signed it stays signed.
+
+Two years later Theo Härder and Andreas Reuter, writing about crash recovery, packed the properties into an acronym: ACID. Atomicity, consistency, isolation, durability. It stuck, partly because it sounds good. Gray won the Turing Award in 1998, largely for this work. Every database you will use, and most of the money in the world, runs on these ideas.
+
+</Origin>
+
+## The Idea
+
+### A transaction is a bracket
+
+A <Term w="transaction">A group of database operations that the database treats as one unit: either all of them take effect, or none do, and other users never see it half-done.</Term> is a pair of brackets around some work:
+
+```sql
+BEGIN;
+UPDATE wallets SET balance = balance - 500 WHERE id = 'personal';
+UPDATE wallets SET balance = balance + 500 WHERE id = 'team';
+COMMIT;
+```
+
+`BEGIN` opens the bracket. <Term w="COMMIT">The statement that ends a transaction and makes all of its changes permanent and visible to everyone, at one instant.</Term> closes it and says "make all of this real". <Term w="ROLLBACK">The statement that ends a transaction by throwing away every change it made, as if it never ran.</Term> closes it and says "forget all of it". Everything inside the bracket gets four promises, and those are the four letters.
+
+One detail that bites Python people: drivers like `psycopg` open a transaction for you on the first statement and keep it open until you call `commit()` or `rollback()`. Your naive `charge()` above *was* inside a transaction. It still lost money. Hold that thought: being in a transaction is not the same as being protected from the interleaving problem. That depends on the I, and the I has settings.
+
+### A is for atomic: all or nothing
+
+<Term w="Atomicity">The guarantee that a transaction's changes happen completely or not at all. If anything fails partway, the database undoes the part that already happened.</Term> fixes the transfer. If the process dies after the first `UPDATE`, the database acts as if the transaction never started. The 500 credits are still in the personal wallet.
+
+"Atomic" here means indivisible, like the Greek word, not "about concurrency" (that's the I). It is about failure: crashes, errors, a constraint that rejects the second write, or your own code deciding to `ROLLBACK`.
+
+How can a database undo work after the process that was doing it is dead? It keeps a diary. Before changing anything in its data files, the database writes a record of the change to an append-only file, the <Term w="write-ahead log">WAL. An append-only file where the database records every change before applying it to the data files. After a crash, replaying it rebuilds exactly what was committed.</Term>. The last thing a transaction writes to the log is a commit record. After a crash, the database reads the log: transactions with a commit record are kept, transactions without one are treated as if they never happened.
+
+<Figure n="001" title="THE LOG DECIDES" caption="Every change goes into the write-ahead log first. A transaction exists the instant its commit record is safely on disk, not before. After a crash, recovery keeps T1 (it has a commit record) and drops T2 (it doesn't), so the half-done transfer vanishes instead of leaving money in limbo.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Write-ahead log with records for two transactions, a crash, and recovery keeping only the committed one">
+  <text x="10" y="24" class="strong">WRITE-AHEAD LOG (APPEND ONLY) →</text>
+  <rect x="10" y="40" width="96" height="46" class="fill-wash" stroke-width="1.2" />
+  <text x="58" y="60" text-anchor="middle" class="strong">T1</text>
+  <text x="58" y="76" text-anchor="middle">wallet -10</text>
+  <rect x="112" y="40" width="96" height="46" class="fill-wash" stroke-width="1.2" />
+  <text x="160" y="60" text-anchor="middle" class="strong">T1</text>
+  <text x="160" y="76" text-anchor="middle">ledger +row</text>
+  <rect x="214" y="40" width="96" height="46" class="fill-paper" stroke-width="1.2" />
+  <text x="262" y="60" text-anchor="middle" class="strong">T2</text>
+  <text x="262" y="76" text-anchor="middle">personal -500</text>
+  <rect x="316" y="40" width="96" height="46" class="fill-blue" />
+  <text x="364" y="60" text-anchor="middle" style="fill:var(--paper)" class="strong">T1</text>
+  <text x="364" y="76" text-anchor="middle" style="fill:var(--paper)">COMMIT</text>
+  <rect x="418" y="40" width="96" height="46" class="fill-paper dash" stroke-width="1" />
+  <text x="466" y="60" text-anchor="middle">T2</text>
+  <text x="466" y="76" text-anchor="middle">team +500</text>
+  <line x1="530" y1="30" x2="530" y2="100" class="ink" stroke-width="1.5" />
+  <text x="540" y="56" class="strong">CRASH</text>
+  <text x="540" y="72">never written</text>
+  <line x1="364" y1="86" x2="364" y2="130" class="blue" stroke-width="1.2" />
+  <text x="364" y="146" text-anchor="middle" class="blue-t">FSYNC THE LOG, THEN TELL</text>
+  <text x="364" y="160" text-anchor="middle" class="blue-t">THE CLIENT "COMMITTED"</text>
+  <text x="10" y="200" class="strong">AFTER RESTART, RECOVERY READS THE LOG:</text>
+  <rect x="10" y="214" width="290" height="60" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="236" class="strong">T1: HAS COMMIT RECORD</text>
+  <text x="22" y="256">redo its changes. it happened.</text>
+  <rect x="320" y="214" width="310" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="332" y="236" class="strong">T2: NO COMMIT RECORD</text>
+  <text x="332" y="256">treat as aborted. personal keeps 500.</text>
+</svg>
+</Figure>
+
+Databases differ in how they undo. MySQL's InnoDB keeps an <Term w="undo log">A record of the old value of every row a transaction changed, so the database can put the old values back if the transaction aborts.</Term> and copies old values back on rollback. Postgres does something lazier and cleverer that we'll see in the MVCC section: it never overwrites a row, it writes a new version and marks the transaction that made it as committed or aborted. An aborted transaction's versions simply stay invisible forever, and get cleaned up later. Either way, the commit record is the single moment of truth.
+
+### D is for durable: committed means it survives
+
+<Term w="Durability">The guarantee that once the database says COMMIT succeeded, the change survives crashes and power loss.</Term> is about the other side of that moment. When `COMMIT` returns, your data must survive a power cut one microsecond later.
+
+You already know from [What happens when you save a file?](/lessons/files-and-disks/) that `write()` returning means almost nothing: the bytes are in the OS page cache, in RAM. So Postgres, by default, does not answer your `COMMIT` until it has written the WAL and called `fsync` (or an equivalent) and the drive has said the bytes are on flash. The data files themselves can be updated lazily, minutes later, because the log is enough to rebuild them.
+
+That has a price you can now put a number on. Every commit waits for a flush. On a typical NVMe SSD on Linux that's very roughly tens of microseconds to a millisecond; on a Mac, the files-and-disks lesson showed how different "flushed" can mean (Postgres's `wal_sync_method` setting decides which flush call it uses; on my Mac it reported `open_datasync`). Postgres softens this with group commit: when many transactions commit at once, one flush covers all of their commit records.
+
+And there's a dial. `SET synchronous_commit = off` lets `COMMIT` return before the flush. You might lose the last fraction of a second of commits in a crash (the docs bound it at three times `wal_writer_delay`, which defaults to 200 ms), but the database never ends up half-done, because the log is still the source of truth. That's a reasonable trade for, say, analytics events. It is not one you make for a wallet.
+
+### C is for consistent: the rules always hold
+
+<Term w="Consistency">In ACID: the guarantee that a transaction moves the database from one valid state to another, where "valid" means every rule you declared still holds.</Term> means the rules you wrote down hold before and after every transaction. The rules are <Term w="constraints">Rules declared in the schema that the database enforces on every write: NOT NULL, UNIQUE, CHECK (some condition), FOREIGN KEY (this id must exist in that table).</Term>:
+
+```sql
+CREATE TABLE wallets (
+  id      text PRIMARY KEY,
+  balance bigint NOT NULL CHECK (balance >= 0)
+);
+```
+
+With that `CHECK`, no transaction can ever commit a negative balance. Try, and the statement fails, and the transaction can only roll back. The failure it prevents: a bug, or a race, quietly writing nonsense that you discover in a month.
+
+Honest note: C is the odd letter. Martin Kleppmann points out in *Designing Data-Intensive Applications* that consistency is mostly a property of your application, not the database. The database checks the rules you declared; it can't know that "the ledger sum must equal the balance change" unless you find a way to declare it. A, I and D are the database's tools; C is what you build with them.
+
+### I is for isolation: no one sees your half-done work
+
+<Term w="Isolation">The guarantee that concurrently running transactions don't interfere with each other: each behaves (to some degree, set by the isolation level) as if it were running alone.</Term> is the one that would have saved the credits service, and the one with settings.
+
+The ideal is simple to state. Run a thousand transactions at once, and the result must be the same as if they had run one at a time, in *some* order. That ideal is called <Term w="serializable">The strongest isolation: the outcome of running transactions concurrently is always equal to running them one after another in some order.</Term>, because the outcome matches a serial schedule. It is expensive, so databases offer weaker levels too, and each weaker level lets certain specific bad things through. Those bad things have names. Let's meet them.
+
+### The lost update, again
+
+You've seen this bug. In [the threads lesson](/lessons/processes-threads-gil/), two threads ran `counter += 1`, each read 41, each wrote 42, and one increment vanished. The credits bug is the identical shape, one level down: two transactions read the same balance, each subtracts its own cost from the value *it read*, and the second write erases the first.
+
+<Figure n="002" title="THE LOST CHARGE" caption="Two workers charge the same wallet. Both read 100 before either writes. Worker A writes 90, worker B writes 75 computed from its stale 100, and A's charge is gone. Both ledger rows exist, so the ledger and the balance now disagree by exactly 10.">
+<svg viewBox="0 0 640 260" role="img" aria-label="Timeline of two transactions reading the same balance and overwriting each other">
+  <text x="10" y="30" class="strong">WORKER A</text>
+  <text x="10" y="130" class="strong">WALLET ROW</text>
+  <text x="10" y="230" class="strong">WORKER B</text>
+  <line x1="110" y1="26" x2="630" y2="26" class="ink dash" stroke-width="1" />
+  <line x1="110" y1="226" x2="630" y2="226" class="ink dash" stroke-width="1" />
+  <rect x="110" y="110" width="250" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="235" y="130" text-anchor="middle" class="strong">balance = 100</text>
+  <rect x="360" y="110" width="120" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="420" y="130" text-anchor="middle" class="strong">90</text>
+  <rect x="480" y="110" width="150" height="30" class="fill-blue" />
+  <text x="555" y="130" text-anchor="middle" style="fill:var(--paper)" class="strong">75 (SHOULD BE 65)</text>
+  <circle cx="150" cy="26" r="4" class="fill-blue" />
+  <text x="150" y="16" text-anchor="middle">READ 100</text>
+  <line x1="150" y1="30" x2="150" y2="108" class="blue" stroke-width="1" />
+  <circle cx="210" cy="226" r="4" class="fill-blue" />
+  <text x="210" y="248" text-anchor="middle">READ 100</text>
+  <line x1="210" y1="222" x2="210" y2="142" class="blue" stroke-width="1" />
+  <circle cx="360" cy="26" r="4" class="fill-blue" />
+  <text x="360" y="16" text-anchor="middle">WRITE 100-10</text>
+  <line x1="360" y1="30" x2="360" y2="108" class="blue" stroke-width="1.5" />
+  <circle cx="480" cy="226" r="4" class="fill-blue" />
+  <text x="480" y="248" text-anchor="middle">WRITE 100-25</text>
+  <line x1="480" y1="222" x2="480" y2="142" class="blue" stroke-width="1.5" />
+  <text x="420" y="96" text-anchor="middle" class="blue-t">A'S CHARGE</text>
+  <text x="555" y="96" text-anchor="middle" class="blue-t">ERASED BY B</text>
+</svg>
+</Figure>
+
+A <Term w="lost update">Two transactions read the same value, both compute a new value from it, and both write. The second write silently overwrites the first, so the first change is lost.</Term> is the anomaly that cost 3,428 credits. Here are the other four.
+
+### The other anomalies
+
+A <Term w="dirty read">Reading a change another transaction has made but not yet committed. If that transaction rolls back, you acted on data that never existed.</Term>: T1 deducts 100 credits for a big run, and before it commits, T2 reads the wallet, sees 0, and rejects the user's next request for "no credits". Then T1's payment step fails and it rolls back. T2 refused a customer based on a balance that never officially existed.
+
+A <Term w="non-repeatable read">Reading the same row twice in one transaction and getting two different values, because another transaction changed it and committed in between.</Term>: a billing report reads the wallet balance at the top ("100"), computes a few things, reads it again for the invoice total ("90"), and prints an invoice that disagrees with itself.
+
+A <Term w="phantom">A row that appears in (or disappears from) the result of a query you run twice in one transaction, because another transaction inserted or deleted a matching row in between.</Term>: you `SELECT count(*) FROM runs WHERE wallet_id = 'w1'`, get 2, and a moment later the same query in the same transaction returns 3. Nobody changed a row you read; a *new* row appeared that matches your condition. Row locks can't stop that, because you can't lock a row that doesn't exist yet.
+
+And the subtle one, <Term w="write skew">Two transactions each read some shared facts, each decide a write is safe based on those facts, and each write a different row. Each alone is fine; together they break a rule neither one broke by itself.</Term>. The classic example, from Kleppmann's book: a hospital needs at least one doctor on call. Alice and Bob are both on call, and both feel sick. Each one, at the same moment, opens the app, which runs:
+
+```sql
+SELECT count(*) FROM doctors WHERE on_call;  -- sees 2
+-- 2 >= 2, so it's safe for me to leave
+UPDATE doctors SET on_call = false WHERE name = 'alice';  -- (bob's app: name = 'bob')
+COMMIT;
+```
+
+Both see 2. Both leave. Nobody is on call. Notice that they wrote *different* rows, so there was never a moment when both wanted the same row. No row lock was ever contested. That's why write skew slips past defenses that stop the lost update.
+
+You have a TinyFish-shaped version of this too. "A customer may have at most 3 concurrent browser sessions": count the open sessions, if fewer than 3, insert a new one. Two requests both count 2, both insert, and the customer has 4. Same shape, with a phantom on the side (the new rows are the thing each check couldn't see).
+
+### How Postgres keeps transactions apart: MVCC
+
+Before the isolation levels make sense, you need the trick Postgres uses to give each transaction its own view of the data. The simple approach is locks: readers lock what they read, writers wait for readers. It's correct and slow: a long report would block every charge.
+
+Postgres uses <Term w="MVCC">Multi-version concurrency control. Instead of overwriting a row, the database writes a new version of it and keeps the old one, so each transaction can read the version that was current for it.</Term> instead. It never updates a row in place. An `UPDATE` writes a brand new version of the row and marks the old one as replaced. Every row version carries two hidden fields:
+
+- `xmin`: the ID of the transaction that created this version.
+- `xmax`: the ID of the transaction that replaced or deleted it (empty if nobody has).
+
+When a transaction reads, it uses a <Term w="snapshot">A record of which transactions had committed at a given moment. A reader uses it to decide which row versions it is allowed to see.</Term>: essentially a list of which transactions had committed at the moment the snapshot was taken. A version is visible if the transaction that made it had committed in the snapshot and the transaction that replaced it (if any) had not. Everything else is invisible to you, even though it's sitting right there on disk.
+
+<Figure n="003" title="ROW VERSIONS AND SNAPSHOTS" caption="One logical row, three physical versions. Each snapshot sees exactly one of them. The report started before T2 committed, so it keeps seeing 100 for as long as it uses its snapshot. A new reader sees 90. T3 hasn't committed, so its 65 is invisible to everyone else, and if T3 rolls back it stays invisible forever. Nobody waited for anybody.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Three versions of a wallet row with xmin and xmax, and three readers with different snapshots each seeing one version">
+  <text x="10" y="24" class="strong">WALLET w1, AS STORED ON DISK</text>
+  <rect x="10" y="40" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="62" class="strong">balance = 100</text>
+  <text x="22" y="80">xmin T1 (committed)</text>
+  <text x="22" y="96">xmax T2</text>
+  <rect x="225" y="40" width="190" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="237" y="62" class="strong">balance = 90</text>
+  <text x="237" y="80">xmin T2 (committed)</text>
+  <text x="237" y="96">xmax T3</text>
+  <rect x="440" y="40" width="190" height="70" class="fill-paper dash" stroke-width="1.2" />
+  <text x="452" y="62" class="strong">balance = 65</text>
+  <text x="452" y="80">xmin T3 (in progress)</text>
+  <text x="452" y="96">xmax -</text>
+  <line x1="200" y1="75" x2="225" y2="75" class="ink" stroke-width="1" />
+  <line x1="415" y1="75" x2="440" y2="75" class="ink" stroke-width="1" />
+  <rect x="10" y="190" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="212" class="strong">REPORT (OLD SNAPSHOT)</text>
+  <text x="22" y="230">committed: T1</text>
+  <text x="22" y="246" class="blue-t">sees 100</text>
+  <rect x="225" y="190" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="237" y="212" class="strong">NEW READER</text>
+  <text x="237" y="230">committed: T1, T2</text>
+  <text x="237" y="246" class="blue-t">sees 90</text>
+  <rect x="440" y="190" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="452" y="212" class="strong">T3 ITSELF</text>
+  <text x="452" y="230">its own writes count</text>
+  <text x="452" y="246" class="blue-t">sees 65</text>
+  <line x1="105" y1="190" x2="105" y2="112" class="blue" stroke-width="1.2" />
+  <line x1="320" y1="190" x2="320" y2="112" class="blue" stroke-width="1.2" />
+  <line x1="535" y1="190" x2="535" y2="112" class="blue" stroke-width="1.2" />
+  <text x="320" y="150" text-anchor="middle">EACH READER PICKS THE ONE VERSION ITS SNAPSHOT ALLOWS</text>
+  <text x="320" y="290" text-anchor="middle">old versions are deleted later by VACUUM once no snapshot can see them</text>
+</svg>
+</Figure>
+
+Three consequences fall out of this picture.
+
+1. **Readers never block writers, and writers never block readers.** The report reads its old version while T3 writes a new one. No waiting.
+2. **Writers do block writers.** Only one transaction at a time may create the next version of a given row. A transaction that updates a row holds a <Term w="row lock">A lock on a single row, taken automatically by UPDATE, DELETE or SELECT ... FOR UPDATE, and held until the transaction commits or rolls back. Other writers of that row wait.</Term> on it until it ends, and a second writer waits. That wait is where the interesting decisions in the next section happen.
+3. **Old versions pile up**, and someone has to clean them up. That someone is <Term w="VACUUM">Postgres's garbage collector. It removes row versions that no current or future snapshot can see, and reclaims the space.</Term>. A transaction left open for hours holds an old snapshot, which stops VACUUM from cleaning anything newer than it. That's one reason long-open transactions are bad manners.
+
+You can see these hidden fields yourself: `SELECT xmin, xmax, * FROM wallets;` works on any Postgres table. You'll do it in the Build.
+
+### The isolation levels, and what Postgres actually does
+
+The SQL standard defines four <Term w="isolation level">A setting, per transaction, that picks how much protection from concurrent transactions you get. Stronger levels prevent more anomalies and cost more (waits or retries).</Term>s by which anomalies they forbid. Every database then implements them a little differently, so the names are less useful than knowing what *your* database does. Here is Postgres, which is what you'll use at work and here. The only thing that differs between the first three rows is *when the snapshot is taken* and *what happens when you try to write a row someone else changed*.
+
+| Level | Snapshot | Write to a row changed by a concurrent transaction | Stops | Lets through |
+| --- | --- | --- | --- | --- |
+| READ UNCOMMITTED | Postgres runs it as READ COMMITTED | | | |
+| READ COMMITTED (default) | New snapshot per statement | Wait for its lock, then write on top of the newest version | dirty read | lost update (read-then-write in app code), non-repeatable read, phantom, write skew |
+| REPEATABLE READ | One snapshot, taken at the transaction's first statement | Wait, then fail with a serialization error if the other one committed | + non-repeatable read, phantom, lost update (as an error) | write skew |
+| SERIALIZABLE | Same as REPEATABLE READ, plus tracking of who read what | Same, plus may fail at commit if a cycle of read/write dependencies appears | everything above, and write skew | nothing (but you must retry) |
+
+Some notes in plain words.
+
+**READ COMMITTED** is the default, and it is what your naive `charge()` ran under. Each statement sees everything committed before *that statement* started. So it never sees uncommitted data (no dirty reads), but two `SELECT`s in one transaction can disagree, and nothing stops the read-then-write pattern: your `SELECT` saw 100, your `UPDATE ... SET balance = 75` writes 75, whatever the row says now.
+
+**REPEATABLE READ** in Postgres is what the research literature calls <Term w="snapshot isolation">Each transaction reads from one consistent snapshot of the database taken when it started, and a write conflicts if someone else committed a change to the same row after that snapshot. Coined in a 1995 paper by Berenson et al.</Term>. The whole transaction reads one frozen picture. If you try to update a row that someone else changed and committed after your snapshot, Postgres refuses with `could not serialize access due to concurrent update` rather than let you write over a change you never saw. That turns the silent lost update into a loud error. (Postgres's version also blocks phantoms, which the standard doesn't require of this level.)
+
+**SERIALIZABLE** in Postgres (since 9.1, in 2011) is <Term w="SSI">Serializable snapshot isolation. Snapshot isolation plus bookkeeping of which transaction read data that another wrote; when those dependencies could form a cycle that no serial order explains, one transaction is aborted.</Term>. It runs exactly like REPEATABLE READ, plus it remembers what each transaction read. If T1 read something T2 wrote and T2 read something T1 wrote, there is no serial order that explains both, so one of them gets aborted with `could not serialize access due to read/write dependencies among transactions`. It doesn't block extra; it lets transactions run and then vetoes the ones that would break the illusion. It can also abort some transactions that would actually have been fine (false positives). Either way, the deal is: **at SERIALIZABLE, any transaction can fail with SQLSTATE `40001`, and your code must retry it.**
+
+Two warnings about other databases, so the names don't mislead you later. MySQL's InnoDB defaults to REPEATABLE READ, with different rules from Postgres's (its locking reads see the latest data, not the snapshot). And Oracle's "SERIALIZABLE" has historically been snapshot isolation, which allows write skew. Same words, different guarantees. Kleppmann's Hermitage project (in Go Deeper) tests exactly these differences.
+
+<Predict id="which-level">
+Two doctors, the on-call check from above, both running at the same moment. Which is the weakest Postgres isolation level at which at least one doctor stays on call: READ COMMITTED, REPEATABLE READ, or SERIALIZABLE? Why doesn't the level below it work?
+<Fragment slot="answer">
+
+SERIALIZABLE. At REPEATABLE READ, each transaction reads from its own snapshot (both see 2 on call) and then writes a *different* row (alice vs bob). There's no row that both write, so the "concurrent update" check never fires, and both commit. I ran this against Postgres 16: under REPEATABLE READ both committed and 0 doctors were left on call. Under SERIALIZABLE, the first commit succeeded and the second failed with `could not serialize access due to read/write dependencies among transactions`, leaving one doctor on call. SSI noticed that each one read a row the other wrote, which no one-at-a-time order can explain.
+
+</Fragment>
+</Predict>
+
+Now play with it. The figure below is a small simulation of Postgres's rules: real row versions with `xmin` and `xmax`, a snapshot per statement or per transaction depending on the level, row locks, and a simplified version of the serializable check. Pick a scenario and a level, then step T1 and T2 in whatever order you like (or play the bad order). Watch the middle column: every write adds a version, and what each transaction "sees" depends only on its snapshot.
+
+<Figure n="004" title="TWO TRANSACTIONS, ONE DATABASE" caption="Try each scenario at each level. Things to find: the lost update at READ COMMITTED turning into an error at REPEATABLE READ; the atomic UPDATE being correct even at READ COMMITTED (T2 waits for T1's lock, then subtracts from the newest value); write skew surviving REPEATABLE READ and dying at SERIALIZABLE; and the dirty read, which needs the textbook level Postgres doesn't offer." wide>
+
+<TxnIsolationLab />
+
+</Figure>
+
+### Fixing the lost update: four tools
+
+Back to the credits service. You have four standard fixes. They all work. They differ in who waits, who retries, and how much code you write.
+
+**1. Do the arithmetic in the database.** Don't read the balance into Python at all:
+
+```sql
+UPDATE wallets
+   SET balance = balance - 10
+ WHERE id = 'w1' AND balance >= 10
+RETURNING balance;
+```
+
+This is an <Term w="atomic update">A single UPDATE statement that computes the new value from the current one inside the database (balance = balance - 10), so there is no gap between the read and the write for another transaction to slip into.</Term>. Even at READ COMMITTED it can't lose an update: the `UPDATE` takes the row lock, and if another transaction holds it, it waits; when the lock is released, Postgres re-reads the *newest* version of the row and re-checks the `WHERE` against it before writing. The `balance >= 10` is the insufficient-credits check, folded into the same step, so two charges can't both pass the check against the same old balance. If zero rows come back, the wallet didn't have enough. This is the fix to reach for first: one round trip, no retries, nothing to get wrong. It only works when the decision fits in one statement.
+
+**2. Lock the row before you read it.** When the logic is too complex for one statement (look up the price plan, check a spending limit, then charge), take the lock up front:
+
+```sql
+SELECT balance FROM wallets WHERE id = 'w1' FOR UPDATE;
+-- ... any Python logic you like ...
+UPDATE wallets SET balance = %s WHERE id = 'w1';
+COMMIT;
+```
+
+`FOR UPDATE` takes the row lock at read time, so a second transaction's `SELECT ... FOR UPDATE` on the same row waits until you commit, and then reads your new value. This is <Term w="pessimistic locking">Assume conflicts will happen and prevent them by locking data before using it. Others wait.</Term>: it assumes a collision and makes everyone queue. Correct and simple, and the cost is waiting: whatever happens between the `SELECT` and the `COMMIT` is time the row is held. Never make a network call (to an LLM, to Stripe) while holding it.
+
+**3. Check that nothing changed when you write.** Add a `version` column. Read the balance *and* the version, compute, and make the write conditional:
+
+```sql
+UPDATE wallets SET balance = %s, version = version + 1
+ WHERE id = 'w1' AND version = %s;   -- the version you read
+```
+
+If someone else wrote in between, the version moved on, the `WHERE` matches zero rows, and you start over from the read. This is <Term w="optimistic concurrency">Assume conflicts are rare; do the work without locks, and at write time check that nothing changed since you read (usually with a version number). If something did, retry.</Term>, the database version of the <Term w="compare-and-swap">A CPU instruction (and by analogy, any operation) that writes a new value only if the current value still equals what you expected, and reports whether it did.</Term> instruction. Nobody waits; losers retry. Brilliant when conflicts are rare, and the only option when the read and write happen in different requests (a user opens an edit form, saves it a minute later; HTTP's `ETag` and `If-Match` headers are this idea). Terrible on one hot row, as you'll measure.
+
+**4. Raise the isolation level and retry.** Keep the naive code, run it at SERIALIZABLE (or REPEATABLE READ, which is enough for a single-row lost update), and wrap it in a loop that retries on error `40001`:
+
+```python
+for attempt in range(MAX_TRIES):
+    try:
+        with conn.transaction():
+            ...naive read-check-write...
+        break
+    except psycopg.errors.SerializationFailure:
+        continue  # someone else won; start the whole transaction again
+```
+
+The database detects the conflict for you. You don't have to think about which rows to lock, which is the real appeal: SERIALIZABLE also catches the write-skew bugs you didn't notice you had. The costs are retries under contention, and the discipline that *every* code path that touches the database must be retry-safe.
+
+The rule of thumb: atomic update when the logic fits in one statement; `FOR UPDATE` when it doesn't and contention is high; optimistic versions when contention is low or the transaction spans requests; SERIALIZABLE when the invariants are complicated enough that you don't trust yourself to lock the right rows.
+
+### Deadlocks
+
+Locks bring their own failure. Transfer A moves credits from wallet 1 to wallet 2: it locks 1, then wants 2. Transfer B, at the same moment, moves from 2 to 1: it locks 2, then wants 1. Each waits for the other, forever.
+
+<Figure n="005" title="A DEADLOCK" caption="Each transaction holds the lock the other one needs. Neither can finish, so neither will ever release. Postgres notices after deadlock_timeout (1 second by default), kills one of them with a deadlock error, and the other proceeds. Locking rows in a fixed order (always the smaller id first) makes the cycle impossible.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Two transactions each holding a row lock and waiting on the other's">
+  <rect x="40" y="30" width="160" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="120" y="54" text-anchor="middle" class="strong">TRANSFER A</text>
+  <text x="120" y="72" text-anchor="middle">1 → 2</text>
+  <rect x="440" y="30" width="160" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="520" y="54" text-anchor="middle" class="strong">TRANSFER B</text>
+  <text x="520" y="72" text-anchor="middle">2 → 1</text>
+  <rect x="40" y="150" width="160" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="120" y="180" text-anchor="middle" class="strong">WALLET 1</text>
+  <rect x="440" y="150" width="160" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="520" y="180" text-anchor="middle" class="strong">WALLET 2</text>
+  <line x1="120" y1="150" x2="120" y2="88" class="blue" stroke-width="1.5" />
+  <text x="128" y="124" class="blue-t">HELD BY A</text>
+  <line x1="520" y1="150" x2="520" y2="88" class="blue" stroke-width="1.5" />
+  <text x="512" y="124" text-anchor="end" class="blue-t">HELD BY B</text>
+  <line x1="200" y1="72" x2="440" y2="168" class="ink dash" stroke-width="1.2" />
+  <line x1="440" y1="72" x2="200" y2="168" class="ink dash" stroke-width="1.2" />
+  <text x="320" y="96" text-anchor="middle">A WAITS FOR 2</text>
+  <text x="320" y="152" text-anchor="middle">B WAITS FOR 1</text>
+  <text x="320" y="222" text-anchor="middle" class="strong">A CYCLE OF WAITING: NOBODY CAN MOVE</text>
+</svg>
+</Figure>
+
+A <Term w="deadlock">Two or more transactions each waiting for a lock that another one holds, in a cycle, so none can ever proceed.</Term> doesn't fix itself. Postgres runs a deadlock check when a transaction has been waiting for a lock longer than `deadlock_timeout` (1 s by default). If it finds a cycle, it picks a victim and aborts it with SQLSTATE `40P01`, `deadlock detected`, and a detail line naming the processes and the row. The other transaction gets its lock and carries on. From the application's side, a deadlock is just another error that means "retry the whole transaction".
+
+The prevention is boring and effective: **always lock rows in the same order.** Sort the two wallet ids and touch the smaller first, or `SELECT ... WHERE id IN (1, 2) ORDER BY id FOR UPDATE`. A cycle needs someone going the other way around. Short transactions help too, because a deadlock needs two transactions to be holding locks at the same time.
+
+### Across two databases: why people avoid distributed transactions
+
+Everything so far happens inside one Postgres. Now suppose the wallet lives in Postgres and the record of the agent run lives in another service with its own database, and you want "charge credits and mark the run paid" to be atomic across both.
+
+The textbook answer is <Term w="two-phase commit">2PC. A coordinator asks every participating database to prepare (do everything except the final commit and promise it can commit), and only if all say yes tells them all to commit.</Term>. Phase one, the coordinator asks each database "can you commit?", and each one writes everything durably, keeps its locks, and votes yes. Phase two, if every vote was yes, the coordinator says commit. It works, and Postgres supports it (`PREPARE TRANSACTION`, off by default: `max_prepared_transactions` is 0). People avoid it because of the gap between the phases: a participant that voted yes has promised to commit and so can't decide on its own anymore. If the coordinator dies right then, every participant sits holding its locks, possibly for a long time, until the coordinator comes back. Your wallet row is frozen because some other service crashed. Throughput is also bounded by the slowest participant and extra round trips. So most systems design around it.
+
+The two tools they use instead:
+
+**Idempotency keys.** Make every operation safe to repeat. The caller generates a unique key per logical action ("charge for step 7 of run abc"), and the credits service stores it with a `UNIQUE` constraint in the same transaction as the charge. A retry with the same key finds the row already there and returns the original result instead of charging twice. Now the caller can retry freely after any failure or timeout. Stripe's API works exactly this way with its `Idempotency-Key` header. An <Term w="idempotent">An operation that has the same effect whether you do it once or many times. "Set balance to 90" is idempotent; "subtract 10" is not, unless you deduplicate it.</Term> charge turns "exactly once" (impossible over a network) into "at least once, with duplicates ignored" (easy).
+
+**The outbox pattern.** Don't write to two systems. Write to one database, twice, in one local transaction: the charge, and a row in an `outbox` table saying "tell the runs service that run abc is paid". A separate relay process reads the outbox and delivers those messages (to a queue or the other service), retrying until each is acknowledged. The local transaction makes the charge and the message atomic; the relay makes delivery eventual; idempotency on the receiving end makes duplicate deliveries harmless.
+
+<Figure n="006" title="THE OUTBOX" caption="One local transaction writes both the charge and the message about it, so they can't disagree. A relay delivers outbox rows at least once; the receiver ignores duplicates by their idempotency key. No transaction ever spans two databases.">
+<svg viewBox="0 0 640 240" role="img" aria-label="Credits service writes wallet and outbox in one transaction; a relay delivers outbox rows to the runs service">
+  <rect x="10" y="30" width="300" height="150" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="52" class="strong">CREDITS DB · ONE TRANSACTION</text>
+  <rect x="22" y="66" width="130" height="46" class="fill-paper" stroke-width="1" />
+  <text x="87" y="86" text-anchor="middle" class="strong">wallets</text>
+  <text x="87" y="102" text-anchor="middle">balance -10</text>
+  <rect x="166" y="66" width="130" height="46" class="fill-paper" stroke-width="1" />
+  <text x="231" y="86" text-anchor="middle" class="strong">outbox</text>
+  <text x="231" y="102" text-anchor="middle">"run abc paid"</text>
+  <rect x="22" y="122" width="274" height="46" class="fill-paper" stroke-width="1" />
+  <text x="159" y="142" text-anchor="middle" class="strong">ledger</text>
+  <text x="159" y="158" text-anchor="middle">key = run-abc-step-7 (UNIQUE)</text>
+  <rect x="360" y="66" width="110" height="46" class="fill-paper" stroke-width="1.2" />
+  <text x="415" y="86" text-anchor="middle" class="strong">RELAY</text>
+  <text x="415" y="102" text-anchor="middle">retry until ack</text>
+  <rect x="510" y="56" width="120" height="66" class="fill-wash" stroke-width="1.2" />
+  <text x="570" y="80" text-anchor="middle" class="strong">RUNS SERVICE</text>
+  <text x="570" y="96" text-anchor="middle">own DB</text>
+  <text x="570" y="112" text-anchor="middle">dedupe by key</text>
+  <line x1="296" y1="89" x2="360" y2="89" class="blue" stroke-width="1.2" />
+  <line x1="470" y1="89" x2="510" y2="89" class="blue" stroke-width="1.2" />
+  <text x="328" y="80" text-anchor="middle" class="blue-t">POLL</text>
+  <text x="490" y="80" text-anchor="middle" class="blue-t">SEND</text>
+  <text x="10" y="214">ATOMIC: LOCAL TRANSACTION</text>
+  <text x="360" y="214">EVENTUAL: AT LEAST ONCE + IDEMPOTENT</text>
+</svg>
+</Figure>
+
+You'll meet both again: idempotency keys in [The life of an API](/lessons/api-lifecycle/), and the relay-plus-queue half in [Queues and logs](/lessons/queues/).
+
+<Predict id="lost-credits">
+Before you build anything: 8 Python threads, each with its own connection, each doing 500 naive charges of 1 credit against one wallet of 100,000, at READ COMMITTED. Roughly how much will the balance drop? What fraction of charges get lost? Then: if you fix it with optimistic retries, how many retries do you expect in total?
+<Fragment slot="answer">
+
+On my M4 Pro the balance dropped by only 509 to 572 across two runs, out of 4,000 charges, so about 86% were lost. That seems absurdly high until you think about timing: each charge is a few round trips to Postgres, a sizeable fraction of a millisecond, and with 8 workers on one row almost every read overlaps someone else's read-to-write window. When the window is that wide and 8 workers share one row, losing most updates is the normal case.
+
+Optimistic retries: about 19,000 retries for 4,000 successful charges, so almost 5 failed attempts per success. With 8 workers hammering one row, a worker that reads and then tries to write usually finds that one of the other 7 got there first. You'll measure this.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Everything goes in one folder, say `~/workbench/txn/`. One Postgres, one Python file per experiment, and one shared harness. Python threads are fine for this: `psycopg` releases the GIL while it waits on the network, so the threads genuinely overlap their transactions (exactly the I/O-bound case from the threads lesson). Each thread needs its own connection, because a connection can only be in one transaction at a time.
+
+<Task id="t0" title="Get Postgres, the schema and the harness" agent="ok">
+
+Any of these gets you a Postgres 16 or newer:
+
+- **Homebrew:** `brew install postgresql@16 && brew services start postgresql@16`, then connect with `postgresql://localhost/postgres` (check `brew info postgresql@16` for the exact role name; often it's your macOS username).
+- **Docker** (Mac or Spark): `docker run -d --name pg -e POSTGRES_PASSWORD=pg -p 5432:5432 postgres:16`, then `postgresql://postgres:pg@localhost:5432/postgres`.
+- **No install at all:** `pip install pgserver` bundles Postgres binaries in a Python package. This is what I used for the numbers in this lesson: `srv = pgserver.get_server("./pgdata")` starts a server in that folder, and `srv.get_uri()` returns its URI (check the project's README if the API has moved).
+
+Then `pip install "psycopg[binary]"` for the driver (psycopg 3).
+
+```python
+# harness.py
+import os, threading, time
+import psycopg
+
+URI = os.environ.get("PG_URI", "postgresql://postgres:pg@localhost:5432/postgres")
+START, WORKERS, N, COST = 100_000, 8, 500, 1
+
+SCHEMA = """
+DROP TABLE IF EXISTS ledger, wallets;
+CREATE TABLE wallets (
+  id      int PRIMARY KEY,
+  balance bigint NOT NULL CHECK (balance >= 0),
+  version int    NOT NULL DEFAULT 0
+);
+CREATE TABLE ledger (
+  id        bigserial PRIMARY KEY,
+  wallet_id int    NOT NULL REFERENCES wallets(id),
+  amount    bigint NOT NULL
+);
+"""
+
+def reset():
+    with psycopg.connect(URI, autocommit=True) as c:
+        c.execute(SCHEMA)
+        c.execute("INSERT INTO wallets (id, balance) VALUES (1, %s)", (START,))
+
+def audit(label, dt, retries=0):
+    with psycopg.connect(URI) as c:
+        bal = c.execute("SELECT balance FROM wallets WHERE id = 1").fetchone()[0]
+        charged = -c.execute("SELECT coalesce(sum(amount), 0) FROM ledger").fetchone()[0]
+    lost = (START - charged) - bal
+    print(f"{label:14s} ledger says {charged:5d} charged, balance {bal}, "
+          f"should be {START - charged}, lost {-lost:5d}, retries {retries:6d}, {dt:.2f}s")
+
+def run(label, charge, workers=WORKERS, n=N):
+    """Reset, then run `charge(conn)` n times in each of `workers` threads, all starting together."""
+    reset()
+    stats = {"retries": 0}
+    gate = threading.Barrier(workers)
+    def worker():
+        with psycopg.connect(URI) as conn:
+            gate.wait()
+            for _ in range(n):
+                stats["retries"] += charge(conn) or 0
+    threads = [threading.Thread(target=worker) for _ in range(workers)]
+    t = time.perf_counter()
+    for th in threads: th.start()
+    for th in threads: th.join()
+    audit(label, time.perf_counter() - t, stats["retries"])
+```
+
+The invariant the audit checks: **starting balance minus the sum of the ledger must equal the balance**. A charge function returns the number of retries it needed (or nothing).
+
+</Task>
+
+<Task id="t1" title="Lose money on purpose" agent="hands">
+
+Write the naive charge: read the balance, check it, write `balance - COST`, insert a ledger row, all inside one transaction. Use `with conn.transaction():` (psycopg 3) so it commits at the end of the block and rolls back on any exception.
+
+```python
+# naive.py
+from harness import run, COST
+
+def charge_naive(conn):
+    with conn.transaction():
+        ...  # SELECT balance; if too low, return; UPDATE to the computed value; INSERT ledger row
+
+if __name__ == "__main__":
+    run("naive", charge_naive)
+```
+
+Write your prediction in the Measure table first. Then run it three times. Then run it with `workers=1` and confirm the loss goes to zero: it's the concurrency, not your arithmetic.
+
+Last, run it once more with `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ` as the first statement inside the transaction block and *no* retry. Catch `psycopg.errors.SerializationFailure` and count them. The balance is now correct for the charges that went through. How many charges failed, and what's the error text?
+
+</Task>
+
+<Task id="t2" title="Fix it four ways" agent="hands">
+
+Four functions in `fixes.py`, each run through `run()`. Each must leave `lost 0`.
+
+```python
+# fixes.py
+import psycopg
+from psycopg import errors
+from harness import run, COST
+
+def charge_atomic(conn):
+    """One UPDATE ... SET balance = balance - %s WHERE id = 1 AND balance >= %s RETURNING balance.
+    Insert the ledger row only if a row came back. Same transaction."""
+
+def charge_for_update(conn):
+    """SELECT balance ... FOR UPDATE, then the same Python logic as the naive version."""
+
+def charge_optimistic(conn) -> int:
+    """Read balance and version. UPDATE ... WHERE id = 1 AND version = <what you read>.
+    cur.rowcount tells you whether it matched. If 0, the transaction did nothing useful:
+    leave it and loop. Return how many times you looped."""
+
+def charge_serializable(conn) -> int:
+    """The naive body, at SERIALIZABLE, in a retry loop that catches errors.SerializationFailure.
+    The retry must restart the WHOLE transaction, not just the failed statement."""
+
+if __name__ == "__main__":
+    for name, fn in [("atomic", charge_atomic), ("for update", charge_for_update),
+                     ("optimistic", charge_optimistic), ("serializable", charge_serializable)]:
+        run(name, fn)
+```
+
+Hints:
+
+- `conn.execute(...)` returns a cursor; `.fetchone()` is `None` when `RETURNING` produced no row; `.rowcount` is the number of rows an `UPDATE` touched.
+- To set the level, run `SET TRANSACTION ISOLATION LEVEL SERIALIZABLE` as the first statement inside `with conn.transaction():`, or set `conn.isolation_level = psycopg.IsolationLevel.SERIALIZABLE` once per connection (check the psycopg docs for the version you installed).
+- When a statement fails inside `with conn.transaction():`, psycopg rolls the transaction back as the exception leaves the block. Catch the exception *outside* the `with`, then loop.
+- Put a cap on retries (say 1,000) and raise if you hit it. An infinite retry loop is a hang waiting to happen.
+
+</Task>
+
+<Task id="t3" title="Write skew: the doctors" agent="hands">
+
+This one needs a precise interleaving, not a load test, so drive two connections by hand from one script: `a = psycopg.connect(URI)` and `b = psycopg.connect(URI)`, and call their statements in the order you choose.
+
+```python
+# skew.py
+import psycopg
+from harness import URI
+
+def setup():
+    """doctors(name text primary key, on_call bool not null), with alice and bob both on call."""
+
+def attempt(level: str):
+    setup()
+    a, b = psycopg.connect(URI), psycopg.connect(URI)
+    # 1. both: SET TRANSACTION ISOLATION LEVEL <level>
+    # 2. a counts on-call doctors, then b counts (both should see 2)
+    # 3. a takes alice off call, b takes bob off call
+    # 4. a.commit(), then b.commit(): wrap each in try/except and print what happened
+    # 5. print how many doctors are on call now
+```
+
+Run it at `repeatable read` and at `serializable`. Print the full error message for the one that fails: the `DETAIL` and `HINT` lines are worth reading.
+
+Then do the TinyFish version: a `sessions(id serial, wallet_id int)` table and the rule "at most 3 sessions per wallet". Two connections each count (2), each insert. Show 4 sessions at REPEATABLE READ. Fix it two ways: SERIALIZABLE, and (staying at READ COMMITTED) by first locking the wallet's own row with `SELECT ... FROM wallets WHERE id = 1 FOR UPDATE` so that both transactions contend on something real. That second trick has a name worth remembering: materializing the conflict.
+
+</Task>
+
+<Task id="t4" title="Make a deadlock and read it" agent="explain">
+
+Two wallets, ids 1 and 2. Connection `a` updates wallet 1, connection `b` updates wallet 2. Then, in two threads, `a` updates wallet 2 and `b` updates wallet 1. One of them will hang for about a second and then raise `psycopg.errors.DeadlockDetected`. Print the whole message. Mine read:
+
+```text
+deadlock detected
+DETAIL:  Process 46616 waits for ShareLock on transaction 58528; blocked by process 46617.
+Process 46617 waits for ShareLock on transaction 58527; blocked by process 46616.
+CONTEXT:  while updating tuple (0,2) in relation "accounts"
+```
+
+Explain each part out loud (an agent may help you decode it, not write the code): why is the lock it waits on a lock on a *transaction*, not on a row? (Hint: a row's `xmax` points at the transaction that is changing it; to wait for the row, you wait for that transaction to finish.) What is tuple `(0,2)`? Time how long the hang lasted and compare it to `SHOW deadlock_timeout`. Then fix it by ordering the updates by id, and show the deadlock is gone.
+
+</Task>
+
+<Task id="t5" title="Look at the row versions" agent="explain">
+
+Open two `psql` sessions (or two Python REPLs) on the same database.
+
+- In session 1: `BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT xmin, xmax, * FROM wallets;` and `SELECT pg_current_xact_id();`
+- In session 2: `UPDATE wallets SET balance = balance - 1 WHERE id = 1;` (autocommits), then `SELECT xmin, xmax, * FROM wallets;`
+- Back in session 1, select again. You should still see the old balance and the old `xmin`. That's your snapshot.
+- In session 1, try `UPDATE wallets SET balance = balance - 1 WHERE id = 1;` and read the error.
+
+Match each thing you saw to Figure 003.
+
+</Task>
+
+<DoneWhen>
+
+- The naive run shows a nonzero `lost` every time with 8 workers and zero with 1 worker.
+- All four fixes show `lost 0`, and you have their retries and times in the Measure table.
+- `skew.py` leaves 0 doctors on call at REPEATABLE READ and 1 at SERIALIZABLE, and the session cap holds under both of your fixes.
+- You produced a deadlock, can explain every line of the error, and made it impossible by ordering locks.
+- You can say, for each fix, who waits and who retries.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Run each configuration at least twice; timings are noisy (my Mac was busy with other work and the same run varied by 2-5x), but correctness and retry counts are stable.
+
+| Method | Lost credits | Retries / failures | Time | Prediction |
+| --- | --- | --- | --- | --- |
+| naive, 8 workers | | | | |
+| naive, 1 worker | | | | |
+| naive at REPEATABLE READ, no retry | | | | |
+| atomic UPDATE | | | | |
+| SELECT FOR UPDATE | | | | |
+| optimistic version + retry | | | | |
+| SERIALIZABLE + retry | | | | |
+
+My reference runs: M4 Pro, Postgres 16.2 (via `pgserver`), Python 3.12, psycopg 3, 8 threads × 500 charges of 1 credit, one wallet. Yours will differ in time; the shape should not.
+
+| Method | Lost credits | Retries / failures | Time (two runs) |
+| --- | --- | --- | --- |
+| naive | 3,428 and 3,491 of 4,000 | 0 | 0.5 s, 1.7 s |
+| naive at REPEATABLE READ, no retry | 0 | 3,166 to 3,223 charges failed | 0.9 s, 1.4 s |
+| atomic UPDATE | 0 | 0 | 0.5 s, 1.4 s |
+| SELECT FOR UPDATE | 0 | 0 | 0.6 s, 3.8 s |
+| optimistic version | 0 | ~19,000 | 2.1 s, 11.9 s |
+| SERIALIZABLE | 0 | ~16,000 | 4.3 s, 8.3 s |
+
+What the numbers should tell you:
+
+**Naive loses most charges, not a few.** A charge is three statements and a commit, each a round trip, so the window between read and write is a good fraction of a millisecond. Eight workers on one row nearly always overlap. Note what *didn't* happen: no error, no constraint violation, ledger perfectly intact. Only the audit catches it.
+
+**REPEATABLE READ with no retry is correct but useless.** Around 80% of charges fail with `could not serialize access due to concurrent update`. The database refused to lose the update, and handed the problem back to you. An isolation level without a retry loop just converts silent data loss into loud request failures.
+
+**Atomic UPDATE is the fastest correct option.** No retries, the shortest lock hold (the lock is taken by the `UPDATE` and released at commit, with no Python in between). Workers queue on the row lock, but each one holds it very briefly.
+
+**`FOR UPDATE` is correct with zero retries,** a bit slower, because the lock is held across a Python round trip (read, think, write). On one hot row, waiting in a queue beats retrying.
+
+**The retry-based fixes are slowest here, and that's the point of the experiment.** One row, eight workers is the worst case for optimism: most attempts lose and redo all their work. Roughly 4-5 failed attempts per success. Retry-based methods shine when conflicts are rare. Check it: change the harness so each charge picks one of 100 wallets at random (sum the ledger per wallet in the audit). Predict first: retries should collapse to near zero and the optimistic and SERIALIZABLE versions should catch up with the others. Measure it yourself.
+
+**Scaling question to keep in mind.** All of these fixes funnel every charge for one wallet through one row lock, one at a time. If each charge holds the lock for about 0.25 ms, one wallet tops out around 4,000 charges a second, no matter how many servers you add. That's back-of-envelope arithmetic; measure your own number by running atomic UPDATE with more workers until throughput stops rising. Explain It Back asks what you do when one customer needs more than that.
+
+## Break It
+
+**1. Do something non-repeatable inside the retry loop.** Add a `print("charged!")` (stand-in for sending an email or calling Stripe) inside `charge_serializable`'s transaction, before the commit. Count the lines printed versus charges made: you'll see thousands of extra "charges". The database rolled back the failed attempts; the outside world did not. Side effects belong after the commit succeeds, or in an outbox row written in the same transaction (Figure 006).
+
+**2. Hold a lock while you wait on the network.** In `charge_for_update`, add `time.sleep(0.05)` between the `SELECT ... FOR UPDATE` and the `UPDATE`, standing in for a 50 ms call to a pricing service or an LLM. Predict the throughput first: with the lock held for 50 ms, one wallet can do at most 20 charges a second, however many workers you add. Run with 8 workers and fewer charges. Then look at `SELECT pid, state, wait_event_type, query FROM pg_stat_activity;` from another session while it runs: you'll see sessions waiting on a lock, and the holder as `idle in transaction`. That state is one of the most common causes of production Postgres slowdowns.
+
+**3. Remove the guard and the constraint.** Drop the `AND balance >= %s` from the atomic version, start the wallet at 1,000 credits, and run 4,000 charges. Catch `psycopg.errors.CheckViolation` inside the charge function (otherwise the worker thread dies on the first one). With the `CHECK (balance >= 0)` in place, every charge after the money runs out fails with that error, its transaction rolls back (ledger row included), and the balance stops at exactly 0: consistency (the C) and atomicity doing their jobs together. Now recreate the table without the `CHECK` and run it again. The balance goes to -3,000, and nothing complains.
+
+**4. Run SERIALIZABLE on half the code.** SSI only protects transactions that run at SERIALIZABLE. Run the doctors test with `a` at SERIALIZABLE and `b` at READ COMMITTED. Does write skew come back? It does: I ran it both ways round (a serializable, b read committed, and the reverse) and both commits succeeded with 0 doctors on call. SSI only tracks reads made by serializable transactions, and it can only abort a transaction that is itself serializable. The lesson: if you rely on SERIALIZABLE, set it as the database default (`default_transaction_isolation`), not per call site.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What does a transaction guarantee? Go letter by letter, with a failure each one prevents.</summary>
+
+A transaction is a group of operations the database treats as one unit. **Atomicity**: all or nothing. A transfer that crashes after the debit is undone entirely; the database knows because it only treats a transaction as real once its commit record is in the write-ahead log. **Consistency**: declared rules (CHECK, UNIQUE, foreign keys) hold after every transaction, so a buggy write can't leave a negative balance. It's partly the application's job: the database only enforces the rules you declared. **Isolation**: concurrent transactions don't see each other's half-done work, and, depending on the level, don't interfere; at SERIALIZABLE the result equals some one-at-a-time order, which prevents things like the lost update and write skew. **Durability**: once COMMIT returns, the change survives a crash, because the log was flushed to disk with fsync before the database answered.
+
+</details>
+
+<details>
+<summary>2. Two requests charge the same wallet at the same time and one charge disappears. What happened, and how do you fix it?</summary>
+
+A lost update. Both transactions read the balance (say 100) before either wrote; each computed a new value from its own stale read and wrote it, so the second write overwrote the first. It happens at Postgres's default READ COMMITTED even though each request is inside a transaction, because that level doesn't stop read-then-write in application code. It's the same bug as two threads doing counter += 1. Fixes, in the order I'd reach for them: do the arithmetic in one statement (UPDATE SET balance = balance - 10 WHERE balance >= 10), which is safe because the UPDATE takes the row lock and re-checks against the newest version; lock first with SELECT ... FOR UPDATE when the logic doesn't fit in one statement; optimistic concurrency with a version column and retry when conflicts are rare; or REPEATABLE READ / SERIALIZABLE with a retry loop on serialization errors.
+
+</details>
+
+<details>
+<summary>3. What is write skew, and why doesn't REPEATABLE READ stop it?</summary>
+
+Two transactions each read the same facts, each decide their write is safe based on those facts, and each write a different row; together they break a rule neither broke alone. Two on-call doctors both see "2 on call" and both leave. Postgres's REPEATABLE READ is snapshot isolation: it only complains when two transactions write the same row. Here they write different rows, so no conflict is detected. SERIALIZABLE (Postgres's SSI) also tracks what each transaction read; it sees that each read a row the other wrote, which no serial order can explain, and aborts one. Alternatives without SERIALIZABLE: lock a shared row both must touch (materializing the conflict), or turn the rule into a constraint.
+
+</details>
+
+<details>
+<summary>4. One huge customer needs 20,000 charges a second on a single wallet. Your atomic UPDATE tops out around a few thousand. How does this scale?</summary>
+
+Every fix serializes charges to one wallet through one row lock, so a single row is a hard ceiling: if each transaction holds the lock for about a quarter of a millisecond (statement plus commit flush), that's about 4,000 a second regardless of how many app servers I add. Measure the real number first. Then options, cheapest first: make each transaction as short as possible (one statement, autocommit, no Python between lock and commit); batch, so a worker accumulates charges for 50-100 ms and applies their sum in one UPDATE, with ledger rows inserted in bulk, turning 20,000 lock acquisitions into a few hundred; split the wallet into N sub-balances (a sharded counter) and charge a random one, summing them to read the balance, at the cost of a fuzzier "insufficient credits" check; or pre-allocate: each worker reserves a block of credits (say 1,000) from the wallet in one transaction and spends it locally, returning the unused part, which is how many rate limiters and quota systems work. The trade-off is always the same: you give up a perfectly precise, instantly consistent balance in exchange for throughput, so decide how much overdraft you can tolerate.
+
+</details>
+
+<details>
+<summary>5. Why do people avoid distributed transactions, and what do they do instead?</summary>
+
+Two-phase commit makes a transaction atomic across databases: a coordinator asks everyone to prepare, then tells everyone to commit. The problem is the window between the two phases: a participant that has voted yes must keep its locks and can't decide alone, so if the coordinator crashes, participants sit blocked holding locks until it recovers. It also adds round trips and ties every service's availability together. Instead, keep each transaction inside one database and make the cross-system part eventual and safe to repeat: write the change and an outbox message in one local transaction, have a relay deliver the message at least once, and make the receiver idempotent with a unique idempotency key, so duplicates are ignored. Exactly-once delivery is impossible over a network; at-least-once plus deduplication gets you the same effect.
+
+</details>
+
+## Go Deeper
+
+- **Martin Kleppmann, _Designing Data-Intensive Applications_, Chapter 7 "Transactions"** (and Chapter 9 for distributed transactions). The best explanation of isolation levels and anomalies anywhere, including the doctors example. If you read one thing, read this.
+- **PostgreSQL docs, Chapter 13 "Concurrency Control"**, especially [Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) and [Explicit Locking](https://www.postgresql.org/docs/current/explicit-locking.html). Precise about what each level does in Postgres, including the "re-check the WHERE on the newest version" behaviour of READ COMMITTED.
+- **Hal Berenson, Phil Bernstein, Jim Gray, Jim Melton, Elizabeth O'Neil, Patrick O'Neil, "A Critique of ANSI SQL Isolation Levels"**, SIGMOD 1995. Shows the SQL standard's definitions were ambiguous, defines snapshot isolation, and names write skew.
+- **Dan Ports and Kevin Grittner, "Serializable Snapshot Isolation in PostgreSQL"**, VLDB 2012. How SERIALIZABLE actually works in the database you use, by the people who built it. Builds on Cahill, Röhm and Fekete, "Serializable Isolation for Snapshot Databases", SIGMOD 2008.
+- **Jim Gray, "The Transaction Concept: Virtues and Limitations"**, VLDB 1981. Short, readable, and the origin of the whole idea. Gray and Reuter's book _Transaction Processing: Concepts and Techniques_ (1992) is the deep reference.
+- **Martin Kleppmann, Hermitage** ([github.com/ept/hermitage](https://github.com/ept/hermitage)). Hand-run tests of every anomaly against many databases, showing how differently "REPEATABLE READ" behaves across Postgres, MySQL, Oracle and others.
+- **Brandur Leach, "Implementing Stripe-like Idempotency Keys in Postgres"** (on brandur.org). A practical, detailed walkthrough of idempotency keys and transactional state machines, from someone who built them at Stripe.
+- **Kyle Kingsbury, [Jepsen: Consistency Models](https://jepsen.io/consistency)**. A map of every isolation and consistency guarantee and how they relate, from the person who tests whether databases actually keep their promises.
+
+## Connections
+
+This lesson is [Processes, threads and the GIL](/lessons/processes-threads-gil/) again, one floor down: the lost update is `counter += 1` with a network round trip in the middle, and `SELECT ... FOR UPDATE` is a lock around the critical section. Durability is [What happens when you save a file?](/lessons/files-and-disks/) applied to a log: the database is a very careful user of `fsync`.
+
+It leans forward to [Why not a JSON file?](/lessons/why-databases/) (build your own log and recovery, and see why the commit record is the moment of truth), [Indexes and B-trees](/lessons/indexes/) (Postgres's SERIALIZABLE tracks reads using index ranges, so a missing index makes it abort more), and [Queues and logs](/lessons/queues/), where the outbox relay lives. Idempotency keys come back in [The life of an API](/lessons/api-lifecycle/), and the "one hot row" ceiling is a [How does it scale?](/lessons/back-of-envelope/) problem: a lock is a queue, and a queue has a maximum throughput.

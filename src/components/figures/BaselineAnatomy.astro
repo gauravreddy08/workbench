@@ -1,0 +1,92 @@
+---
+// Static figure: where the time goes in one streaming LLM request.
+// Top row: the places the request passes through. Middle: the same request as a timeline.
+// Bottom: the two brackets people mean by "fast" (TTFT and end-to-end).
+---
+<svg viewBox="0 0 720 300" role="img" aria-label="Anatomy of a streaming request: send, handshake, queue, prefill, first token back, then a stream of decode tokens. TTFT covers everything up to the first token; end-to-end covers the whole stream.">
+  <defs>
+    <marker id="ba-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+
+  <!-- places -->
+  <rect x="10" y="14" width="96" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="58" y="31" text-anchor="middle" class="strong">CLIENT</text>
+  <text x="58" y="45" text-anchor="middle">your harness</text>
+
+  <rect x="140" y="14" width="120" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="200" y="31" text-anchor="middle" class="strong">NETWORK</text>
+  <text x="200" y="45" text-anchor="middle">LAN or internet</text>
+
+  <rect x="294" y="14" width="110" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="349" y="31" text-anchor="middle" class="strong">GATEWAY</text>
+  <text x="349" y="45" text-anchor="middle">TLS, auth</text>
+
+  <rect x="438" y="14" width="96" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="486" y="31" text-anchor="middle" class="strong">QUEUE</text>
+  <text x="486" y="45" text-anchor="middle">wait your turn</text>
+
+  <rect x="568" y="14" width="142" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="639" y="31" text-anchor="middle" class="strong">GPU</text>
+  <text x="639" y="45" text-anchor="middle">prefill, decode</text>
+
+  <line x1="106" y1="34" x2="138" y2="34" class="blue" stroke-width="1.2" marker-end="url(#ba-arr)" />
+  <line x1="260" y1="34" x2="292" y2="34" class="blue" stroke-width="1.2" marker-end="url(#ba-arr)" />
+  <line x1="404" y1="34" x2="436" y2="34" class="blue" stroke-width="1.2" marker-end="url(#ba-arr)" />
+  <line x1="534" y1="34" x2="566" y2="34" class="blue" stroke-width="1.2" marker-end="url(#ba-arr)" />
+
+  <!-- leader lines from places to segments -->
+  <line x1="58" y1="54" x2="40" y2="128" class="ink dash" stroke-width="0.8" />
+  <line x1="200" y1="54" x2="40" y2="128" class="ink dash" stroke-width="0.8" />
+  <line x1="200" y1="54" x2="368" y2="128" class="ink dash" stroke-width="0.8" />
+  <line x1="349" y1="54" x2="118" y2="128" class="ink dash" stroke-width="0.8" />
+  <line x1="486" y1="54" x2="205" y2="128" class="ink dash" stroke-width="0.8" />
+  <line x1="639" y1="54" x2="300" y2="128" class="ink dash" stroke-width="0.8" />
+  <line x1="639" y1="54" x2="540" y2="128" class="ink dash" stroke-width="0.8" />
+
+  <!-- the timeline -->
+  <rect x="10" y="130" width="60" height="26" class="fill-paper" stroke-width="1" />
+  <rect x="70" y="130" width="96" height="26" class="fill-paper dash" stroke-width="1" />
+  <rect x="166" y="130" width="80" height="26" style="fill:var(--paper-2);stroke:var(--ink-3)" stroke-width="1" />
+  <rect x="246" y="130" width="108" height="26" class="fill-blue" />
+  <rect x="354" y="130" width="34" height="26" class="fill-paper" stroke-width="1" />
+  <rect x="388" y="130" width="322" height="26" class="fill-wash" stroke-width="1" />
+  <!-- decode tokens -->
+  <g class="blue" stroke-width="1.2">
+    <line x1="388" y1="130" x2="388" y2="156" />
+    <line x1="414" y1="134" x2="414" y2="152" />
+    <line x1="440" y1="134" x2="440" y2="152" />
+    <line x1="466" y1="134" x2="466" y2="152" />
+    <line x1="492" y1="134" x2="492" y2="152" />
+    <line x1="518" y1="134" x2="518" y2="152" />
+    <line x1="544" y1="134" x2="544" y2="152" />
+    <line x1="570" y1="134" x2="570" y2="152" />
+    <line x1="596" y1="134" x2="596" y2="152" />
+    <line x1="622" y1="134" x2="622" y2="152" />
+    <line x1="648" y1="134" x2="648" y2="152" />
+    <line x1="674" y1="134" x2="674" y2="152" />
+    <line x1="700" y1="134" x2="700" y2="152" />
+  </g>
+  <!-- ITL callout -->
+  <line x1="440" y1="120" x2="466" y2="120" class="ink" stroke-width="1" marker-start="url(#ba-arr)" marker-end="url(#ba-arr)" />
+  <text x="453" y="114" text-anchor="middle" class="blue-t">ITL</text>
+
+  <text x="40" y="174" text-anchor="middle">½ RTT</text>
+  <text x="118" y="174" text-anchor="middle">TCP + TLS</text>
+  <text x="118" y="187" text-anchor="middle">first call</text>
+  <text x="206" y="174" text-anchor="middle">QUEUE</text>
+  <text x="300" y="174" text-anchor="middle" class="strong">PREFILL</text>
+  <text x="300" y="187" text-anchor="middle">compute-bound</text>
+  <text x="371" y="174" text-anchor="middle">½ RTT</text>
+  <text x="549" y="174" text-anchor="middle" class="strong">DECODE STREAM</text>
+  <text x="549" y="187" text-anchor="middle">bandwidth-bound, one token per step</text>
+
+  <!-- brackets -->
+  <path d="M10,212 v8 h378 v-8" class="blue" stroke-width="1.2" />
+  <text x="199" y="236" text-anchor="middle" class="blue-t">TIME TO FIRST TOKEN (TTFT)</text>
+  <path d="M10,254 v8 h700 v-8" class="ink" stroke-width="1.2" />
+  <text x="360" y="280" text-anchor="middle" class="strong">END-TO-END LATENCY</text>
+  <text x="10" y="296">t = 0: request leaves your code</text>
+  <text x="710" y="296" text-anchor="end">last token arrives</text>
+</svg>

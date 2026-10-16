@@ -1,0 +1,318 @@
+---
+// A Bitcask-style store: an append-only log on "disk" (segments of records) and an in-memory hash
+// index of key -> (segment, byte offset). Put, get, delete, compact, crash, and replay the log to
+// rebuild the index. Crash with "tear the last write" on to see the CRC catch a half-written record.
+---
+<div class="dbl" data-fig="db-log-index">
+  <div class="ctl dbl-top">
+    <span>Key</span>
+    <button class="btn" type="button" data-key="a" aria-pressed="true">a</button>
+    <button class="btn" type="button" data-key="b" aria-pressed="false">b</button>
+    <button class="btn" type="button" data-key="c" aria-pressed="false">c</button>
+    <button class="btn" type="button" data-key="d" aria-pressed="false">d</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-op="put">Put</button>
+    <button class="btn" type="button" data-op="get">Get</button>
+    <button class="btn" type="button" data-op="del">Delete</button>
+    <button class="btn" type="button" data-op="compact">Compact</button>
+    <button class="btn" type="button" data-op="crash">Crash</button>
+    <button class="btn" type="button" data-op="replay">Replay log</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-torn aria-pressed="false">Tear the last write: off</button>
+    <button class="btn" type="button" data-op="reset">Reset</button>
+  </div>
+
+  <div class="dbl-grid">
+    <div class="dbl-mem">
+      <div class="label">RAM · hash index <span data-state></span></div>
+      <table class="dbl-idx">
+        <thead><tr><th>key</th><th>→ where</th></tr></thead>
+        <tbody data-idx></tbody>
+      </table>
+    </div>
+    <div class="dbl-disk">
+      <div class="label">Disk · append-only log</div>
+      <div data-segs></div>
+    </div>
+  </div>
+
+  <div class="dbl-stats">
+    <span>log <b class="readout" data-total>0</b> B</span>
+    <span>live <b class="readout" data-live>0</b> B</span>
+    <span>garbage <b class="readout" data-junk>0</b>%</span>
+  </div>
+  <p class="dbl-msg" data-msg></p>
+</div>
+
+<style is:global>
+  .dbl-top { margin-top: 0; }
+  .dbl .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .dbl-grid { display: grid; grid-template-columns: minmax(0, 150px) minmax(0, 1fr); gap: 14px; margin-top: 16px; align-items: start; }
+  .dbl-mem, .dbl-disk { border: 1px solid var(--ink); background: var(--paper); padding: 8px 10px 10px; min-width: 0; }
+  .dbl-mem .label, .dbl-disk .label { font-size: 10.5px; display: block; margin-bottom: 6px; }
+  .dbl-idx { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
+  .dbl-idx th { font-weight: 400; color: var(--ink-3); text-align: left; font-size: 10.5px; border-bottom: 1px solid var(--rule); padding: 2px 4px 4px 0; }
+  .dbl-idx td { padding: 4px 4px 4px 0; border-bottom: 1px solid var(--rule); color: var(--ink); }
+  .dbl-idx tr.hit td { color: var(--blue); font-weight: 600; background: var(--blue-wash); }
+  .dbl-idx tr.empty td { color: var(--ink-3); font-style: italic; }
+  .dbl-mem.wiped { border-style: dashed; border-color: var(--warn); }
+  .dbl-seg { margin-bottom: 8px; }
+  .dbl-seg:last-child { margin-bottom: 0; }
+  .dbl-seg-h { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); margin-bottom: 3px; }
+  .dbl-recs { display: flex; flex-wrap: wrap; gap: 4px; }
+  .dbl-rec { font-family: var(--mono); font-size: 11.5px; line-height: 1.25; border: 1px solid var(--blue); background: var(--blue-fill); color: var(--ink); padding: 3px 6px; min-width: 52px; }
+  .dbl-rec small { display: block; font-size: 9.5px; color: var(--ink-3); }
+  .dbl-rec.stale { background: var(--paper); border-color: var(--rule); color: var(--ink-3); text-decoration: line-through; text-decoration-color: var(--ink-3); }
+  .dbl-rec.tomb { background: var(--paper); border-style: dashed; border-color: var(--ink-3); color: var(--ink-2); }
+  .dbl-rec.torn { background: var(--paper); border: 1px dashed var(--warn); color: var(--warn); }
+  .dbl-rec.hit { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .dbl-rec.cursor { outline: 2px solid var(--ink); outline-offset: 1px; }
+  .dbl-rec.new { box-shadow: 0 0 0 1px var(--blue) inset; }
+  .dbl-stats { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .dbl-msg { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; min-height: 3.2em; }
+  @media (max-width: 520px) {
+    .dbl-grid { grid-template-columns: minmax(0, 1fr); }
+  }
+</style>
+
+<script>
+  type Rec = { key: string; val: string | null; off: number; size: number; torn?: boolean };
+  type Seg = { id: number; recs: Rec[] };
+  type Ptr = { seg: number; off: number };
+
+  const SEG_MAX = 6; // records per segment before the active file is closed
+  const HDR = 12; // crc32 + key length + value length, 4 bytes each
+
+  const recSize = (k: string, v: string | null) => HDR + k.length + (v === null ? 0 : v.length);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="db-log-index"]').forEach((root) => {
+    const $ = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const keyBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-key]')];
+    const opBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-op]')];
+    const tornBtn = $<HTMLButtonElement>('[data-torn]');
+    const idxEl = $<HTMLElement>('[data-idx]');
+    const segsEl = $<HTMLElement>('[data-segs]');
+    const memEl = $<HTMLElement>('.dbl-mem');
+    const stateEl = $<HTMLElement>('[data-state]');
+    const msgEl = $<HTMLElement>('[data-msg]');
+    const totalEl = $<HTMLElement>('[data-total]');
+    const liveEl = $<HTMLElement>('[data-live]');
+    const junkEl = $<HTMLElement>('[data-junk]');
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    let segs: Seg[] = [];
+    let index = new Map<string, Ptr>();
+    let key = 'a';
+    let tear = false;
+    let crashed = false;
+    let replaying = false;
+    let ver: Record<string, number> = {};
+    let hit: { seg: number; off: number } | null = null;
+    let hitKey: string | null = null;
+    let cursor: { seg: number; off: number } | null = null;
+    let segCounter = 0;
+    let timer: number | undefined;
+
+    const active = () => segs[segs.length - 1];
+
+    function append(k: string, v: string | null, torn = false): Ptr {
+      let seg = active();
+      if (!seg || seg.recs.length >= SEG_MAX) {
+        seg = { id: segCounter++, recs: [] };
+        segs.push(seg);
+      }
+      const last = seg.recs[seg.recs.length - 1];
+      const off = last ? last.off + last.size : 0;
+      const size = torn ? Math.ceil(recSize(k, v) / 2) : recSize(k, v);
+      seg.recs.push({ key: k, val: v, off, size, torn });
+      return { seg: seg.id, off };
+    }
+
+    function nextVal(k: string) {
+      ver[k] = (ver[k] ?? 0) + 1;
+      return `v${ver[k]}`;
+    }
+
+    function put(k: string) {
+      const v = nextVal(k);
+      const p = append(k, v);
+      index.set(k, p);
+      hit = p; hitKey = k;
+      say(`put(${k}, ${v}): appended ${recSize(k, v)} bytes at the end of segment ${p.seg}, offset ${p.off}. Then pointed index[${k}] at it. The old ${k}, if any, is still on disk, now garbage.`);
+    }
+
+    function get(k: string) {
+      const p = index.get(k);
+      if (!p) { hit = null; hitKey = k; say(`get(${k}): not in the index, so not in the store. Zero disk reads.`); return; }
+      const r = findRec(p)!;
+      hit = p; hitKey = k;
+      say(`get(${k}): one hash lookup in RAM gives segment ${p.seg} @ ${p.off}, then one read of ${r.size} bytes from disk → ${r.val}. Never scans the log.`);
+    }
+
+    function del(k: string) {
+      if (!index.has(k)) { say(`delete(${k}): nothing to delete.`); return; }
+      const p = append(k, null);
+      index.delete(k);
+      hit = p; hitKey = null;
+      say(`delete(${k}): you can't erase from an append-only log, so append a tombstone record that says "${k} is gone", and drop ${k} from the index. Replay will see the tombstone too.`);
+    }
+
+    function compact() {
+      const live = [...index.entries()].map(([k, p]) => ({ k, v: findRec(p)!.val }));
+      const before = totalBytes();
+      segs = []; index = new Map();
+      for (const { k, v } of live) index.set(k, append(k, v));
+      hit = null; hitKey = null;
+      say(`compact: copied only the records the index points at into fresh segments, then swapped them in (write new file, fsync, rename) and deleted the old ones. ${before} B → ${totalBytes()} B. Stale values and tombstones are gone.`);
+    }
+
+    function crash() {
+      if (tear) {
+        const k = key; const v = `v${(ver[k] ?? 0) + 1}`;
+        append(k, v, true);
+      }
+      index = new Map();
+      crashed = true; hit = null; hitKey = null;
+      say(tear
+        ? `crash in the middle of put(${key}): only the first half of the record reached the disk. The process is gone, and so is the index: it only ever lived in RAM. The log is all that is left. Press Replay log.`
+        : `crash: the process died. The index lived in RAM, so it's gone. Every record that was fully written is still in the log. Press Replay log.`);
+    }
+
+    function replay() {
+      if (replaying) return;
+      replaying = true; index = new Map(); hit = null; hitKey = null;
+      const order: { seg: Seg; i: number }[] = [];
+      segs.forEach((s) => s.recs.forEach((_, i) => order.push({ seg: s, i })));
+      let n = 0; let ok = 0; let cut = false;
+      const step = () => {
+        if (n >= order.length) {
+          replaying = false; crashed = false; cursor = null;
+          say(`replay done: ${ok} good records read start to finish${cut ? ', torn tail cut off' : ''}, ${index.size} live keys rebuilt. This is why startup gets slower as the log grows, and why compaction (and Bitcask's hint files) matter.`);
+          draw(); return;
+        }
+        const { seg, i } = order[n++];
+        const r = seg.recs[i];
+        cursor = { seg: seg.id, off: r.off };
+        if (r.torn) {
+          seg.recs.splice(i);
+          say(`segment ${seg.id} @ ${r.off}: the record's length says more bytes should follow than the file has, and the CRC over what is there doesn't match. Torn write. Truncate the log here and stop.`);
+          n = order.length; cut = true;
+        } else if (r.val === null) {
+          ok++;
+          index.delete(r.key);
+          say(`segment ${seg.id} @ ${r.off}: CRC ok, tombstone for ${r.key} → remove ${r.key} from the index.`);
+        } else {
+          ok++;
+          index.set(r.key, { seg: seg.id, off: r.off });
+          say(`segment ${seg.id} @ ${r.off}: CRC ok, ${r.key}=${r.val} → index[${r.key}] = ${seg.id} @ ${r.off}. A later record for ${r.key} will overwrite this.`);
+        }
+        draw();
+        if (reduce) step(); else timer = window.setTimeout(step, 700);
+      };
+      step();
+    }
+
+    function findRec(p: Ptr) {
+      return segs.find((s) => s.id === p.seg)?.recs.find((r) => r.off === p.off);
+    }
+    const totalBytes = () => segs.reduce((a, s) => a + s.recs.reduce((b, r) => b + r.size, 0), 0);
+    const liveBytes = () => [...index.values()].reduce((a, p) => a + (findRec(p)?.size ?? 0), 0);
+    const say = (t: string) => { msgEl.textContent = t; };
+
+    function draw() {
+      // index
+      const keys = [...index.keys()].sort();
+      idxEl.replaceChildren();
+      if (keys.length === 0) {
+        const tr = document.createElement('tr'); tr.className = 'empty';
+        tr.innerHTML = `<td colspan="2">${crashed ? 'lost in crash' : 'empty'}</td>`;
+        idxEl.append(tr);
+      }
+      for (const k of keys) {
+        const p = index.get(k)!;
+        const tr = document.createElement('tr');
+        if (k === hitKey) tr.className = 'hit';
+        const a = document.createElement('td'); a.textContent = k;
+        const b = document.createElement('td'); b.textContent = `seg ${p.seg} @ ${p.off}`;
+        tr.append(a, b); idxEl.append(tr);
+      }
+      memEl.classList.toggle('wiped', crashed && !replaying);
+      stateEl.textContent = replaying ? '(rebuilding)' : crashed ? '(gone)' : '';
+
+      // segments
+      segsEl.replaceChildren();
+      segs.forEach((s, si) => {
+        const box = document.createElement('div'); box.className = 'dbl-seg';
+        const h = document.createElement('div'); h.className = 'dbl-seg-h';
+        const isActive = si === segs.length - 1;
+        h.textContent = `segment ${s.id} · ${isActive ? 'active, appending' : 'closed, read-only'}`;
+        const row = document.createElement('div'); row.className = 'dbl-recs';
+        for (const r of s.recs) {
+          const el = document.createElement('div');
+          const p = index.get(r.key);
+          const live = !!p && p.seg === s.id && p.off === r.off;
+          let cls = 'dbl-rec';
+          if (r.torn) cls += ' torn';
+          else if (r.val === null) cls += ' tomb';
+          else if (!live && !replaying) cls += ' stale';
+          if (hit && hit.seg === s.id && hit.off === r.off) cls += ' hit';
+          if (cursor && cursor.seg === s.id && cursor.off === r.off) cls += ' cursor';
+          el.className = cls;
+          const label = r.torn ? `${r.key}=??` : r.val === null ? `${r.key} ✕del` : `${r.key}=${r.val}`;
+          el.innerHTML = `<small>@${r.off}${r.torn ? ' torn' : ''}</small>`;
+          el.append(document.createTextNode(label));
+          row.append(el);
+        }
+        box.append(h, row); segsEl.append(box);
+      });
+
+      const t = totalBytes(), l = liveBytes();
+      totalEl.textContent = String(t);
+      liveEl.textContent = String(l);
+      junkEl.textContent = t ? String(Math.round(((t - l) / t) * 100)) : '0';
+
+      for (const b of opBtns) {
+        const op = b.dataset.op;
+        if (op === 'reset') { b.disabled = false; continue; }
+        if (replaying) { b.disabled = true; continue; }
+        b.disabled = crashed ? op !== 'replay' : op === 'replay';
+      }
+      keyBtns.forEach((b) => (b.disabled = replaying));
+      tornBtn.disabled = crashed || replaying;
+    }
+
+    function reset() {
+      if (timer) clearTimeout(timer);
+      segs = []; index = new Map(); ver = {}; segCounter = 0;
+      crashed = false; replaying = false; hit = null; hitKey = null; cursor = null;
+      for (const [k] of [['a'], ['b'], ['c'], ['a'], ['b']]) index.set(k, append(k, nextVal(k)));
+      say('Five puts so far: a, b, c, then a and b again. The old a and b are still on disk but nothing points at them. Pick a key and try put, get, delete, compact, then crash.');
+      draw();
+    }
+
+    keyBtns.forEach((b) => b.addEventListener('click', () => {
+      key = b.dataset.key!;
+      keyBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+    }));
+    tornBtn.addEventListener('click', () => {
+      tear = !tear;
+      tornBtn.setAttribute('aria-pressed', String(tear));
+      tornBtn.textContent = `Tear the last write: ${tear ? 'on' : 'off'}`;
+    });
+    opBtns.forEach((b) => b.addEventListener('click', () => {
+      cursor = null;
+      const op = b.dataset.op;
+      if (op === 'put') put(key);
+      else if (op === 'get') get(key);
+      else if (op === 'del') del(key);
+      else if (op === 'compact') compact();
+      else if (op === 'crash') crash();
+      else if (op === 'replay') { replay(); return; }
+      else if (op === 'reset') { reset(); return; }
+      draw();
+    }));
+    reset();
+  });
+</script>

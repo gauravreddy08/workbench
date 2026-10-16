@@ -1,0 +1,776 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import HTTPAnatomy from '../components/figures/HTTPAnatomy.astro';
+
+## Today
+
+- Type an HTTP request by hand into a raw TCP connection, to example.com and to your own server, and read the reply line by line.
+- Explain every part of a request and response: request line, headers, blank line, body, status codes, and the two ways a body says where it ends (Content-Length and chunked).
+- Write an HTTP/1.1 server with nothing but Python's `socket` module that serves JSON, returns correct status codes, reuses connections, and survives garbage input. Then make it concurrent with threads and with asyncio.
+- Say what ASGI is, write an ASGI app with no framework, run it under uvicorn, and list exactly what FastAPI adds on top.
+- Explain at a high level what HTTP/2 and HTTP/3 change and why.
+
+Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) and [Waiting vs working](/lessons/waiting-vs-working/) (you'll reuse your `loadgen.py` and your understanding of the event loop). Rough time: one long evening. The server is about 150 lines.
+
+## The Problem
+
+An interviewer asks, almost in passing: "Could you spin up an API yourself, in Python, without a framework?"
+
+You've shipped a dozen FastAPI services. You know `@app.post`, Pydantic models, `uvicorn main:app --reload`. But the honest answer, in that moment, is "I'd `pip install fastapi`." What is FastAPI actually *doing* when a request arrives? What arrives? Bytes? An object? Who turned it into the `dict` your function receives?
+
+Here is the whole secret, and the rest of this lesson is the proof: **HTTP is text, sent over a TCP connection.** A client connects, writes a few lines of plain text, and waits. The server reads the text, decides what it means, and writes a few lines of text back. That's it. Every framework, every API gateway, every `requests.get` is a machine for writing and reading that text.
+
+Which means yes, you can spin up an API with nothing but the `socket` module. By the end of tonight you will have, and you'll be able to explain each byte of what it sends. That's the real interview answer: not "yes, I can", but "yes, and here's what the framework is doing for me that I'd have to do by hand".
+
+It pays off at work too. A request that hangs, a proxy's 502, a streaming LLM response that stops halfway, CORS blocking a request that works in curl: the explanation is always in the text on the wire.
+
+<Origin year="1991" title="A protocol with one line">
+
+In 1989, Tim Berners-Lee, a software engineer at CERN, proposed a way for physicists to link documents across different computers. By the end of 1990 he had the first web server and the first browser running on a NeXT workstation. The protocol between them was so small it barely had a name.
+
+That first version, later called HTTP/0.9, had exactly one kind of request: a single line, `GET /some/document`, followed by a line break. The server sent back the HTML of the document and closed the connection. No version number, no headers, no status codes, no way to say "not found" except by sending an HTML page that said so. No images, because there was no way to say "this is an image".
+
+Everything else was added because the web outgrew that one line. HTTP/1.0 (1996) added a version on the request line, status codes, and headers, so a response could say what it was (`Content-Type: image/gif`). HTTP/1.1 (1997, revised 1999 and again in 2014 and 2022) made connections reusable, required the `Host` header so one machine could serve many websites, and added chunked encoding for responses whose size isn't known in advance. HTTP/2 (2015) and HTTP/3 (2022) changed how the bytes are packaged, but not what a request *means*: methods, status codes and headers are the same in all three.
+
+The text format you'll type tonight is HTTP/1.1, and it is still everywhere: between your load balancer and your app, between uvicorn and your laptop, in every `curl -v`.
+
+</Origin>
+
+## The Idea
+
+### A conversation in a pipe
+
+Start with what you already know from the networking lessons: a <Term w="TCP connection">A reliable two-way byte stream between two programs on (possibly) different machines. TCP guarantees the bytes arrive in order, without gaps, or the connection fails. It does not know or care what the bytes mean.</Term> is a pipe. Whatever bytes one end writes, the other end reads, in the same order. TCP doesn't know about messages, lines, or JSON. It's a stream: if you write 10 bytes and then 20 bytes, the other side might read them as one 30-byte chunk, or as 3 chunks of 10.
+
+A program gets at that pipe through a <Term w="socket">The operating system's handle for one end of a network connection. To your program it looks like a file descriptor you can read bytes from and write bytes to.</Term>. In Python, `socket.recv(n)` gives you up to `n` bytes that have arrived, and `socket.sendall(data)` pushes bytes in.
+
+HTTP is an agreement about what to write into that pipe. The client writes a request, the server writes a response. Both are text with a strict shape. The fact that it's text, readable by humans, typed by hand if you like, was a deliberate choice in 1991, and it's why you can debug most of the web with `curl -v` and your eyes.
+
+<Figure n="001" title="HTTP IS TEXT IN A PIPE" caption="Your program writes plain text into a socket. The kernel cuts it into TCP segments, ships them, and the other kernel hands the same bytes, in order, to the server's socket. The server reads text, writes text back. HTTP is only the agreement about what that text looks like.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Client and server programs exchanging HTTP text through sockets over a TCP connection">
+  <rect x="10" y="20" width="150" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="44" text-anchor="middle" class="strong">CLIENT</text>
+  <text x="85" y="62" text-anchor="middle">curl / browser</text>
+  <rect x="480" y="20" width="150" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="555" y="44" text-anchor="middle" class="strong">SERVER</text>
+  <text x="555" y="62" text-anchor="middle">your rawhttp.py</text>
+  <rect x="10" y="100" width="150" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="85" y="122" text-anchor="middle">SOCKET (fd 5)</text>
+  <rect x="480" y="100" width="150" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="555" y="122" text-anchor="middle">SOCKET (fd 7)</text>
+  <line x1="85" y1="76" x2="85" y2="100" class="ink" stroke-width="1.2" />
+  <line x1="555" y1="76" x2="555" y2="100" class="ink" stroke-width="1.2" />
+  <rect x="10" y="158" width="620" height="40" class="fill-paper" stroke-width="1" />
+  <text x="320" y="176" text-anchor="middle" class="strong">TCP CONNECTION: ORDERED BYTES, BOTH WAYS</text>
+  <text x="320" y="191" text-anchor="middle">kernel ↔ network ↔ kernel</text>
+  <line x1="85" y1="134" x2="85" y2="158" class="ink" stroke-width="1.2" />
+  <line x1="555" y1="134" x2="555" y2="158" class="ink" stroke-width="1.2" />
+  <line x1="172" y1="40" x2="466" y2="40" class="blue" stroke-width="1.2" marker-end="url(#h1a)" />
+  <text x="320" y="33" text-anchor="middle" class="blue-t">GET /health HTTP/1.1⏎ Host: …⏎ ⏎</text>
+  <line x1="468" y1="64" x2="174" y2="64" class="ink" stroke-width="1.2" marker-end="url(#h1b)" />
+  <text x="320" y="84" text-anchor="middle">HTTP/1.1 200 OK⏎ Content-Length: 17⏎ ⏎ &#123;"status": "ok"&#125;</text>
+  <text x="320" y="230" text-anchor="middle">⏎ = the two bytes \r\n</text>
+  <defs>
+    <marker id="h1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+    <marker id="h1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+### The shape of a request
+
+Here is exactly what `curl` sends when you run `curl -X POST -H 'Content-Type: application/json' -d '{"q": "hello"}' http://127.0.0.1:8080/v1/echo`. I captured it by pointing curl at `nc -l 8080`, a program that just prints whatever arrives (you'll do this yourself in Build It):
+
+```http
+POST /v1/echo HTTP/1.1
+Host: 127.0.0.1:8080
+User-Agent: curl/8.7.1
+Accept: */*
+Content-Type: application/json
+Content-Length: 14
+
+{"q": "hello"}
+```
+
+Four parts, always in this order:
+
+1. **The request line.** Three things separated by single spaces: the <Term w="method">The verb of the request: what you want done. GET (give me), POST (here, process this), PUT, PATCH, DELETE, HEAD, OPTIONS.</Term>, the <Term w="target">Which resource the request is about: a path like /v1/echo, optionally with a ?query=string. Also called the request URI or path.</Term>, and the protocol version.
+2. **Headers.** Zero or more lines of `Name: value`. Names are case-insensitive (`content-length` and `Content-Length` are the same header). They're metadata: who's asking, what format the body is in, how big it is, what the client can accept.
+3. **A blank line.** This is the most important line in HTTP. It's the only thing that says "headers are over".
+4. **The body.** Optional. Raw bytes, as many as `Content-Length` says. GET requests usually have none.
+
+Every line ends in two bytes, a carriage return and a line feed, written `\r\n` and called <Term w="CRLF">Carriage return + line feed, bytes 13 and 10. A leftover from typewriters and teleprinters (return the carriage to the left, feed the paper up a line). HTTP, SMTP and many old protocols end lines with both.</Term>. Not just `\n`. So the blank line is really the four bytes `\r\n\r\n`: the end of the last header line, then an empty line. That four-byte sequence is the first thing your server looks for.
+
+<Predict id="where-body-ends">
+
+The server has read the request line and headers and found the `\r\n\r\n`. It now has to read the body. How does it know when the body is finished? There's no closing tag, and the connection stays open afterwards. What would go wrong if the client lied about it?
+
+<Fragment slot="answer">
+
+It counts. `Content-Length: 14` says the body is exactly 14 bytes, so the server reads exactly 14 bytes after the blank line and stops. There is no end marker in the body itself: JSON, an image, a protobuf, all just bytes.
+
+If the client says 20 and sends 14, the server sits waiting for 6 bytes that never come, until a timeout fires. If it says 10 and sends 14, the server takes 10 bytes as the body, and treats the leftover 4 bytes, `lo"}`, as the start of the *next request* on that connection. When I tried it on my server, the next request line became `lo"}GET /health HTTP/1.1`, which my parser happily read as a request with the method `lo"}GET`, and answered 405. Garbage in, confident garbage out. Getting this count wrong is the classic bug in hand-written HTTP, and disagreements about it between a proxy and a server are a real class of security hole (request smuggling, in Break It).
+
+</Fragment>
+
+</Predict>
+
+### The shape of a response
+
+The server's reply has the same four-part shape, with a different first line:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 24
+Connection: keep-alive
+
+{"echo": {"q": "hello"}}
+```
+
+The <Term w="status line">The first line of a response: protocol version, a three-digit status code, and a short human-readable reason phrase.</Term> has the version, a three-digit <Term w="status code">A number that says how the request went. Programs branch on it; the reason phrase after it ("OK", "Not Found") is for humans and can be anything.</Term>, and a reason phrase. Then headers, the blank line, the body.
+
+Hover each line below. Then flip the toggle to see the other way a response can mark where its body ends.
+
+<Figure n="002" title="ANATOMY OF AN EXCHANGE" caption="The same JSON echo, as bytes on the wire. With Content-Length the server announces the body size up front. With chunked encoding it sends the body in pieces, each with its size in hex, and a zero-size chunk at the end. The byte counts are computed from the actual text, including every \r\n." wide>
+<HTTPAnatomy />
+</Figure>
+
+### Two ways to say "the body ends here"
+
+You saw the first one: **Content-Length**. The server builds the whole body, measures it, and writes the length before the body. Simple, cheap, and what your server will do.
+
+But sometimes the server doesn't know the length when it starts sending. An LLM generating tokens doesn't know how many it will produce. A database query streaming a million rows doesn't want to buffer them all just to count bytes. HTTP/1.0 had one answer for this: send the body and then close the connection; the close means "done". That works, but it throws away the connection, and a dropped connection looks the same as a finished one.
+
+HTTP/1.1 added <Term w="chunked transfer encoding">A way to send a body of unknown length as a sequence of pieces. Each piece is its size in hexadecimal, \r\n, the bytes, \r\n. A piece of size 0 ends the body.</Term>. The response says `Transfer-Encoding: chunked` instead of `Content-Length`, and then the body arrives as size-prefixed pieces:
+
+```text
+6\r\n
+hello \r\n
+8\r\n
+chunked \r\n
+6\r\n
+world\n\r\n
+0\r\n
+\r\n
+```
+
+That's not made up: it's exactly what uvicorn sent when I wrote an app that emits three pieces without a length. Sizes are hex, so a 577-byte chunk is written `241`. The pieces can arrive seconds apart, which is how an HTTP/1.1 server streams. When you streamed tokens from your fake LLM in [Waiting vs working](/lessons/waiting-vs-working/), this is what was on the wire underneath the SSE lines.
+
+You'll also see it from real servers. When I typed a request to example.com by hand (Build It, task 1), the reply came back `Transfer-Encoding: chunked` with a first chunk size of `241`: Cloudflare, which serves example.com today, was streaming the page from its cache rather than announcing a length.
+
+The rule for your server: send `Content-Length` (you always know the size of your JSON), never send both headers, and reject requests with `Transfer-Encoding` with a 501 unless you implement chunked decoding. Real servers must accept chunked request bodies; yours can say "not implemented", honestly, with the right code.
+
+### Status codes, by family
+
+You don't need to memorize all of them. You need the families, because the first digit tells you whose problem it is, and about fifteen specific codes that you'll see every week.
+
+| Family | Meaning | The ones you'll meet |
+|---|---|---|
+| 1xx | Informational: hold on | `101 Switching Protocols` (a WebSocket upgrade), `100 Continue` |
+| 2xx | It worked | `200 OK`, `201 Created`, `204 No Content` (success, empty body) |
+| 3xx | Look elsewhere | `301`/`308` moved permanently, `302`/`307` moved for now, `304 Not Modified` (your cached copy is still good) |
+| 4xx | You (the client) did something wrong | `400 Bad Request`, `401 Unauthorized` (really "unauthenticated": who are you?), `403 Forbidden` (I know who you are, and no), `404 Not Found`, `405 Method Not Allowed`, `413 Content Too Large`, `415 Unsupported Media Type`, `422 Unprocessable Content`, `429 Too Many Requests` |
+| 5xx | I (the server) failed | `500 Internal Server Error`, `502 Bad Gateway` (a proxy got garbage or nothing from the app behind it), `503 Service Unavailable` (overloaded, try later), `504 Gateway Timeout` (the proxy gave up waiting) |
+
+The 4xx/5xx split matters more than any single code. A 4xx says "retrying the same request won't help; fix it". A 5xx says "it might work next time". Your load generator, your retry logic, and your alerts all branch on that first digit. A server that returns 500 for bad JSON is lying: it's blaming itself for the client's mistake, paging someone at 3 a.m. for a typo in a curl command.
+
+502 and 504 are worth a second look, because you'll debug them. They come from a <Term w="proxy">A server that sits between the client and your app and forwards requests: a load balancer, nginx, an API gateway, Cloudflare. To your app, the proxy is the client.</Term>, not your app. 502 usually means your app crashed, closed the connection early, or sent something that wasn't valid HTTP. 504 means your app was too slow for the proxy's timeout. Neither will appear in your app's logs, because from your app's point of view either nothing happened or it was still working.
+
+### Methods, and two promises: safe and idempotent
+
+The method is a promise about what the request will do. Two properties matter, and they're the reason the method isn't just decoration:
+
+- <Term w="safe">A method is safe if it only reads: the client expects no change on the server. GET, HEAD and OPTIONS are safe.</Term> means read-only. Browsers prefetch GET links, crawlers follow them, caches replay them. If your `GET /delete-account?id=7` deletes an account, a link-preview bot will delete it for you.
+- <Term w="idempotent">Doing it twice has the same effect on the server as doing it once. Setting x = 5 is idempotent; x += 1 is not.</Term> means safe to repeat. If the connection drops before the response arrives, did the request happen? You can't know. For an idempotent request, you don't care: send it again.
+
+| Method | Means | Safe | Idempotent | Body? |
+|---|---|---|---|---|
+| `GET` | Give me this resource | yes | yes | no |
+| `HEAD` | Same as GET, headers only | yes | yes | no |
+| `OPTIONS` | What can I do here? (used by CORS) | yes | yes | rarely |
+| `PUT` | Replace this resource with this body | no | yes | yes |
+| `DELETE` | Remove this resource | no | yes | rarely |
+| `POST` | Process this (create, run, compute) | no | no | yes |
+| `PATCH` | Change part of this resource | no | not guaranteed | yes |
+
+Idempotency is why retries are subtle. HTTP clients and proxies may automatically retry a GET after a dropped connection; they shouldn't silently retry a POST, because "charge the card" might run twice. Every LLM API call is a POST (you're asking it to compute something), so a retrying client might pay for the same completion twice. APIs that care about this (Stripe is the famous example) accept an `Idempotency-Key` header: a random ID the client generates once per logical operation, so the server can recognize a retry and return the stored result instead of doing the work again.
+
+### Headers that matter
+
+There are hundreds of registered headers. These are the ones that cause real bugs.
+
+**`Content-Type` and `Accept`.** Content-Type says what format *this* body is in (`application/json`, `text/html; charset=utf-8`, `multipart/form-data` for file uploads). Accept says what the client would like back. They're the two halves of <Term w="content negotiation">The client lists the formats it can handle (Accept), the server picks one and says which it chose (Content-Type).</Term>. Most API bugs here are a client sending JSON labelled as something else (`curl -d` defaults to `application/x-www-form-urlencoded`), which a strict server rejects with 415, or FastAPI with 422.
+
+**`Authorization`.** How the client proves who it is, usually `Authorization: Bearer sk-...`, an API key or a token. A 401 response means "missing or bad credentials". Two things to burn in: HTTP is plain text, so over `http://` anyone on the path can read this header (that's what [TLS](/lessons/tls/) is for); and never log it, which is a real way keys leak.
+
+**`Cache-Control`.** Instructions for anything that might store the response: the browser, a CDN, a proxy. `no-store` means never keep it (for anything personal). `max-age=60` means reuse it for 60 seconds without asking. `no-cache` confusingly does *not* mean "don't cache": it means "store it, but check with me before reusing it". `private` means a browser may keep it but a shared cache (a CDN) may not.
+
+**`ETag` and `If-None-Match`.** An <Term w="ETag">Entity tag. A short fingerprint of a response's content (often a hash or a version number) that the server sends, so the client can later ask "has it changed since this version?"</Term> lets a client ask "has this changed?" without downloading it again. The server sends `ETag: "v42"`. Next time, the client sends `If-None-Match: "v42"`. If nothing changed, the server replies `304 Not Modified` with no body: a few hundred bytes instead of the whole resource. That 304 in your browser's network tab is this.
+
+**CORS: `Origin` and `Access-Control-Allow-Origin`.** Browsers follow the <Term w="same-origin policy">A browser rule: JavaScript loaded from one origin (scheme + host + port, like https://app.example.com) can't read responses from a different origin unless that server explicitly allows it.</Term>. When a page on `http://localhost:3000` calls your API on `http://localhost:8000`, the browser adds `Origin: http://localhost:3000` to the request, and refuses to let the page's JavaScript see the response unless the response includes `Access-Control-Allow-Origin: http://localhost:3000` (or `*`). For anything beyond a plain form-style request (a JSON body, an `Authorization` header), the browser first sends a <Term w="preflight">An automatic OPTIONS request the browser sends before a cross-origin request with a JSON body, custom headers, or methods like PUT/DELETE, asking the server which origins, methods and headers it allows.</Term> `OPTIONS` request asking permission, and only sends the real request if the answer allows it.
+
+The two facts that make CORS bugs make sense: **CORS is enforced by the browser, not the server**, which is why the same request works in curl and fails in the browser; and **CORS is not security for your server**: curl, scripts and other servers ignore it entirely. It protects the *user* from a malicious page reading their data with their cookies. It doesn't protect your API from anyone.
+
+**`Connection`.** Covered next.
+
+### Keep-alive: reusing the pipe
+
+Opening a TCP connection isn't free. Before the first byte of HTTP can be sent, the two machines exchange three packets (the <Term w="TCP handshake">The three-packet greeting that opens a TCP connection: SYN, SYN-ACK, ACK. It costs one round trip before any data can be sent.</Term>), which costs one round trip: tens of microseconds on localhost, ~20 ms across a country, ~150 ms across an ocean. Over HTTPS, the [TLS](/lessons/tls/) handshake adds at least one more round trip, plus some real CPU for the key exchange.
+
+HTTP/1.0 opened a fresh connection for every request and closed it after the response. A web page with 30 images paid 30 handshakes. HTTP/1.1 flipped the default: a connection stays open after a response (it's <Term w="persistent connection">A TCP connection that stays open after one request/response so the next request can reuse it. Also called keep-alive. The default in HTTP/1.1.</Term>), and the client can send its next request down the same pipe. Either side says `Connection: close` to end it.
+
+<Figure n="003" title="FRESH CONNECTIONS VS KEEP-ALIVE" caption="Three requests from the same client. Top: a new TCP connection for each, so every request pays a handshake round trip first (and over HTTPS, a TLS handshake too). Bottom: one connection, kept open, so only the first request pays. This is also why a framework's connection pool matters: reusing connections is most of the speedup." wide>
+<svg viewBox="0 0 680 230" role="img" aria-label="Timeline comparing three requests on new connections versus one reused connection">
+  <text x="10" y="20" class="strong">NEW CONNECTION PER REQUEST</text>
+  <line x1="10" y1="62" x2="670" y2="62" class="ink" stroke-width="1" />
+  <rect x="10" y="40" width="60" height="18" class="fill-paper" stroke-width="1" />
+  <text x="40" y="53" text-anchor="middle">HSHAKE</text>
+  <rect x="70" y="40" width="90" height="18" class="fill-wash" stroke-width="1" />
+  <text x="115" y="53" text-anchor="middle">REQ 1</text>
+  <rect x="160" y="40" width="30" height="18" class="fill-paper dash" stroke-width="1" />
+  <text x="175" y="53" text-anchor="middle">FIN</text>
+  <rect x="200" y="40" width="60" height="18" class="fill-paper" stroke-width="1" />
+  <text x="230" y="53" text-anchor="middle">HSHAKE</text>
+  <rect x="260" y="40" width="90" height="18" class="fill-wash" stroke-width="1" />
+  <text x="305" y="53" text-anchor="middle">REQ 2</text>
+  <rect x="350" y="40" width="30" height="18" class="fill-paper dash" stroke-width="1" />
+  <text x="365" y="53" text-anchor="middle">FIN</text>
+  <rect x="390" y="40" width="60" height="18" class="fill-paper" stroke-width="1" />
+  <text x="420" y="53" text-anchor="middle">HSHAKE</text>
+  <rect x="450" y="40" width="90" height="18" class="fill-wash" stroke-width="1" />
+  <text x="495" y="53" text-anchor="middle">REQ 3</text>
+  <rect x="540" y="40" width="30" height="18" class="fill-paper dash" stroke-width="1" />
+  <text x="555" y="53" text-anchor="middle">FIN</text>
+  <line x1="570" y1="76" x2="570" y2="88" class="ink" stroke-width="1" />
+  <text x="570" y="102" text-anchor="middle">DONE</text>
+  <text x="10" y="138" class="strong">ONE CONNECTION, KEPT ALIVE</text>
+  <line x1="10" y1="180" x2="670" y2="180" class="ink" stroke-width="1" />
+  <rect x="10" y="158" width="60" height="18" class="fill-paper" stroke-width="1" />
+  <text x="40" y="171" text-anchor="middle">HSHAKE</text>
+  <rect x="70" y="158" width="90" height="18" class="fill-wash" stroke-width="1" />
+  <text x="115" y="171" text-anchor="middle">REQ 1</text>
+  <rect x="160" y="158" width="90" height="18" class="fill-wash" stroke-width="1" />
+  <text x="205" y="171" text-anchor="middle">REQ 2</text>
+  <rect x="250" y="158" width="90" height="18" class="fill-wash" stroke-width="1" />
+  <text x="295" y="171" text-anchor="middle">REQ 3</text>
+  <line x1="340" y1="194" x2="340" y2="206" class="blue" stroke-width="1.2" />
+  <text x="340" y="220" text-anchor="middle" class="blue-t">DONE</text>
+  <line x1="340" y1="200" x2="570" y2="200" class="blue dash" stroke-width="1" />
+  <text x="455" y="215" text-anchor="middle" class="blue-t">SAVED: 2 HANDSHAKES + 2 CLOSES</text>
+  <text x="560" y="138">time →</text>
+</svg>
+</Figure>
+
+Keep-alive changes your server in one important way. Without it, a connection carries exactly one request: read it, answer, hang up. With it, your server has to loop: read a request, answer it, then go back and read the *next* request from the same socket, and keep doing that until the client closes or says `Connection: close` or goes quiet for too long.
+
+And because TCP is a stream with no message boundaries, one `recv()` can return the end of one request and the start of the next. A client is even allowed to send several requests back-to-back without waiting for answers (that's <Term w="pipelining">Sending several HTTP/1.1 requests on one connection without waiting for each response. Allowed by the spec, rarely used by browsers, but your server must not lose the extra bytes.</Term>). So your parser can never assume "what I read is exactly one request". It keeps a buffer of bytes it has read but not used yet, and the next parse starts from there. Forget that, and the second request on a connection vanishes or turns into garbage. You'll test exactly this.
+
+<Predict id="keepalive-speedup">
+
+On localhost, with a trivial `/health` endpoint, how much faster per request do you think keep-alive is than opening a new connection each time: about the same, 2-3x, or 10x+? And would the answer be bigger or smaller between your laptop and the Spark over Tailscale?
+
+<Fragment slot="answer">
+
+On my Mac, a single client looping over one connection took about 30-35 µs per request against the threaded raw server; opening a fresh connection each time took about 90 µs. So roughly **2.5-3x on localhost**, where the "network" round trip is almost free and most of the extra cost is the kernel setting up and tearing down the connection (plus, for the threaded server, starting a new thread).
+
+Over a real network the gap gets *much* bigger, because each new connection costs a full round trip before any HTTP happens. If the round trip to the Spark is 5 ms, a new connection adds at least 5 ms to a request that might itself take 5 ms: roughly 2x by round trips alone. Add HTTPS and the TLS handshake adds another round trip and some CPU. That's why every serious HTTP client keeps a pool of open connections, and why "create one `httpx.AsyncClient` for the whole app" was the rule in the last lesson.
+
+</Fragment>
+
+</Predict>
+
+### The server you're going to write
+
+Here's the whole job of an HTTP/1.1 server, with nothing hidden. **Listen** on a port and `accept()` connections. **Read** until `\r\n\r\n`, refusing to buffer forever (16 KB of headers is plenty; past that, 431). **Parse** the request line into exactly three parts and each header on its first `:`. **Read the body**: exactly `Content-Length` bytes, keeping any extra for the next request. **Route** on method and path. **Respond** with a status line, `Content-Type`, `Content-Length`, the blank line and the body. Then **loop or close**: HTTP/1.1 without `Connection: close` means go back and read the next request from the same socket. And for every way input can be wrong, answer with the right 4xx and close, because once you've misparsed, you can't trust where the next request starts.
+
+That's the server. Concurrency is a separate question you've already answered twice: the loop above handles one connection at a time, so while it's waiting on one slow client, nobody else gets served. You'll fix it the two ways you know, a thread per connection ([Processes, threads and the GIL](/lessons/processes-threads-gil/)) and then asyncio ([Waiting vs working](/lessons/waiting-vs-working/)), where `asyncio.start_server` gives you a reader with `readuntil(b"\r\n\r\n")` and `readexactly(n)`, the two operations HTTP/1.1 parsing is made of.
+
+### What a framework adds
+
+Once your server works, look at what you wrote. About half of it is HTTP (reading, parsing, framing, keep-alive, timeouts, error codes). The other half is your API: routes, JSON, validation. Those halves are separable, and the Python world separates them on purpose.
+
+<Figure n="004" title="WHO DOES WHAT" caption="In production Python, the HTTP half and the application half are different programs. The server (uvicorn) owns the socket and speaks HTTP. The framework (FastAPI, built on Starlette) owns routing, validation and middleware. ASGI is the narrow interface between them: one async function call per request." wide>
+<svg viewBox="0 0 680 300" role="img" aria-label="Layer diagram from TCP socket through uvicorn, the ASGI interface, FastAPI, to the endpoint function">
+  <rect x="10" y="250" width="660" height="38" class="fill-paper" stroke-width="1" />
+  <text x="24" y="273" class="strong">KERNEL</text>
+  <text x="200" y="273">TCP connections, sockets, the listen backlog</text>
+  <rect x="10" y="176" width="660" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="24" y="198" class="strong">SERVER · uvicorn</text>
+  <text x="200" y="198">accept, read bytes, parse HTTP (h11 or httptools)</text>
+  <text x="200" y="214">keep-alive, timeouts, Content-Length / chunked framing</text>
+  <text x="200" y="230">bad requests → 400 before your code ever runs</text>
+  <rect x="10" y="134" width="660" height="32" class="fill-blue" stroke-width="0" />
+  <text x="24" y="155" style="fill:var(--paper)" class="strong">ASGI</text>
+  <text x="200" y="155" style="fill:var(--paper)">await app(scope, receive, send)</text>
+  <rect x="10" y="60" width="660" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="24" y="82" class="strong">FRAMEWORK · FastAPI</text>
+  <text x="200" y="82">routing + path params, middleware (CORS, gzip, auth, logs)</text>
+  <text x="200" y="98">parse JSON → validate with Pydantic → 422 on failure</text>
+  <text x="200" y="114">serialize return value, exception handlers, OpenAPI docs</text>
+  <rect x="10" y="12" width="660" height="38" class="fill-paper" stroke-width="1" />
+  <text x="24" y="35" class="strong">YOUR CODE</text>
+  <text x="200" y="35">async def echo(payload: dict) -> dict</text>
+  <line x1="600" y1="240" x2="600" y2="250" class="ink" stroke-width="1" />
+  <line x1="600" y1="166" x2="600" y2="176" class="ink" stroke-width="1" />
+  <line x1="600" y1="124" x2="600" y2="134" class="ink" stroke-width="1" />
+  <line x1="600" y1="50" x2="600" y2="60" class="ink" stroke-width="1" />
+</svg>
+</Figure>
+
+The interface between the two halves is a calling convention. The older one is <Term w="WSGI">Web Server Gateway Interface (PEP 333, 2003; PEP 3333 for Python 3). A synchronous calling convention: the server calls app(environ, start_response) once per request and the app returns the body. Flask and Django use it, served by gunicorn.</Term>: the server calls `app(environ, start_response)`, a plain synchronous function, once per request. `environ` is a dict of everything about the request; the app calls `start_response("200 OK", headers)` and returns the body. It's simple and it's why gunicorn can serve any Flask or Django app. But it's synchronous to the core: one request occupies one thread until it returns, and there's no clean way to hold a connection open for a WebSocket.
+
+<Term w="ASGI">Asynchronous Server Gateway Interface. The async successor to WSGI: the server awaits app(scope, receive, send) for each connection, and the app talks back through two async functions. Uvicorn, Hypercorn and Daphne are ASGI servers; Starlette and FastAPI are ASGI frameworks.</Term> is the async version, and it's what uvicorn speaks. An ASGI app is a single async function:
+
+```python
+async def app(scope, receive, send):
+    ...
+```
+
+- `scope` is a dict describing the request, already parsed by the server: `scope["type"]` is `"http"`, plus `method`, `path`, `query_string` (bytes), and `headers` as a list of `(name, value)` byte pairs with names lowercased.
+- `await receive()` returns the next piece of the request body: a dict like `{"type": "http.request", "body": b"...", "more_body": False}`.
+- `await send(...)` is how you reply: first one `{"type": "http.response.start", "status": 200, "headers": [...]}`, then one or more `{"type": "http.response.body", "body": b"...", "more_body": ...}`.
+
+Notice what's been taken away from you: no sockets, no `\r\n`, no Content-Length counting, no keep-alive loop. The server does all of that. And notice what the shape gives back: because `send` can be called many times with `more_body: True`, streaming is natural; if you don't send a `content-length` header, uvicorn switches to chunked encoding for you (that's how I produced the chunked example above). The same interface also carries WebSockets (`scope["type"] == "websocket"`) and a startup/shutdown signal (`"lifespan"`, which is what FastAPI's `lifespan=` hooks ride on).
+
+So the stack is: **uvicorn** (the server: sockets, HTTP parsing, keep-alive, timeouts) calls **FastAPI** (an ASGI app, built on a smaller framework called Starlette) which calls **your function**. "Running FastAPI" really means "running uvicorn, which calls FastAPI". That's why the command is `uvicorn main:app`: uvicorn is the program; `main:app` is just which function to call.
+
+What the framework adds, concretely: **routing** (matching `/users/{id}` and pulling out `id`; yours is an `if`), **parsing** (query strings, JSON, forms, file uploads, cookies), **validation** (declare `payload: EchoRequest` and get a precise 422 instead of a `KeyError` three lines in), **serialization** (return a dict, get JSON with the right Content-Type), **middleware** (code that wraps every request: CORS, gzip, auth, request IDs, timing; in ASGI terms just an ASGI app wrapping another), **error handling** (an exception becomes a 500, not a dropped connection), and **docs** generated from your type hints.
+
+None of that is HTTP. It's convenience on top of HTTP. That's the answer to the interview question, and after tonight you'll have written both halves yourself.
+
+### HTTP/2 and HTTP/3: same meaning, new packaging
+
+Everything above is HTTP/1.1, and its text format has one structural weakness: on a single connection, responses come back one at a time, in order. If request 1 is slow, request 2 waits behind it even if it's ready, which is called <Term w="head-of-line blocking">When one slow item at the front of a queue holds up everything behind it, even items that are ready.</Term>. Browsers work around it by opening about six connections per site, which is six handshakes and six slow starts.
+
+**HTTP/2** (2015, grown from Google's SPDY experiment) keeps every method, header and status code, and changes the packaging:
+
+- **Binary framing.** Instead of text lines, everything is sent as <Term w="frames">Small binary messages, each with a 9-byte header saying its length, its type (HEADERS, DATA, ...), and which stream it belongs to.</Term>. Parsing is faster and unambiguous: no more "where does the line end?" questions.
+- **Multiplexing.** Each request/response pair is a numbered <Term w="stream">In HTTP/2 and HTTP/3, one request and its response, identified by a stream ID. Many streams share one connection, and their frames can be interleaved.</Term>, and frames from many streams interleave on one TCP connection. Response 2 doesn't wait for response 1; their frames take turns. One connection replaces six.
+- **HPACK header compression.** Headers repeat on every request (the same `User-Agent`, `Accept`, cookies, auth token). <Term w="HPACK">HTTP/2's header compression: both sides keep a table of headers already seen, so a repeated header is sent as a small index number instead of the full text. Plus a static table of 61 common headers and Huffman coding for the rest.</Term> lets each side refer to a header it has already sent by a small number.
+
+You can see it with `curl -sI --http2 https://example.com`: the first line says `HTTP/2 200`, and the header names come back in lowercase, which HTTP/2 requires. Browsers only use HTTP/2 over TLS. gRPC is built on it.
+
+But HTTP/2 moved the head-of-line problem down a layer rather than removing it. All the streams share one TCP connection, and TCP delivers bytes strictly in order. Lose one packet, and TCP holds back *everything* after it, every stream's frames, until the lost packet is resent. On a lossy mobile network, one big multiplexed connection can do worse than six separate ones.
+
+**HTTP/3** (2022) fixes that by leaving TCP. It runs over <Term w="QUIC">A transport protocol built on UDP (originally at Google, standardized in 2021). It provides reliable, ordered streams like TCP, but each stream is ordered independently, and TLS 1.3 encryption is built into its handshake.</Term>, which runs on UDP and does its own reliability *per stream*: a lost packet only stalls the stream it belongs to. QUIC also folds the TLS handshake into the connection handshake (one round trip to start instead of two or more), and identifies connections by an ID rather than by IP address and port, so a phone switching from Wi-Fi to cellular can keep its connection.
+
+<Figure n="005" title="1.1 VS 2 VS 3" caption="Three requests, A B C. HTTP/1.1 sends them one after another on a connection (or opens more connections). HTTP/2 interleaves their frames on one TCP connection, but a lost packet (X) stalls every stream behind it, because TCP delivers in order. HTTP/3 runs streams over QUIC on UDP, so a loss stalls only its own stream." wide>
+<svg viewBox="0 0 680 270" role="img" aria-label="Comparison of HTTP/1.1 sequential requests, HTTP/2 multiplexed frames over TCP, and HTTP/3 independent streams over QUIC">
+  <text x="10" y="22" class="strong">HTTP/1.1 · TEXT · TCP</text>
+  <text x="10" y="38">one at a time per connection</text>
+  <rect x="220" y="14" width="140" height="24" class="fill-wash" stroke-width="1" />
+  <text x="290" y="30" text-anchor="middle">A</text>
+  <rect x="360" y="14" width="80" height="24" class="fill-paper" stroke-width="1" />
+  <text x="400" y="30" text-anchor="middle">B (waits)</text>
+  <rect x="440" y="14" width="80" height="24" class="fill-paper" stroke-width="1" />
+  <text x="480" y="30" text-anchor="middle">C (waits)</text>
+  <line x1="220" y1="44" x2="670" y2="44" class="ink" stroke-width="1" />
+  <text x="10" y="102" class="strong">HTTP/2 · BINARY · TCP</text>
+  <text x="10" y="118">frames interleaved, one conn</text>
+  <rect x="220" y="94" width="34" height="24" class="fill-wash" stroke-width="1" /><text x="237" y="110" text-anchor="middle">A</text>
+  <rect x="254" y="94" width="34" height="24" class="fill-paper" stroke-width="1" /><text x="271" y="110" text-anchor="middle">B</text>
+  <rect x="288" y="94" width="34" height="24" class="fill-paper" stroke-width="1" /><text x="305" y="110" text-anchor="middle">C</text>
+  <rect x="322" y="94" width="34" height="24" class="fill-paper" stroke-width="1.5" style="stroke:var(--warn)" /><text x="339" y="110" text-anchor="middle" style="fill:var(--warn)">X</text>
+  <rect x="356" y="94" width="34" height="24" class="fill-paper dash" stroke-width="1" /><text x="373" y="110" text-anchor="middle">B</text>
+  <rect x="390" y="94" width="34" height="24" class="fill-paper dash" stroke-width="1" /><text x="407" y="110" text-anchor="middle">C</text>
+  <rect x="424" y="94" width="34" height="24" class="fill-paper dash" stroke-width="1" /><text x="441" y="110" text-anchor="middle">B</text>
+  <line x1="220" y1="124" x2="670" y2="124" class="ink" stroke-width="1" />
+  <text x="470" y="110">← all stall until X</text>
+  <text x="470" y="140">is resent (TCP order)</text>
+  <text x="10" y="186" class="strong">HTTP/3 · BINARY · QUIC/UDP</text>
+  <text x="10" y="202">independent streams</text>
+  <rect x="220" y="168" width="34" height="18" class="fill-wash" stroke-width="1" /><text x="237" y="181" text-anchor="middle">A</text>
+  <rect x="254" y="168" width="34" height="18" class="fill-paper" stroke-width="1.5" style="stroke:var(--warn)" /><text x="271" y="181" text-anchor="middle" style="fill:var(--warn)">X</text>
+  <rect x="288" y="168" width="34" height="18" class="fill-wash" stroke-width="1" /><text x="305" y="181" text-anchor="middle">A</text>
+  <text x="330" y="181">only A waits</text>
+  <rect x="220" y="192" width="34" height="18" class="fill-paper" stroke-width="1" /><text x="237" y="205" text-anchor="middle">B</text>
+  <rect x="254" y="192" width="34" height="18" class="fill-paper" stroke-width="1" /><text x="271" y="205" text-anchor="middle">B</text>
+  <rect x="288" y="192" width="34" height="18" class="fill-paper" stroke-width="1" /><text x="305" y="205" text-anchor="middle">B</text>
+  <rect x="220" y="216" width="34" height="18" class="fill-paper" stroke-width="1" /><text x="237" y="229" text-anchor="middle">C</text>
+  <rect x="254" y="216" width="34" height="18" class="fill-paper" stroke-width="1" /><text x="271" y="229" text-anchor="middle">C</text>
+  <rect x="288" y="216" width="34" height="18" class="fill-paper" stroke-width="1" /><text x="305" y="229" text-anchor="middle">C</text>
+  <line x1="220" y1="242" x2="670" y2="242" class="ink" stroke-width="1" />
+  <text x="560" y="262">time →</text>
+</svg>
+</Figure>
+
+In practice: HTTP/1.1 between your services and inside data centers (simple, and the network is reliable), HTTP/2 for browsers and gRPC, HTTP/3 increasingly for browsers on phones. A server announces HTTP/3 support with a header; example.com's response included `alt-svc: h3=":443"; ma=86400`, meaning "I also speak HTTP/3 on UDP port 443, remember that for a day". You won't write an HTTP/2 or HTTP/3 server by hand tonight (the binary framing and compression are a lot of careful code; you'd use a library like `h2`), but everything you learn about methods, status codes and headers carries over unchanged.
+
+## Build It
+
+Everything goes in `~/workbench/http/`. Python 3.11 or newer; only the last two tasks need packages.
+
+<Task id="t0" title="Set up" agent="ok">
+
+```bash
+mkdir -p ~/workbench/http && cd ~/workbench/http
+python3 -m venv .venv && source .venv/bin/activate
+pip install uvicorn fastapi httpx
+```
+
+You'll also use `nc` (netcat, preinstalled on macOS and most Linux), `curl`, and `ab` (ApacheBench; on macOS it's at `/usr/sbin/ab`, on Ubuntu it's in the `apache2-utils` package). Copy your `loadgen.py` from [Waiting vs working](/lessons/waiting-vs-working/) into this folder.
+
+</Task>
+
+<Task id="t1" title="Speak HTTP by hand" agent="hands">
+
+Before writing a server, be the client. `nc` opens a TCP connection and connects your keyboard to it. On macOS, pass `-c` so that pressing Enter sends `\r\n` instead of just `\n`:
+
+```bash
+nc -c example.com 80
+```
+
+Nothing happens: you're connected and the server is waiting for you. Type these lines, then press Enter on an empty line:
+
+```http
+GET / HTTP/1.1
+Host: example.com
+
+```
+
+Read the reply. Find the status line, the headers, the blank line. Does it use Content-Length or chunked? Find the first chunk size and convert it from hex. Notice the connection doesn't close: type the same request again and you'll get a second response on the same connection. That's keep-alive, by hand. Ctrl-C to quit.
+
+Now try the history, one per connection:
+
+- `GET / HTTP/1.0` with no Host header. What status do you get, and why would a server that hosts many sites refuse it?
+- The 1991 request: just `GET /` and Enter. What comes back? Is there a status line at all?
+- A request with a typo in the version, `GET / HTTP/1.7`. And a header line with no colon.
+
+Then flip it around: be the server, and watch what real clients send.
+
+```bash
+nc -c -l 8080
+```
+
+In another terminal, `curl http://127.0.0.1:8080/health`. The request appears in the `nc` window. curl is now waiting for a reply, so type one, by hand, into `nc`:
+
+```http
+HTTP/1.1 200 OK
+Content-Length: 3
+
+hi
+```
+
+(Count carefully: `hi` plus the `\r\n` that `nc -c` sends when you press Enter is 4 bytes. What does curl do if you claim 3? If you claim 10?) Then repeat with your browser pointed at `http://127.0.0.1:8080/` and read everything a browser sends that curl didn't.
+
+A non-interactive version, useful for scripted tests later: `(printf 'GET / HTTP/1.1\r\nHost: example.com\r\n\r\n'; sleep 2) | nc example.com 80`. The `sleep` keeps the pipe open long enough to read the reply; macOS `nc` hangs up as soon as its input ends.
+
+</Task>
+
+<Task id="t2" title="One request, one response, raw sockets" agent="hands">
+
+Write `rawhttp.py`. Start with the smallest thing that a browser will accept: accept one connection at a time, read until `\r\n\r\n`, ignore the request completely, send a fixed response, close. Only `import socket`.
+
+```python
+import socket
+
+def main(host="127.0.0.1", port=8080):
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # rebind right after a restart
+    srv.bind((host, port))
+    srv.listen(128)  # backlog: how many not-yet-accepted connections the kernel will queue
+    while True:
+        conn, addr = srv.accept()
+        ...  # recv until b"\r\n\r\n" is in the buffer, then sendall a hard-coded response, then close
+```
+
+Hard-code the response bytes yourself, with a correct `Content-Length`. Test with `curl -v http://127.0.0.1:8080/`, then a browser. Then deliberately get the length wrong by one in each direction and watch what curl says.
+
+</Task>
+
+<Task id="t3" title="Parse, route, and refuse garbage" agent="hands">
+
+Now make it a real server. Grow `rawhttp.py` into this shape (signatures are a suggestion; the behavior table is the spec):
+
+```python
+MAX_HEAD = 16 * 1024        # bytes of request line + headers
+MAX_BODY = 1024 * 1024      # bytes of body
+
+class BadRequest(Exception):
+    """Raise with a status code and message; the connection loop turns it into a response."""
+    def __init__(self, status: int, msg: str): ...
+
+def read_request(conn, buf: bytes):
+    """Read exactly one request from conn.
+    buf: bytes already received but not yet used (from a previous request).
+    Returns ((method, target, version, headers, body), leftover_bytes),
+    or (None, b"") if the client closed the connection cleanly before sending anything."""
+
+def handle(method, path, headers, body) -> tuple[int, object, dict]:
+    """Your API. Returns (status, json-able object, extra headers)."""
+
+def respond(status: int, obj, keep_alive: bool, extra: dict | None = None) -> bytes:
+    """json.dumps(obj), then status line + Content-Type + Content-Length + Connection + extra headers,
+    blank line, body. Encode the head as latin-1 and the body as UTF-8."""
+```
+
+The spec:
+
+| Request | Status | Notes |
+|---|---|---|
+| `GET /health` | 200 | `{"status": "ok"}` |
+| `HEAD /health` | 200 | Same headers as GET, including Content-Length, but no body |
+| `POST /health` | 405 | Include `Allow: GET, HEAD` |
+| `POST /v1/echo`, valid JSON | 200 | `{"echo": <the parsed JSON>}` |
+| `POST /v1/echo`, invalid JSON | 400 | |
+| `POST /v1/echo`, Content-Type not JSON | 415 | |
+| `GET /v1/echo` | 405 | `Allow: POST` |
+| any other path | 404 | Ignore the `?query` part when routing |
+| request line not exactly 3 parts | 400 | Then close |
+| version not HTTP/1.0 or HTTP/1.1 | 505 | |
+| HTTP/1.1 with no Host header | 400 | |
+| header line with no colon | 400 | |
+| Content-Length not a non-negative integer | 400 | |
+| body bigger than MAX_BODY | 413 | Check the header *before* reading the body |
+| head bigger than MAX_HEAD without `\r\n\r\n` | 431 | |
+| any `Transfer-Encoding` on the request | 501 | You don't decode chunked requests |
+| client closes mid-request | none | Just close your side |
+
+Hints:
+
+- `recv` returns `b""` when the other side has closed. It can also return half a header, or a request and a half.
+- Decode the head with `latin-1` (every byte maps to one character, so it never throws), and split on `\r\n`, not `\n`.
+- `name, sep, value = line.partition(":")` splits on the *first* colon, so `Host: 127.0.0.1:8080` works. Lowercase the name.
+- Every error response should say `Connection: close`, and you should actually close. After a parse error you can't know where the next request starts.
+- Use `conn.settimeout(10)` and treat `socket.timeout` as "close the connection", so a client that connects and says nothing can't hold your server forever.
+
+Test every row. The `(printf '...'; sleep 1) | nc 127.0.0.1 8080` pattern is the fastest way to send exactly the bytes you mean, including broken ones. Put the tests in a shell script so you can rerun them after every change.
+
+</Task>
+
+<Task id="t4" title="Keep the connection alive" agent="hands">
+
+Wrap the read-handle-respond in a loop per connection. Decide keep-alive per request:
+
+- HTTP/1.1: keep alive unless the request says `Connection: close`.
+- HTTP/1.0: close unless the request says `Connection: keep-alive`.
+
+Send `Connection: keep-alive` or `Connection: close` accordingly, and carry the leftover buffer from one `read_request` into the next.
+
+Two tests. First, curl will reuse a connection when you give it two URLs:
+
+```bash
+curl -sv http://127.0.0.1:8080/health http://127.0.0.1:8080/health 2>&1 | grep -i 're-us'
+```
+
+You should see `Re-using existing connection`. Second, the pipelining test: two requests in one write, which only passes if you keep leftover bytes.
+
+```bash
+(printf 'GET /health HTTP/1.1\r\nHost: x\r\n\r\nPOST /v1/echo HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\n{"a": 1}'; sleep 1) | nc 127.0.0.1 8080
+```
+
+Two complete responses, the second with `Connection: close`.
+
+</Task>
+
+<Task id="t5" title="Make it concurrent: threads, then asyncio" agent="hands">
+
+First, feel the problem. With your one-at-a-time server running, open `nc 127.0.0.1 8080` in one terminal and type nothing. In another, `curl -m 5 http://127.0.0.1:8080/health`. It hangs: your server is inside `recv` on the silent connection, and the new one is sitting in the kernel's backlog. One idle client stopped the whole server. When I did this, curl waited until `nc` hung up and then got its answer in 5.4 s instead of 1.5 ms.
+
+**Threads.** The smallest fix: in the accept loop, start a `threading.Thread(target=serve_conn, args=(conn,), daemon=True)` per connection. Everything else stays the same, because each thread has its own stack and blocks in its own `recv`. Rerun the idle-nc test; curl should answer instantly. (Why is this fine despite the GIL? Revisit [Processes, threads and the GIL](/lessons/processes-threads-gil/): a thread blocked in `recv` releases it.)
+
+**asyncio.** Now write `asynchttp.py` with the same `handle` and `respond` (import them), but the connection layer rewritten on asyncio streams:
+
+```python
+import asyncio
+from rawhttp import handle, respond, BadRequest, MAX_HEAD
+
+async def read_request(reader: asyncio.StreamReader):
+    # head = await reader.readuntil(b"\r\n\r\n")   # raises IncompleteReadError if the client hangs up,
+    #                                               # LimitOverrunError if no separator within `limit`
+    # parse exactly as before
+    # body = await reader.readexactly(content_length)
+    ...
+
+async def serve_conn(reader, writer):
+    # loop: wrap read_request in asyncio.wait_for(..., timeout=10)
+    # writer.write(respond(...)); await writer.drain()
+    # finally: writer.close()
+    ...
+
+async def main():
+    server = await asyncio.start_server(serve_conn, "127.0.0.1", 8081, limit=MAX_HEAD, backlog=128)
+    async with server:
+        await server.serve_forever()
+
+asyncio.run(main())
+```
+
+Notice how much shorter the reading part gets: `StreamReader` keeps the leftover buffer for you, which is exactly the bookkeeping you did by hand in t4. Rerun all your tests from t3 and t4 against port 8081.
+
+</Task>
+
+<Task id="t6" title="Hit it with curl, a browser, and your load generator" agent="review">
+
+- `curl -v` every route. Read the `>` lines (what curl sent) and `<` lines (what you sent back).
+- Open `http://127.0.0.1:8080/health` in a browser. Watch your server's log (print the request line of every request). What extra request does the browser make that you didn't ask for? Open the browser's network tab and check that it shows your status code and headers as you sent them.
+- `python loadgen.py http://127.0.0.1:8080/health -n 2000 -c 50` against the threaded and the asyncio server. Zero errors is the bar.
+- Ask an agent to review your parser against the t3 table and RFC 9112, section 2 to 6. Have it look for one classic bug: what happens if a client sends `Content-Length` twice with different values?
+
+</Task>
+
+<Task id="t7" title="An ASGI app with no framework" agent="hands">
+
+Write `asgi_app.py`: the same two endpoints, as a bare ASGI callable, served by uvicorn. No FastAPI, no Starlette.
+
+```python
+import json
+
+async def app(scope, receive, send):
+    if scope["type"] != "http":
+        return  # uvicorn also sends a "lifespan" scope at startup; ignoring it is allowed
+    # 1. read the body: call `await receive()` in a loop, concatenating message["body"],
+    #    until message.get("more_body") is false
+    # 2. route on scope["method"] and scope["path"]
+    # 3. headers are scope["headers"]: a list of (bytes, bytes), names already lowercase
+    # 4. await send({"type": "http.response.start", "status": ..., "headers": [(b"content-type", b"application/json"), ...]})
+    # 5. await send({"type": "http.response.body", "body": ...})
+    ...
+```
+
+Run it: `uvicorn asgi_app:app --port 8082`. Rerun your t3 test script against 8082 and compare: which malformed requests did uvicorn reject before your code even ran? Which status codes did *you* still have to get right?
+
+Then, as an experiment, leave out the `content-length` header and send the body in two `send` calls with `more_body: True` on the first. Look at the response with `nc`: uvicorn chose chunked encoding for you.
+
+</Task>
+
+<Task id="t8" title="The same endpoints in FastAPI" agent="ok">
+
+```python
+# fast_app.py
+from typing import Any
+from fastapi import FastAPI
+
+app = FastAPI()
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+@app.post("/v1/echo")
+async def echo(payload: dict[str, Any]):
+    return {"echo": payload}
+```
+
+`uvicorn fast_app:app --port 8083`. Run your test script against it and write down every difference from your server: status codes for bad JSON and wrong Content-Type (FastAPI says 422 for both), the error body format, the headers uvicorn adds (`date`, `server`), lowercase header names, what a `DELETE /health` returns. Open `http://127.0.0.1:8083/docs` and notice that nothing you wrote by hand gave you that.
+
+</Task>
+
+<DoneWhen>
+
+- `nc -c example.com 80` and a hand-typed request returns a 200, and you can point to the status line, the headers, the blank line and the first chunk size.
+- Every row of the t3 table produces the right status on both `rawhttp.py` (threaded) and `asynchttp.py`, from a script you can rerun.
+- curl reports `Re-using existing connection`, and the two-requests-in-one-write test returns two responses.
+- An idle `nc` connection no longer blocks other clients.
+- `loadgen.py` at `-c 50` reports zero errors against both of your servers.
+- The bare ASGI app passes the same tests under uvicorn, and you can list what FastAPI added.
+
+</DoneWhen>
+
+## Measure
+
+Two questions: how much does connection reuse buy, and how much does each layer (server, framework) cost on a trivial endpoint?
+
+**Connection reuse.** Write `seq.py`: one client, no concurrency, raw sockets. Send 2,000 `GET /health` requests down one kept-alive connection and time it; then 2,000 requests each on a fresh connection (connect, send, read the response, close). Print microseconds per request. Keep it at 2,000: see Break It for why.
+
+**Throughput.** Use `ab`, which is written in C, so it's not the bottleneck the way a Python client can be:
+
+```bash
+ab -n 8000 -c 50 http://127.0.0.1:8080/health       # a new connection per request
+ab -k -n 8000 -c 50 http://127.0.0.1:8080/health    # keep-alive
+```
+
+Read `Requests per second`, the percentile table, and the `Keep-Alive requests` line. Run each server on its own port: threaded `rawhttp.py` (8080), `asynchttp.py` (8081), bare ASGI under uvicorn (8082), FastAPI under uvicorn (8083).
+
+| Server | `seq.py` keep-alive, µs/req | `seq.py` new conn, µs/req | `ab` req/s, new conns (best run) | `ab -k` req/s (best run) | Keep-Alive requests (of 8000) | Yours |
+|---|---|---|---|---|---|---|
+| rawhttp, threads | ~30-35 | ~90 | ~17,000 | ~41,000 | 8000 | |
+| asynchttp | ~57 | ~160 | ~9,500 | ~78,000 | 8000 | |
+| bare ASGI + uvicorn | ~100 | ~190 | ~12,000 | no gain (see below) | 0 | |
+| FastAPI + uvicorn | ~140 | ~230 | ~8,000 | no gain (see below) | 0 | |
+
+My numbers are from a MacBook that was also running a lot of other heavy jobs (load average near 90 at one point), and `ab` throughput swung by 5-10x between runs; the table shows the best of several runs, and the `seq.py` numbers (one client, no contention) are the more trustworthy ones. Trust the ratios within one run, not the absolute numbers, and do several runs of your own on a quiet machine. What to look for:
+
+- **Reuse is worth 2-3x on localhost, for one client.** Every server got faster per request on a kept-alive connection. On localhost the round trip is nearly free, so this is mostly kernel bookkeeping; over a real network, add a round trip (and a TLS handshake) per new connection, and the gap gets far bigger.
+- **Each layer costs tens of microseconds.** For `GET /health`, raw sockets beat uvicorn, and uvicorn plus FastAPI's routing, validation and serialization adds another ~40 µs. That sounds damning until you put it next to the real work: an LLM call takes ~1,000,000 µs. On a real endpoint the framework is noise; on a health check or a tiny proxy it's most of the time. Know which one you have.
+- **The surprise: uvicorn shows `Keep-Alive requests: 0` under `ab -k`.** `ab` speaks HTTP/1.0 and asks for keep-alive with a `Connection: keep-alive` header. Your server honors that (you wrote the HTTP/1.0 rule in t4). Uvicorn, with its default pure-Python parser (h11), doesn't support HTTP/1.0 keep-alive, so it closes every connection, and its `ab -k` number is really a new-connection number. Check it yourself with `curl -v --http1.0 -H 'Connection: keep-alive'` against both. With `uvicorn[standard]` installed (the httptools parser) the behavior may differ; check yourself. The general lesson: a benchmark tool's protocol choices can quietly change what you're measuring.
+- **Your Python load generator tops out first.** Point `loadgen.py` at `/health` and you'll likely see a few hundred to ~2,000 req/s no matter which server, because the client is doing more Python per request than the server is. I saw httpx at 50 connections get *slower* than at 1. Always check which side's CPU is pegged (`top`) before believing a throughput number. For latency of a real endpoint, `loadgen.py` is the right tool; for "how fast can this server go", use `ab` or `wrk`.
+
+## Break It
+
+**1. Run out of ports.** Remove the 2,000 limit from `seq.py`'s new-connection loop and make it 20,000. On my Mac it died after about 16,000 with `OSError: [Errno 49] Can't assign requested address`. Run `netstat -an -p tcp | grep -c TIME_WAIT` right after: about 16,350. Each closed connection leaves a record in <Term w="TIME_WAIT">A state a TCP connection stays in for a while after closing (twice the "maximum segment lifetime"), so stray late packets from the old connection can't be mistaken for a new one using the same ports.</Term> for 30 seconds on macOS (`sysctl net.inet.tcp.msl` is 15000 ms, doubled), and each one holds a local port. macOS gives you 49152-65535 for outgoing connections (`sysctl net.inet.ip.portrange.first net.inet.ip.portrange.last`): 16,384 ports. Open connections faster than ~550 per second to one server and you run out. Keep-alive makes this go away entirely. You'll see the same thing in production when a service creates a new HTTP client per request.
+
+**2. Lie about the length.** Against your server, send `Content-Length: 20` with a 14-byte body: the request hangs until your 10 s timeout fires, then you close. Send `Content-Length: 10` with the same 14 bytes on a kept-alive connection, followed by a valid `GET /health`: the first request gets a 400 (its body `{"q": "hel` isn't JSON) and the leftover `lo"}` glues onto the next request line, giving a request whose method is `lo"}GET`. Mine answered 405, which is wrong in an instructive way. Fix it: method names may only contain letters and a few symbols (RFC 9110 calls them tokens; `"` and `}` aren't allowed), so validate the method and return 400. Now imagine a proxy and a server that disagree on where a request ends, say one believes `Content-Length` and the other believes `Transfer-Encoding`. An attacker can hide a second request inside the first: the proxy sees one request, the app sees two. That's <Term w="request smuggling">An attack that exploits two HTTP parsers (a proxy and a server) disagreeing about where one request ends, so a hidden request slips past the proxy's checks.</Term>, and it's why RFC 9112 says a request with both headers must be treated with suspicion, and why your server rejects `Transfer-Encoding` outright.
+
+**3. Slow down a client.** Start the asyncio server, then open 200 connections that each send `GET /health HTTP/1.1\r\n` and then one header byte every few seconds, never finishing. (A loop of `nc` processes, or a small asyncio script.) Does your server still answer curl? It should, but each connection costs memory, and each stays open as long as it keeps trickling, because your timeout is per read, not per request. This is the <Term w="Slowloris">A 2009 attack that ties up a server by opening many connections and sending each request very slowly, so threads or connection slots stay busy forever.</Term> attack. Fix it with a deadline for the whole head, not just each read. Then try it on the threaded server: 200 slow clients is 200 parked threads. Which server would survive 20,000?
+
+**4. Return the wrong family.** Make your echo endpoint return 500 for invalid JSON instead of 400, and point your load generator's error counting at it. Then think about what your alerting would page on. Separately, make `/health` return 200 with `{"status": "error"}` in the body when something's wrong. A load balancer's health check only reads the status code, so it will keep sending traffic to a broken server. The status code is the API; the body is for humans.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. "Could you build an HTTP API in Python without a framework?" Walk me through it.</summary>
+
+Yes. HTTP/1.1 is text over a TCP connection, so the `socket` module is enough. Listen on a port and accept connections. For each connection, read bytes until the blank line (`\r\n\r\n`) that ends the headers; parse the request line into method, path and version and the headers into a case-insensitive dict; read exactly `Content-Length` more bytes as the body. Route on method and path, run the handler, and write back a status line, headers including `Content-Type` and `Content-Length`, a blank line and the body. Loop on the same connection for keep-alive, keeping any extra bytes for the next request. Return 4xx for malformed input and close. Then make it concurrent, with a thread per connection or asyncio streams. In real life I'd use uvicorn for the HTTP part, because it's battle-tested against every weird client and attack, and a framework for routing and validation, but I know what both are doing.
+
+</details>
+
+<details>
+<summary>2. How does the receiver know where a body ends? When would you use chunked encoding?</summary>
+
+Either `Content-Length` gives the exact number of bytes up front, or `Transfer-Encoding: chunked` sends the body as pieces, each prefixed with its size in hex, ending with a zero-size piece. (Old HTTP/1.0 style: close the connection at the end, which wastes the connection and can't tell a finished response from a dropped one.) Chunked is for when the server doesn't know the length when it starts: streaming LLM tokens, large query results, generated files. It lets the response start immediately and still keep the connection reusable. Never send both headers; disagreement between parsers about which one wins is how request smuggling works.
+
+</details>
+
+<details>
+<summary>3. What's the difference between uvicorn and FastAPI? What is ASGI?</summary>
+
+Uvicorn is the server: it owns the sockets, parses HTTP, handles keep-alive, timeouts, chunked encoding, and rejects malformed requests. FastAPI is the application framework: routing, request parsing, Pydantic validation (422 errors), serialization, middleware, docs. ASGI is the contract between them: the server calls `await app(scope, receive, send)` per request, where `scope` is the parsed request metadata and `receive`/`send` are async functions for body chunks and response messages. Because of that contract you can swap servers (uvicorn, hypercorn) or frameworks (Starlette, FastAPI, Django) independently. WSGI is the older synchronous version of the same idea, used by Flask and Django with gunicorn.
+
+</details>
+
+<details>
+<summary>4. Why do safe and idempotent matter? Which methods are which?</summary>
+
+Safe means read-only (GET, HEAD, OPTIONS); caches, crawlers and prefetchers assume they can send safe requests freely, so a GET that changes state will get triggered by accident. Idempotent means repeating it has the same effect as doing it once (GET, HEAD, OPTIONS, PUT, DELETE). It matters for retries: when a connection drops mid-request, you don't know if it happened, and only idempotent requests are safe to resend blindly. POST isn't idempotent, so retrying a POST can double a payment or an expensive LLM call; the fix is an idempotency key the server uses to deduplicate.
+
+</details>
+
+<details>
+<summary>5. Your service handles 500 requests per second from one upstream client that opens a new connection per request. How does that scale, and what breaks first?</summary>
+
+Each request pays a TCP handshake (a round trip), and over HTTPS a TLS handshake (another round trip plus key-exchange CPU), so latency goes up by at least one or two round trips and both sides burn CPU on setup. Each closed connection also leaves a TIME_WAIT entry holding a port on the side that closed, for 30-60 s depending on the OS. With ~16,000 ephemeral ports per destination on macOS (more on Linux, roughly 28,000 by default), the client runs out somewhere around 500 new connections per second sustained, and starts failing with "can't assign requested address". The fix is connection reuse: keep-alive with a client-side pool, so 500 req/s might need a few dozen connections total. HTTP/2 goes further by multiplexing many concurrent requests on one connection.
+
+</details>
+
+<details>
+<summary>6. What do HTTP/2 and HTTP/3 change, and what stays the same?</summary>
+
+Same: methods, status codes, headers, what a request means. HTTP/2 changes the packaging: binary frames instead of text lines, many requests multiplexed as streams on one TCP connection (no more six connections per site, no waiting in line for a slow response), and HPACK compression for repetitive headers. Its weakness is that TCP delivers in order, so one lost packet stalls all streams. HTTP/3 runs over QUIC on UDP, which gives each stream independent delivery (a loss only stalls its own stream), combines the TLS and connection handshakes into one round trip, and survives network changes like Wi-Fi to cellular.
+
+</details>
+
+## Go Deeper
+
+- **RFC 9112, "HTTP/1.1"** (Fielding, Nottingham, Reschke, 2022; rfc-editor.org/rfc/rfc9112). The current definition of the wire format you just implemented: message syntax, Content-Length vs Transfer-Encoding, persistent connections. Short for an RFC, and section 6 on message bodies is the one to read twice.
+- **RFC 9110, "HTTP Semantics"** (same authors, 2022). What methods, status codes and headers *mean*, for every HTTP version. The authoritative source for safe, idempotent, and every status code in the table.
+- **Tim Berners-Lee, "The Original HTTP as defined in 1991"** (w3.org/Protocols/HTTP/AsImplemented.html). One page. The entire protocol fits on it, which is the point.
+- **MDN Web Docs, "HTTP"** (developer.mozilla.org/en-US/docs/Web/HTTP). The best practical reference, with clear pages on CORS, caching, conditional requests and every header. Read the CORS guide before your next frontend integration.
+- **Ilya Grigorik, "High Performance Browser Networking"** (O'Reilly, 2013; free at hpbn.co). The chapters on HTTP/1.1, HTTP/2 and TCP explain where the round trips go and why multiplexing was needed. Some details predate HTTP/3, but the reasoning is timeless.
+- **The ASGI specification** (asgi.readthedocs.io). Short. The HTTP connection scope page lists every key in `scope` and every message type for `receive` and `send`; you can now read it as a description of what uvicorn did for you.
+- **Daniel Stenberg, "HTTP/3 explained"** (free online book, http3-explained.haxx.se). By curl's author. The clearest explanation of QUIC and why HTTP left TCP.
+- **PEP 3333, "Python Web Server Gateway Interface v1.0.1"** (Phillip J. Eby). The WSGI spec, for comparison. Its rationale section explains why Python separated servers from frameworks in the first place.
+
+## Connections
+
+- Builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/) (thread per connection) and [Waiting vs working](/lessons/waiting-vs-working/) (asyncio streams, the event loop, your load generator). The TCP pieces come from [TCP vs UDP](/lessons/tcp-vs-udp/), and the full trip from typing a URL to rendering a page is [What happens when you type a URL](/lessons/what-happens-url/).
+- [How does HTTPS keep secrets?](/lessons/tls/) wraps everything here in encryption: the same bytes, sent through TLS instead of straight into the socket.
+- Next, [Polling, SSE and WebSockets](/lessons/streaming/) builds on chunked encoding and the ASGI `send` loop to stream LLM tokens three ways.
+- [Load balancing](/lessons/load-balancing/) and [Rate limits](/lessons/rate-limits/) are about proxies and status codes (502, 503, 429) you can now read at the byte level.

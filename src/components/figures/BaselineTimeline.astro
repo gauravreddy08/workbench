@@ -1,0 +1,211 @@
+---
+// Interactive: one request's timeline on the Spark (naive server) vs Fireworks, built from a
+// simple model. All rates are illustrative assumptions printed under the figure; the Measure
+// section replaces them with his own numbers.
+---
+<div class="bt" data-fig="baseline-timeline">
+  <div class="bt-panel">
+    <span class="label">To first token</span>
+    <svg viewBox="0 0 480 74" class="bt-ttft" role="img" aria-label="Time to first token, Spark versus Fireworks"></svg>
+  </div>
+  <div class="bt-panel">
+    <span class="label">Whole request</span>
+    <svg viewBox="0 0 480 74" class="bt-e2e" role="img" aria-label="End-to-end time, Spark versus Fireworks"></svg>
+  </div>
+
+  <div class="bt-legend">
+    <span><i class="sw sw-net"></i>network</span>
+    <span><i class="sw sw-hs"></i>handshake</span>
+    <span><i class="sw sw-q"></i>queue</span>
+    <span><i class="sw sw-pf"></i>prefill</span>
+    <span><i class="sw sw-dec"></i>decode</span>
+  </div>
+
+  <div class="bt-read">
+    <div><span class="label">TTFT · Spark</span><span class="readout" data-o="ttftS"></span></div>
+    <div><span class="label">TTFT · Fireworks</span><span class="readout" data-o="ttftF"></span></div>
+    <div><span class="label">E2E · Spark</span><span class="readout" data-o="e2eS"></span></div>
+    <div><span class="label">E2E · Fireworks</span><span class="readout" data-o="e2eF"></span></div>
+  </div>
+  <p class="bt-verdict" data-o="verdict"></p>
+
+  <div class="ctl">
+    <span class="bt-group">
+      <span>Spark link</span>
+      <button class="btn" type="button" data-link="local" aria-pressed="true">localhost</button>
+      <button class="btn" type="button" data-link="lan" aria-pressed="false">LAN</button>
+      <button class="btn" type="button" data-link="ts" aria-pressed="false">Tailscale, away</button>
+    </span>
+    <label>Fireworks RTT <input type="range" min="10" max="200" step="5" value="80" data-k="rtt" /><output></output></label>
+    <label>Prompt <input type="range" min="0" max="9" step="1" value="4" data-k="prompt" /><output></output></label>
+    <label>Output <input type="range" min="0" max="6" step="1" value="4" data-k="out" /><output></output></label>
+    <label>Concurrency <input type="range" min="0" max="3" step="1" value="0" data-k="conc" /><output></output></label>
+    <button class="btn" type="button" data-k="cold" aria-pressed="false">First call (cold)</button>
+  </div>
+  <p class="bt-assume">
+    Model, not measurement. Spark: prefill ≈ max(60 ms, prompt ÷ 3,000 tok/s), decode ≈ 13 tok/s,
+    one request at a time. Fireworks: 50 ms gateway + scheduling, prefill ≈ prompt ÷ 25,000 tok/s,
+    decode ≈ 180 tok/s, shared batch. Replace these with your own numbers once you have them.
+  </p>
+</div>
+
+<style>
+  .bt-panel { margin-bottom: 10px; }
+  .bt-panel .label { display: block; margin-bottom: 4px; font-size: 10.5px; }
+  .bt-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; font-family: var(--mono); font-size: 11px; color: var(--ink-2); margin: 6px 0 12px; }
+  .bt-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .sw { display: inline-block; width: 14px; height: 10px; border: 1px solid var(--ink-3); }
+  .sw-net { background: var(--paper); border-color: var(--ink); }
+  .sw-hs { background: var(--paper); border-style: dashed; border-color: var(--ink); }
+  .sw-q { background: var(--paper-2); }
+  .sw-pf { background: var(--blue); border-color: var(--blue); }
+  .sw-dec { background: var(--blue-fill); border-color: var(--blue); }
+  .bt-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 16px; border-top: 1px solid var(--rule); padding-top: 12px; }
+  .bt-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .bt-read .label { font-size: 10px; }
+  .bt-read .readout { font-size: 18px; }
+  .bt-verdict { font-family: var(--mono); font-size: 12px; color: var(--ink); margin: 12px 0 0; line-height: 1.5; }
+  .bt-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .bt-assume { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 14px 0 0; }
+</style>
+
+<script>
+  const PROMPTS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192];
+  const OUTS = [16, 32, 64, 128, 256, 512, 1024];
+  const CONCS = [1, 4, 16, 64];
+  const SPARK_RTT: Record<string, number> = { local: 0.2, lan: 2, ts: 40 };
+  const NS = 'http://www.w3.org/2000/svg';
+
+  const fmt = (ms: number) =>
+    ms < 1000 ? `${ms < 10 ? ms.toFixed(1) : Math.round(ms)} ms` : ms < 60000 ? `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)} s` : `${(ms / 60000).toFixed(1)} min`;
+
+  type Seg = { kind: string; ms: number };
+
+  function el(tag: string, attrs: Record<string, string | number>) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    return e;
+  }
+
+  const STYLE: Record<string, string> = {
+    net: 'fill:var(--paper);stroke:var(--ink);stroke-width:1',
+    hs: 'fill:var(--paper);stroke:var(--ink);stroke-width:1;stroke-dasharray:3 3',
+    q: 'fill:var(--paper-2);stroke:var(--ink-3);stroke-width:1',
+    pf: 'fill:var(--blue);stroke:none',
+    dec: 'fill:var(--blue-fill);stroke:var(--blue);stroke-width:1',
+  };
+
+  function drawBars(svg: SVGSVGElement, rows: { name: string; segs: Seg[] }[], maxMs: number) {
+    svg.replaceChildren();
+    const x0 = 78, x1 = 470, w = x1 - x0;
+    rows.forEach((row, i) => {
+      const y = 6 + i * 28;
+      const t = el('text', { x: 0, y: y + 14 });
+      t.textContent = row.name;
+      t.setAttribute('class', 'strong');
+      svg.appendChild(t);
+      let x = x0;
+      for (const s of row.segs) {
+        const sw = (s.ms / maxMs) * w;
+        if (sw <= 0) continue;
+        const r = el('rect', { x: x.toFixed(2), y, width: Math.max(sw, 0.6).toFixed(2), height: 18, style: STYLE[s.kind] });
+        svg.appendChild(r);
+        x += sw;
+      }
+    });
+    const axis = el('line', { x1: x0, y1: 64, x2: x1, y2: 64, style: 'stroke:var(--ink-3);stroke-width:1' });
+    svg.appendChild(axis);
+    const t0 = el('text', { x: x0, y: 74 });
+    t0.textContent = '0';
+    svg.appendChild(t0);
+    const tm = el('text', { x: x1, y: 74, 'text-anchor': 'end' });
+    tm.textContent = fmt(maxMs);
+    svg.appendChild(tm);
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="baseline-timeline"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const inputs = {
+      rtt: q<HTMLInputElement>('[data-k="rtt"]'),
+      prompt: q<HTMLInputElement>('[data-k="prompt"]'),
+      out: q<HTMLInputElement>('[data-k="out"]'),
+      conc: q<HTMLInputElement>('[data-k="conc"]'),
+    };
+    const coldBtn = q<HTMLButtonElement>('[data-k="cold"]');
+    const linkBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-link]')];
+    let link = 'local';
+    let cold = false;
+
+    function render() {
+      const fwRtt = +inputs.rtt.value;
+      const P = PROMPTS[+inputs.prompt.value];
+      const O = OUTS[+inputs.out.value];
+      const C = CONCS[+inputs.conc.value];
+      const sRtt = SPARK_RTT[link];
+
+      // Spark, naive: one request at a time, closed-loop steady state waits behind C - 1 others.
+      const sPf = Math.max(60, (P / 3000) * 1000);
+      const sItl = 1000 / 13;
+      const sService = sPf + (O - 1) * sItl;
+      const sQueue = (C - 1) * sService;
+      const sHs = cold ? sRtt : 0; // TCP only: plain HTTP on your own network
+      const spark: Seg[] = [
+        { kind: 'net', ms: sRtt / 2 }, { kind: 'hs', ms: sHs }, { kind: 'q', ms: sQueue },
+        { kind: 'pf', ms: sPf }, { kind: 'net', ms: sRtt / 2 },
+      ];
+      // Fireworks: shared batch; per-stream decode slows a little as the batch grows.
+      const fPf = Math.max(5, (P / 25000) * 1000);
+      const fItl = (1000 / 180) * (1 + C / 256);
+      const fHs = cold ? 2 * fwRtt : 0; // TCP + TLS 1.3
+      const fw: Seg[] = [
+        { kind: 'net', ms: fwRtt / 2 }, { kind: 'hs', ms: fHs }, { kind: 'q', ms: 50 },
+        { kind: 'pf', ms: fPf }, { kind: 'net', ms: fwRtt / 2 },
+      ];
+      const sum = (s: Seg[]) => s.reduce((a, b) => a + b.ms, 0);
+      const ttftS = sum(spark), ttftF = sum(fw);
+      const e2eS = ttftS + (O - 1) * sItl;
+      const e2eF = ttftF + (O - 1) * fItl;
+
+      drawBars(q<SVGSVGElement>('.bt-ttft'), [{ name: 'SPARK', segs: spark }, { name: 'FIREWORKS', segs: fw }], Math.max(ttftS, ttftF));
+      drawBars(
+        q<SVGSVGElement>('.bt-e2e'),
+        [
+          { name: 'SPARK', segs: [...spark, { kind: 'dec', ms: (O - 1) * sItl }] },
+          { name: 'FIREWORKS', segs: [...fw, { kind: 'dec', ms: (O - 1) * fItl }] },
+        ],
+        Math.max(e2eS, e2eF),
+      );
+
+      q('[data-o="ttftS"]').textContent = fmt(ttftS);
+      q('[data-o="ttftF"]').textContent = fmt(ttftF);
+      q('[data-o="e2eS"]').textContent = fmt(e2eS);
+      q('[data-o="e2eF"]').textContent = fmt(e2eF);
+      const tWin = ttftS < ttftF ? 'Spark' : 'Fireworks';
+      const eWin = e2eS < e2eF ? 'Spark' : 'Fireworks';
+      const ratio = (a: number, b: number) => (Math.max(a, b) / Math.min(a, b)).toFixed(1);
+      q('[data-o="verdict"]').textContent =
+        `First token: ${tWin} by ${ratio(ttftS, ttftF)}×. Whole answer: ${eWin} by ${ratio(e2eS, e2eF)}×.` +
+        (C > 1 ? ` At ${C} users the Spark request waits behind ${C - 1} others.` : '');
+
+      inputs.rtt.nextElementSibling!.textContent = `${fwRtt} ms`;
+      inputs.prompt.nextElementSibling!.textContent = `${P} tok`;
+      inputs.out.nextElementSibling!.textContent = `${O} tok`;
+      inputs.conc.nextElementSibling!.textContent = `${C}`;
+    }
+
+    Object.values(inputs).forEach((i) => i.addEventListener('input', render));
+    coldBtn.addEventListener('click', () => {
+      cold = !cold;
+      coldBtn.setAttribute('aria-pressed', String(cold));
+      render();
+    });
+    linkBtns.forEach((b) =>
+      b.addEventListener('click', () => {
+        link = b.dataset.link!;
+        linkBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

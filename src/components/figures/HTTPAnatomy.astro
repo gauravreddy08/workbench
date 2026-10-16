@@ -1,0 +1,169 @@
+---
+// An annotated raw HTTP/1.1 exchange. Hover, focus or tap any line to see what it does.
+// A toggle switches the response body framing between Content-Length and chunked encoding,
+// and the byte counts are computed live from the actual strings.
+---
+<div class="hx" data-fig="http-anatomy">
+  <div class="hx-cols">
+    <div class="hx-pane">
+      <div class="label">Client sends <span class="hx-bytes readout" data-reqbytes></span></div>
+      <ol class="hx-lines" data-req></ol>
+    </div>
+    <div class="hx-pane">
+      <div class="label">Server replies <span class="hx-bytes readout" data-resbytes></span></div>
+      <ol class="hx-lines" data-res></ol>
+    </div>
+  </div>
+  <div class="ctl">
+    <span>Response body framing:</span>
+    <button class="btn" type="button" data-mode="cl" aria-pressed="true">Content-Length</button>
+    <button class="btn" type="button" data-mode="chunked" aria-pressed="false">Chunked</button>
+  </div>
+  <div class="hx-note" aria-live="polite">
+    <div class="label hx-note-t" data-nt>How to read this</div>
+    <p data-nb>Hover, focus or tap any line. Each grey <code>\r\n</code> is two real bytes (carriage return, line feed) that end the line. The empty line is the only thing that tells the reader where the headers stop.</p>
+  </div>
+</div>
+
+<style>
+  .hx-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  .hx-pane { border: 1px solid var(--rule); background: var(--paper); padding: 10px 10px 8px; min-width: 0; }
+  .hx-bytes { margin-left: 6px; }
+  .hx-lines { list-style: none; margin: 8px 0 0; padding: 0; font-family: var(--mono); font-size: 12px; line-height: 1.5; }
+  .hx-lines li {
+    display: block; padding: 2px 6px; border-left: 2px solid transparent; cursor: help;
+    color: var(--ink); overflow-wrap: anywhere; outline: none;
+  }
+  .hx-lines li:hover, .hx-lines li:focus, .hx-lines li.on { background: var(--blue-wash); border-left-color: var(--blue); }
+  .hx-lines .k { color: var(--blue); }
+  .hx-lines .start { font-weight: 600; }
+  .hx-lines .body { color: var(--ink-2); }
+  .hx-lines .size { color: var(--blue); font-weight: 600; }
+  .hx-lines .crlf { color: var(--ink-3); font-size: 10px; margin-left: 4px; white-space: nowrap; }
+  .hx-note { margin-top: 14px; border-top: 1px solid var(--blue); padding-top: 8px; min-height: 7.5em; }
+  .hx-note p { margin: 4px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); }
+  .hx-note-t { color: var(--blue); }
+  @media (max-width: 620px) { .hx-cols { grid-template-columns: 1fr; } }
+</style>
+
+<script>
+  type Line = { text: string; kind: 'start' | 'header' | 'blank' | 'body' | 'size'; title: string; note: string; crlf: boolean };
+
+  const enc = new TextEncoder();
+  const len = (s: string) => enc.encode(s).length;
+
+  const reqBody = '{"q": "hello"}';
+  const resBody = '{"echo": {"q": "hello"}}';
+  const parts = ['{"echo": ', '{"q": "hello"}}'];
+
+  const H = (text: string, title: string, note: string): Line => ({ text, kind: 'header', title, note, crlf: true });
+
+  const request: Line[] = [
+    { text: 'POST /v1/echo HTTP/1.1', kind: 'start', crlf: true, title: 'Request line',
+      note: 'Three words separated by single spaces: the method (what you want done), the target (which resource, path plus optional ?query), and the protocol version. Your parser splits on spaces and rejects anything that is not exactly three parts with a 400.' },
+    H('Host: 127.0.0.1:8080', 'Host', 'Which site you mean. One IP address can serve thousands of domains, so HTTP/1.1 made this header mandatory. A 1.1 request without it must get a 400.'),
+    H('User-Agent: curl/8.7.1', 'User-Agent', 'Free text naming the client. Informational. Servers log it; some sites block clients by it.'),
+    H('Accept: */*', 'Accept', 'Which response formats the client can read, in preference order. */* means anything. A browser sends text/html first. The server may pick a format based on this (content negotiation).'),
+    H('Content-Type: application/json', 'Content-Type', 'What format the body is in, so the server knows how to parse it. Send JSON with text/plain and a strict server answers 415 (or FastAPI, 422).'),
+    H(`Content-Length: ${len(reqBody)}`, 'Content-Length', `The body is exactly ${len(reqBody)} bytes. After the blank line the server reads exactly this many bytes, then the next request (if any) starts on the same connection. Count it yourself: ${len(reqBody)} characters of ASCII is ${len(reqBody)} bytes.`),
+    { text: '', kind: 'blank', crlf: true, title: 'Blank line',
+      note: 'Just \\r\\n on its own: the headers are over. Your server reads until it sees the four bytes \\r\\n\\r\\n, splits there, and everything after is body (or the next request).' },
+    { text: reqBody, kind: 'body', crlf: false, title: 'Body',
+      note: 'Raw bytes, no line ending. HTTP itself does not care what is in here; Content-Type says how to interpret it. Note there is no \\r\\n after it: the length, not a delimiter, says where it ends.' },
+  ];
+
+  function response(mode: 'cl' | 'chunked'): Line[] {
+    const head: Line[] = [
+      { text: 'HTTP/1.1 200 OK', kind: 'start', crlf: true, title: 'Status line',
+        note: 'Version, a three-digit status code, and a reason phrase for humans. Programs only look at the number. The first digit is the family: 2xx worked, 3xx look elsewhere, 4xx your fault, 5xx my fault.' },
+      H('Content-Type: application/json', 'Content-Type', 'Same header, other direction: the server says what it is sending back, so the client knows to JSON-decode it.'),
+    ];
+    const tail: Line[] = [
+      H('Connection: keep-alive', 'Connection', 'Keep the TCP connection open after this response; the client may send another request down the same pipe. In HTTP/1.1 this is the default and the header is optional. Connection: close means hang up after this.'),
+      { text: '', kind: 'blank', crlf: true, title: 'Blank line', note: 'End of headers. Same rule as the request.' },
+    ];
+    if (mode === 'cl') {
+      return [
+        ...head,
+        H(`Content-Length: ${len(resBody)}`, 'Content-Length', `The server knew the whole body up front (${len(resBody)} bytes), so it says so. The client reads exactly that many bytes after the blank line and knows the response is complete without the connection closing. This is what your server will send.`),
+        ...tail,
+        { text: resBody, kind: 'body', crlf: false, title: 'Body', note: `Exactly ${len(resBody)} bytes, then nothing. If the header said one byte more, the client would sit waiting for a byte that never comes; one byte fewer, and the last byte would be read as the start of the next response.` },
+      ];
+    }
+    const lines: Line[] = [
+      ...head,
+      H('Transfer-Encoding: chunked', 'Transfer-Encoding', 'The server does not know the total length yet (it is streaming: an LLM generating tokens, a big query result). Instead of one length up front, it sends the body in pieces, each prefixed by its own size. Never send this and Content-Length together.'),
+      ...tail,
+    ];
+    parts.forEach((p, i) => {
+      lines.push({ text: len(p).toString(16), kind: 'size', crlf: true, title: `Chunk ${i + 1} size`,
+        note: `The size of the next chunk in hexadecimal: 0x${len(p).toString(16)} = ${len(p)} bytes. The client reads this line, then exactly ${len(p)} bytes, then a \\r\\n.` });
+      lines.push({ text: p, kind: 'body', crlf: true, title: `Chunk ${i + 1} data`,
+        note: `${len(p)} bytes of the body, followed by \\r\\n. The server could have waited seconds between chunks; this is how streaming works over plain HTTP/1.1.` });
+    });
+    lines.push({ text: '0', kind: 'size', crlf: true, title: 'Last chunk',
+      note: 'A chunk of size zero means the body is over. Optional trailer headers could follow here (rare).' });
+    lines.push({ text: '', kind: 'blank', crlf: true, title: 'Final blank line',
+      note: 'Ends the chunked body (and any trailers). Now the connection is ready for the next response. Total body bytes are the same; the framing costs a few bytes more.' });
+    return lines;
+  }
+
+  function wireBytes(lines: Line[]) {
+    return lines.reduce((n, l) => n + len(l.text) + (l.crlf ? 2 : 0), 0);
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="http-anatomy"]').forEach((root) => {
+    const reqEl = root.querySelector<HTMLOListElement>('[data-req]')!;
+    const resEl = root.querySelector<HTMLOListElement>('[data-res]')!;
+    const nt = root.querySelector<HTMLElement>('[data-nt]')!;
+    const nb = root.querySelector<HTMLElement>('[data-nb]')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+
+    function show(l: Line, li: HTMLElement) {
+      root.querySelectorAll('.hx-lines li.on').forEach((x) => x.classList.remove('on'));
+      li.classList.add('on');
+      nt.textContent = l.title;
+      nb.textContent = l.note;
+    }
+
+    function fill(ol: HTMLOListElement, lines: Line[]) {
+      ol.replaceChildren(...lines.map((l) => {
+        const li = document.createElement('li');
+        li.tabIndex = 0;
+        if (l.kind === 'header') {
+          const i = l.text.indexOf(':');
+          const k = document.createElement('span');
+          k.className = 'k';
+          k.textContent = l.text.slice(0, i + 1);
+          li.append(k, document.createTextNode(l.text.slice(i + 1)));
+        } else {
+          const s = document.createElement('span');
+          s.className = l.kind;
+          s.textContent = l.text;
+          li.append(s);
+        }
+        if (l.crlf) {
+          const c = document.createElement('span');
+          c.className = 'crlf';
+          c.textContent = '\\r\\n';
+          li.append(c);
+        }
+        const on = () => show(l, li);
+        li.addEventListener('mouseenter', on);
+        li.addEventListener('focus', on);
+        li.addEventListener('click', on);
+        return li;
+      }));
+      return wireBytes(lines);
+    }
+
+    function render(mode: 'cl' | 'chunked') {
+      btns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+      root.querySelector('[data-reqbytes]')!.textContent = `${fill(reqEl, request)} bytes`;
+      root.querySelector('[data-resbytes]')!.textContent = `${fill(resEl, response(mode))} bytes`;
+    }
+
+    btns.forEach((b) => b.addEventListener('click', () => render(b.dataset.mode as 'cl' | 'chunked')));
+    render('cl');
+  });
+</script>

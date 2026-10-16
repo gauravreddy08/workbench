@@ -1,0 +1,715 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import APITimeline from '../components/figures/APITimeline.astro';
+import APIPipeline from '../components/figures/APIPipeline.astro';
+
+## Today
+
+- Answer "what's an API lifecycle?" in an interview, and say out loud that the phrase has two meanings: the months-long life of an API *product* (design to retirement) and the milliseconds-long life of one *request* inside a server.
+- Design an endpoint the way API teams do: contract first in OpenAPI, one error shape everywhere, idempotency keys on POST, API keys with per-key rate limits.
+- Tell an additive change from a breaking one, including the sneaky kind that breaks nobody loudly and everybody quietly.
+- Ship a breaking change safely: v2 next to v1, Deprecation and Sunset headers, a contract test that would have caught the break, and a migrated client.
+- Walk one request through your server stage by stage and name the status code each stage can return.
+
+Prerequisites: [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/) (your OpenAI-compatible `server_naive.py` and `bench.py`) and [Rate limits](/lessons/rate-limits/) (your token bucket). [HTTP from scratch](/lessons/http-from-scratch/) helps but is not required. Time: one evening to read, two to build. Everything runs on your Mac with a fake model; swap in the Spark at the end.
+
+## The Problem
+
+The interviewer asks, "What's an API lifecycle?" You say something about requests and responses. They nod politely and move on, and you know you missed it.
+
+Here is the same gap from the other side, on your own machine. Your Spark server takes `max_tokens`. You read that OpenAI renamed that field to `max_completion_tokens` in 2024, when reasoning models arrived, so you rename it in your server too. Thirty seconds of work. Every test you have still passes. The server starts. `curl` works.
+
+A week later you notice the scoreboard: every request now finishes in about a second, and the decode numbers have shifted. You didn't change the model. What happened is that `bench.py` still sends `max_tokens: 256`. Your server, like most Python servers, quietly ignores fields it doesn't know. So it used the new field's default, 16 tokens, and every request in the benchmark has been a 16-token request. Short answers have a different speed profile from long ones, so every scoreboard row since the rename is measuring something else. Nothing crashed. Nothing logged an error. The only client you have broke, and neither of you noticed.
+
+That is what the interviewer was asking about. An API is a promise to people whose code you can't see and can't redeploy. The "lifecycle" is the discipline of making, keeping, changing, and finally ending that promise without hurting anyone. And inside it there's a smaller lifecycle: the path each request takes through your server, where every one of those promises is checked.
+
+<Origin year="2000" title="An architecture for things you can't redeploy">
+
+By the late 1990s the web had millions of servers and hundreds of millions of browsers, and nobody could upgrade them all at once. A server written in 1996 had to keep working with a browser from 1999 and the other way round. Roy Fielding, who had helped write the HTTP/1.1 spec, described the architecture that made this work in his 2000 PhD dissertation and named it REST. The point was not "use JSON over HTTP"; it was that clients and servers evolve independently, so the interface between them has to be uniform, stable, and self-describing.
+
+Ten years later companies started selling APIs as products. Stripe's whole business was an API, and its customers' code charged real cards. Stripe could not break that code, but it also could not stop improving. Its answer, versioning by date with every account pinned to the version it started on, became one of the most copied ideas in API design. You will build a small version of both ideas today.
+
+</Origin>
+
+## The Idea
+
+### Two lifecycles, one word
+
+When someone says "API lifecycle" they almost always mean the first one below. Say both in an interview anyway: it shows you know where each promise gets enforced.
+
+<Figure n="001" title="TWO LIFECYCLES" caption="Top: the life of an API product, measured in months or years. Observe feeds back into design; each version eventually walks off the right edge. Bottom: the life of one request, measured in milliseconds. Every promise made at the top is checked somewhere along the bottom." wide>
+<svg viewBox="0 0 860 300" role="img" aria-label="Product lifecycle stages above request lifecycle stages">
+  <text x="10" y="22" class="strong">1 · THE API AS A PRODUCT</text>
+  <text x="850" y="22" text-anchor="end">MONTHS TO YEARS</text>
+  <rect x="10" y="40" width="80" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="50" y="64" text-anchor="middle" class="strong">DESIGN</text>
+  <rect x="104" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="144" y="64" text-anchor="middle">BUILD</text>
+  <rect x="198" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="238" y="64" text-anchor="middle">DOCUMENT</text>
+  <rect x="292" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="332" y="64" text-anchor="middle">TEST</text>
+  <rect x="386" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="426" y="64" text-anchor="middle">RELEASE</text>
+  <rect x="480" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="520" y="64" text-anchor="middle">OBSERVE</text>
+  <rect x="574" y="40" width="80" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="614" y="64" text-anchor="middle" class="strong">VERSION</text>
+  <rect x="668" y="40" width="88" height="40" class="fill-paper dash" stroke-width="1.2" />
+  <text x="712" y="64" text-anchor="middle">DEPRECATE</text>
+  <rect x="770" y="40" width="80" height="40" class="fill-paper dash" stroke-width="1.2" />
+  <text x="810" y="64" text-anchor="middle">RETIRE</text>
+  <line x1="90" y1="60" x2="104" y2="60" class="ink" stroke-width="1" />
+  <line x1="184" y1="60" x2="198" y2="60" class="ink" stroke-width="1" />
+  <line x1="278" y1="60" x2="292" y2="60" class="ink" stroke-width="1" />
+  <line x1="372" y1="60" x2="386" y2="60" class="ink" stroke-width="1" />
+  <line x1="466" y1="60" x2="480" y2="60" class="ink" stroke-width="1" />
+  <line x1="560" y1="60" x2="574" y2="60" class="ink" stroke-width="1" />
+  <line x1="654" y1="60" x2="668" y2="60" class="ink" stroke-width="1" />
+  <line x1="756" y1="60" x2="770" y2="60" class="ink" stroke-width="1" />
+  <path d="M520 80 L520 104 L50 104 L50 80" class="blue" stroke-width="1.2" />
+  <text x="285" y="120" text-anchor="middle" class="blue-t">WHAT YOU LEARN FEEDS THE NEXT DESIGN</text>
+  <line x1="10" y1="150" x2="850" y2="150" class="ink dash" stroke-width="1" />
+  <text x="10" y="180" class="strong">2 · ONE REQUEST INSIDE THE SERVER</text>
+  <text x="850" y="180" text-anchor="end">MILLISECONDS</text>
+  <rect x="10" y="200" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="224" text-anchor="middle">CLIENT</text>
+  <rect x="115" y="200" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="160" y="224" text-anchor="middle">TLS</text>
+  <rect x="220" y="200" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="265" y="224" text-anchor="middle">ROUTE</text>
+  <rect x="325" y="200" width="110" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="380" y="217" text-anchor="middle" class="strong">MIDDLEWARE</text>
+  <text x="380" y="232" text-anchor="middle">auth · limit · log</text>
+  <rect x="450" y="200" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="495" y="224" text-anchor="middle">VALIDATE</text>
+  <rect x="555" y="200" width="90" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="600" y="224" text-anchor="middle" class="strong">HANDLER</text>
+  <rect x="660" y="200" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="705" y="224" text-anchor="middle">SERIALIZE</text>
+  <rect x="765" y="200" width="85" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="807" y="224" text-anchor="middle">RESPONSE</text>
+  <line x1="100" y1="220" x2="115" y2="220" class="ink" stroke-width="1" />
+  <line x1="205" y1="220" x2="220" y2="220" class="ink" stroke-width="1" />
+  <line x1="310" y1="220" x2="325" y2="220" class="ink" stroke-width="1" />
+  <line x1="435" y1="220" x2="450" y2="220" class="ink" stroke-width="1" />
+  <line x1="540" y1="220" x2="555" y2="220" class="ink" stroke-width="1" />
+  <line x1="645" y1="220" x2="660" y2="220" class="ink" stroke-width="1" />
+  <line x1="750" y1="220" x2="765" y2="220" class="ink" stroke-width="1" />
+  <line x1="50" y1="80" x2="380" y2="200" class="blue dash" stroke-width="1" />
+  <line x1="50" y1="80" x2="495" y2="200" class="blue dash" stroke-width="1" />
+  <line x1="614" y1="80" x2="265" y2="200" class="blue dash" stroke-width="1" />
+  <text x="430" y="275" text-anchor="middle" class="blue-t">DESIGN DECIDES THE RULES · THE PIPELINE ENFORCES THEM · THE URL PICKS THE VERSION</text>
+</svg>
+</Figure>
+
+First, the word itself. An <Term w="API">Application programming interface: the set of requests one program agrees to accept from another, and what it promises to send back. For a web API that's URLs, methods, request bodies, responses and errors.</Term> is a promise between two programs. A web API is that promise spoken over HTTP. The thing that makes it hard is the same thing that made the web hard in 2000: once someone else's code depends on your promise, you can't take it back on your own schedule.
+
+### Part one: the life of an API product
+
+Start with the long one. Each stage below is a set of decisions, and each decision is cheaper now than later.
+
+### Design: write the contract before the code
+
+The <Term w="contract">The exact, written-down list of what an API accepts and returns: every path, field, type, status code and error. Clients are written against it; the server is tested against it.</Term> is the promise in writing. You can write it after the code (most frameworks, FastAPI included, will generate one from your Python), or before. API teams who care write it first, for the same reason you write a test before a bug fix: it forces you to decide what you promise before the implementation decides for you.
+
+The standard language for writing it is <Term w="OpenAPI">A standard format (YAML or JSON) for describing an HTTP API: paths, methods, parameters, request and response bodies as JSON Schema, auth, and errors. Formerly called Swagger.</Term>. One YAML file describes every path, and every body as a <Term w="JSON Schema">A vocabulary for describing the shape of JSON: which fields exist, their types, which are required, allowed ranges and values.</Term>. From that one file you get human docs, client SDKs, request validators, mock servers, and the input to the contract test you'll write later. "Contract-first" just means the YAML exists before the Python does and the Python is checked against it.
+
+A few design decisions show up in every contract. Each one is cheap to get right on day one and expensive to change on day four hundred, because by then someone depends on the wrong version.
+
+**Resources and names.** In the classic REST style, URLs name *things* (nouns) and HTTP methods say what you're doing to them: `GET /v1/models` lists, `GET /v1/models/llama-8b` fetches one, `POST /v1/chat/completions` creates a completion. Pick one convention and never mix: `snake_case` fields (OpenAI's choice, so it's yours), plural collection names, the same word for the same idea everywhere. If it's `max_tokens` in one endpoint it can't be `maxTokens` or `token_limit` in another. Consistency is what lets a client guess correctly.
+
+**Pagination.** Any list that can grow must be paged from day one, because adding paging later changes what `GET /v1/models` returns, and that breaks everyone who read the whole list. There are two styles. <Term w="Offset pagination">"Give me items 200 to 299": ?offset=200&limit=100. Simple, but slow on big tables and it skips or repeats items if rows are inserted while you page.</Term> is easy and drifts when data changes underneath it. <Term w="Cursor pagination">The server returns an opaque token pointing just past the last item it sent; you pass it back to get the next page. Stable under inserts and fast with an index, but you can't jump to page 50.</Term> is what most large APIs use; OpenAI's list endpoints take an `after` ID and return `has_more`. The [indexes lesson](/lessons/indexes/) explains why cursors are fast: "rows after this ID" is one B-tree seek, while "skip 1,000,000 rows" walks them all.
+
+**Errors, in one shape.** Every error from every endpoint should look the same, so a client writes one error handler. Your server speaks OpenAI's dialect, so its errors should look like OpenAI's:
+
+```json
+{"error": {"message": "max_tokens must be at most 4096", "type": "invalid_request_error",
+           "param": "max_tokens", "code": "invalid_value"}}
+```
+
+`message` is for humans and can change. `type` and `code` are for programs and are part of the contract. `param` says which field was wrong. The status code carries the category: 400 your request is wrong, 401 who are you, 403 you can't do that, 404 no such thing, 409 conflict, 429 slow down, 500 our fault, 503 we're overloaded. If you're not bound to a dialect, there's a standard for this: <Term w="Problem Details">RFC 9457: a standard JSON error format (media type application/problem+json) with type, title, status, detail and instance fields. It replaced RFC 7807 in 2023.</Term>. The worst choice is the one FastAPI makes by default, and you'll measure it soon: a different shape (`{"detail": [...]}`) and a different status code (422) from everything else your API returns.
+
+### Idempotency: the retry problem
+
+A network call can fail in three ways: the request never arrived, it arrived and failed, or it arrived, *succeeded*, and the answer got lost on the way back. The client can't tell the last case from the first. So it retries. Every good client retries; the OpenAI Python SDK retries twice by default on timeouts, connection errors, 408, 409, 429 and 5xx (I read this in the SDK source; check your version).
+
+An operation is <Term w="idempotent">Doing it twice has the same effect as doing it once. Setting x = 5 is idempotent; adding 5 to x isn't. HTTP defines GET, PUT and DELETE as idempotent; POST isn't.</Term> if doing it twice is the same as doing it once. `GET` is idempotent by definition. `POST /v1/chat/completions` isn't: every POST runs the model again. On a payments API a retried POST charges a card twice. On yours it burns GPU time and, at temperature above zero, returns a *different* answer to what the client thinks is the same request.
+
+<Predict id="retry-gen">
+A client calls your server with the OpenAI SDK: `timeout=1.0`, `max_retries=2`. Your (fake) model takes 2 seconds to answer. How many times does the model run before the client gives up? What changes if your server holds a GPU lock so requests run one at a time?
+
+<Fragment slot="answer">
+
+Three. The first attempt times out after 1 s, but the server doesn't know the client left; it keeps generating. The SDK waits a moment and sends attempt two, which also times out, then attempt three. All three run to completion on the server, and the client gets an error anyway. I measured exactly this: 3 generations, about 4.3 s of client time, zero useful answers. With the GPU lock it's worse: attempts two and three queue behind attempt one, so they each wait *and then* run, and the queue for everyone else grows by two ghost requests. Retries make overload worse, which is the retry-storm story from [Rate limits](/lessons/rate-limits/).
+
+</Fragment>
+</Predict>
+
+The fix, which Stripe popularised, is an <Term w="idempotency key">A unique string (usually a random UUID) the client generates once per logical operation and sends as a header on every attempt. The server uses it to recognise a retry and return the first result instead of doing the work again.</Term>. The client makes up a random ID per *logical* request and sends it on every retry in an `Idempotency-Key` header. The server keeps a small table: key, a hash of the request body, a status, and the saved response. The first request claims the key. A retry finds it.
+
+<Figure n="002" title="ONE KEY, THREE ATTEMPTS, ONE GENERATION" caption="Attempt one claims key K and starts generating. The client times out and retries; the server sees K is still running and says 409. The SDK retries 409s. By attempt three the first generation has finished, so the server replays the saved response. The GPU ran once.">
+<svg viewBox="0 0 640 380" role="img" aria-label="Sequence diagram of an idempotent retry">
+  <text x="80" y="20" text-anchor="middle" class="strong">CLIENT</text>
+  <text x="330" y="20" text-anchor="middle" class="strong">SERVER</text>
+  <text x="560" y="20" text-anchor="middle" class="strong">KEY STORE</text>
+  <line x1="80" y1="30" x2="80" y2="370" class="ink" stroke-width="1" />
+  <line x1="330" y1="30" x2="330" y2="370" class="ink" stroke-width="1" />
+  <line x1="560" y1="30" x2="560" y2="370" class="ink" stroke-width="1" />
+  <line x1="80" y1="56" x2="330" y2="56" class="blue" stroke-width="1.2" />
+  <text x="90" y="50">POST · Idempotency-Key: K</text>
+  <line x1="330" y1="74" x2="560" y2="74" class="ink" stroke-width="1" />
+  <text x="440" y="68" text-anchor="middle">INSERT K · RUNNING</text>
+  <rect x="322" y="82" width="16" height="190" class="fill-wash" stroke-width="1" />
+  <text x="346" y="180">GENERATING (2 s)</text>
+  <text x="90" y="100">TIMEOUT AT 1 s ✕</text>
+  <line x1="80" y1="128" x2="330" y2="128" class="blue" stroke-width="1.2" />
+  <text x="90" y="122">RETRY · SAME K, SAME BODY</text>
+  <line x1="330" y1="144" x2="560" y2="144" class="ink" stroke-width="1" />
+  <text x="440" y="138" text-anchor="middle">K EXISTS · RUNNING</text>
+  <line x1="330" y1="160" x2="80" y2="160" class="ink dash" stroke-width="1" />
+  <text x="90" y="176">← 409 STILL IN PROGRESS</text>
+  <line x1="330" y1="280" x2="560" y2="280" class="ink" stroke-width="1" />
+  <text x="440" y="274" text-anchor="middle">K · DONE · SAVE BODY</text>
+  <line x1="80" y1="306" x2="330" y2="306" class="blue" stroke-width="1.2" />
+  <text x="90" y="300">RETRY AGAIN · SAME K</text>
+  <line x1="330" y1="322" x2="560" y2="322" class="ink" stroke-width="1" />
+  <text x="440" y="316" text-anchor="middle">K · DONE</text>
+  <line x1="330" y1="340" x2="80" y2="340" class="blue" stroke-width="1.5" />
+  <text x="90" y="358" class="blue-t">← 200 REPLAYED · NO GPU WORK</text>
+</svg>
+</Figure>
+
+Three details make it correct rather than approximately correct:
+
+- **Hash the body.** If the same key arrives with a *different* body, that's a client bug (it reused a key for a new request). Return an error rather than replaying an unrelated answer. Stripe does this; the IETF draft for the header suggested 422 for it and 409 for "still running".
+- **Claim atomically.** Two retries can arrive at the same moment. "Check if the key exists, then insert it" has a gap between the check and the insert, exactly the race from [Processes, threads and the GIL](/lessons/processes-threads-gil/). Use a single `INSERT ... ON CONFLICT DO NOTHING` and look at how many rows it inserted; the database makes that one step.
+- **Scope and expire.** Keys belong to an API key, never global, or Alice's retry could replay Bob's response. And they expire: Stripe documents that keys can be pruned after 24 hours. You're storing a response per request, so without a TTL the table grows forever.
+
+The `Idempotency-Key` header was on its way to becoming an IETF standard; the draft has since expired without becoming an RFC, but the header name and behaviour are a de facto convention (Stripe, and many payment and cloud APIs).
+
+### Authentication: who is calling
+
+<Term w="Authentication">Working out who is making the request. Authorization is the next question: is this caller allowed to do this?</Term> on an API usually comes in one of three forms.
+
+- An <Term w="API key">A long random secret string that identifies a caller. Sent on every request, usually as Authorization: Bearer key. Whoever holds it is that caller.</Term>. The simplest: a long random secret, sent in `Authorization: Bearer ...`. That's what OpenAI, Fireworks and your server use. Store only a hash of each key (a database leak then doesn't leak keys), compare in constant time, give keys a readable prefix so leaked ones can be spotted in logs and git history, and let each caller have several so they can rotate.
+- <Term w="OAuth">A protocol (OAuth 2.0) for letting a user grant an app limited access to their account on another service without giving the app their password. The app gets a short-lived access token instead.</Term>. For when a *third-party app* acts on behalf of a *user*: "let this app read my GitHub repos". The user approves on the provider's site, and the app gets a short-lived access token with limited scopes. Overkill for a model server with three clients you know personally.
+- A <Term w="JWT">JSON Web Token: a small signed JSON document (header.payload.signature, base64-encoded) that says who you are and until when. The server checks the signature instead of looking anything up.</Term>. A signed token that carries its own claims ("this is user 42, scope chat, expires at 15:00"). The server checks the signature with a key instead of hitting a database, which is why JWTs scale across many servers. The cost: you can't easily revoke one before it expires, so they're kept short-lived. OAuth access tokens are often JWTs.
+
+For your server: API keys. Each key also gets a name, a rate limit, and (soon) a record of which API version it uses. That record is what makes deprecation possible: you can't email the people still on v1 if you don't know who they are.
+
+### Build, document, test, release, observe
+
+These five stages are where most engineering time goes, and each has one idea worth knowing by name.
+
+**Build** against the contract. Either generate server models from the OpenAPI file (tools like `datamodel-code-generator` turn schemas into pydantic classes) or write them by hand and test that they match. Either way, the YAML is the source of truth.
+
+**Document** from the contract too. A docs page generated from the YAML can't drift from it, and one written by hand will. You'll generate one with Redocly's CLI in one command. Good docs add what a schema can't: an example request for every endpoint, every error code and what to do about it, and a changelog.
+
+**Test** for the contract, not just for correctness. A <Term w="contract test">A test that checks the interface rather than the logic: does the server accept what the contract says it accepts and return what it says it returns, with the right status codes and fields? It catches breaking changes, not wrong answers.</Term> asks "does the server still keep its promise?" Two flavours: the provider checks itself against its own spec (Schemathesis generates hundreds of requests straight from an OpenAPI file), or each client writes down the exact requests it sends and the fields it reads, and the server runs those in CI. That second flavour is <Term w="consumer-driven contract">A contract test written from the client's side: each consumer records what it sends and what it relies on in the response, and the provider must keep all those recordings passing. Pact is the best-known tool.</Term> testing, and it's the one that would have caught your `max_tokens` rename, because it encodes what a real client actually does.
+
+**Release** in stages. *Beta* means "the shape may still change, don't build a business on it". *GA* (general availability) means "this is the promise; from now on it changes only by the rules below". That's the moment the clock in Figure 004 starts. Announce in a changelog every time.
+
+**Observe** per endpoint, per version, per key. The [observability lesson](/lessons/observability/) covers the tools; the API-specific part is the labels. For each route record request rate, error rate by status code, and latency percentiles (the "RED" metrics: rate, errors, duration), and tag each with API version and key name. Then "who is still on v1?" is a query, not a guess, and a sudden jump in 400s from one key the day after a deploy tells you exactly whose integration you just broke.
+
+### Versioning: what you can change without asking
+
+Once you're GA, every change is one of two kinds. An <Term w="additive change">A change that adds something new without altering what already exists, so every client that worked before still works: a new endpoint, a new optional request field, a new response field.</Term> is safe in principle. A <Term w="breaking change">A change after which some correctly written client stops working, or silently gets different results. Removing or renaming a field, making an optional field required, changing a type or a default, changing what a status code means.</Term> needs a new version.
+
+<Predict id="breaking">
+Which of these break existing clients of your `/v1/chat/completions`? (a) Add an optional `top_p` request field. (b) Add a `system_fingerprint` field to responses. (c) Add a new `finish_reason` value, `"content_filter"`. (d) Change the default `max_tokens` from 256 to 512. (e) Start rejecting requests that have unknown fields.
+
+<Fragment slot="answer">
+
+(a) Safe: old clients don't send it and get the old behaviour. (b) Safe for any client that ignores unknown fields, which is most of them, but a client that validates responses strictly will choke. (c) This is the classic grey zone: it's "just a new value", but a client with a `match` or `switch` over `finish_reason` and no default branch now crashes or mishandles it. Stripe's docs handle this by marking each enum as *open* (may grow; write a default branch) or *closed* (fixed). (d) Breaking, and silently: every client that relied on the default gets longer, slower, more expensive answers with no error. (e) Breaking: any client that sends an extra field it always sent and you always ignored now gets a 400.
+
+The pattern: "breaking" isn't about what you meant to promise, it's about what clients actually rely on.
+
+</Fragment>
+</Predict>
+
+That last sentence has a name. <Term w="Hyrum's Law">"With a sufficient number of users of an API, it does not matter what you promise in the contract: all observable behaviours of your system will be depended on by somebody." Hyrum Wright, Google.</Term> says that past a certain size, every observable behaviour is part of your API whether you wrote it down or not: field order, error message wording, how long a request takes. You can't stop that. You can make it less likely, by documenting clearly what's guaranteed, telling clients to be <Term w="tolerant readers">Clients that read only the fields they need and ignore everything else, so new fields and unexpected extras don't break them. A name from Martin Fowler's writing on service design.</Term>, and testing the contract instead of the implementation.
+
+There are two common places to put the version.
+
+| | URL versioning | Header versioning |
+|---|---|---|
+| Looks like | `POST /v1/chat/completions` | `anthropic-version: 2023-06-01`, `Stripe-Version: ...` |
+| Visible in | Every log line, every `curl`, every browser bar | Only if you print headers |
+| Routing | Plain path routing; easy to send v1 and v2 to different servers | One URL; the app reads the header and adapts |
+| Granularity | Coarse: v1, v2, rarely v3 | Can be fine: a new version every month |
+| Used by | OpenAI (`/v1/...`), most public APIs | Stripe (dates), Anthropic (dates), GitHub (dates, since 2022) |
+
+**Stripe's date versioning** is the famous one, so state it carefully. A Stripe API version is a date, and your account gets a default version. Requests use that default unless you send a `Stripe-Version` header to override it, which is how you test an upgrade before committing to it. So code written in 2019 keeps getting 2019 behaviour until someone upgrades it on purpose. Inside Stripe, as Brandur Leach described on Stripe's blog in 2017, the code is written for the newest version, and each breaking change ships with a small "version change" module that transforms a new-style response back into the old shape for accounts pinned behind it. Responses walk backwards through those modules until they match the caller's version. The scheme has evolved: starting with the `2024-09-30.acacia` release, Stripe ships a monthly version with no breaking changes and a major release with breaking changes twice a year, each major named (acacia, basil, and so on), so version strings now look like a date plus a name. Check Stripe's versioning docs for the current rules; the idea that matters is the pin.
+
+<Figure n="003" title="ONE CORE, TWO SKINS" caption="Both versions call the same internal function. Each version is a thin adapter that translates its request shape into the core's, and the core's response back into its own. v1 also adds deprecation headers. Fixing a bug in the core fixes it for everyone; a breaking change touches only an adapter.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Two version adapters in front of one shared core">
+  <rect x="10" y="40" width="150" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="62" text-anchor="middle" class="strong">bench.py (old)</text>
+  <text x="85" y="80" text-anchor="middle">max_tokens: 256</text>
+  <rect x="10" y="190" width="150" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="212" text-anchor="middle" class="strong">new client</text>
+  <text x="85" y="230" text-anchor="middle">max_completion_tokens</text>
+  <rect x="210" y="36" width="160" height="64" class="fill-paper dash" stroke-width="1.2" />
+  <text x="290" y="56" text-anchor="middle" class="strong">/v1 ADAPTER</text>
+  <text x="290" y="73" text-anchor="middle">max_tokens → limit</text>
+  <text x="290" y="89" text-anchor="middle">+ Deprecation, Sunset</text>
+  <rect x="210" y="186" width="160" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="290" y="206" text-anchor="middle" class="strong">/v2 ADAPTER</text>
+  <text x="290" y="223" text-anchor="middle">max_completion_tokens</text>
+  <text x="290" y="239" text-anchor="middle">→ limit · strict fields</text>
+  <rect x="440" y="108" width="190" height="72" class="fill-wash" stroke-width="1.5" />
+  <text x="535" y="132" text-anchor="middle" class="strong">CORE</text>
+  <text x="535" y="150" text-anchor="middle">generate(messages, limit)</text>
+  <text x="535" y="166" text-anchor="middle">one GPU lock, one model</text>
+  <line x1="160" y1="68" x2="210" y2="68" class="ink" stroke-width="1.2" />
+  <line x1="160" y1="218" x2="210" y2="218" class="blue" stroke-width="1.2" />
+  <line x1="370" y1="68" x2="440" y2="130" class="ink" stroke-width="1.2" />
+  <line x1="370" y1="218" x2="440" y2="158" class="blue" stroke-width="1.2" />
+  <text x="85" y="20" text-anchor="middle">SENT YEARS AGO</text>
+  <text x="85" y="275" text-anchor="middle">WRITTEN TODAY</text>
+  <text x="535" y="210" text-anchor="middle">TESTED ONCE</text>
+  <text x="535" y="226" text-anchor="middle">USED BY BOTH</text>
+</svg>
+</Figure>
+
+Whichever way you version, build it like Figure 003. The worst version of versioning is copying the whole server into `v2/` and fixing bugs twice for three years.
+
+### Deprecate, then retire
+
+<Term w="Deprecation">Announcing that something still works but is going away, and you should stop using it. It's a warning, not a change in behaviour.</Term> is the announcement. Retirement (or <Term w="sunset">The date after which a deprecated API stops working. Also the name of an HTTP header that announces that date.</Term>) is the end. The gap between them is the <Term w="migration window">The time between announcing a deprecation and turning the old thing off, during which clients are expected to move. Months for public APIs; often a year or more for anything that touches money.</Term>.
+
+Two HTTP headers carry this in-band, so a client can notice without anyone reading email:
+
+```http
+HTTP/1.1 200 OK
+Deprecation: @1790812800
+Sunset: Sun, 31 Jan 2027 00:00:00 GMT
+Link: </docs/migrate-v2>; rel="deprecation"; type="text/html"
+```
+
+`Deprecation` (RFC 9745, March 2025) says when the thing was or will be deprecated, as `@` plus a Unix timestamp. `Sunset` (RFC 8594, 2019) says when it stops working, in the older HTTP date format; RFC 9745 notes the mismatch is there "for historical reasons". `Link` with `rel="deprecation"` points at the migration guide. None of these change behaviour: the response is still the full, correct v1 response. They're a hint, and a client that logs a warning when it sees one is a client that migrates in time.
+
+Now the uncomfortable part. Telling people isn't enough.
+
+<Figure n="004" title="THE LIFE OF v1" caption="Drag the deprecation date and the migration window, and toggle what you do to get clients moving. The black line is clients on v1; blue is v2. Watch the tail: some clients never read the notice, and only an outage finds their owners." wide>
+<APITimeline />
+</Figure>
+
+Play with it until two things feel obvious. First, migration has a long tail: the first 70% of clients move quickly, the last 10% take forever, and some never move until something breaks. Second, the only reliable way to find the clients nobody is watching (a cron job written by someone who left, a notebook on a forgotten VM) is to break them briefly and on purpose. That's a <Term w="brownout">A planned, short, announced outage of a deprecated API before its sunset, say an hour at a time, so the owners of clients still using it notice errors while there's still time to fix them.</Term>. GitHub, among others, has run scheduled brownouts before removing old behaviour. After the sunset, the old URL should answer with `410 Gone` and a message pointing at v2, not a `404`: "this existed and was removed on purpose" is more useful than "never heard of it".
+
+### REST, RPC and GraphQL, briefly
+
+All of the above applies whatever *style* of API you build. There are three common ones.
+
+| | REST | RPC (e.g. gRPC) | GraphQL |
+|---|---|---|---|
+| The idea | URLs name resources; HTTP methods act on them | Call a named function on a remote server | One endpoint; the client sends a query naming exactly the fields it wants |
+| Looks like | `GET /v1/models/llama-8b` | `Inference.Generate(req)` | `query { model(id: "llama-8b") { name contextLength } }` |
+| Contract | OpenAPI | `.proto` files (Protocol Buffers) | A typed schema |
+| Wins at | Public APIs, caching, `curl`-ability, every language has an HTTP client | Service-to-service speed: compact binary encoding, HTTP/2, streaming, generated clients | Many different frontends that each want different slices of linked data, in one round trip |
+| Costs | Over- and under-fetching; "is this a resource?" arguments | Not human-readable; awkward from browsers | Hard to cache, easy to write one query that costs the server a fortune; rate limiting by "cost" not count |
+
+<Term w="RPC">Remote procedure call: making a call to a function on another machine look like a local function call. gRPC is Google's open-source RPC framework, released in 2015.</Term> is older than REST, and honestly, `POST /v1/chat/completions` is RPC wearing REST's clothes: "completions" aren't really a resource you fetch later, it's a function call. That's fine. Most real "REST" APIs are pragmatic HTTP+JSON, and nobody serious will argue with you about it in an interview if you can name the tradeoffs. <Term w="GraphQL">A query language for APIs, made at Facebook (2012) and open-sourced in 2015. The client asks for exactly the fields it needs across linked objects in one request.</Term> evolves without versions by design: you add fields and mark old ones `@deprecated`, and since clients only receive what they ask for, new fields never surprise anyone.
+
+### Why "OpenAI-compatible" became the standard
+
+Nobody voted for it. OpenAI shipped the first LLM API most developers used, the official SDKs let you change `base_url`, and every competitor realised the fastest way to win a customer was to require zero code changes to try them. So vLLM, SGLang, llama.cpp's server, Ollama, Fireworks, Together and many others serve `/v1/chat/completions` with OpenAI's shapes, and Anthropic and Google both publish OpenAI-compatible endpoints alongside their own APIs. It's a <Term w="de facto standard">A standard by adoption rather than by committee: no spec body owns it, everyone follows it because everyone else does.</Term>: the network effect of every tutorial, SDK, eval harness and agent framework speaking the same JSON.
+
+For your server, that means three things.
+
+1. **You don't own your contract.** OpenAI does, and changes it on its own schedule: `max_completion_tokens` replacing `max_tokens`, new fields in `usage`, the newer Responses API next to chat completions. "Compatible" is a moving target, so pick a subset, write it down in your OpenAPI file, and say which subset in your docs.
+2. **The error shape is part of compatibility.** The OpenAI SDK turns status codes into exception classes (`BadRequestError` for 400, `AuthenticationError` for 401, `RateLimitError` for 429, and so on) and decides whether to retry by status code. Return FastAPI's default 422 for a bad request and the SDK raises `UnprocessableEntityError` instead, so a client written against OpenAI doesn't catch it. Return 409 for "still running" and the SDK retries it, which is exactly what you want from idempotency.
+3. **Fidelity is in the details.** The streaming format, the `[DONE]` sentinel, `usage` in the last chunk, `finish_reason` values: [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/) already showed that clients depend on these. Hyrum's Law applies to OpenAI's API with millions of users, and so to yours.
+
+### Part two: the life of one request
+
+Now zoom in from months to milliseconds. Every promise from part one gets enforced somewhere between the socket and your handler. Click through it, then send a few requests and watch where each one stops.
+
+<Figure n="005" title="ONE REQUEST, ELEVEN STAGES" caption="Click a stage to see what it does and which status codes it can return. Send a request to watch it travel until a stage answers it. Most requests are answered before the handler; that's the point." wide>
+<APIPipeline />
+</Figure>
+
+The stages, in plain words, from the outside in:
+
+- **TLS termination.** Something decrypts HTTPS. Usually not your Python: a reverse proxy like Caddy or nginx, a cloud load balancer, or `tailscale serve`. It hands your app plain HTTP on localhost. The [TLS lesson](/lessons/tls/) covers the handshake; the API-design point is that the proxy also owns timeouts, so a 504 can come from a layer your app never saw.
+- **Routing.** Method + path → function. This is where `/v1` vs `/v2` is decided, and where `404` and `405` come from. [HTTP from scratch](/lessons/http-from-scratch/) builds this by hand.
+- <Term w="middleware">Code that wraps every request: it runs before the handler and again after it, without the handler knowing. Used for anything that applies to all routes, like logging, auth, or adding headers.</Term>. The cross-cutting stuff. A request ID and a log line (outermost, so it sees every outcome, even failures). Auth (401/403). Rate limiting (429), which must come after auth because it needs to know *whose* bucket, which is the [rate limits](/lessons/rate-limits/) bucket keyed by API key.
+- **Validation.** Does the body match the schema? 400 with `param` if not.
+- **Idempotency.** After validation, so invalid requests never get a stored answer (Stripe's docs describe the same rule). Before the handler, so a replay skips the GPU.
+- **Handler.** Your actual code, which now only ever sees well-formed, authenticated, within-budget, non-duplicate requests.
+- **Serialization and response.** Python objects to JSON or SSE, optionally checked against your response schema, plus headers on the way out: request ID, rate-limit headers, Deprecation/Sunset. The log line is written with the final status and latency, which is where the [observability](/lessons/observability/) metrics come from.
+
+<Predict id="order">
+In FastAPI, you put auth in a dependency on the route. A client with *no* API key sends a body that isn't valid JSON (`{nope`). Which error does it get: 401 or a validation error? And with no key but valid JSON that's missing `messages`?
+
+<Fragment slot="answer">
+
+I measured this on FastAPI 0.143: broken JSON with no key returns **422**, a validation error. FastAPI reads and parses the body before it runs your dependencies, so the auth check never ran. Valid JSON missing `messages`, with no key, returns **401**: parsing succeeded, dependencies ran, auth said no before the body was checked against the schema. So "the order of the pipeline" isn't always the order you'd draw on a whiteboard; frameworks have their own. That matters in two ways: anonymous callers can make you parse large bodies (cap the body size at the proxy), and your error handler has to rewrite *both* paths into the OpenAI shape.
+
+</Fragment>
+</Predict>
+
+The ordering has a logic. Cheap checks that reject the most traffic go first. Anything that needs to know who you are goes after auth. Anything that costs money (GPU) goes last. And the outermost layer, logging, wraps everything, because the requests you most need to see in the logs are the ones that got rejected.
+
+## Build It
+
+You'll extend the inference project with an API layer that runs on your Mac with a fake model, then point it at the real one.
+
+```text
+inference/
+  server_naive.py        # from Baseline vs Fireworks
+  bench.py               # the harness: your one real client
+  api/
+    openapi.yaml         # the contract, written first
+    core.py              # generate(messages, limit): fake or real
+    errors.py            # one error shape
+    keys.py              # API keys, per-key buckets
+    idem.py              # idempotency store (SQLite)
+    app.py               # routes: v1 and v2 adapters
+    make_key.py
+    contract/            # consumer contract + breaking-change check
+      bench_contract.py
+      breaking.py
+```
+
+<Task id="t1" title="Set up and write a fake core" agent="ok">
+
+On your Mac:
+
+```bash
+cd inference/api
+python3 -m venv .venv && source .venv/bin/activate
+pip install fastapi uvicorn httpx openai pyyaml pytest
+```
+
+A fake model, so the whole API layer is testable in milliseconds without a GPU. It has the same signature the real one will have. `FAKE_SECONDS` lets you make it slow on purpose.
+
+```python
+# core.py
+import os, time, uuid
+
+FAKE_SECONDS = float(os.environ.get("FAKE_SECONDS", "0.05"))
+GENERATIONS = 0  # count how often the "GPU" actually ran
+
+
+def generate(model: str, messages: list[dict], limit: int) -> dict:
+    """Return a chat.completion object. The real version wraps server_naive's generate."""
+    global GENERATIONS
+    GENERATIONS += 1
+    time.sleep(FAKE_SECONDS)
+    words = (["hello"] * limit)
+    return {
+        "id": f"chatcmpl-{uuid.uuid4().hex[:12]}", "object": "chat.completion",
+        "created": int(time.time()), "model": model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": " ".join(words)},
+                     "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 5, "completion_tokens": len(words), "total_tokens": 5 + len(words)},
+    }
+```
+
+This lesson does non-streaming responses (`stream: false`) for the API-layer work; streaming plus idempotency is a Break It item.
+
+</Task>
+
+<Task id="t2" title="Write the contract first" agent="hands">
+
+Write `openapi.yaml` for the subset of `/v1/chat/completions` your server actually supports, *before* touching `app.py`. Here's the frame and the one schema that's the same for every endpoint; the rest is yours.
+
+```yaml
+openapi: 3.1.0
+info:
+  title: Spark inference API
+  version: 1.0.0
+  description: OpenAI-compatible subset served from the DGX Spark.
+security:
+  - bearerAuth: []
+paths:
+  /v1/chat/completions:
+    post:
+      operationId: createChatCompletion
+      parameters: []            # TODO: the optional Idempotency-Key header
+      requestBody: {}           # TODO: ref ChatRequest
+      responses: {}             # TODO: 200 (ChatCompletion), and every error status you return
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [message, type]
+          properties:
+            message: { type: string }
+            type: { type: string }
+            param: { type: [string, 'null'] }
+            code: { type: [string, 'null'] }
+    # TODO: Message (role enum, content), ChatRequest, ChatCompletion (choices, usage)
+```
+
+Decide, and write into the schema, every limit you'll enforce: `messages` must have at least one item, `max_tokens` has a minimum and a maximum, `temperature` has a range, which `role` values exist, which `finish_reason` values you can return. Give the 429 response a `Retry-After` header. Every error status should reference the same `Error` schema. Those decisions *are* the design.
+
+Lint it and generate docs:
+
+```bash
+npx @redocly/cli lint openapi.yaml
+npx @redocly/cli build-docs openapi.yaml -o docs.html && open docs.html
+```
+
+On my machine the lint passed with one warning (no `license` in `info`), and the docs build produced a single ~60 KB HTML file. Read your own docs as if you were a stranger. Anything you'd have to ask about is missing from the spec.
+
+</Task>
+
+<Task id="t3" title="Validation and one error shape" agent="hands">
+
+First, feel the default. Write the v1 route with a pydantic model that mirrors your spec and no custom handlers, then send it an empty `messages` list through the OpenAI SDK:
+
+```python
+from openai import OpenAI
+c = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="x", max_retries=0)
+c.chat.completions.create(model="m", messages=[], max_tokens=4)
+```
+
+Note the exception class and the body. Then write `errors.py` so that *every* failure leaves your server in the OpenAI shape:
+
+```python
+# errors.py: the shape. You fill in the bodies.
+class APIError(Exception):
+    def __init__(self, status: int, message: str, type: str = "invalid_request_error",
+                 code: str | None = None, param: str | None = None, headers: dict | None = None): ...
+
+def install(app):
+    @app.exception_handler(APIError)
+    async def _api(request, exc): ...            # your own raises
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation(request, exc): ...     # pydantic failures and broken JSON -> 400 + param
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _http(request, exc): ...           # 404 / 405 from routing
+
+    @app.exception_handler(Exception)
+    async def _crash(request, exc): ...          # 500, generic message + request id; trace to the log
+```
+
+Hints: `exc.errors()` on a validation error is a list of dicts with `loc`, `msg`, `type`. `loc` looks like `("body", "messages")`; drop the first element and join the rest with dots for `param`. Broken JSON shows up here too, with an error type of `json_invalid`; give it its own `code`. Never put the exception text in a 500's message: stack traces leak paths, library versions and sometimes data.
+
+Retry the SDK call. With the default handler I got `UnprocessableEntityError` (422, `{"detail": [...]}`); with yours you should get `BadRequestError` (400) whose `.body` has your `param` and `code`.
+
+</Task>
+
+<Task id="t4" title="Idempotency keys with a store" agent="hands">
+
+Add `idem.py`: a SQLite table and one function that wraps the handler. SQLite survives a server restart, and its single-statement inserts give you the atomic claim for free.
+
+```sql
+CREATE TABLE IF NOT EXISTS idem (
+  owner     TEXT NOT NULL,      -- API key name: keys are per caller, never global
+  key       TEXT NOT NULL,
+  req_hash  TEXT NOT NULL,      -- sha256 of the canonical request body
+  status    INTEGER NOT NULL,   -- 0 = running, else the saved HTTP status
+  body      TEXT,               -- saved response JSON
+  created   REAL NOT NULL,
+  PRIMARY KEY (owner, key)
+);
+```
+
+```python
+def run_idempotent(owner: str, idem_key: str | None, body: dict, work) -> tuple[int, dict, dict]:
+    """Return (status, response_body, extra_headers). Calls work() at most once per (owner, key)."""
+    # no key -> just work()
+    # hash json.dumps(body, sort_keys=True)
+    # INSERT ... ON CONFLICT DO NOTHING; cursor.rowcount == 1 means you claimed it
+    # not claimed: different hash -> 422; status 0 -> 409; else replay saved body,
+    #   with header Idempotent-Replayed: true
+    # claimed: run work(); on success save status + body; on exception DELETE the row
+    #   (so a retry can try again), then re-raise
+```
+
+Decide and write down (in the spec, as the header's description) two policies: how long keys live (Stripe documents 24 hours) and whether a failed request's key is released (above: yes) or its error is saved and replayed (Stripe's v1 API saves and replays even 500s). Add a cleanup that deletes rows older than your TTL.
+
+Test it the way it'll actually be used: start the server with `FAKE_SECONDS=2`, call it with the SDK at `timeout=1.0, max_retries=4` and an `extra_headers={"Idempotency-Key": str(uuid.uuid4())}`, and read `core.GENERATIONS` from a debug endpoint afterwards. Then the same with no key.
+
+</Task>
+
+<Task id="t5" title="API keys and per-key rate limits" agent="hands">
+
+Keys first. `make_key.py` is boilerplate:
+
+```python
+# make_key.py: prints a new key once; stores only its hash.
+import hashlib, json, secrets, sys
+name = sys.argv[1]
+key = "wb_" + secrets.token_urlsafe(32)
+db = json.load(open("keys.json")) if __import__("os").path.exists("keys.json") else {}
+db[hashlib.sha256(key.encode()).hexdigest()] = {"name": name, "rate": 1.0, "burst": 5}
+json.dump(db, open("keys.json", "w"), indent=2)
+print(key)  # shown once. If it's lost, make a new one.
+```
+
+Then `keys.py` is yours: a FastAPI dependency that reads `Authorization: Bearer ...`, hashes it, looks it up, and returns the key record or raises `APIError` 401 (missing vs unknown get different `code`s). Then take one token from that key's bucket, your token bucket from [Rate limits](/lessons/rate-limits/), keyed by key name and guarded by a `threading.Lock` because sync handlers run in a thread pool. Out of tokens: 429 with `Retry-After` in whole seconds.
+
+```python
+def require_key(request: Request) -> dict: ...   # 401s, then bucket.take() or 429
+```
+
+On success, set response headers in the shape OpenAI uses (`x-ratelimit-limit-requests`, `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests`) so a well-behaved client can slow down *before* it hits the wall. Look up the exact header semantics in OpenAI's rate-limit docs; the names are what matter for compatibility.
+
+Two details to get right: compare hashes with `hmac.compare_digest` (constant time), and decide whether a request that fails validation still costs a token. (In my version it did, because auth and the bucket run before the body is validated. That's a defensible choice: otherwise invalid requests are free to spam.)
+
+</Task>
+
+<Task id="t6" title="Break it the wrong way, then write the test that catches it" agent="review">
+
+Do the bad thing from The Problem on purpose. In the v1 pydantic model, rename `max_tokens` to `max_completion_tokens` with a default of 16, restart, and run `bench.py` (pointed at this server) for a handful of requests. Look at `usage.completion_tokens` in its results. Nothing errored.
+
+Now write two guards, either of which would have stopped this.
+
+**A consumer contract.** `contract/bench_contract.py`: a pytest file that sends *exactly* the requests `bench.py` sends (same fields, same headers) and asserts on exactly the fields `bench.py` reads. The assertion that catches this break:
+
+```python
+def test_max_tokens_is_honoured(client):
+    r = client.post("/v1/chat/completions", json=BENCH_BODY | {"max_tokens": 7}, headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["usage"]["completion_tokens"] <= 7   # fails after the rename: 16
+```
+
+Add one test per behaviour `bench.py` depends on: the error shape on a bad key, `finish_reason` values it switches on, the `usage` fields. Run it with FastAPI's `TestClient` against the app object, so it needs no running server.
+
+**A spec diff.** `contract/breaking.py old.yaml new.yaml`: walk the request schemas of both specs and print every breaking difference. Exit 1 if any. The shape:
+
+```python
+def walk(old, new, path, direction, out):
+    # follow $ref on both sides
+    # type changed -> breaking
+    # direction == "request":  property removed (clients still send it), newly required,
+    #                          enum lost a value
+    # direction == "response": property removed (clients still read it),
+    #                          enum gained a value (warn: strict clients may choke)
+    # recurse into properties and items
+```
+
+Mine was about 40 lines and printed `POST /v1/chat/completions request.max_tokens: removed (clients still send it)` for the rename. Run it in CI against the spec on `main`. For real projects, `oasdiff` does this properly (check its README for install); writing a small one yourself is how you learn what it checks.
+
+Revert the rename. Then ask an agent to review both guards: what breaking changes would they still miss?
+
+</Task>
+
+<Task id="t7" title="Ship v2 next to v1, deprecate v1, migrate the client" agent="hands">
+
+Now make the change properly, shaped like Figure 003.
+
+1. **Core and adapters.** `app.py` gets two thin routes. v1 accepts `max_tokens` exactly as before. v2 accepts `max_completion_tokens` and, because it's a fresh contract, rejects unknown fields (`model_config = ConfigDict(extra="forbid")`), so the next silent rename is impossible on v2. Both call `core.generate(model, messages, limit)` through `run_idempotent`.
+2. **Spec.** Add `/v2/chat/completions` to `openapi.yaml`. Mark the v1 operation `deprecated: true` (OpenAPI supports this; your generated docs will strike it through). `breaking.py old.yaml new.yaml` must still pass: you added a path, you didn't change one.
+3. **Deprecation headers.** Every v1 response, including errors, gets `Deprecation` (`@` + Unix seconds), `Sunset` (an HTTP date: `email.utils.format_datetime(dt, usegmt=True)`), and a `Link` to a migration note. Check Sunset is not earlier than Deprecation; RFC 9745 says it must not be.
+4. **Know who's left.** Log one line per request with key name and version. Write a 10-line script that reads the log and prints v1 request counts per key over the last day. This is the list you'd email.
+5. **Migrate the client.** Change `bench.py` to call v2 with `max_completion_tokens`, and make it print a warning whenever any response carries a `Deprecation` header. Re-run its consumer contract against v2. Run the per-key script again: your key should drop off the v1 list.
+6. **Sunset.** Set the sunset date to yesterday. v1 now returns `410` with `code: "version_retired"` and a message naming v2. Keep the route; the 410 *is* the documentation for anyone who shows up late.
+
+Finally, swap the fake core for the real one: `core.generate` calls into the generate logic from `server_naive.py` under its GPU lock. The API layer doesn't change at all. That's how you know the layering is right.
+
+</Task>
+
+<DoneWhen>
+
+- `openapi.yaml` lints, `docs.html` builds from it, and v1 shows as deprecated in the docs.
+- Every error your server can return (bad JSON, missing field, bad key, rate limit, idempotency conflict, 404, 405, crash) has the `{"error": {...}}` shape, and the OpenAI SDK raises the matching exception class for each.
+- With `FAKE_SECONDS=2`, a 1-second-timeout client with retries runs the model once with an idempotency key and several times without.
+- Reusing an idempotency key with a different body returns 422; a key from Alice can't replay Bob's response.
+- The rename from t6 fails both `bench_contract.py` and `breaking.py`; the v2 addition passes both.
+- `bench.py` runs on v2 without warnings, v1 returns Deprecation/Sunset headers until sunset and 410 after, and your per-key report shows who still uses v1.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. My numbers are from the fake core on an M-series Mac, localhost, FastAPI 0.143, OpenAI Python SDK 3.x; yours will differ in the milliseconds but should match in shape.
+
+| Measurement | Prediction | Mine (fake core) | Yours |
+|---|---|---|---|
+| Generations, SDK timeout 1 s, 2 retries, 2 s model, no idempotency key | | 3 (client got a timeout error after ~4.3 s) | |
+| Generations, same, with `Idempotency-Key`, 4 retries | | 1 (client got a replayed 200 after ~2.5 s) | |
+| SDK exception for `messages: []`, FastAPI default handler | | `UnprocessableEntityError`, 422 | |
+| SDK exception for `messages: []`, your handler | | `BadRequestError`, 400, `param: "messages"` | |
+| Broken JSON, no API key | | 422 (body parsed before auth) | |
+| p50 latency through auth + bucket, fake core with 0 s sleep | | ~1.4 ms | |
+| Same plus an idempotency key (one SQLite insert + update) | | ~2.0 ms | |
+| `completion_tokens` from `bench.py` after the t6 rename (asked for 256) | | 16 | |
+| v1 requests per key, before and after migrating `bench.py` | | | |
+
+**What the numbers say.** The API layer costs on the order of a millisecond or two per request on localhost: rough numbers, from a few dozen sequential requests on my Mac. Put that next to the ~20 seconds a 256-token request spends on the GPU in [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/): the whole pipeline is under a ten-thousandth of the request. So you never skip auth, validation or idempotency "for speed" on an inference server. The thing that costs is the GPU, and the API layer's whole job is to stop wasted GPU work: duplicate retries, invalid requests, over-budget callers.
+
+The retry row is the one to remember. Without a key, the client got *nothing* and the server did three requests' worth of work. On your real server with the GPU lock, those three would queue, and every other user's TTFT would grow by two full generations.
+
+## Break It
+
+**Ignore unknown fields on a contract you're changing.** You already did this in t6; now do it on v2 by removing `extra="forbid"` and sending `max_tokens`. The request succeeds with the default limit. Lesson: being tolerant when *reading* is great for clients; for a server, silently ignoring a field the client clearly meant is how renames become invisible. Strict on new contracts, tolerant only where you've promised to be.
+
+**Make idempotency keys global.** Drop `owner` from the primary key. Have "alice" and "bob" both send `Idempotency-Key: 1` (people really do use counters). Bob gets Alice's completion, which on a real service means Bob reads Alice's data. With the body hash in place he gets a 422 instead, unless their bodies happen to match. Lesson: every cache keyed by something the client chooses must also be keyed by who the client is.
+
+**Stream with an idempotency key.** Send `stream: true` with a key, kill the client mid-stream, retry. What should the server replay: the events so far? All of them, once it's done? Neither is obvious, which is why many APIs only honour idempotency on non-streaming requests or document something specific. Write down what yours does. If it's "it generates again", say so in the spec.
+
+**Put the rate limiter before auth.** Move the bucket to run first, keyed by client IP. Now everyone behind one NAT (an office, a Tailscale exit node) shares a bucket, and a stranger sending garbage keys spends your real users' budget. The fix most APIs use is two limiters: a coarse per-IP one in front of auth to stop key-guessing, and the real per-key one after it.
+
+## Explain It Back
+
+<details>
+<summary>"What's an API lifecycle?" Answer it in under a minute.</summary>
+
+There are two meanings and I'd check which one you mean. Usually it's the lifecycle of an API as a product: you **design** the contract first, usually in OpenAPI, with consistent naming, pagination, one error shape, idempotency keys on POSTs and auth; **build** against it; **document** it from the same spec; **test** that the server keeps the contract, ideally with consumer-driven contract tests; **release** through beta to GA, after which changes follow rules; **observe** usage per endpoint, version and key; **version**, meaning additive changes go out freely and breaking ones get a new version, by URL like `/v2` or by header like Stripe's date versions; **deprecate** with notice, Deprecation and Sunset headers and a migration window; and **retire**, returning 410 Gone. The other meaning is the lifecycle of one request in a server: TLS termination, routing, middleware like auth, rate limiting and logging, validation, the handler, serialization, response. The two connect: the design stage decides the rules, and the request pipeline enforces them on every call.
+
+</details>
+
+<details>
+<summary>What makes a change breaking? Give one that's breaking but looks harmless.</summary>
+
+A change is breaking if some correctly written existing client stops working or silently gets different results. Removing or renaming a field, making something required, changing a type or a meaning or a status code are obvious. The harmless-looking ones: changing a default (every client that relied on it changes behaviour with no error), adding a value to an enum clients switch on, starting to reject unknown fields, or a rename on a server that ignores unknown fields, where the client's old field is silently dropped. That last one is the worst kind because nothing fails; it just gives wrong answers. By Hyrum's Law, with enough users any observable behaviour is something somebody depends on, so "breaking" is about what clients do, not what the docs say.
+
+</details>
+
+<details>
+<summary>Why do POST endpoints need idempotency keys, and how do you implement them correctly?</summary>
+
+Because networks lose responses. A client that times out can't tell "never arrived" from "succeeded but the answer got lost", so it retries, and a retried POST does the work again: double charge, double generation. The client sends a random key per logical operation on every attempt. The server stores key, a hash of the body, status, and the saved response. The first request atomically claims the key (a single insert-if-absent, not check-then-insert, which races). Retries while it's running get 409; retries after get the saved response; the same key with a different body gets 422. Keys are scoped per API key so one caller can't replay another's response, and expire after a TTL like 24 hours. Validation runs before the claim, so invalid requests never get stored.
+
+</details>
+
+<details>
+<summary>Your inference API grows from 3 clients to 3,000 across 20 servers. What changes in the API layer?</summary>
+
+The ideas stay; the state has to move. With one server, the key table, the token buckets and the idempotency store all live in-process or in a local SQLite file. Across 20 servers behind a load balancer, a retry can land on a different server than the original, so the idempotency store must be shared (Redis or Postgres), and the claim must still be atomic there (Redis `SET NX` with an expiry, or a unique constraint in Postgres). Per-key rate limits must be shared too, or each key effectively gets 20× its limit; the [rate limits lesson](/lessons/rate-limits/) covers the distributed bucket. Key lookups get cached, since they happen on every request. The idempotency store's size is requests per day × TTL × response size: 3,000 clients doing 10,000 requests a day each at 2 KB per response with a 24-hour TTL is 30 million rows and about 60 GB, so you'd store a shorter TTL, or store a hash plus a pointer instead of every full body. And with 3,000 clients, deprecation becomes a real project: you need per-version, per-key usage to find who's left, and months-long windows with brownouts, because the long tail is now hundreds of clients.
+
+</details>
+
+<details>
+<summary>Why did "OpenAI-compatible" become the standard, and what does it cost you?</summary>
+
+Network effects. OpenAI's API was the first one most people used, its SDKs let you change the base URL, and every competitor and open-source engine (vLLM, SGLang, Ollama, Fireworks, and even Anthropic and Google via compatibility endpoints) realised that "change one line to try us" beats any better-designed API. Now every SDK, eval harness and agent framework speaks it. The cost: you don't own your contract. OpenAI changes it on its own schedule, so compatibility is a moving target; you have to pick a documented subset and match the details clients rely on, including the error shape and status codes, because the SDK maps them to exception classes and retry decisions, and the streaming format down to the `[DONE]` line.
+
+</details>
+
+## Go Deeper
+
+- **Roy Fielding, "Architectural Styles and the Design of Network-based Software Architectures" (PhD dissertation, UC Irvine, 2000), chapter 5.** Where REST comes from. Read it for the *why*: independent evolution of clients and servers, which is the whole lifecycle problem.
+- **Brandur Leach, "APIs as infrastructure: future-proofing Stripe with versioning" (Stripe blog, 2017).** The canonical write-up of date-based versioning and version-change modules. Pair with Stripe's current versioning docs to see how the scheme evolved.
+- **Brandur Leach, "Designing robust and predictable APIs with idempotency" (Stripe blog, 2017).** Idempotency keys explained by the people who popularised them, including the failure cases.
+- **The OpenAPI Specification (spec.openapis.org).** The format you wrote. Skim the Schema Object and the `deprecated` field; the spec is more readable than you'd expect.
+- **RFC 9745 (Deprecation header, 2025), RFC 8594 (Sunset header, 2019) and RFC 9457 (Problem Details, 2023).** Short, readable standards for exactly the headers and error bodies in this lesson.
+- **Google's API Improvement Proposals (aip.dev), especially AIP-180 "Backwards compatibility" and AIP-158 "Pagination".** The most careful public list of what counts as breaking, from a company with thousands of APIs.
+- **Hyrum Wright, "Hyrum's Law" (hyrumslaw.com), and "Software Engineering at Google" (Winters, Manshreck, Wright, O'Reilly 2020).** Why every observable behaviour becomes part of the contract, and what that does to large codebases.
+- **OpenAI API reference: error codes, rate limits, and the `openai-python` README on retries and timeouts.** The dialect your server imitates. Check here when compatibility questions come up; it changes.
+
+## Connections
+
+- Builds on [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/) (the server and the client you just versioned) and [Rate limits](/lessons/rate-limits/) (the bucket behind your 429s).
+- [HTTP from scratch](/lessons/http-from-scratch/) builds the routing and parsing stages by hand; [TLS](/lessons/tls/) is the first stage of the pipeline.
+- [Observability](/lessons/observability/) turns the per-request log line into the per-endpoint, per-version metrics that make deprecation possible.
+- [Transactions](/lessons/transactions/) explains why the atomic insert in your idempotency store is safe, and what "atomic" costs. [Indexes](/lessons/indexes/) explains why cursor pagination is fast.
+- [Load balancing](/lessons/load-balancing/) is where a single-server idempotency store stops being enough.

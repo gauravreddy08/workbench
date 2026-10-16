@@ -1,0 +1,261 @@
+---
+// One training step as a memory timeline: forward (activations pile up), loss (logits spike),
+// backward (activations freed layer by layer while gradients appear), optimizer step, zero_grad.
+// Toggles: checkpointing, first step vs later steps, model. Scrub or play a cursor through it.
+// Usage: <TrainMemTimeline />
+---
+<div class="tmt" data-fig="trainmem-timeline">
+  <div class="tmt-row">
+    <span class="label">Model</span>
+    <div class="tmt-btns" data-group="model">
+      <button class="btn" type="button" data-v="g124" aria-pressed="true">GPT-2 124M · b8 · s1024</button>
+      <button class="btn" type="button" data-v="l1b">Llama 3.2 1B · b4 · s2048</button>
+    </div>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-tog="ckpt" aria-pressed="false">Checkpointing</button>
+    <button class="btn" type="button" data-tog="first" aria-pressed="false">First step</button>
+    <button class="btn" type="button" data-act="play">Play</button>
+  </div>
+
+  <svg viewBox="0 0 600 272" role="img" aria-label="Stacked area chart of memory during one training step" data-out="svg"></svg>
+
+  <div class="ctl">
+    <label>time <input type="range" min="0" max="40" step="1" value="13" data-in="t" /> <output data-out="phase">loss</output></label>
+  </div>
+  <dl class="tmt-sum" data-out="sum"></dl>
+  <p class="tmt-note" data-out="note"></p>
+</div>
+
+<style is:global>
+  .tmt-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 4px; }
+  .tmt-row > .label { width: 56px; flex: none; font-size: 10.5px; }
+  .tmt-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tmt .btn { padding: 5px 9px; font-size: 10.5px; }
+  .tmt svg { margin-top: 14px !important; width: 100%; max-width: 680px; }
+  .tmt .ctl input[type='range'] { width: 220px; max-width: 60vw; }
+  .tmt-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(96px, 1fr)); gap: 8px 14px; margin: 14px 0 0; }
+  .tmt-sum div { border-top: 1px solid var(--rule); padding-top: 4px; }
+  .tmt-sum dt { font-size: 10px; }
+  .tmt-sum dd { margin: 2px 0 0; font-size: 13px; }
+  .tmt-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const GiB = 2 ** 30;
+  // Bucket sizes in GiB, computed with the lesson's formulas (BF16 weights + FP32 master + AdamW,
+  // fused attention). Illustrative, not measured: your snapshot will differ in the details.
+  const MODELS: Record<string, { L: number; W: number; M: number; O: number; G: number; A: number; bd: number; LG: number }> = {
+    g124: (() => {
+      const p = 124_439_808, b = 8, s = 1024, h = 768, V = 50257;
+      return { L: 12, W: (2 * p) / GiB, M: (4 * p) / GiB, O: (8 * p) / GiB, G: (2 * p) / GiB, A: (34 * b * s * h) / GiB, bd: (2 * b * s * h) / GiB, LG: (10 * b * s * V) / GiB };
+    })(),
+    l1b: (() => {
+      const p = 1_235_814_400, b = 4, s = 2048, h = 2048, V = 128256;
+      return { L: 16, W: (2 * p) / GiB, M: (4 * p) / GiB, O: (8 * p) / GiB, G: (2 * p) / GiB, A: (46 * b * s * h) / GiB, bd: (2 * b * s * h) / GiB, LG: (10 * b * s * V) / GiB };
+    })(),
+  };
+  const KEYS = ['W', 'M', 'O', 'G', 'A', 'LG'] as const;
+  type Key = (typeof KEYS)[number];
+  const NAMES: Record<Key, string> = { W: 'bf16 weights', M: 'fp32 master', O: 'Adam m, v', G: 'gradients', A: 'activations', LG: 'logits + loss' };
+  const STYLE: Record<Key, string> = {
+    W: 'fill:var(--blue);stroke:var(--blue)',
+    M: 'fill:var(--blue-2);stroke:var(--blue-2)',
+    O: 'fill:var(--blue-fill);stroke:var(--blue)',
+    G: 'fill:var(--paper);stroke:var(--blue)',
+    A: 'fill:var(--paper-2);stroke:var(--ink)',
+    LG: 'stroke:var(--ink-3)',
+  };
+  type Tick = { label: string; v: Record<Key, number> };
+  const NS = 'http://www.w3.org/2000/svg';
+  const g2 = (x: number) => (x >= 10 ? x.toFixed(1) : x.toFixed(2));
+  let uid = 0;
+
+  const build = (mk: string, ckpt: boolean, first: boolean): Tick[] => {
+    const m = MODELS[mk];
+    const ticks: Tick[] = [];
+    let v: Record<Key, number> = { W: m.W, M: m.M, O: first ? 0 : m.O, G: 0, A: 0, LG: 0 };
+    const push = (label: string) => ticks.push({ label, v: { ...v } });
+    push('start · zero_grad left no grads');
+    for (let i = 1; i <= m.L; i++) {
+      v.A += ckpt ? m.bd : m.A;
+      push(`forward · layer ${i} ${ckpt ? 'keeps only its input' : 'saves its activations'}`);
+    }
+    v.LG = m.LG;
+    push('loss · logits + fp32 softmax kept');
+    for (let i = m.L; i >= 1; i--) {
+      const gl = m.G / m.L;
+      if (ckpt) {
+        v.LG = 0;
+        v.A += m.A;
+        push(`backward · layer ${i} recomputed`);
+        v.A -= m.A + m.bd;
+        v.G += gl;
+        push(`backward · layer ${i} done, freed`);
+      } else {
+        v.LG = 0;
+        v.G += gl / 2;
+        push(`backward · layer ${i} in progress`);
+        v.A -= m.A;
+        v.G += gl / 2;
+        push(`backward · layer ${i} done, freed`);
+      }
+    }
+    v.A = Math.max(0, v.A);
+    v.O = m.O;
+    push(first ? 'optimizer.step() · Adam states created now' : 'optimizer.step() · update weights');
+    v.G = 0;
+    push('zero_grad(set_to_none=True)');
+    return ticks;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="trainmem-timeline"]').forEach((root) => {
+    const st = { model: 'g124', ckpt: false, first: false, t: 13 };
+    const q = <T extends Element>(sel: string) => root.querySelector<T>(sel)!;
+    const svg = q<SVGSVGElement>('[data-out="svg"]');
+    const slider = q<HTMLInputElement>('[data-in="t"]');
+    const pid = `tmt-hatch-${uid++}`;
+    let timer: number | undefined;
+    const X0 = 46, Y0 = 220, Y1 = 22;
+    let X1 = 590, W = 600;
+
+    const el = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+      const e = document.createElementNS(NS, tag);
+      for (const [k, val] of Object.entries(attrs)) e.setAttribute(k, String(val));
+      if (text !== undefined) e.textContent = text;
+      return e;
+    };
+
+    const render = () => {
+      W = root.clientWidth > 0 && root.clientWidth < 520 ? 380 : 600; // fewer units on phones, so text stays readable
+      X1 = W - 10;
+      svg.setAttribute('viewBox', `0 0 ${W} 272`);
+      const ticks = build(st.model, st.ckpt, st.first);
+      const n = ticks.length - 1;
+      slider.max = String(n);
+      if (st.t > n) st.t = n;
+      slider.value = String(st.t);
+      const totals = ticks.map((t) => KEYS.reduce((s, k) => s + t.v[k], 0));
+      const peak = Math.max(...totals);
+      const peakAt = totals.indexOf(peak);
+      // fixed y scale per model (no-checkpoint later-step peak) so toggles are comparable
+      const ref = build(st.model, false, false).map((t) => KEYS.reduce((s, k) => s + t.v[k], 0));
+      const ymax = Math.max(...ref) * 1.12;
+      const x = (i: number) => X0 + ((X1 - X0) * i) / n;
+      const y = (gb: number) => Y0 - ((Y0 - Y1) * gb) / ymax;
+
+      svg.replaceChildren();
+      const defs = el('defs', {});
+      const pat = el('pattern', { id: pid, width: 6, height: 6, patternUnits: 'userSpaceOnUse', patternTransform: 'rotate(45)' });
+      pat.appendChild(el('line', { x1: 0, y1: 0, x2: 0, y2: 6, style: 'stroke:var(--ink-3)', 'stroke-width': 1.5 }));
+      defs.appendChild(pat);
+      svg.appendChild(defs);
+
+      // phase bands
+      const L = MODELS[st.model].L;
+      const fEnd = L, lossAt = L + 1, bEnd = L + 1 + 2 * L;
+      const band = (a: number, b: number, label: string) => {
+        svg.appendChild(el('line', { x1: x(a), y1: Y1 - 8, x2: x(b), y2: Y1 - 8, class: 'ink', 'stroke-width': 1 }));
+        svg.appendChild(el('line', { x1: x(a), y1: Y1 - 12, x2: x(a), y2: Y1 - 4, class: 'ink', 'stroke-width': 1 }));
+        svg.appendChild(el('text', { x: (x(a) + x(b)) / 2, y: Y1 - 12, 'text-anchor': 'middle' }, label));
+      };
+      band(0, fEnd, 'FORWARD');
+      band(lossAt, bEnd, 'BACKWARD');
+      svg.appendChild(el('text', { x: x(n) - 2, y: Y1 - 12, 'text-anchor': 'end' }, 'STEP'));
+
+      // axes
+      svg.appendChild(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, class: 'ink', 'stroke-width': 1 }));
+      svg.appendChild(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, class: 'ink', 'stroke-width': 1 }));
+      const stepG = ymax > 30 ? 10 : ymax > 12 ? 4 : 2;
+      for (let gb = 0; gb <= ymax; gb += stepG) {
+        svg.appendChild(el('text', { x: X0 - 6, y: y(gb) + 4, 'text-anchor': 'end' }, String(gb)));
+        if (gb > 0) svg.appendChild(el('line', { x1: X0, y1: y(gb), x2: X1, y2: y(gb), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      }
+      svg.appendChild(el('text', { x: 12, y: 120, 'text-anchor': 'middle', transform: 'rotate(-90 12 120)' }, 'GiB'));
+
+      // stacked areas
+      const base = ticks.map(() => 0);
+      for (const k of KEYS) {
+        const top = ticks.map((t, i) => base[i] + t.v[k]);
+        if (Math.max(...ticks.map((t) => t.v[k])) > 0) {
+          const pts = top.map((v, i) => `${x(i)},${y(v)}`).concat(base.map((v, i) => `${x(i)},${y(v)}`).reverse());
+          const style = k === 'LG' ? `fill:url(#${pid});${STYLE[k]}` : STYLE[k];
+          svg.appendChild(el('polygon', { points: pts.join(' '), style, 'stroke-width': 0.8 }));
+        }
+        top.forEach((v, i) => (base[i] = v));
+      }
+
+      // peak line
+      svg.appendChild(el('line', { x1: X0, y1: y(peak), x2: X1, y2: y(peak), class: 'ink dash', 'stroke-width': 1 }));
+      const pr = peakAt > n / 2;
+      svg.appendChild(el('text', { x: pr ? x(peakAt) - 6 : x(peakAt) + 6, y: y(peak) - 5, 'text-anchor': pr ? 'end' : 'start', class: 'strong' }, `PEAK ${g2(peak)} GiB`));
+
+      // cursor
+      svg.appendChild(el('line', { x1: x(st.t), y1: Y1 - 2, x2: x(st.t), y2: Y0 + 6, style: 'stroke:var(--warn)', 'stroke-width': 1.5 }));
+      svg.appendChild(el('circle', { cx: x(st.t), cy: y(totals[st.t]), r: 3.5, style: 'fill:var(--warn)' }));
+
+      // legend
+      KEYS.forEach((k, i) => {
+        const style = k === 'LG' ? `fill:url(#${pid});${STYLE[k]}` : STYLE[k];
+        const lx = 10 + (i % 3) * ((W - 10) / 3), ly = 238 + Math.floor(i / 3) * 18;
+        svg.appendChild(el('rect', { x: lx, y: ly, width: 10, height: 10, style, 'stroke-width': 1 }));
+        svg.appendChild(el('text', { x: lx + 15, y: ly + 9 }, NAMES[k]));
+      });
+
+      const cur = ticks[st.t];
+      q<HTMLElement>('[data-out="phase"]').textContent = cur.label;
+      const sum = q<HTMLElement>('[data-out="sum"]');
+      sum.replaceChildren();
+      const cell = (k: string, v: string) => {
+        const d = document.createElement('div');
+        d.innerHTML = `<dt class="label">${k}</dt><dd class="readout">${v}</dd>`;
+        sum.appendChild(d);
+      };
+      cell('now', `${g2(totals[st.t])} GiB`);
+      cell('activations', `${g2(cur.v.A + cur.v.LG)} GiB`);
+      cell('gradients', `${g2(cur.v.G)} GiB`);
+      cell('Adam m, v', `${g2(cur.v.O)} GiB`);
+
+      const m = MODELS[st.model];
+      let note: string;
+      if (st.ckpt) note = `Checkpointing keeps only each layer's input (${g2(m.bd * L)} GiB in all) and rebuilds one layer at a time during backward: the little spikes. Peak falls from ${g2(Math.max(...ref))} to ${g2(peak)} GiB, paid for with one extra forward pass. What is left on top is the logits.`;
+      else if (st.first) note = `On the very first step Adam has no states yet: torch creates m and v inside the first optimizer.step(). A step-1 measurement under-counts by ${g2(m.O)} GiB. Measure step 2 or later.`;
+      else note = `Activations climb layer by layer in forward, the logits spike at the loss, then backward frees each layer's activations as it finishes with them while that layer's gradients appear. The peak is at the loss, the one moment everything saved is alive at once.`;
+      q<HTMLElement>('[data-out="note"]').textContent = note;
+    };
+
+    root.querySelectorAll<HTMLElement>('[data-group]').forEach((grp) => {
+      grp.querySelectorAll<HTMLButtonElement>('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          grp.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === btn)));
+          st.model = btn.dataset.v!;
+          render();
+        });
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-tog]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.tog as 'ckpt' | 'first';
+        st[k] = !st[k];
+        btn.setAttribute('aria-pressed', String(st[k]));
+        render();
+      });
+    });
+    slider.addEventListener('input', () => { st.t = Number(slider.value); render(); });
+    let lastW = W;
+    window.addEventListener('resize', () => { const w = root.clientWidth < 520 ? 380 : 600; if (w !== lastW) { lastW = w; render(); } });
+    q<HTMLButtonElement>('[data-act="play"]').addEventListener('click', () => {
+      if (timer !== undefined) { clearInterval(timer); timer = undefined; }
+      const n = Number(slider.max);
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) { st.t = n; render(); return; }
+      st.t = 0;
+      render();
+      timer = window.setInterval(() => {
+        st.t += 1;
+        render();
+        if (st.t >= n) { clearInterval(timer); timer = undefined; }
+      }, 140);
+    });
+    render();
+  });
+</script>

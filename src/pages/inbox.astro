@@ -1,0 +1,145 @@
+---
+import Base from '../layouts/Base.astro';
+import { tracks } from '../data/curriculum';
+---
+<Base title="Gap inbox · Workbench">
+  <main class="page">
+    <span class="label">Workbench</span>
+    <h1 style="margin-top:14px">Gap inbox.</h1>
+    <p style="color:var(--ink-2);margin:0">Every word you didn't know, every interview question you fumbled, every term in a job post. Drop it here the moment you hit it, from any device. Claude Code reads this inbox and turns items into lessons.</p>
+
+    <section id="locked" hidden>
+      <form class="io" id="unlock" autocomplete="off">
+        <div class="io-row"><span class="label">Key:</span><div><input type="password" name="token" placeholder="owner key (WORKBENCH_TOKEN in .env.local)" required aria-label="Owner key" /></div></div>
+        <div class="io-row"><span class="label">Out:</span><div><button class="btn" type="submit">Unlock this device</button></div></div>
+      </form>
+      <p class="label" id="unlock-msg">Unlocking also syncs your lesson progress across devices.</p>
+    </section>
+
+    <section id="open" hidden>
+      <form class="io" id="add" autocomplete="off">
+        <div class="io-row"><span class="label">In:</span><div><input type="text" name="term" placeholder="e.g. coordinated omission" required aria-label="Term or question" /></div></div>
+        <div class="io-row"><span class="label">From:</span><div><input type="text" name="src" placeholder="where you saw it: Anthropic Code RL post, interview, Slack..." aria-label="Where you saw it" /></div></div>
+        <div class="io-row"><span class="label">Track:</span><div>
+          <select name="track" aria-label="Track guess">
+            <option value="">Not sure</option>
+            {tracks.map((t) => <option value={t.title}>{t.n}. {t.title}</option>)}
+          </select>
+        </div></div>
+        <div class="io-row"><span class="label">Out:</span><div><button class="btn" type="submit">Add to inbox</button></div></div>
+      </form>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:40px">
+        <span class="label" id="count">Loading…</span>
+        <span style="display:flex;gap:8px;flex-wrap:wrap">
+          <button class="btn" type="button" data-view="open" aria-pressed="true">Open</button>
+          <button class="btn" type="button" data-view="done" aria-pressed="false">Done</button>
+        </span>
+      </div>
+      <ul class="inbox-list" id="list"></ul>
+      <p id="empty" class="label" style="padding:24px 0;display:none">Nothing here.</p>
+
+      <div class="ticks" style="margin:48px 0 20px"></div>
+      <span class="label">Turning items into lessons</span>
+      <dl class="stub-card" style="margin-top:12px">
+        <dt>In Claude Code</dt><dd>Open this repo and say <code>triage my workbench inbox</code>. Claude reads the open items, writes lessons for <b>now</b>, adds stubs for <b>map</b>, and marks each one done with a note.</dd>
+        <dt>Now</dt><dd>It blocks something you're building right now. It becomes the next lesson.</dd>
+        <dt>Map</dt><dd>It shows up in job posts, interviews or your work. It becomes a stub lesson in the right track.</dd>
+        <dt>Later</dt><dd>Neither. It stays here. If it keeps coming back, it gets promoted.</dd>
+      </dl>
+      <p style="margin-top:20px"><button class="btn" type="button" id="lock">Lock this device</button></p>
+    </section>
+  </main>
+
+  <script>
+    import { client, api, getToken, setToken, pullProgress } from '../lib/db';
+
+    type Item = { _id: string; _creationTime: number; term: string; source: string; track: string; tag: '' | 'now' | 'map' | 'later'; status: 'open' | 'done'; note?: string };
+    const $ = (id: string) => document.getElementById(id)!;
+    const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
+    let view: 'open' | 'done' = 'open';
+    let items: Item[] = [];
+
+    function show(unlocked: boolean) {
+      $('locked').hidden = unlocked;
+      $('open').hidden = !unlocked;
+    }
+
+    async function load() {
+      const token = getToken();
+      if (!token) return show(false);
+      try {
+        items = (await client.query(api.inbox.list, { token, status: view })) as Item[];
+        show(true);
+        render();
+      } catch (e) {
+        setToken(null);
+        show(false);
+        $('unlock-msg').textContent = 'That key was rejected. Check WORKBENCH_TOKEN in .env.local.';
+      }
+    }
+
+    function render() {
+      $('count').textContent = `${items.length} ${view} item${items.length === 1 ? '' : 's'}`;
+      $('empty').style.display = items.length ? 'none' : 'block';
+      $('list').innerHTML = items.map((it) => `
+        <li data-id="${it._id}">
+          <div>
+            <div class="term-t">${esc(it.term)}</div>
+            <div class="src">${esc([it.source, it.track].filter(Boolean).join(' · ') || 'no source')} · <span class="label">${new Date(it._creationTime).toISOString().slice(0, 10)}</span></div>
+            ${it.note ? `<div class="src" style="color:var(--blue)">${esc(it.note)}</div>` : ''}
+          </div>
+          <div class="acts">
+            ${view === 'open' ? (['now', 'map', 'later'] as const).map((t) => `<button type="button" data-tag="${t}" aria-pressed="${it.tag === t}">${t}</button>`).join('') : ''}
+            <button type="button" data-del title="Remove">×</button>
+          </div>
+        </li>`).join('');
+    }
+
+    $('unlock').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const f = e.target as HTMLFormElement;
+      setToken(String(new FormData(f).get('token') ?? '').trim());
+      f.reset();
+      await load();
+      pullProgress();
+    });
+
+    $('lock').addEventListener('click', () => { setToken(null); show(false); });
+
+    $('add').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const f = e.target as HTMLFormElement;
+      const d = new FormData(f);
+      const term = String(d.get('term') ?? '').trim();
+      if (!term) return;
+      await client.mutation(api.inbox.add, { token: getToken()!, term, source: String(d.get('src') ?? ''), track: String(d.get('track') ?? '') });
+      f.reset();
+      (f.elements.namedItem('term') as HTMLInputElement).focus();
+      if (view === 'open') load();
+    });
+
+    document.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => b.addEventListener('click', () => {
+      view = b.dataset.view as 'open' | 'done';
+      document.querySelectorAll('[data-view]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      load();
+    }));
+
+    $('list').addEventListener('click', async (e) => {
+      const b = (e.target as HTMLElement).closest('button');
+      const li = b?.closest('li');
+      if (!b || !li) return;
+      const id = li.dataset.id as any;
+      const token = getToken()!;
+      if (b.hasAttribute('data-del')) await client.mutation(api.inbox.remove, { token, id });
+      else {
+        const it = items.find((i) => i._id === id)!;
+        const tag = it.tag === b.dataset.tag ? '' : (b.dataset.tag as Item['tag']);
+        await client.mutation(api.inbox.setTag, { token, id, tag });
+      }
+      load();
+    });
+
+    load();
+  </script>
+</Base>

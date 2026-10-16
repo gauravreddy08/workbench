@@ -1,0 +1,234 @@
+---
+// Toy KV block pool with automatic prefix caching.
+// 16 physical blocks. Each request is a chain of blocks; a block's key is its whole prefix
+// (a stand-in for a chained hash). Lookup walks the chain until the first miss.
+// Running requests pin their blocks (ref > 0). "Finish all" releases them and advances the clock.
+// Eviction: only ref-0 blocks, least recently used first, tails before heads.
+// LRU + TTL also drops any idle block older than the TTL, even when there is room.
+---
+<div class="pxpool" data-fig="prefix-pool">
+  <svg role="img" aria-label="A pool of sixteen KV cache blocks, showing which prefixes are cached, their reference counts and idle times"></svg>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="A">+ Prompt A</button>
+    <button class="btn" type="button" data-act="B">+ Prompt B</button>
+    <button class="btn" type="button" data-act="chat">+ Chat turn (A + history)</button>
+    <button class="btn" type="button" data-act="U">+ One-off long prompt</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="tick">Finish all · +1 min</button>
+    <button class="btn" type="button" data-act="ttl" aria-pressed="false">Eviction: LRU</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+  </div>
+  <p class="pxpool-read">
+    clock <span class="readout" data-r="clock">0 min</span> ·
+    running <span class="readout" data-r="run">0</span> ·
+    block hits <span class="readout" data-r="hits">0</span> ·
+    misses <span class="readout" data-r="miss">0</span> ·
+    hit rate <span class="readout" data-r="rate">-</span><br />
+    evicted <span class="readout" data-r="ev">0</span> ·
+    expired <span class="readout" data-r="exp">0</span> ·
+    prefill tokens skipped <span class="readout" data-r="saved">0</span>
+  </p>
+  <p class="pxpool-read pxpool-msg" data-r="msg">Send prompt A twice. The second time, every block is already there.</p>
+</div>
+
+<style>
+  .pxpool-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.7; }
+  .pxpool-msg { color: var(--ink); min-height: 5.1em; }
+</style>
+
+<script>
+  interface Slot { key: string; label: string; ref: number; stamp: number; used: number }
+  interface Req { name: string; slots: number[] }
+  const NS = 'http://www.w3.org/2000/svg';
+  const N = 16;
+  const TTL = 3; // minutes
+  const TOK = 16; // tokens per block
+
+  document.querySelectorAll<HTMLElement>('[data-fig="prefix-pool"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const btn = (k: string) => root.querySelector<HTMLButtonElement>(`[data-act="${k}"]`)!;
+
+    let pool: (Slot | null)[];
+    let running: Req[];
+    let clock: number, stamp: number, chatTurn: number, oneOff: number;
+    let ttlOn = false;
+    let st = { hits: 0, miss: 0, ev: 0, exp: 0 };
+    let hl: Record<number, 'hit' | 'new'> = {};
+
+    function reset() {
+      pool = Array(N).fill(null);
+      running = [];
+      clock = 0; stamp = 0; chatTurn = 0; oneOff = 0;
+      st = { hits: 0, miss: 0, ev: 0, exp: 0 };
+      hl = {};
+    }
+
+    const expired = (s: Slot) => ttlOn && s.ref === 0 && clock - s.used > TTL;
+    const find = (key: string) => pool.findIndex((s) => s !== null && s.key === key);
+
+    function chainFor(kind: string): { name: string; labels: string[] } {
+      if (kind === 'A') return { name: 'prompt A', labels: ['A0', 'A1', 'A2', 'A3'] };
+      if (kind === 'B') return { name: 'prompt B', labels: ['B0', 'B1', 'B2', 'B3'] };
+      if (kind === 'chat') {
+        const t = Math.min(chatTurn, 3);
+        chatTurn++;
+        return { name: `chat turn ${t + 1}`, labels: ['A0', 'A1', 'A2', 'A3', ...Array.from({ length: t + 1 }, (_, i) => `H${i}`)] };
+      }
+      oneOff++;
+      return { name: `one-off #${oneOff}`, labels: Array.from({ length: 5 }, (_, i) => `U${oneOff}.${i}`) };
+    }
+
+    // Pick a slot to (re)use: empty first, then an expired idle block, then the LRU idle block.
+    function victim(): { i: number; why: string } {
+      let i = pool.findIndex((s) => s === null);
+      if (i >= 0) return { i, why: '' };
+      let best = -1;
+      pool.forEach((s, j) => {
+        if (s && s.ref === 0 && (best < 0 || s.stamp < pool[best]!.stamp)) best = j;
+      });
+      if (best < 0) return { i: -1, why: '' };
+      const s = pool[best]!;
+      return { i: best, why: s.label };
+    }
+
+    function admit(kind: string): string {
+      const { name, labels } = chainFor(kind);
+      const keys = labels.map((_, i) => labels.slice(0, i + 1).join('>'));
+      hl = {};
+      // 1. lookup: walk until the first miss
+      const slots: number[] = [];
+      let hits = 0;
+      for (const k of keys) {
+        const i = find(k);
+        if (i < 0) break;
+        slots.push(i); hits++;
+      }
+      // 2. is there room? empty slots plus unpinned blocks that this request didn't just hit
+      const room = pool.filter((s, i) => s === null || (s.ref === 0 && !slots.includes(i))).length;
+      if (room < keys.length - hits) {
+        if (kind === 'U') oneOff--;
+        if (kind === 'chat') chatTurn--;
+        return `${name} can't start: it needs ${keys.length - hits} new blocks, and only ${room} are empty or unpinned. Blocks with ref > 0 belong to running requests and may not be evicted. It waits. Press "Finish all".`;
+      }
+      slots.forEach((i) => { pool[i]!.ref++; hl[i] = 'hit'; });
+      // 3. allocate the misses
+      const evicted: string[] = [];
+      for (let j = hits; j < keys.length; j++) {
+        const v = victim();
+        if (v.why) { evicted.push(v.why); st.ev++; }
+        pool[v.i] = { key: keys[j], label: labels[j], ref: 1, stamp: 0, used: clock };
+        slots.push(v.i); hl[v.i] = 'new';
+      }
+      // 4. touch the chain tail-first, so the head ends up most recently used
+      for (let q = slots.length - 1; q >= 0; q--) { const s = pool[slots[q]]!; s.stamp = ++stamp; s.used = clock; }
+      running.push({ name, slots });
+      st.hits += hits; st.miss += keys.length - hits;
+      let msg = `${name}: ${keys.length} blocks. `;
+      msg += hits ? `${hits} hit${hits > 1 ? 's' : ''}: ${hits * TOK} prompt tokens of prefill skipped. ` : 'No cached prefix: full prefill. ';
+      if (keys.length - hits) msg += `${keys.length - hits} computed and stored. `;
+      if (evicted.length) msg += `Pool full, so LRU evicted idle ${evicted.join(', ')}. `;
+      if (kind === 'U') msg += 'Nobody will ever ask for these blocks again, but they push useful ones out.';
+      else if (kind === 'chat' && hits > 4) msg += 'The system prompt and the earlier turns came from cache; only the new turn was computed.';
+      else if (kind === 'chat' && hits === 4) msg += 'The system prompt came from cache; only the first turn was computed.';
+      return msg;
+    }
+
+    function tick(): string {
+      const n = running.length;
+      running.forEach((q) => q.slots.forEach((i) => { if (pool[i]) pool[i]!.ref--; }));
+      running = [];
+      clock++;
+      hl = {};
+      let msg = n ? `${n} request${n > 1 ? 's' : ''} finished; their blocks drop to ref 0 but stay cached. ` : 'Clock +1 min. ';
+      if (ttlOn) {
+        const gone: string[] = [];
+        pool.forEach((s, i) => { if (s && expired(s)) { gone.push(s.label); pool[i] = null; st.exp++; } });
+        if (gone.length) msg += `TTL: ${gone.join(', ')} sat idle more than ${TTL} min and were dropped, even though nothing needed the space.`;
+        else msg += `TTL is ${TTL} min: idle blocks older than that get dropped.`;
+      } else msg += 'Under plain LRU an idle block stays until something needs its space.';
+      return msg;
+    }
+
+    function act(k: string) {
+      let msg = '';
+      if (k === 'reset') { reset(); msg = 'Send prompt A twice. The second time, every block is already there.'; }
+      else if (k === 'ttl') {
+        ttlOn = !ttlOn;
+        msg = ttlOn ? `LRU + TTL: on top of LRU, an idle block older than ${TTL} min is dropped at the next tick. A hit refreshes its timer.` : 'Plain LRU: blocks leave only when the pool is full and something new needs the space.';
+      } else if (k === 'tick') msg = tick();
+      else msg = admit(k);
+      r('msg').textContent = msg;
+      draw();
+    }
+
+    function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+      const e = document.createElementNS(NS, tag);
+      for (const [a, v] of Object.entries(attrs)) e.setAttribute(a, String(v));
+      if (text !== undefined) e.textContent = text;
+      svg.appendChild(e);
+      return e;
+    }
+
+    function draw() {
+      const cols = root.clientWidth < 520 ? 4 : 8;
+      const rows = N / cols;
+      const CW = 72, CH = 64, G = 6, M = 11, TOP = 26;
+      const W = M * 2 + cols * CW + (cols - 1) * G;
+      const H = TOP + rows * (CH + G) + 34;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      el('text', { x: M, y: 16, class: 'strong' }, `KV POOL · ${N} BLOCKS × ${TOK} TOKENS`);
+      pool.forEach((s, i) => {
+        const x = M + (i % cols) * (CW + G);
+        const y = TOP + Math.floor(i / cols) * (CH + G);
+        const cls = !s ? 'fill-paper dash' : s.ref > 0 ? 'fill-wash' : 'fill-paper';
+        const sw = hl[i] ? 2.4 : 1;
+        const rect = el('rect', { x, y, width: CW, height: CH, class: cls, 'stroke-width': sw });
+        if (hl[i] === 'new') rect.setAttribute('style', 'stroke:var(--ink)');
+        if (hl[i] === 'hit') rect.setAttribute('style', 'stroke:var(--blue)');
+        el('text', { x: x + 6, y: y + 14 }, `#${i}`);
+        if (!s) { el('text', { x: x + CW / 2, y: y + 38, 'text-anchor': 'middle' }, 'empty'); return; }
+        el('text', { x: x + CW / 2, y: y + 31, 'text-anchor': 'middle', class: 'strong' }, s.label);
+        const idle = clock - s.used;
+        el('text', { x: x + CW / 2, y: y + 45, 'text-anchor': 'middle', class: s.ref > 0 ? 'blue-t' : '' }, `ref ${s.ref}`);
+        if (s.ref === 0) el('text', { x: x + CW / 2, y: y + 58, 'text-anchor': 'middle' }, ttlOn ? `ttl ${Math.max(0, TTL - idle)}m` : `idle ${idle}m`);
+      });
+      const ly = TOP + rows * (CH + G) + 14;
+      el('rect', { x: M, y: ly - 9, width: 12, height: 12, class: 'fill-wash', 'stroke-width': 1 });
+      el('text', { x: M + 18, y: ly + 1 }, 'in use');
+      el('rect', { x: M + 80, y: ly - 9, width: 12, height: 12, class: 'fill-paper', 'stroke-width': 1 });
+      el('text', { x: M + 98, y: ly + 1 }, ttlOn ? 'idle (ttl left)' : 'idle (cached)');
+      if (cols === 8) {
+        el('rect', { x: M + 250, y: ly - 9, width: 12, height: 12, class: 'fill-paper', 'stroke-width': 2.4, style: 'stroke:var(--blue)' });
+        el('text', { x: M + 268, y: ly + 1 }, 'hit');
+        el('rect', { x: M + 310, y: ly - 9, width: 12, height: 12, class: 'fill-paper', 'stroke-width': 2.4, style: 'stroke:var(--ink)' });
+        el('text', { x: M + 328, y: ly + 1 }, 'just computed');
+      }
+
+      r('clock').textContent = `${clock} min`;
+      r('run').textContent = String(running.length);
+      r('hits').textContent = String(st.hits);
+      r('miss').textContent = String(st.miss);
+      const tot = st.hits + st.miss;
+      r('rate').textContent = tot ? `${Math.round((100 * st.hits) / tot)}%` : '-';
+      r('ev').textContent = String(st.ev);
+      r('exp').textContent = String(st.exp);
+      r('saved').textContent = String(st.hits * TOK);
+      const t = btn('ttl');
+      t.setAttribute('aria-pressed', String(ttlOn));
+      t.textContent = ttlOn ? `Eviction: LRU + TTL ${TTL}m` : 'Eviction: LRU';
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act!)));
+    let lastCols = 0;
+    const ro = new ResizeObserver(() => {
+      const c = root.clientWidth < 520 ? 4 : 8;
+      if (c !== lastCols) { lastCols = c; draw(); }
+    });
+    ro.observe(root);
+    reset();
+    draw();
+  });
+</script>

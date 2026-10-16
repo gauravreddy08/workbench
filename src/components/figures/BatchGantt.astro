@@ -1,0 +1,247 @@
+---
+// Interactive: ten requests of different lengths on a GPU with N batch slots, scheduled four ways.
+// Time is in decode steps. Every step costs about the same no matter how many slots are full
+// (decode is bandwidth-bound), so the readouts convert steps at an illustrative 60 ms each.
+---
+<div class="bg" data-fig="batch-gantt">
+  <div class="bg-modes" role="group" aria-label="Scheduling policy">
+    <button class="btn" type="button" data-mode="none" aria-pressed="false">No batching</button>
+    <button class="btn" type="button" data-mode="static" aria-pressed="false">Static</button>
+    <button class="btn" type="button" data-mode="dynamic" aria-pressed="false">Dynamic</button>
+    <button class="btn" type="button" data-mode="cont" aria-pressed="true">Continuous</button>
+  </div>
+  <svg class="bg-gantt" viewBox="0 0 480 200" role="img" aria-label="Gantt chart: one row per request, time in decode steps"></svg>
+  <div class="label bg-sub">GPU slots, step by step</div>
+  <svg class="bg-slots" viewBox="0 0 480 60" role="img" aria-label="Slot occupancy per decode step"></svg>
+  <div class="bg-read">
+    <div><span class="label">Slot utilization</span><span class="readout" data-o="util"></span></div>
+    <div><span class="label">TTFT · mean</span><span class="readout" data-o="ttft"></span></div>
+    <div><span class="label">TTFT · worst</span><span class="readout" data-o="ttftmax"></span></div>
+    <div><span class="label">Latency · mean</span><span class="readout" data-o="e2e"></span></div>
+    <div><span class="label">All done at</span><span class="readout" data-o="span"></span></div>
+    <div><span class="label">Throughput</span><span class="readout" data-o="tput"></span></div>
+  </div>
+  <div class="ctl">
+    <label>Batch slots <input type="range" min="1" max="8" step="1" value="4" data-k="slots" /><output></output></label>
+    <label data-wrap="wait">Max wait <input type="range" min="0" max="16" step="1" value="3" data-k="wait" /><output></output></label>
+  </div>
+  <div class="ctl">
+    <span class="bg-group" role="group" aria-label="Output lengths">
+      <button class="btn" type="button" data-len="mixed" aria-pressed="true">Mixed lengths</button>
+      <button class="btn" type="button" data-len="equal" aria-pressed="false">Equal lengths</button>
+    </span>
+    <span class="bg-group" role="group" aria-label="Arrivals">
+      <button class="btn" type="button" data-arr="trickle" aria-pressed="true">Trickle in</button>
+      <button class="btn" type="button" data-arr="burst" aria-pressed="false">All at once</button>
+    </span>
+    <button class="btn" type="button" data-play>Play</button>
+  </div>
+  <p class="bg-note">Dashed = waiting in the queue. Solid blue = prefill (makes token 1). Light blue = decoding. Grey hatch = finished, but its slot is still held by the batch. Numbers at the right of each row: TTFT / total latency, in steps. Illustrative: 1 step ≈ 60 ms (one read of an 8B model's weights on the Spark).</p>
+</div>
+
+<style>
+  .bg-modes, .bg-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .bg-modes { margin-bottom: 12px; }
+  .bg-sub { display: block; font-size: 10px; margin: 6px 0 2px; }
+  .bg-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px 16px; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 10px; }
+  .bg-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .bg-read .label { font-size: 10px; }
+  .bg-read .readout { font-size: 17px; }
+  .bg-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+  .bg label[data-wrap='wait'][hidden] { display: none; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const STEP_MS = 60;
+  const MIXED = [24, 6, 14, 40, 8, 4, 30, 10, 18, 6];
+  const EQUAL = MIXED.map(() => 16);
+  const TRICKLE = [0, 1, 2, 4, 5, 7, 9, 12, 14, 17];
+  const BURST = MIXED.map(() => 0);
+
+  type Cell = 'wait' | 'pre' | 'dec' | 'held';
+  type Res = { cells: Cell[][]; start: number[]; first: number[]; end: number[]; span: number; used: number };
+
+  function simulate(mode: string, slots: number, wait: number, lens: number[], arr: number[]): Res {
+    const n = lens.length;
+    const cap = mode === 'none' ? 1 : slots;
+    const cells: Cell[][] = lens.map(() => []);
+    const start = Array(n).fill(-1), first = Array(n).fill(-1), end = Array(n).fill(-1);
+    const made = Array(n).fill(0);
+    let running: number[] = [];
+    let batchEnd = -1; // static/dynamic: step at which the current batch releases its slots
+    let used = 0;
+    const lastArrival = Math.max(...arr);
+    for (let t = 0; t < 2000; t++) {
+      const waiting = [...Array(n).keys()].filter((i) => arr[i] <= t && start[i] < 0);
+      if (mode === 'none' || mode === 'cont') {
+        const free = cap - running.length;
+        for (const i of waiting.slice(0, Math.max(0, free))) { start[i] = t; running.push(i); }
+      } else if (running.length === 0 && waiting.length) {
+        const oldest = Math.min(...waiting.map((i) => arr[i]));
+        const full = waiting.length >= cap;
+        const timedOut = mode === 'dynamic' && t - oldest >= wait;
+        const flush = mode === 'static' && t >= lastArrival; // a real static server would wait forever here
+        if (full || timedOut || flush) {
+          running = waiting.slice(0, cap);
+          running.forEach((i) => (start[i] = t));
+          batchEnd = t + Math.max(...running.map((i) => lens[i]));
+        }
+      }
+      for (let i = 0; i < n; i++) {
+        if (arr[i] <= t && start[i] < 0) cells[i][t] = 'wait';
+        else if (arr[i] <= t && start[i] > t) cells[i][t] = 'wait';
+      }
+      const next: number[] = [];
+      for (const i of running) {
+        if (made[i] < lens[i]) {
+          cells[i][t] = made[i] === 0 ? 'pre' : 'dec';
+          made[i]++; used++;
+          if (made[i] === 1) first[i] = t + 1;
+          if (made[i] === lens[i]) end[i] = t + 1;
+        } else cells[i][t] = 'held';
+        const batchy = mode === 'static' || mode === 'dynamic';
+        if (batchy ? t + 1 < batchEnd : made[i] < lens[i]) next.push(i);
+      }
+      running = next;
+      if (end.every((e) => e >= 0) && running.length === 0) {
+        return { cells, start, first, end, span: Math.max(...end), used };
+      }
+    }
+    return { cells, start, first, end, span: Math.max(...end), used };
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const fmt = (ms: number) => (ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="batch-gantt"]').forEach((root) => {
+    const gantt = root.querySelector<SVGSVGElement>('.bg-gantt')!;
+    const slotsSvg = root.querySelector<SVGSVGElement>('.bg-slots')!;
+    const sSlots = root.querySelector<HTMLInputElement>('[data-k="slots"]')!;
+    const sWait = root.querySelector<HTMLInputElement>('[data-k="wait"]')!;
+    const waitWrap = root.querySelector<HTMLElement>('[data-wrap="wait"]')!;
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-play]')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let mode = 'cont', len = 'mixed', arrive = 'trickle';
+    let reveal = Infinity, raf = 0;
+
+    const pressGroup = (attr: string, val: string) =>
+      root.querySelectorAll<HTMLButtonElement>(`[${attr}]`).forEach((b) => b.setAttribute('aria-pressed', String(b.getAttribute(attr) === val)));
+
+    function render() {
+      const slots = +sSlots.value, wait = +sWait.value;
+      const lens = len === 'mixed' ? MIXED : EQUAL;
+      const arr = arrive === 'trickle' ? TRICKLE : BURST;
+      const res = simulate(mode, slots, wait, lens, arr);
+      const allSpans = ['none', 'static', 'dynamic', 'cont'].map((m) => simulate(m, slots, wait, lens, arr).span);
+      const tMax = Math.max(...allSpans);
+      const n = lens.length;
+
+      // gantt
+      const x0 = 26, x1 = 430, rowH = 15, top = 4;
+      const cw = (x1 - x0) / tMax;
+      const h = top + n * rowH + 22;
+      gantt.setAttribute('viewBox', `0 0 480 ${h}`);
+      gantt.replaceChildren();
+      for (let i = 0; i < n; i++) {
+        const y = top + i * rowH;
+        gantt.appendChild(el('text', { x: 0, y: y + 9, style: 'font-size:9px' }, `R${i + 1}`));
+        res.cells[i].forEach((c, t) => {
+          if (!c || t >= reveal) return;
+          const x = x0 + t * cw;
+          if (c === 'wait') gantt.appendChild(el('line', { x1: x, y1: y + 5.5, x2: x + cw, y2: y + 5.5, style: 'stroke:var(--ink-3);stroke-width:1;stroke-dasharray:2 2' }));
+          else if (c === 'pre') gantt.appendChild(el('rect', { x, y, width: Math.max(0.8, cw - 0.4), height: 11, style: 'fill:var(--blue)' }));
+          else if (c === 'dec') gantt.appendChild(el('rect', { x, y, width: Math.max(0.8, cw - 0.4), height: 11, style: 'fill:var(--blue-fill);stroke:var(--blue);stroke-width:0.4' }));
+          else gantt.appendChild(el('rect', { x, y: y + 2, width: Math.max(0.8, cw - 0.4), height: 7, style: 'fill:var(--paper-2);stroke:var(--ink-3);stroke-width:0.5;stroke-dasharray:1.5 1.5' }));
+        });
+        if (reveal >= res.span) {
+          const tt = res.first[i] - arr[i], e2e = res.end[i] - arr[i];
+          gantt.appendChild(el('text', { x: 478, y: y + 9, 'text-anchor': 'end', style: 'font-size:9px' }, `${tt} / ${e2e}`));
+        }
+      }
+      const ay = top + n * rowH + 4;
+      gantt.appendChild(el('line', { x1: x0, y1: ay, x2: x1, y2: ay, style: 'stroke:var(--ink-3);stroke-width:1' }));
+      gantt.appendChild(el('text', { x: x0, y: ay + 13, style: 'font-size:9px' }, '0'));
+      gantt.appendChild(el('text', { x: x1, y: ay + 13, 'text-anchor': 'end', style: 'font-size:9px' }, `${tMax} STEPS`));
+      if (reveal < Infinity && reveal <= tMax) {
+        const cx = x0 + reveal * cw;
+        gantt.appendChild(el('line', { x1: cx, y1: 0, x2: cx, y2: ay, style: 'stroke:var(--blue);stroke-width:1' }));
+      }
+
+      // slot occupancy strip: one column per step, one cell per slot
+      const cap = slots;
+      const cellH = Math.min(6, 44 / cap);
+      const sh = cap * cellH + 6;
+      slotsSvg.setAttribute('viewBox', `0 0 480 ${sh}`);
+      slotsSvg.replaceChildren();
+      for (let t = 0; t < Math.min(res.span, reveal); t++) {
+        const col: Cell[] = [];
+        for (let i = 0; i < n; i++) { const c = res.cells[i][t]; if (c === 'pre' || c === 'dec') col.push(c); }
+        for (let i = 0; i < n; i++) { if (res.cells[i][t] === 'held') col.push('held'); }
+        const x = x0 + t * cw;
+        for (let s = 0; s < cap; s++) {
+          const y = 2 + (cap - 1 - s) * cellH;
+          const c = col[s];
+          const style = !c
+            ? 'fill:none;stroke:var(--rule);stroke-width:0.4'
+            : c === 'held'
+              ? 'fill:var(--paper-2);stroke:var(--ink-3);stroke-width:0.4'
+              : 'fill:var(--blue);stroke:none';
+          slotsSvg.appendChild(el('rect', { x, y, width: Math.max(0.8, cw - 0.4), height: Math.max(1, cellH - 0.6), style }));
+        }
+      }
+      slotsSvg.appendChild(el('text', { x: 0, y: sh / 2 + 3, style: 'font-size:9px' }, `${cap}×`));
+
+      // readouts
+      const ttfts = res.first.map((f, i) => f - arr[i]);
+      const e2es = res.end.map((e, i) => e - arr[i]);
+      const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+      const t0 = Math.min(...arr);
+      const util = res.used / (slots * (res.span - t0));
+      const tokens = lens.reduce((a, b) => a + b, 0);
+      out('util').textContent = `${Math.round(util * 100)}%`;
+      out('ttft').textContent = fmt(mean(ttfts) * STEP_MS);
+      out('ttftmax').textContent = fmt(Math.max(...ttfts) * STEP_MS);
+      out('e2e').textContent = fmt(mean(e2es) * STEP_MS);
+      out('span').textContent = fmt(res.span * STEP_MS);
+      out('tput').textContent = `${(tokens / ((res.span - t0) * STEP_MS / 1000)).toFixed(0)} tok/s`;
+      sSlots.nextElementSibling!.textContent = String(slots);
+      sWait.nextElementSibling!.textContent = `${wait} steps`;
+      waitWrap.hidden = mode !== 'dynamic';
+      return res.span;
+    }
+
+    function stop() { cancelAnimationFrame(raf); raf = 0; reveal = Infinity; playBtn.textContent = 'Play'; }
+
+    function play() {
+      if (raf) { stop(); render(); return; }
+      if (reduce) { render(); return; }
+      const span = render();
+      reveal = 0; playBtn.textContent = 'Stop';
+      let last = performance.now();
+      const tick = (now: number) => {
+        if (now - last > 90) { reveal++; last = now; render(); }
+        if (reveal > span) { stop(); render(); return; }
+        raf = requestAnimationFrame(tick);
+      };
+      raf = requestAnimationFrame(tick);
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) =>
+      b.addEventListener('click', () => { stop(); mode = b.dataset.mode!; pressGroup('data-mode', mode); render(); }));
+    root.querySelectorAll<HTMLButtonElement>('[data-len]').forEach((b) =>
+      b.addEventListener('click', () => { stop(); len = b.dataset.len!; pressGroup('data-len', len); render(); }));
+    root.querySelectorAll<HTMLButtonElement>('[data-arr]').forEach((b) =>
+      b.addEventListener('click', () => { stop(); arrive = b.dataset.arr!; pressGroup('data-arr', arrive); render(); }));
+    sSlots.addEventListener('input', () => { stop(); render(); });
+    sWait.addEventListener('input', () => { stop(); render(); });
+    playBtn.addEventListener('click', play);
+    render();
+  });
+</script>

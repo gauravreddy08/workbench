@@ -1,0 +1,232 @@
+---
+// Memory budget calculator: pick a model, weight format, KV format, context and users;
+// see a stacked bar (reserved / weights / KV cache / overhead / free) for three machines,
+// with a "fits?" readout and the most users that fit at this context.
+// Usage: <MemMathBudget />
+---
+<div class="mmb" data-fig="memmath-budget">
+  <div class="mmb-row">
+    <span class="label">Model</span>
+    <div class="mmb-btns" data-group="model">
+      <button class="btn" type="button" data-v="1b">Llama 3.2 1B</button>
+      <button class="btn" type="button" data-v="8b" aria-pressed="true">Llama 3.1 8B</button>
+      <button class="btn" type="button" data-v="moe">Qwen3 30B-A3B</button>
+      <button class="btn" type="button" data-v="70b">Llama 3.1 70B</button>
+    </div>
+  </div>
+  <div class="mmb-row">
+    <span class="label">Weights</span>
+    <div class="mmb-btns" data-group="w">
+      <button class="btn" type="button" data-v="bf16" aria-pressed="true">BF16</button>
+      <button class="btn" type="button" data-v="fp8">FP8</button>
+      <button class="btn" type="button" data-v="q8">Q8_0</button>
+      <button class="btn" type="button" data-v="awq">AWQ 4-bit</button>
+      <button class="btn" type="button" data-v="q4">Q4_K_M</button>
+    </div>
+  </div>
+  <div class="mmb-row">
+    <span class="label">KV cache</span>
+    <div class="mmb-btns" data-group="kv">
+      <button class="btn" type="button" data-v="2" aria-pressed="true">BF16 · 2 B</button>
+      <button class="btn" type="button" data-v="1">FP8 · 1 B</button>
+    </div>
+  </div>
+  <div class="ctl">
+    <label>context <input type="range" min="0" max="7" step="1" value="3" data-in="ctx" /> <output data-out="ctx">8K</output></label>
+    <label>users <input type="range" min="0" max="15" step="1" value="5" data-in="users" /> <output data-out="users">8</output></label>
+  </div>
+
+  <dl class="mmb-sum">
+    <div><dt class="label">Weights</dt><dd class="readout" data-out="wgib">-</dd></div>
+    <div><dt class="label">KV per token</dt><dd class="readout" data-out="kvtok">-</dd></div>
+    <div><dt class="label">KV per user</dt><dd class="readout" data-out="kvuser">-</dd></div>
+    <div><dt class="label">KV, all users</dt><dd class="readout" data-out="kvall">-</dd></div>
+  </dl>
+
+  <div class="mmb-devs" data-out="devs"></div>
+
+  <div class="mmb-legend" aria-hidden="true">
+    <span><i class="sw rsv"></i>OS / reserved</span>
+    <span><i class="sw w"></i>weights</span>
+    <span><i class="sw k"></i>KV cache</span>
+    <span><i class="sw o"></i>overhead</span>
+    <span><i class="sw f"></i>free</span>
+  </div>
+  <p class="mmb-note" data-out="note"></p>
+</div>
+
+<style is:global>
+  /* global because the device rows are built in JS; every class is mmb- prefixed */
+  .mmb-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+  .mmb-row > .label { width: 74px; flex: none; font-size: 10.5px; }
+  .mmb-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .mmb-btns .btn { padding: 5px 9px; font-size: 10.5px; }
+  .mmb-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px 16px; margin: 16px 0 6px; }
+  .mmb-sum div { border-top: 1px solid var(--rule); padding-top: 5px; }
+  .mmb-sum dt { font-size: 10px; }
+  .mmb-sum dd { margin: 2px 0 0; font-size: 14px; }
+  .mmb-devs { margin-top: 10px; }
+  .mmb-dev { margin-top: 14px; }
+  .mmb-dev-head { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 2px 12px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+  .mmb-dev-head b { color: var(--ink); font-weight: 600; }
+  .mmb-track { position: relative; display: flex; height: 18px; border: 1px solid var(--ink); margin: 5px 0 4px; background: var(--paper); overflow: hidden; }
+  .mmb-track span { height: 100%; flex: none; }
+  .mmb-track .rsv { background: var(--paper-2); border-right: 1px dashed var(--ink-3); }
+  .mmb-track .w { background: var(--blue); }
+  .mmb-track .k { background: var(--blue-fill); border-left: 1px solid var(--blue); }
+  .mmb-track .o { background: repeating-linear-gradient(135deg, var(--ink-3) 0 1.5px, transparent 1.5px 5px); }
+  .mmb-track .cap { position: absolute; top: -1px; bottom: -1px; width: 0; border-left: 2px solid var(--warn); }
+  .mmb-track.over { border-color: var(--warn); }
+  .mmb-dev-foot { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+  .mmb-dev-foot .bad { color: var(--warn); font-weight: 600; }
+  .mmb-dev-foot .good { color: var(--ok); font-weight: 600; }
+  .mmb-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 14px; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+  .mmb-legend .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border: 1px solid var(--ink-3); vertical-align: -1px; }
+  .mmb-legend .sw.rsv { background: var(--paper-2); }
+  .mmb-legend .sw.w { background: var(--blue); border-color: var(--blue); }
+  .mmb-legend .sw.k { background: var(--blue-fill); border-color: var(--blue); }
+  .mmb-legend .sw.o { background: repeating-linear-gradient(135deg, var(--ink-3) 0 1.5px, transparent 1.5px 4px); }
+  .mmb-legend .sw.f { background: var(--paper); }
+  .mmb-note { margin: 14px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const GiB = 2 ** 30;
+  type Model = {
+    params: number; // all parameters
+    edge: number; // embedding + untied lm_head params (AWQ / FP8 checkpoints usually keep these in 16-bit)
+    hidden: number;
+    inter: number; // MLP width a token actually passes through
+    vocab: number;
+    kvTok: number; // KV bytes per token at 2 bytes per value: 2 x layers x kv_heads x head_dim x 2
+  };
+  // Shapes from the public Hugging Face config.json files; param counts checked against
+  // transformers on the meta device (dense models) and the published total (MoE).
+  const MODELS: Record<string, Model> = {
+    '1b': { params: 1_235_814_400, edge: 262_668_288, hidden: 2048, inter: 8192, vocab: 128256, kvTok: 2 * 16 * 8 * 64 * 2 },
+    '8b': { params: 8_030_261_248, edge: 1_050_673_152, hidden: 4096, inter: 14336, vocab: 128256, kvTok: 2 * 32 * 8 * 128 * 2 },
+    moe: { params: 30.53e9, edge: 622_329_856, hidden: 2048, inter: 8 * 768, vocab: 151936, kvTok: 2 * 48 * 4 * 128 * 2 },
+    '70b': { params: 70_553_706_496, edge: 2_101_346_304, hidden: 8192, inter: 28672, vocab: 128256, kvTok: 2 * 80 * 8 * 128 * 2 },
+  };
+  // Effective bits per weight. body = transformer layers, edge = embedding + lm_head.
+  // Approximate: real files mix formats per tensor. Q4_K_M ~4.9 is an average over a whole llama.cpp file.
+  const FORMATS: Record<string, { body: number; edge: number; name: string }> = {
+    bf16: { body: 16, edge: 16, name: 'BF16' },
+    fp8: { body: 8, edge: 16, name: 'FP8' },
+    q8: { body: 8.5, edge: 8.5, name: 'Q8_0' },
+    awq: { body: 4.16, edge: 16, name: 'AWQ 4-bit' },
+    q4: { body: 4.9, edge: 4.9, name: 'Q4_K_M' },
+  };
+  // Capacity in GiB. Spark reserve is an assumption for DGX OS + desktop + your CPU-side processes: measure yours.
+  const HW = [
+    { id: 'spark', name: 'DGX SPARK', cap: 128, reserve: 10, note: '128 GiB unified, shared with the OS' },
+    { id: 'h100', name: 'H100 SXM', cap: 79.6, reserve: 0, note: '80 GB HBM3' },
+    { id: '4090', name: 'RTX 4090', cap: 24, reserve: 0, note: '24 GB GDDR6X' },
+  ];
+  const RUNTIME = 1.5; // GiB: CUDA context, library workspaces, CUDA graphs. Approximate; measure it.
+  const CHUNK = 8192; // prefill tokens processed per forward pass (an engine setting)
+  const CTX = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const USERS = [1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256];
+  const ctxLabel = (c: number) => `${c / 1024}K`;
+  const g = (x: number) => (x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x >= 1 ? x.toFixed(2) : x.toFixed(3));
+  const sz = (bytes: number) => (bytes >= GiB ? `${g(bytes / GiB)} GiB` : bytes >= 2 ** 20 ? `${g(bytes / 2 ** 20)} MiB` : `${g(bytes / 1024)} KiB`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="memmath-budget"]').forEach((root) => {
+    const state = { model: '8b', w: 'bf16', kv: 2, c: 3, u: 5 };
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+
+    const render = () => {
+      const m = MODELS[state.model];
+      const f = FORMATS[state.w];
+      const ctx = CTX[state.c];
+      const users = USERS[state.u];
+      const wBytes = ((m.params - m.edge) * f.body + m.edge * f.edge) / 8;
+      const kvTok = (m.kvTok * state.kv) / 2;
+      const kvUser = kvTok * ctx;
+      const kvAll = kvUser * users;
+      // Peak activations: one prefill chunk through one layer (residual, q/k/v, MLP gate+up+product),
+      // plus fp32 logits for every running sequence's last token. Transient, but it must fit.
+      const chunk = Math.min(CHUNK, ctx * users);
+      const act = chunk * (4 * m.hidden + 3 * m.inter) * 2 + users * m.vocab * 4;
+      const over = RUNTIME * GiB + act;
+      const w = wBytes / GiB, k = kvAll / GiB, o = over / GiB;
+
+      out('ctx').textContent = ctxLabel(ctx);
+      out('users').textContent = String(users);
+      out('wgib').textContent = `${sz(wBytes)} (${(wBytes / 1e9).toFixed(1)} GB)`;
+      out('kvtok').textContent = sz(kvTok);
+      out('kvuser').textContent = sz(kvUser);
+      out('kvall').textContent = sz(kvAll);
+
+      const devs = out('devs');
+      devs.replaceChildren();
+      const results: { name: string; fits: boolean; max: number }[] = [];
+      for (const hw of HW) {
+        const need = hw.reserve + w + k + o;
+        const fits = need <= hw.cap;
+        const room = hw.cap - hw.reserve - w - RUNTIME - act / GiB;
+        const max = room > 0 ? Math.floor((room * GiB) / kvUser) : 0;
+        results.push({ name: hw.name, fits, max });
+        const scale = Math.max(hw.cap, need);
+        const pct = (x: number) => `${(100 * x) / scale}%`;
+
+        const d = document.createElement('div');
+        d.className = 'mmb-dev';
+        const head = document.createElement('div');
+        head.className = 'mmb-dev-head';
+        head.innerHTML = `<span><b>${hw.name}</b> · ${hw.note}</span><span>${g(need)} of ${g(hw.cap)} GiB</span>`;
+        const track = document.createElement('div');
+        track.className = 'mmb-track' + (fits ? '' : ' over');
+        const parts: [string, number][] = [['rsv', hw.reserve], ['w', w], ['k', k], ['o', o]];
+        for (const [cls, v] of parts) {
+          if (v <= 0) continue;
+          const s = document.createElement('span');
+          s.className = cls;
+          s.style.width = pct(v);
+          track.appendChild(s);
+        }
+        if (!fits) {
+          const cap = document.createElement('span');
+          cap.className = 'cap';
+          cap.style.left = pct(hw.cap);
+          track.appendChild(cap);
+        }
+        const foot = document.createElement('div');
+        foot.className = 'mmb-dev-foot';
+        const verdict = fits
+          ? `<span class="good">FITS</span> · ${g(hw.cap - need)} GiB free`
+          : `<span class="bad">DOES NOT FIT</span> · over by ${g(need - hw.cap)} GiB`;
+        const maxTxt = room <= 0 ? 'weights alone do not fit' : `max users at ${ctxLabel(ctx)}: ${max}`;
+        foot.innerHTML = `${verdict} · ${maxTxt}`;
+        d.append(head, track, foot);
+        devs.appendChild(d);
+      }
+
+      const [spark, h100, r4090] = results;
+      let note: string;
+      if (w > 79.6) note = `${sz(wBytes)} of weights. Only the Spark can even hold this model, and only if the KV cache is small. This is the Spark's trick: lots of memory, slowly.`;
+      else if (!r4090.fits && spark.fits && h100.fits) note = `The 24 GB card is out. The Spark holds about ${spark.max} users at ${ctxLabel(ctx)}, the H100 about ${h100.max}. Holding them is not the same as serving them fast: on the Spark every step reads all those caches through 273 GB/s.`;
+      else if (k > w) note = `The KV cache (${sz(kvAll)}) now outweighs the model (${sz(wBytes)}). Past this point, users and context are what you are buying memory for, not the model.`;
+      else if (spark.fits && h100.fits && r4090.fits) note = `Fits everywhere. Push context or users until something breaks, then try FP8 for the KV cache and watch every "max users" number double.`;
+      else note = `Something does not fit. Halve the KV cache with FP8, shrink the weights, or cut context: each one is a different trade.`;
+      out('note').textContent = note;
+    };
+
+    root.querySelectorAll<HTMLElement>('[data-group]').forEach((grp) => {
+      const key = grp.dataset.group as 'model' | 'w' | 'kv';
+      grp.querySelectorAll<HTMLButtonElement>('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          grp.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+          const v = btn.dataset.v!;
+          if (key === 'kv') state.kv = Number(v);
+          else state[key] = v;
+          render();
+        });
+      });
+    });
+    q<HTMLInputElement>('[data-in="ctx"]').addEventListener('input', (e) => { state.c = Number((e.target as HTMLInputElement).value); render(); });
+    q<HTMLInputElement>('[data-in="users"]').addEventListener('input', (e) => { state.u = Number((e.target as HTMLInputElement).value); render(); });
+    render();
+  });
+</script>

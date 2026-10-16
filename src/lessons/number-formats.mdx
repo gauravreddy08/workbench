@@ -1,0 +1,839 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import FloatBitFlipper from '../components/figures/FloatBitFlipper.astro';
+
+## Today
+
+- Read any float bit by bit: sign, exponent, mantissa, and say what value the bits mean.
+- Say exactly how fp32, fp16, bf16, tf32 and the two fp8 formats differ, in range and in precision, with the real numbers (65,504, 6×10⁻⁵, 3.4×10³⁸, 2⁻⁷...).
+- Explain why the gap between neighbouring floats grows with the size of the number, and what that does to weight updates, sums and subtractions.
+- Make fp16 overflow and underflow happen on purpose, then fix them: the max trick for softmax, loss scaling for gradients.
+- Train the same small GPT four ways (fp32, fp16, fp16 with a gradient scaler, bf16), watch one of them die, and explain why bf16 doesn't need the scaler.
+
+Prerequisites: none, really. It helps to have done [How much memory does a model need?](/lessons/memory-math/), where "2 bytes per parameter" first showed up. Rough time: an evening on your Mac, plus an optional session on the Spark.
+
+## The Problem
+
+In the diagnostic, asked about bf16 versus fp16, you said: "I think BF16 has smaller precision, like the points after the decimal are less than FP16, but I don't know the exact numbers."
+
+Half of that is right. bf16 really is *less precise* than fp16. But "points after the decimal" is the wrong picture, and the missing half is the whole reason bf16 won. Floats don't have a fixed number of decimal places. And the thing bf16 gives up precision *for*, range, is the thing that makes training stable.
+
+Here is how the missing half bites. You take a fine-tuning script that works in fp32, and to save memory and time you flip it to fp16. It trains for a few hundred steps. Then the loss prints `nan` and stays there. Or, sneakier: no NaN at all, the loss just stops going down, because most of the gradients have quietly become exactly zero. Flip the same script to bf16 and it trains fine, with no extra code. Same 16 bits, same speed on the GPU. Something about *how those 16 bits are split* decides whether your run lives.
+
+To see why, you need to know what's inside a float. It's simpler than it sounds: three fields and one formula.
+
+<Origin year="1985" title="IEEE 754: one set of rules for every computer">
+
+Before 1985, every computer maker invented its own floating point. IBM mainframes worked in base 16. Cray supercomputers did division with a reciprocal approximation, so even `x / y` could be off in the last bit. VAX had its own formats. The same program, compiled for two machines, gave two answers, and numerical code had to be written defensively for each one.
+
+William Kahan, a Berkeley mathematician, had spent years collecting these horrors. In the late 1970s Intel hired him to design the math for the 8087 floating-point coprocessor, and he pushed the same design through an IEEE committee. The result, IEEE 754, published in 1985, fixed the bit layouts, the rounding rule, and what happens at the edges: infinity, "not a number", and the tiny numbers near zero. Kahan won the Turing Award in 1989 for it. Every CPU and GPU you will ever use follows it.
+
+Thirty years later, deep learning wanted narrower numbers, because fewer bits means less memory and faster math. IEEE already had a 16-bit format (fp16, standardised in 2008), and NVIDIA's Volta GPUs (2017) ran it on their new <Term w="tensor cores">Dedicated matrix-multiply units inside NVIDIA GPUs. They take small tiles of low-precision inputs (fp16, bf16, fp8...) and multiply them far faster than the general-purpose cores can.</Term>. Training in it worked, but only with a trick called loss scaling. Meanwhile Google Brain chose a different 16-bit split for its TPUs: keep fp32's exponent, chop the mantissa. They called it bfloat16, "brain floating point". NVIDIA added bf16 to its tensor cores with the A100 in 2020, and within a couple of years almost everyone training large models had switched.
+
+</Origin>
+
+## The Idea
+
+### Scientific notation, in binary
+
+You already know how to write very big and very small numbers: Avogadro's number is 6.02 × 10²³, the mass of an electron is 9.11 × 10⁻³¹ kg. Scientific notation has three parts: a sign, a few significant digits, and an exponent that says where the decimal point goes.
+
+The trick is that the digits and the exponent do different jobs. The exponent decides *how big* the number is, its range. The digits decide *how precise* it is. Three significant digits means you know the number to about one part in a thousand, whether it's 6.02 × 10²³ or 6.02 × 10⁻²³. That is the idea to hold onto: precision is **relative**, not a number of decimal places.
+
+A <Term w="floating-point number">A number stored as sign × significand × 2^exponent, so the binary point "floats" to wherever the exponent puts it. Lets one format hold both huge and tiny values.</Term> is scientific notation in base 2, stored in three fields of bits:
+
+- the <Term w="sign bit">One bit: 0 means positive, 1 means negative.</Term>,
+- the <Term w="exponent">The bits saying which power of two the number sits near. More exponent bits, more range: bigger biggest numbers and smaller smallest ones.</Term>, which sets the range,
+- the <Term w="mantissa">The bits after the binary point in the significand: where between two powers of two the number sits. More mantissa bits, finer precision. Officially called the significand (strictly, the significand includes the hidden leading 1).</Term>, which sets the precision.
+
+<Figure n="001" title="A FLOAT IS SCIENTIFIC NOTATION" caption="Decimal scientific notation splits a number into sign, digits and exponent. A float does the same in binary. Here the fp32 bits of −2.5: sign 1 (negative), exponent field 128 (minus the bias 127, so 2¹), mantissa .01 (so the significand is 1.01 in binary, which is 1.25).">
+<svg viewBox="0 0 640 262" role="img" aria-label="Scientific notation split into sign, digits and exponent, and the same three parts as bits of the fp32 number minus 2.5">
+  <text x="10" y="20" class="strong">DECIMAL SCIENTIFIC NOTATION</text>
+  <text x="180" y="66" text-anchor="middle" class="strong" style="font-size:30px">−</text>
+  <text x="290" y="66" text-anchor="middle" class="strong" style="font-size:30px">6.02</text>
+  <text x="400" y="66" text-anchor="middle" class="strong" style="font-size:30px">× 10</text>
+  <text x="452" y="46" text-anchor="middle" class="blue-t" style="font-size:18px">23</text>
+  <line x1="166" y1="82" x2="194" y2="82" class="ink" stroke-width="1.2" />
+  <text x="180.0" y="98" text-anchor="middle" class="">SIGN</text>
+  <line x1="250" y1="82" x2="330" y2="82" class="ink" stroke-width="1.2" />
+  <text x="290.0" y="98" text-anchor="middle" class="">DIGITS: HOW PRECISE</text>
+  <line x1="436" y1="82" x2="470" y2="82" class="blue" stroke-width="1.2" />
+  <text x="453.0" y="98" text-anchor="middle" class="blue-t">EXPONENT: HOW BIG</text>
+  <text x="10" y="134" class="strong">THE SAME IDEA IN BITS · FP32 · THE NUMBER −2.5</text>
+  <rect x="48" y="148" width="17" height="24" class="fill-blue" stroke-width="1" />
+  <text x="56.5" y="164" text-anchor="middle" class="" style="fill:var(--paper)">1</text>
+  <rect x="65" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="73.5" y="164" text-anchor="middle" class="strong">1</text>
+  <rect x="82" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="90.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="99" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="107.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="116" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="124.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="133" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="141.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="150" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="158.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="167" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="175.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="184" y="148" width="17" height="24" class="fill-wash" stroke-width="1" />
+  <text x="192.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="201" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="209.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="218" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="226.5" y="164" text-anchor="middle" class="strong">1</text>
+  <rect x="235" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="243.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="252" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="260.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="269" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="277.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="286" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="294.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="303" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="311.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="320" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="328.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="337" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="345.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="354" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="362.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="371" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="379.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="388" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="396.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="405" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="413.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="422" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="430.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="439" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="447.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="456" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="464.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="473" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="481.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="490" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="498.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="507" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="515.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="524" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="532.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="541" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="549.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="558" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="566.5" y="164" text-anchor="middle" class="strong">0</text>
+  <rect x="575" y="148" width="17" height="24" class="fill-paper" stroke-width="1" />
+  <text x="583.5" y="164" text-anchor="middle" class="strong">0</text>
+  <line x1="50" y1="180" x2="63" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="50" y1="176" x2="50" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="63" y1="176" x2="63" y2="180" class="ink" stroke-width="1.2" />
+  <text x="56.5" y="196" text-anchor="middle" class="strong">S</text>
+  <text x="56.5" y="212" text-anchor="middle" class="">−</text>
+  <line x1="67" y1="180" x2="199" y2="180" class="blue" stroke-width="1.2" />
+  <line x1="67" y1="176" x2="67" y2="180" class="blue" stroke-width="1.2" />
+  <line x1="199" y1="176" x2="199" y2="180" class="blue" stroke-width="1.2" />
+  <text x="133.0" y="196" text-anchor="middle" class="strong">EXPONENT · 8 BITS</text>
+  <text x="133.0" y="212" text-anchor="middle" class="b">128 − 127 = 1</text>
+  <line x1="203" y1="180" x2="590" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="203" y1="176" x2="203" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="590" y1="176" x2="590" y2="180" class="ink" stroke-width="1.2" />
+  <text x="396.5" y="196" text-anchor="middle" class="strong">MANTISSA · 23 BITS</text>
+  <text x="396.5" y="212" text-anchor="middle" class="">.0100…0 → 1.01₂ = 1.25</text>
+  <text x="320" y="252" text-anchor="middle" class="blue-t">−1.25 × 2¹ = −2.5   ·   HEX 0xC0200000</text>
+</svg>
+</Figure>
+
+### Decoding one by hand
+
+Take −2.5 and turn it into fp32 bits, the slow way.
+
+1. **Sign.** Negative, so the sign bit is 1.
+2. **Write it in binary.** 2.5 is 2 + 0.5, which is `10.1` in binary (the 1 after the point is the halves place).
+3. **Normalise.** Slide the point so exactly one 1 is in front of it: `10.1` = `1.01` × 2¹. Every nonzero number can be written as 1.something × 2^something. So the leading 1 is always there, and IEEE doesn't bother storing it. That free bit is the <Term w="hidden bit">The leading 1 of a normal float's significand. It's always 1, so it isn't stored, which gives one extra bit of precision for free.</Term>.
+4. **Mantissa.** Store what comes after the point: `01`, then zeros to fill 23 bits.
+5. **Exponent.** The power is 1. The exponent field doesn't store it directly; it stores the power plus a fixed <Term w="bias">A constant added to the real exponent so the stored field is never negative. 127 for fp32 and bf16, 15 for fp16. Stored field e means a power of e − bias.</Term> of 127, so the field holds 128, which is `10000000`.
+
+Put together: `1 10000000 01000000000000000000000`, or `0xC0200000` in hex. Going the other way is one formula, for every format in this lesson:
+
+```text
+value = (−1)^sign × 1.mantissa (binary) × 2^(exponent field − bias)
+```
+
+That's the normal case. Two exponent values are reserved. An exponent field of all zeros means "tiny or zero" (we'll get to these). All ones means infinity (if the mantissa is 0) or <Term w="NaN">"Not a Number". The result of an undefined operation like inf − inf or 0 × inf. Any arithmetic involving NaN gives NaN, and NaN is not even equal to itself.</Term> (if it isn't).
+
+### The formats
+
+Every format in deep learning is this same recipe with a different number of bits in each field.
+
+<Figure n="002" title="THE FORMATS, FIELD BY FIELD" caption="Blue: exponent bits (range). White: mantissa bits (precision). bf16 keeps all 8 of fp32's exponent bits, so it has the same range, and keeps only 7 mantissa bits, fewer than fp16's 10. Epsilon is the gap between 1 and the next number up: the smaller, the more precise.">
+<svg viewBox="0 0 640 278" role="img" aria-label="Bit layouts of fp32, tf32, fp16, bf16 and the two fp8 formats, with largest value, smallest normal value and machine epsilon">
+  <text x="10" y="22" class="strong">FORMAT</text>
+  <text x="62" y="22" class="strong">BITS: SIGN · EXPONENT · MANTISSA</text>
+  <text x="440" y="22" text-anchor="end" class="strong">MAX</text>
+  <text x="530" y="22" text-anchor="end" class="strong">MIN NORMAL</text>
+  <text x="630" y="22" text-anchor="end" class="strong">EPSILON</text>
+  <text x="10" y="59" class="strong">FP32</text>
+  <rect x="62" y="44" width="9.5" height="22" class="fill-blue" />
+  <rect x="71.5" y="44" width="76.0" height="22" class="fill-wash" stroke-width="1" />
+  <text x="109.5" y="59" text-anchor="middle" class="blue-t">8</text>
+  <rect x="147.5" y="44" width="218.5" height="22" class="fill-paper" stroke-width="1" />
+  <text x="256.75" y="59" text-anchor="middle">23</text>
+  <text x="440" y="59" text-anchor="end">3.4e38</text>
+  <text x="530" y="59" text-anchor="end">1.2e−38</text>
+  <text x="630" y="59" text-anchor="end">1.2e−7</text>
+  <text x="10" y="93" class="strong">TF32</text>
+  <rect x="62" y="78" width="9.5" height="22" class="fill-blue" />
+  <rect x="71.5" y="78" width="76.0" height="22" class="fill-wash" stroke-width="1" />
+  <text x="109.5" y="93" text-anchor="middle" class="blue-t">8</text>
+  <rect x="147.5" y="78" width="95.0" height="22" class="fill-paper" stroke-width="1" />
+  <text x="195.0" y="93" text-anchor="middle">10</text>
+  <text x="440" y="93" text-anchor="end">3.4e38</text>
+  <text x="530" y="93" text-anchor="end">1.2e−38</text>
+  <text x="630" y="93" text-anchor="end">9.8e−4</text>
+  <text x="10" y="127" class="strong">FP16</text>
+  <rect x="62" y="112" width="9.5" height="22" class="fill-blue" />
+  <rect x="71.5" y="112" width="47.5" height="22" class="fill-wash" stroke-width="1" />
+  <text x="95.25" y="127" text-anchor="middle" class="blue-t">5</text>
+  <rect x="119.0" y="112" width="95.0" height="22" class="fill-paper" stroke-width="1" />
+  <text x="166.5" y="127" text-anchor="middle">10</text>
+  <text x="440" y="127" text-anchor="end">65,504</text>
+  <text x="530" y="127" text-anchor="end">6.1e−5</text>
+  <text x="630" y="127" text-anchor="end">9.8e−4</text>
+  <text x="10" y="161" class="strong">BF16</text>
+  <rect x="62" y="146" width="9.5" height="22" class="fill-blue" />
+  <rect x="71.5" y="146" width="76.0" height="22" class="fill-wash" stroke-width="1" />
+  <text x="109.5" y="161" text-anchor="middle" class="blue-t">8</text>
+  <rect x="147.5" y="146" width="66.5" height="22" class="fill-paper" stroke-width="1" />
+  <text x="180.75" y="161" text-anchor="middle">7</text>
+  <text x="440" y="161" text-anchor="end">3.4e38</text>
+  <text x="530" y="161" text-anchor="end">1.2e−38</text>
+  <text x="630" y="161" text-anchor="end">7.8e−3</text>
+  <text x="10" y="195" class="strong">E4M3</text>
+  <rect x="62" y="180" width="9.5" height="22" class="fill-blue" />
+  <rect x="71.5" y="180" width="38.0" height="22" class="fill-wash" stroke-width="1" />
+  <text x="90.5" y="195" text-anchor="middle" class="blue-t">4</text>
+  <rect x="109.5" y="180" width="28.5" height="22" class="fill-paper" stroke-width="1" />
+  <text x="123.75" y="195" text-anchor="middle">3</text>
+  <text x="440" y="195" text-anchor="end">448</text>
+  <text x="530" y="195" text-anchor="end">1.6e−2</text>
+  <text x="630" y="195" text-anchor="end">0.125</text>
+  <text x="10" y="229" class="strong">E5M2</text>
+  <rect x="62" y="214" width="9.5" height="22" class="fill-blue" />
+  <rect x="71.5" y="214" width="47.5" height="22" class="fill-wash" stroke-width="1" />
+  <text x="95.25" y="229" text-anchor="middle" class="blue-t">5</text>
+  <rect x="119.0" y="214" width="19.0" height="22" class="fill-paper" stroke-width="1" />
+  <text x="128.5" y="229" text-anchor="middle">2</text>
+  <text x="440" y="229" text-anchor="end">57,344</text>
+  <text x="530" y="229" text-anchor="end">6.1e−5</text>
+  <text x="630" y="229" text-anchor="end">0.25</text>
+  <text x="10" y="260">EXPONENT WIDTH SETS RANGE. MANTISSA WIDTH SETS PRECISION. BF16 = TOP HALF OF FP32.</text>
+</svg>
+</Figure>
+
+Here are the numbers that matter, so you can say them in an interview:
+
+| Format | Bits (S/E/M) | Largest | Smallest normal | Epsilon | Decimal digits |
+| --- | --- | --- | --- | --- | --- |
+| fp32 | 1 / 8 / 23 | 3.4 × 10³⁸ | 1.2 × 10⁻³⁸ | 2⁻²³ ≈ 1.2 × 10⁻⁷ | ~7 |
+| fp16 | 1 / 5 / 10 | 65,504 | 6.1 × 10⁻⁵ | 2⁻¹⁰ ≈ 0.001 | ~3 |
+| bf16 | 1 / 8 / 7 | 3.4 × 10³⁸ | 1.2 × 10⁻³⁸ | 2⁻⁷ ≈ 0.0078 | ~2 |
+| tf32 | 1 / 8 / 10 | 3.4 × 10³⁸ | 1.2 × 10⁻³⁸ | 2⁻¹⁰ ≈ 0.001 | ~3 |
+| fp8 E4M3 | 1 / 4 / 3 | 448 | 0.0156 | 2⁻³ = 0.125 | ~1 |
+| fp8 E5M2 | 1 / 5 / 2 | 57,344 | 6.1 × 10⁻⁵ | 2⁻² = 0.25 | &lt;1 |
+
+<Term w="machine epsilon">The gap between 1.0 and the next representable number. It's 2^−(mantissa bits). Every rounding step can be off by up to half of it, relative to the number's size.</Term> is the precision column in one number. "Decimal digits" is just epsilon translated: 24 bits of significand (23 stored plus the hidden 1) is about 7.2 decimal digits, fp16's 11 is about 3.3, bf16's 8 is about 2.4.
+
+So, the corrected version of your diagnostic answer:
+
+- **fp16 has more precision, less range.** About 3 significant digits. But nothing bigger than 65,504, and nothing (normal) smaller than about 0.00006.
+- **bf16 has less precision, the same range as fp32.** Only about 2 significant digits: it can't tell 256 from 257. But it reaches 3.4 × 10³⁸ and down to 10⁻³⁸, exactly like fp32.
+- **bf16 is literally the top half of fp32.** Same sign bit, same 8 exponent bits, first 7 mantissa bits. Converting fp32 to bf16 is (nearly) "drop the bottom 16 bits", which made it cheap to adopt: every fp32 number lands somewhere sensible in bf16, it just gets blurrier.
+
+And "points after the decimal" was the wrong frame because precision is relative. bf16 stores 3.140625 for 3.14159, 3,136 for 3,141.59, and 0.0003147 for 0.000314159. Three very different sizes, and each one is off by less than 0.2%. (Round-to-nearest guarantees under 0.4%, half of bf16's epsilon, at any size.) There is no fixed number of places after the decimal; there's a fixed number of *significant* digits.
+
+The other two rows:
+
+<Term w="tf32">TensorFloat-32. NVIDIA's tensor-core format since Ampere (A100, 2020): fp32's 8-bit exponent with fp16's 10-bit mantissa, 19 bits in all. Inputs are rounded to it inside the matrix unit; you never store a tf32 tensor.</Term> is not a storage format. Your tensors stay fp32 in memory; when a matrix multiply runs on an Ampere-or-newer tensor core with tf32 enabled, the inputs are rounded to 10 mantissa bits inside the hardware and the products are added up in fp32. You get much of the speed of 16-bit math with fp32's range and no code changes. In PyTorch it is off by default for matmuls; `torch.set_float32_matmul_precision` with `"high"` turns it on (check the docs for your version, the flags have moved around).
+
+**fp8** comes in two flavours because 8 bits can't do both jobs. E4M3 is the precise one (max 448), used for weights and activations; E5M2 is the wide one (max 57,344), used for gradients, which swing across many orders of magnitude. [Quantization](/lessons/quantization/) covers fp8 and fp4 for inference in detail. Here we care about the training side, which comes at the end.
+
+<Predict id="bf16-vs-fp16-tenth">
+Neither fp16 nor bf16 can store 0.1 exactly. Which one stores it closer, and roughly how far off is each? Then: what is 256 + 1 in bf16?
+<Fragment slot="answer">
+
+fp16 is closer. It stores 0.0999755859375 (off by about 2.4 × 10⁻⁵, or 0.02%). bf16 stores 0.10009765625 (off by about 1 × 10⁻⁴, or 0.1%). That's the 3 extra mantissa bits: 2³ = 8 times finer.
+
+256 + 1 in bf16 is 256. Between 256 and 512, bf16's 7 mantissa bits make 128 evenly spaced values, so they're 2 apart: 256, 258, 260... 257 is exactly halfway between 256 and 258, and the tie goes to the "even" one (mantissa ending in 0), which is 256. In fp16 the same thing happens at 2048 + 1 = 2048, and in fp32 at 16,777,216 + 1 = 16,777,216. I checked all three in PyTorch.
+
+</Fragment>
+</Predict>
+
+### Flip the bits yourself
+
+This is the format, live. Click any bit to flip it. Switch formats and the current value is rounded into the new one, so you can watch 0.1 turn into a slightly different number in each. The number line underneath shows the representable values on either side of the current one: the only numbers this format can say near here.
+
+<Figure n="003" title="BIT FLIPPER" caption="Things to try. Press '1', then flip the second exponent bit, in bf16 and then in fp16: same click, very different landing (2⁻⁶⁴ against 2⁻⁸), because bf16 has more exponent bits. Press 'max' in fp16, then '+1 step'. Press 'min normal', then '−1 step' a few times: the exponent field goes to zero and you're in the subnormals, where the gap stops shrinking. Type 0.1 and compare the 'exactly' line across formats. Notice that 'relative gap' stays roughly constant as the value changes, while 'gap to next' changes a lot." wide>
+
+<FloatBitFlipper />
+
+</Figure>
+
+### The gaps grow with the number
+
+Play with the flipper long enough and you see the key fact about floats: between any two neighbouring powers of two (2 to 4, or 1,024 to 2,048) there are the same number of representable values, 2^(mantissa bits). bf16 has 128 values between 1 and 2, and 128 values between 1,024 and 2,048. So the second set is spread 1,024 times wider. Each stretch from one power of two to the next is called a <Term w="binade">The range from one power of two up to the next, like [1, 2) or [1024, 2048). Inside a binade, floats are evenly spaced.</Term>, and inside a binade the values are evenly spaced.
+
+The gap from a number to its next neighbour has a name, the <Term w="ULP">Unit in the last place: the gap between a float and the next representable float. It doubles every time you cross a power of two.</Term>, and it doubles every time you cross a power of two. On a log-log plot that's a staircase climbing at 45 degrees:
+
+<Figure n="004" title="THE GAP GROWS WITH THE NUMBER" caption="Gap to the next representable value, against the size of the value, both on log scales. Each format is a staircase: the gap doubles at each power of two. bf16 sits 8× above fp16 (3 fewer mantissa bits) but runs across the whole range, like fp32. fp16 stops at 2¹⁶ (it overflows to infinity past 65,504) and, at the small end, flattens into subnormals and then hits zero below 2⁻²⁴." wide>
+<svg viewBox="0 0 560 270" role="img" aria-label="Gap between neighbouring representable numbers versus magnitude, for fp32, bf16 and fp16, on log scales">
+  <rect x="60" y="20" width="480" height="210" class="ink" stroke-width="1" />
+  <line x1="60.0" y1="230" x2="60.0" y2="234" class="ink" stroke-width="1" />
+  <text x="60.0" y="246" text-anchor="middle">2^−30</text>
+  <line x1="156.0" y1="230" x2="156.0" y2="234" class="ink" stroke-width="1" />
+  <text x="156.0" y="246" text-anchor="middle">2^−20</text>
+  <line x1="252.0" y1="230" x2="252.0" y2="234" class="ink" stroke-width="1" />
+  <text x="252.0" y="246" text-anchor="middle">2^−10</text>
+  <line x1="348.0" y1="230" x2="348.0" y2="234" class="ink" stroke-width="1" />
+  <text x="348.0" y="246" text-anchor="middle">2^0</text>
+  <line x1="444.0" y1="230" x2="444.0" y2="234" class="ink" stroke-width="1" />
+  <text x="444.0" y="246" text-anchor="middle">2^10</text>
+  <line x1="540.0" y1="230" x2="540.0" y2="234" class="ink" stroke-width="1" />
+  <text x="540.0" y="246" text-anchor="middle">2^20</text>
+  <line x1="56" y1="217.6" x2="60" y2="217.6" class="ink" stroke-width="1" />
+  <text x="53" y="221.6" text-anchor="end">2^−50</text>
+  <line x1="56" y1="186.8" x2="60" y2="186.8" class="ink" stroke-width="1" />
+  <text x="53" y="190.8" text-anchor="end">2^−40</text>
+  <line x1="56" y1="155.9" x2="60" y2="155.9" class="ink" stroke-width="1" />
+  <text x="53" y="159.9" text-anchor="end">2^−30</text>
+  <line x1="56" y1="125.0" x2="60" y2="125.0" class="ink" stroke-width="1" />
+  <text x="53" y="129.0" text-anchor="end">2^−20</text>
+  <line x1="56" y1="94.1" x2="60" y2="94.1" class="ink" stroke-width="1" />
+  <text x="53" y="98.1" text-anchor="end">2^−10</text>
+  <line x1="56" y1="63.2" x2="60" y2="63.2" class="ink" stroke-width="1" />
+  <text x="53" y="67.2" text-anchor="end">2^0</text>
+  <line x1="56" y1="32.4" x2="60" y2="32.4" class="ink" stroke-width="1" />
+  <text x="53" y="36.4" text-anchor="end">2^10</text>
+  <text x="300.0" y="264" text-anchor="middle">SIZE OF THE NUMBER |x|</text>
+  <text x="10" y="11">GAP TO NEXT</text>
+  <path d="M60.0 226.9 L69.6 226.9 L69.6 223.8 L79.2 223.8 L79.2 220.7 L88.8 220.7 L88.8 217.6 L98.4 217.6 L98.4 214.6 L108.0 214.6 L108.0 211.5 L117.6 211.5 L117.6 208.4 L127.2 208.4 L127.2 205.3 L136.8 205.3 L136.8 202.2 L146.4 202.2 L146.4 199.1 L156.0 199.1 L156.0 196.0 L165.6 196.0 L165.6 192.9 L175.2 192.9 L175.2 189.9 L184.8 189.9 L184.8 186.8 L194.4 186.8 L194.4 183.7 L204.0 183.7 L204.0 180.6 L213.6 180.6 L213.6 177.5 L223.2 177.5 L223.2 174.4 L232.8 174.4 L232.8 171.3 L242.4 171.3 L242.4 168.2 L252.0 168.2 L252.0 165.1 L261.6 165.1 L261.6 162.1 L271.2 162.1 L271.2 159.0 L280.8 159.0 L280.8 155.9 L290.4 155.9 L290.4 152.8 L300.0 152.8 L300.0 149.7 L309.6 149.7 L309.6 146.6 L319.2 146.6 L319.2 143.5 L328.8 143.5 L328.8 140.4 L338.4 140.4 L338.4 137.4 L348.0 137.4 L348.0 134.3 L357.6 134.3 L357.6 131.2 L367.2 131.2 L367.2 128.1 L376.8 128.1 L376.8 125.0 L386.4 125.0 L386.4 121.9 L396.0 121.9 L396.0 118.8 L405.6 118.8 L405.6 115.7 L415.2 115.7 L415.2 112.6 L424.8 112.6 L424.8 109.6 L434.4 109.6 L434.4 106.5 L444.0 106.5 L444.0 103.4 L453.6 103.4 L453.6 100.3 L463.2 100.3 L463.2 97.2 L472.8 97.2 L472.8 94.1 L482.4 94.1 L482.4 91.0 L492.0 91.0 L492.0 87.9 L501.6 87.9 L501.6 84.9 L511.2 84.9 L511.2 81.8 L520.8 81.8 L520.8 78.7 L530.4 78.7 L530.4 75.6 L540.0 75.6" class="ink dash" stroke-width="1.2" />
+  <path d="M60.0 177.5 L69.6 177.5 L69.6 174.4 L79.2 174.4 L79.2 171.3 L88.8 171.3 L88.8 168.2 L98.4 168.2 L98.4 165.1 L108.0 165.1 L108.0 162.1 L117.6 162.1 L117.6 159.0 L127.2 159.0 L127.2 155.9 L136.8 155.9 L136.8 152.8 L146.4 152.8 L146.4 149.7 L156.0 149.7 L156.0 146.6 L165.6 146.6 L165.6 143.5 L175.2 143.5 L175.2 140.4 L184.8 140.4 L184.8 137.4 L194.4 137.4 L194.4 134.3 L204.0 134.3 L204.0 131.2 L213.6 131.2 L213.6 128.1 L223.2 128.1 L223.2 125.0 L232.8 125.0 L232.8 121.9 L242.4 121.9 L242.4 118.8 L252.0 118.8 L252.0 115.7 L261.6 115.7 L261.6 112.6 L271.2 112.6 L271.2 109.6 L280.8 109.6 L280.8 106.5 L290.4 106.5 L290.4 103.4 L300.0 103.4 L300.0 100.3 L309.6 100.3 L309.6 97.2 L319.2 97.2 L319.2 94.1 L328.8 94.1 L328.8 91.0 L338.4 91.0 L338.4 87.9 L348.0 87.9 L348.0 84.9 L357.6 84.9 L357.6 81.8 L367.2 81.8 L367.2 78.7 L376.8 78.7 L376.8 75.6 L386.4 75.6 L386.4 72.5 L396.0 72.5 L396.0 69.4 L405.6 69.4 L405.6 66.3 L415.2 66.3 L415.2 63.2 L424.8 63.2 L424.8 60.1 L434.4 60.1 L434.4 57.1 L444.0 57.1 L444.0 54.0 L453.6 54.0 L453.6 50.9 L463.2 50.9 L463.2 47.8 L472.8 47.8 L472.8 44.7 L482.4 44.7 L482.4 41.6 L492.0 41.6 L492.0 38.5 L501.6 38.5 L501.6 35.4 L511.2 35.4 L511.2 32.4 L520.8 32.4 L520.8 29.3 L530.4 29.3 L530.4 26.2 L540.0 26.2" class="blue" stroke-width="1.5" />
+  <path d="M117.6 137.4 L213.6 137.4 L213.6 137.4 L223.2 137.4 L223.2 134.3 L232.8 134.3 L232.8 131.2 L242.4 131.2 L242.4 128.1 L252.0 128.1 L252.0 125.0 L261.6 125.0 L261.6 121.9 L271.2 121.9 L271.2 118.8 L280.8 118.8 L280.8 115.7 L290.4 115.7 L290.4 112.6 L300.0 112.6 L300.0 109.6 L309.6 109.6 L309.6 106.5 L319.2 106.5 L319.2 103.4 L328.8 103.4 L328.8 100.3 L338.4 100.3 L338.4 97.2 L348.0 97.2 L348.0 94.1 L357.6 94.1 L357.6 91.0 L367.2 91.0 L367.2 87.9 L376.8 87.9 L376.8 84.9 L386.4 84.9 L386.4 81.8 L396.0 81.8 L396.0 78.7 L405.6 78.7 L405.6 75.6 L415.2 75.6 L415.2 72.5 L424.8 72.5 L424.8 69.4 L434.4 69.4 L434.4 66.3 L444.0 66.3 L444.0 63.2 L453.6 63.2 L453.6 60.1 L463.2 60.1 L463.2 57.1 L472.8 57.1 L472.8 54.0 L482.4 54.0 L482.4 50.9 L492.0 50.9 L492.0 47.8 L501.6 47.8" class="ink" stroke-width="1.5" />
+  <line x1="501.6" y1="39.8" x2="501.6" y2="55.8" class="ink" stroke-width="1.5" />
+  <text x="501.6" y="12" text-anchor="middle" class="strong">FP16 ENDS (→ INF)</text>
+  <line x1="117.6" y1="129.4" x2="117.6" y2="145.4" class="ink" stroke-width="1.5" />
+  <text x="119.6" y="128.4" class="strong">SUBNORMALS</text>
+  <text x="113.6" y="128.4" text-anchor="end">BELOW: 0</text>
+  <text x="386.4" y="62.5" text-anchor="end" class="blue-t">BF16</text>
+  <text x="434.4" y="84.3" class="strong">FP16</text>
+  <text x="386.4" y="137.9">FP32</text>
+</svg>
+</Figure>
+
+Three consequences you will meet in training code.
+
+**Big plus small loses the small.** If the gap around `a` is bigger than twice `b`, then `a + b` rounds straight back to `a`. In bf16, `1.0 + 0.001 == 1.0`, because the gap above 1.0 is 0.0078. Now picture a weight of 1.0 and an update of `lr × grad` = 0.001. In bf16 the update vanishes. Do it a million times and the weight never moves. This is <Term w="stagnation">When updates are smaller than half the gap around the value being updated, so every update rounds away and the value stops changing.</Term>, and it's the reason training keeps a full fp32 copy of the weights.
+
+**Long sums stall.** I added 0.01 to a bf16 accumulator 1,000 times. The true answer is 10. bf16 gave **4.0**. Once the running sum reached 4, the gap there (0.03) was more than twice 0.01, so every further add rounded away. fp16, adding 0.01 ten thousand times (true answer 100), stalled at **32.0**. Any reduction (a sum, a mean, a dot product) over many terms in a narrow format has this problem, which is why hardware adds up products in fp32 even when the inputs are 16-bit.
+
+**Order matters.** Floating-point addition is not associative: `(a + b) + c` can differ from `a + (b + c)`, because each `+` rounds. A GPU summing a million numbers in parallel splits them across threads in an order that can change from run to run, so the last few bits of your loss can change between identical runs. That's not a bug in your code; it's float addition.
+
+### Subnormals: the soft landing at zero
+
+Below the smallest normal number (6.1 × 10⁻⁵ in fp16), the hidden 1 would have to go. IEEE handles this with <Term w="subnormal numbers">Floats with an exponent field of all zeros. They drop the hidden 1 (value = 0.mantissa × 2^(1 − bias)), so they can get closer to zero than any normal number, at the cost of precision. Also called denormals.</Term>: when the exponent field is all zeros, the value is 0.mantissa × 2^(1 − bias), no hidden 1. The gap stays fixed at the smallest step (you can see it as the flat stretch in Figure 004), and numbers fade toward zero gradually instead of falling off a cliff. In fp16 the smallest positive subnormal is 2⁻²⁴ ≈ 6 × 10⁻⁸. Anything smaller than half of that rounds to exactly 0. That's called <Term w="underflow">A result too small in magnitude for the format, so it becomes a subnormal with few bits of precision left, or rounds to zero.</Term>.
+
+Kahan fought hard for this "gradual underflow" in the standard, and it was controversial because subnormals are slow on some hardware. Many CPUs take a slow microcode path for them (it can be many times slower), and GPUs often offer a flush-to-zero mode that skips them. In fp16 training, though, subnormals are exactly where a lot of small gradients live, so they matter.
+
+Remember 6 × 10⁻⁸. It comes back in a few sections.
+
+### Rounding, and why 0.1 + 0.2 ≠ 0.3
+
+Most decimal numbers can't be written exactly in binary, for the same reason 1/3 can't be written exactly in decimal: 0.1 in binary is 0.000110011001100... repeating forever. So the format stores the nearest value it has. The rule IEEE uses is <Term w="round to nearest, ties to even">Pick the closest representable value. If exactly halfway between two, pick the one whose last mantissa bit is 0. Ties going to even avoids a systematic upward drift.</Term>. Every single arithmetic operation computes the exact result and then rounds it this way, so each step is off by at most half an ULP. That's a promise IEEE makes, and it's why float math is predictable even if it isn't exact.
+
+In Python, which uses 64-bit floats, `0.1 + 0.2` is `0.30000000000000004`. Three roundings happened: 0.1 to the nearest double, 0.2 to the nearest double, and their sum to the nearest double, and the errors didn't cancel. Fun twist I found while checking this: in fp32, `float32(0.1) + float32(0.2) == float32(0.3)` is **True**. The errors happen to cancel. Neither result is "the right one"; the lesson is that `==` on floats asks a question about rounding luck. Compare with a tolerance (`math.isclose`, `torch.allclose`).
+
+The flipper shows what's really stored. Type 0.1 in fp32 and the "exactly" line reads 0.100000001490116119384765625. That's the number your model sees.
+
+### Catastrophic cancellation
+
+Subtracting two nearly equal numbers is the most dangerous thing you can do in floating point. It's called <Term w="catastrophic cancellation">Loss of accuracy when subtracting two nearly equal numbers: the matching leading digits cancel, and the result is dominated by the earlier rounding errors.</Term>. Each number has a small relative error from rounding. When you subtract, the shared leading digits cancel, and what's left is mostly those errors.
+
+Example, measured in fp32: compute `x * x − 1` for `x = 1.0001`. True answer: 0.00020001. fp32 gives 0.00020003319. The fifth significant digit is wrong, from a format that promises seven. `x * x` was rounded to about 1.0002000 with an error around 10⁻⁷, which was harmless next to 1, but next to the 0.0002 that survives the subtraction it's a 0.01% error. In bf16, with an epsilon of 0.0078, `1.0001` itself rounds to 1.0, and the answer is 0.
+
+This shows up in ML in a classic place: variance. The textbook formula Var(x) = E[x²] − E[x]² subtracts two big, nearly equal numbers whenever the mean is large compared to the spread. In low precision it can even come out negative, and then `sqrt` gives NaN. That's why normalization layers compute statistics in fp32 and use numerically careful formulas, and why autocast runs them in fp32 for you.
+
+### Overflow: inf, then NaN everywhere
+
+At the top end, fp16 runs out at 65,504. Anything bigger becomes infinity. That's <Term w="overflow">A result too large in magnitude for the format. Under IEEE rounding it becomes ±infinity.</Term>, and in fp16 it is very easy to hit:
+
+- `exp(11)` = 59,874 fits. `exp(12)` = 162,755 doesn't: fp16 gives `inf`.
+- `300 * 300` in fp16 is `inf`.
+- Summing the loss over 40,000 tokens at about 4.0 each is 160,000: `inf`.
+
+Infinity then turns into NaN the moment it meets another infinity or a zero: `inf − inf`, `inf / inf`, `0 × inf` are all NaN. And NaN is contagious: every operation that touches a NaN returns NaN. One NaN in one gradient goes into the optimizer, which writes NaN into the weights, and the next forward pass is NaN everywhere. On multi-GPU training, the gradient <Term w="all-reduce">A collective operation where every GPU contributes a tensor (here, its gradients) and every GPU receives the sum. One NaN in any input makes the sum NaN everywhere.</Term> spreads one GPU's NaN to all of them within one step.
+
+The classic place this happens is softmax. Softmax is exp(xᵢ) / Σ exp(xⱼ). Computed naively in fp16 on the logits [10, 11, 12]:
+
+```text
+exp(10) = 22032   exp(11) = 59872   exp(12) = inf
+softmax = [0, 0, nan]
+```
+
+The fix is to subtract the maximum first: softmax(x) = softmax(x − max(x)), because the shift cancels between top and bottom. After the shift the largest exponent is exp(0) = 1, and nothing can overflow. Every real softmax implementation does this (and [FlashAttention](/lessons/flash-attention/)'s "online softmax" is this same trick done block by block). The same idea, computing log Σ exp(x) as max + log Σ exp(x − max), is called <Term w="logsumexp">A numerically safe way to compute log(Σ exp(xᵢ)): pull out the max first so no exp overflows. Used inside cross-entropy loss.</Term> and lives inside every cross-entropy loss.
+
+But the max trick only protects the softmax. In attention, the logits come from `q @ k.T`, a dot product of two 128-long vectors, and that can overflow *before* the softmax ever sees it. If the entries of q and k grow to around 50 (activations do drift during training), each logit is a sum of 128 products of size ~2,500, and some exceed 65,504. I tried it: with q and k drawn at that scale, 3 of 64 logits in fp16 were `inf`, and the softmax over that row came out all NaN, because subtracting the max computes inf − inf. The 1/√d scale in attention helps, but it's applied after the multiply in many implementations. Some large-model training recipes add <Term w="QK-norm">Applying a normalization (like LayerNorm or RMSNorm) to the query and key vectors before the dot product, which caps how large the attention logits can grow.</Term> partly for exactly this reason. In bf16, the same logits are fine: they're just blurry.
+
+### Training in 16 bits: the underflow problem
+
+Now the training story. Forward pass first: activations are mostly moderate numbers, and with the max trick, fp16 copes. The trouble is the backward pass.
+
+Gradients are small. Cross-entropy averaged over a batch of B × T tokens gives each token's logit gradient a factor of 1/(B × T), and from there the chain rule multiplies by weights and derivatives that are often less than 1, layer after layer. Plenty of gradient values land between 10⁻⁸ and 10⁻⁵. In fp16, anything below 6 × 10⁻⁸ becomes zero, and anything below 6 × 10⁻⁵ is a subnormal with only a few bits of precision.
+
+I measured what fp16 does to a few typical gradient values:
+
+| True value | fp16 | bf16 |
+| --- | --- | --- |
+| 1 × 10⁻⁵ | 1.0014 × 10⁻⁵ | 1.0014 × 10⁻⁵ |
+| 1 × 10⁻⁶ | 1.013 × 10⁻⁶ (subnormal, 1.3% off) | 0.998 × 10⁻⁶ |
+| 1 × 10⁻⁷ | 1.19 × 10⁻⁷ (19% off) | 1.001 × 10⁻⁷ |
+| 3 × 10⁻⁸ | 5.96 × 10⁻⁸ (2× off) | 3.004 × 10⁻⁸ |
+| 1 × 10⁻⁸ | **0** | 1.001 × 10⁻⁸ |
+
+bf16's precision is coarse (always about 2-3 digits) but it never runs out of exponent. fp16 is precise in the middle and falls apart at the bottom.
+
+The 2017 "Mixed Precision Training" paper by Micikevicius and colleagues at NVIDIA and Baidu plotted the gradients of real networks and found a large share of them below fp16's range, while the top of fp16's range sat mostly unused. Their fix was beautifully simple.
+
+### Loss scaling
+
+<Term w="loss scaling">Multiplying the loss by a big constant S before backward, so every gradient is S times bigger and stays above fp16's underflow threshold, then dividing the gradients by S (in fp32) before the optimizer step.</Term>: multiply the loss by a big number S, say 65,536, before calling backward. Backpropagation is all multiplications and additions, so by the chain rule every gradient comes out exactly S times bigger. That shifts the whole gradient distribution up by 16 binades, out of the underflow zone and into the empty top of fp16's range. Then, before the optimizer uses them, divide the gradients by S again, in fp32, where the small values are safe.
+
+Pick S too small and gradients still underflow. Pick it too big and some gradients overflow to inf. And the right S changes as training goes on. So in practice you use a <Term w="dynamic loss scaler">An automatic loss scale: start large; if any gradient comes back inf or NaN, skip that optimizer step and halve the scale; after a long run of good steps, double it. PyTorch's GradScaler.</Term>:
+
+1. Start with a large scale (PyTorch's `GradScaler` starts at 2¹⁶ = 65,536).
+2. Each step, after backward, check every gradient for inf or NaN.
+3. If any are found, skip this optimizer step entirely (don't let the NaN reach the weights) and halve the scale.
+4. If 2,000 steps in a row were clean (the default `growth_interval`), double the scale, to reclaim headroom.
+
+The scaler finds, and keeps finding, the largest scale that doesn't overflow. In PyTorch it's four lines:
+
+```python
+scaler = torch.amp.GradScaler("cuda")      # or "mps" on your Mac
+with torch.autocast("cuda", dtype=torch.float16):
+    loss = model(x, y)
+scaler.scale(loss).backward()              # backward on loss * S
+scaler.step(optimizer)                     # unscale, check for inf/nan, maybe skip
+scaler.update()                            # grow or shrink S
+```
+
+It works. From 2017 to about 2020, this is how big models were trained on V100s. But it's a moving part with failure modes: skipped steps, scales that collapse to tiny values after a bad batch, interactions with gradient clipping (you must unscale before clipping), and one more thing to get right in every custom training loop.
+
+### Why bf16 made it simple
+
+Look at Figure 004 again. bf16's range is fp32's range. The smallest normal bf16 is 1.2 × 10⁻³⁸. A gradient of 10⁻⁸ isn't anywhere near the edge; it's thirty orders of magnitude away. Nothing underflows, so there's nothing to scale. Nothing overflows short of 3.4 × 10³⁸, so the attention logits and loss sums are fine too. With bf16 you delete the scaler and the problem with it.
+
+What bf16 pays is precision: about 2.4 decimal digits instead of 3.3. It turns out neural network training barely cares, *as long as* you keep precision where it matters (next section). Gradient descent with mini-batches is already noisy: the gradient from one batch is a rough estimate of the true gradient, off by far more than 0.4%. Rounding noise at that level is lost in the sampling noise. Range failures, on the other hand, aren't noise: one inf ends the run.
+
+That's the answer to "why did everyone switch to bf16": not because it's more precise (it's less), but because it can't overflow or underflow in practice, so training needs no scaler and no babysitting. TPUs had it from the start; NVIDIA GPUs from the A100 on.
+
+### Mixed precision: what lives in which format
+
+<Term w="mixed precision training">Training with most of the math in a 16-bit format for speed and memory, while keeping the parts that need precision (master weights, optimizer state, sums, softmax, norms, the loss) in fp32.</Term> is the recipe that combines all of this. "bf16 training" never means *everything* in bf16. Here's the split, and why each piece is where it is:
+
+<Figure n="005" title="ONE STEP OF MIXED PRECISION" caption="The weights of record and the optimizer state stay in fp32. A bf16 copy feeds the forward and backward passes, where the matrix multiplies take bf16 inputs and add up their products in fp32. Gradients go back to fp32 for the update. With fp16 instead of bf16, add the dashed path: multiply the loss by S before backward, then divide by S and check for inf before the update." wide>
+<svg viewBox="0 0 640 300" role="img" aria-label="Training step loop: fp32 master weights cast to bf16, forward and backward in bf16 with fp32 accumulation, fp32 optimizer update; dashed loss scaling path for fp16">
+  <rect x="10" y="30" width="160" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="90" y="54" text-anchor="middle" class="strong">MASTER WEIGHTS</text>
+  <text x="90" y="72" text-anchor="middle" class="blue-t">FP32 · 4 B/PARAM</text>
+  <text x="90" y="88" text-anchor="middle">the copy of record</text>
+  <line x1="170" y1="65" x2="234" y2="65" class="ink" stroke-width="1.2" marker-end="url(#fa)" />
+  <text x="202" y="57" text-anchor="middle">CAST</text>
+  <rect x="236" y="30" width="170" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="321" y="54" text-anchor="middle" class="strong">FORWARD</text>
+  <text x="321" y="72" text-anchor="middle">matmuls: bf16 in</text>
+  <text x="321" y="88" text-anchor="middle" class="blue-t">fp32 accumulate</text>
+  <line x1="406" y1="65" x2="470" y2="65" class="ink" stroke-width="1.2" marker-end="url(#fa)" />
+  <rect x="472" y="30" width="158" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="551" y="54" text-anchor="middle" class="strong">LOSS</text>
+  <text x="551" y="72" text-anchor="middle" class="blue-t">softmax, norms,</text>
+  <text x="551" y="88" text-anchor="middle" class="blue-t">loss in fp32</text>
+  <line x1="551" y1="100" x2="551" y2="164" class="ink" stroke-width="1.2" marker-end="url(#fa)" />
+  <rect x="580" y="118" width="54" height="26" class="fill-paper dash" stroke-width="1" />
+  <text x="607" y="135" text-anchor="middle">× S</text>
+  <line x1="557" y1="131" x2="578" y2="131" class="ink dash" stroke-width="1" />
+  <rect x="472" y="166" width="158" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="551" y="190" text-anchor="middle" class="strong">BACKWARD</text>
+  <text x="551" y="208" text-anchor="middle">bf16 in</text>
+  <text x="551" y="224" text-anchor="middle" class="blue-t">fp32 accumulate</text>
+  <line x1="472" y1="201" x2="408" y2="201" class="ink" stroke-width="1.2" marker-end="url(#fa)" />
+  <text x="440" y="193" text-anchor="middle">GRADS</text>
+  <rect x="236" y="166" width="170" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="321" y="190" text-anchor="middle" class="strong">TO FP32</text>
+  <text x="321" y="208" text-anchor="middle">fp16 only: ÷ S,</text>
+  <text x="321" y="224" text-anchor="middle">inf? skip, halve S</text>
+  <line x1="236" y1="201" x2="172" y2="201" class="ink" stroke-width="1.2" marker-end="url(#fa)" />
+  <rect x="10" y="166" width="160" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="90" y="190" text-anchor="middle" class="strong">OPTIMIZER</text>
+  <text x="90" y="208" text-anchor="middle" class="blue-t">FP32 · ADAM m, v</text>
+  <text x="90" y="224" text-anchor="middle">w ← w − lr · update</text>
+  <line x1="90" y1="166" x2="90" y2="102" class="ink" stroke-width="1.2" marker-end="url(#fa)" />
+  <text x="98" y="138">UPDATE IN FP32</text>
+  <text x="10" y="270" class="strong">KEPT IN FP32</text>
+  <text x="110" y="270">weights of record, Adam state, sums inside matmuls, softmax, norms, loss</text>
+  <text x="10" y="288" class="strong">IN BF16</text>
+  <text x="110" y="288">the matmul inputs: weights copy, activations, most gradients</text>
+  <defs>
+    <marker id="fa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" class="fill-blue" />
+    </marker>
+  </defs>
+</svg>
+</Figure>
+
+**fp32 master weights.** Because of stagnation. An update of 10⁻⁴ to a weight of 0.5 vanishes in bf16 (the gap there is 0.004) but survives in fp32 (gap 6 × 10⁻⁸). The optimizer updates the fp32 copy, and a fresh bf16 copy is made from it for the next forward pass. Each tiny update lands, adds up, and eventually changes the bf16 copy too.
+
+**bf16 compute.** The matrix multiplies are where nearly all the time goes, and tensor cores run 16-bit inputs much faster than fp32 (on recent NVIDIA GPUs, bf16 dense matmul throughput is many times fp32's; check the spec sheet for your chip). Half the bytes also means half the memory traffic for activations.
+
+**fp32 accumulation.** A matmul output is a dot product: thousands of products added up. Adding them in bf16 would stall exactly like the 0.01 sum above. So tensor cores multiply bf16 inputs and keep the running sum in fp32, and only round the final result to bf16. This is invisible to you but it's why bf16 matmuls are accurate enough.
+
+**fp32 for the touchy ops.** PyTorch's <Term w="autocast">A PyTorch context manager that picks a precision per operation: matmuls and convolutions run in the low-precision dtype, while ops that are sensitive to range or rounding (softmax, log, exp, norms, losses, sums) run in fp32.</Term> keeps a list: matmuls and convolutions go to bf16; softmax, log_softmax, layer norm, exp, sums and losses run in fp32. That list is the "catastrophic cancellation" and "overflow" sections of this lesson, turned into code.
+
+**Optimizer state in fp32.** Adam keeps two running averages per weight: m (the average gradient) and v (the average *squared* gradient). Squaring a gradient of 10⁻⁵ gives 10⁻¹⁰, which in fp16 is zero. Then Adam divides by √v + ε, and ε's default is 10⁻⁸, which in fp16 is also zero. Zero divided by zero is NaN. In bf16, v doesn't underflow, but its 2-digit precision makes the running averages coarse, and the update itself is subject to stagnation. So Adam's state stays fp32. Those 8 bytes per parameter, plus 4 for the master weights, are most of why training needs so much more memory than inference ([Why training needs so much memory](/lessons/training-memory/) does the full accounting).
+
+In PyTorch's own autocast, the parameters simply stay fp32 and are cast to bf16 on the fly for each matmul, so the "master copy" is just the parameters. Large-scale frameworks (Megatron, DeepSpeed, FSDP's mixed-precision mode) store a bf16 copy of the weights for compute and keep the fp32 master copy inside the optimizer. Same idea, different bookkeeping.
+
+### Stochastic rounding, briefly
+
+There is another way around stagnation. <Term w="stochastic rounding">Rounding up or down at random, with the probability of rounding up equal to how far the true value is toward the upper neighbour. Each rounding is noisy, but the expected value is exact.</Term> rounds a value that's 30% of the way from one neighbour to the next *up* 30% of the time and *down* 70% of the time. Any single rounding is worse than round-to-nearest, but on average it's exact. That's what saves tiny updates: an update of 1/10th of a gap moves the weight one full gap 10% of the time, so on average it moves the right amount instead of never. With stochastic rounding, weights can be stored in bf16 alone, saving the fp32 master copy. Some accelerators support it in hardware and some optimizer libraries implement it in software; it isn't the default in mainstream PyTorch training.
+
+### FP8 training, briefly
+
+The next step down is fp8 for the matmuls. With only 4 or 5 exponent bits, fp8 doesn't have the range to hold a tensor's values directly, so you bring back scaling, this time per tensor: before casting a tensor to fp8, compute its largest absolute value (its <Term w="amax">The largest absolute value in a tensor. In fp8 training it sets the scale: scale = format max / amax, so the biggest value lands just inside the format's range.</Term>), multiply by (448 / amax) so the biggest value lands just under E4M3's max, cast, and remember the scale to undo it after the matmul. The common recipe uses E4M3 for weights and activations in the forward pass and E5M2 for gradients in the backward pass, where range matters more.
+
+NVIDIA's <Term w="Transformer Engine">NVIDIA's library for fp8 (and newer fp4) training and inference of transformers on Hopper and later GPUs. Wraps linear layers to handle fp8 casting, per-tensor scaling and amax tracking.</Term> does this bookkeeping for you on Hopper and newer GPUs. Its classic "delayed scaling" mode picks each tensor's scale from a short history of amax values from previous steps, so it doesn't need an extra pass over the data to find the max first. Newer recipes go finer-grained: DeepSeek-V3 (late 2024) trained in fp8 with scales per small block of each tensor instead of one per tensor, and Blackwell GPUs support block-scaled fp8 formats in hardware. Master weights, optimizer state and the sensitive ops stay in higher precision, exactly as with bf16. It's the same story as this whole lesson, one more turn of the crank: fewer bits, so you have to manage range by hand again.
+
+<Predict id="fp16-shrunk-loss">
+In the build you'll train a small GPT with AdamW. Adam is (almost) scale-invariant: multiply every gradient by 0.001 and its updates barely change, because it divides by the gradient's own running size. So if you multiply the loss by 0.001 before backward, fp32 training should look the same. What happens to bf16 training, fp16 training without a scaler, and fp16 with `GradScaler`? Guess a final loss for each relative to fp32.
+<Fragment slot="answer">
+
+On my run (Mac M4 Pro, MPS backend, 600 steps), fp32, bf16 and fp16-with-scaler all ended at about 1.67-1.68, the same as without the shrink. fp16 without a scaler fell apart: at the very first step 46% of the gradient values were exactly zero (underflow), and by step 600 the loss was 6.9, *worse than where it started* (4.3). Shrinking by 10⁻⁴ instead: 99% of gradients zero at step 0, loss 34 by the end.
+
+bf16 doesn't care because its range reaches 10⁻³⁸. The scaler rescues fp16 because 65,536 × 0.001 = 65.5, which puts the gradients back above where they'd have been unshrunk.
+
+Without the shrink, fp16 with no scaler trained fine on this small model. That's real and worth knowing: small models with modest batch sizes often don't underflow much. The shrink stands in for what happens in bigger models, where gradients are smaller.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Work in one folder, say `~/workbench/floats/`. Everything runs on your Mac. The training part also runs on the Spark, where it's faster and uses real CUDA tensor cores.
+
+<Task id="t0" title="Set up the folder, PyTorch, and some text" agent="ok">
+
+```bash
+mkdir -p ~/workbench/floats && cd ~/workbench/floats
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch numpy matplotlib
+curl -L -o input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+python -c "import torch; print(torch.__version__, 'mps', torch.backends.mps.is_available(), 'cuda', torch.cuda.is_available())"
+```
+
+`input.txt` is about 1.1 MB of Shakespeare, the classic tiny language-modelling dataset. On the Spark, install the CUDA build of PyTorch for ARM64 that NVIDIA's DGX Spark docs recommend (check them; the right wheel has changed over time).
+
+</Task>
+
+<Task id="t1" title="Write a float decoder" agent="hands">
+
+Write one function that decodes a bit pattern in any of the formats, from scratch. No `struct`, no `numpy` inside it: only integer bit operations and the formula from The Idea.
+
+```python
+# decode.py
+from dataclasses import dataclass
+
+@dataclass
+class Fmt:
+    name: str
+    exp_bits: int
+    man_bits: int
+
+    @property
+    def bias(self) -> int: ...
+
+FP32 = Fmt("fp32", 8, 23)
+FP16 = Fmt("fp16", 5, 10)
+BF16 = Fmt("bf16", 8, 7)
+
+def decode(bits: int, fmt: Fmt) -> dict:
+    """Return {'sign': 0|1, 'exp_field': int, 'mantissa': int,
+               'kind': 'normal'|'subnormal'|'zero'|'inf'|'nan', 'value': float}."""
+    ...
+
+def show(bits: int, fmt: Fmt) -> str:
+    """Pretty print, e.g. '1 10000000 0100000... = -1.25 x 2^1 = -2.5'."""
+    ...
+```
+
+Hints:
+
+- Pull out fields with shifts and masks: the mantissa is `bits & ((1 << man_bits) - 1)`; the exponent is the next `exp_bits` bits up; the sign is the top bit.
+- Handle the two special exponent values first: all zeros (subnormal or zero, no hidden 1, power is `1 - bias`, not `0 - bias`) and all ones (inf or NaN).
+- For normal numbers, build the value as `(1 + mantissa / 2**man_bits) * 2**(exp_field - bias)`, with the sign applied.
+
+Then test it against the real thing. Get true bit patterns with:
+
+```python
+import struct, numpy as np, torch
+f32_bits = struct.unpack("<I", struct.pack("<f", -2.5))[0]            # 0xC0200000
+f16_bits = int(np.array(0.1, dtype=np.float16).view(np.uint16))        # 0x2E66
+bf16_bits = int(torch.tensor(0.1, dtype=torch.bfloat16).view(torch.int16)) & 0xFFFF   # 0x3DCD
+```
+
+Check at least: 1.0, −2.5, 0.1, 65504 in fp16, the smallest fp16 subnormal (bits `0x0001`), `0x7C00` (fp16 inf), `0x7E00` (fp16 NaN), and the bf16 version of 3.14159.
+
+</Task>
+
+<Task id="t2" title="Enumerate all 65,536 values and plot the gaps" agent="hands">
+
+Every 16-bit pattern is a number. Use your decoder to decode all of them, for fp16 and for bf16.
+
+```python
+# enumerate.py
+from decode import decode, FP16, BF16
+
+def all_values(fmt) -> list[dict]:
+    """decode() every pattern 0 .. 2**16 - 1."""
+    ...
+
+# 1. Count kinds: how many finite, how many inf, how many NaN, how many subnormal?
+# 2. Check every finite value against torch (view an int16 tensor of all patterns as
+#    float16 / bfloat16, convert to float32). Every one should match exactly.
+# 3. Take the positive finite values, sort them, compute the gap to the next one.
+#    Plot gap vs value on log-log axes, both formats on one plot (matplotlib).
+# 4. Print: the gap just above 1.0, just above 1000, and just above 60000, in each format.
+```
+
+Before you run step 1, predict the counts. A hint for the prediction: only one exponent value (all ones) holds inf and NaN, and inf is just two of those patterns.
+
+Your plot should look like Figure 004. If the fp16 staircase doesn't go flat at the bottom, your subnormal case is wrong.
+
+</Task>
+
+<Task id="t3" title="Make fp16 overflow, three ways" agent="hands">
+
+Write `overflow.py` with three small demos, each printing the fp16 result, the fp32 result, and the bf16 result:
+
+1. **Naive softmax** on `torch.tensor([10., 11., 12.])`: write `exp(x) / exp(x).sum()` yourself, in each dtype. Then write the stable version (subtract the max) and show it works in fp16.
+2. **Attention logits**: `q, k = torch.randn(8, 128) * s, torch.randn(8, 128) * s`, compute `q @ k.T` in fp16 for `s` in 10, 30, 50, 100. Count infs, then run `torch.softmax` on the result and count NaN rows. At what scale does it start? Does dividing by √128 *after* the matmul save it? Does dividing q by √128 *before* the matmul?
+3. **Loss sum**: a tensor of 40,000 per-token losses all equal to 4.0, summed in fp16 vs fp32 vs bf16. Then `.mean()` in fp16. Why does mean survive here while sum doesn't? (Look at what PyTorch accumulates in.)
+
+</Task>
+
+<Task id="t4" title="A tiny GPT to train" agent="ok">
+
+Boilerplate: a character-level GPT, small enough to train in a few minutes on a laptop. Write the attention by hand (not `scaled_dot_product_attention`) so you can see and break the numerics.
+
+```python
+# model.py
+import math, torch, torch.nn as nn
+
+class Block(nn.Module):
+    def __init__(self, D, H, T):
+        super().__init__()
+        self.H = H
+        self.ln1, self.ln2 = nn.LayerNorm(D), nn.LayerNorm(D)
+        self.qkv, self.proj = nn.Linear(D, 3 * D), nn.Linear(D, D)
+        self.mlp = nn.Sequential(nn.Linear(D, 4 * D), nn.GELU(), nn.Linear(4 * D, D))
+        self.register_buffer("mask", torch.tril(torch.ones(T, T)).bool())
+
+    def forward(self, x):
+        b, t, D = x.shape
+        q, k, v = self.qkv(self.ln1(x)).split(D, -1)
+        q, k, v = [z.view(b, t, self.H, D // self.H).transpose(1, 2) for z in (q, k, v)]
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(D // self.H)
+        att = att.masked_fill(~self.mask[:t, :t], float("-inf")).softmax(-1)
+        x = x + self.proj((att @ v).transpose(1, 2).reshape(b, t, D))
+        return x + self.mlp(self.ln2(x))
+
+class GPT(nn.Module):
+    def __init__(self, V, D=128, L=4, H=4, T=64):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(V, D), nn.Embedding(T, D)
+        self.blocks = nn.Sequential(*[Block(D, H, T) for _ in range(L)])
+        self.ln, self.head = nn.LayerNorm(D), nn.Linear(D, V)
+
+    def forward(self, idx):
+        x = self.tok(idx) + self.pos(torch.arange(idx.shape[1], device=idx.device))
+        return self.head(self.ln(self.blocks(x)))
+
+def load_data(path="input.txt"):
+    text = open(path).read()
+    chars = sorted(set(text))
+    stoi = {c: i for i, c in enumerate(chars)}
+    return torch.tensor([stoi[c] for c in text]), len(chars)
+```
+
+About 0.8M parameters with the defaults.
+
+</Task>
+
+<Task id="t5" title="Train it four ways and compare" agent="hands">
+
+This is the core of the lesson. Write the training loop so that one flag picks the precision mode, and one more flag shrinks the loss.
+
+```python
+# train.py
+import sys, torch, torch.nn.functional as F
+from model import GPT, load_data
+
+MODES = ["fp32", "fp16", "fp16_scaler", "bf16"]
+
+def train(mode: str, shrink: float = 1.0, steps: int = 600, device: str = "mps") -> list[dict]:
+    """Same seed, same data order, every mode. AdamW, lr 3e-3, batch 32, context 64.
+    Log every 20 steps: step, loss, fraction of gradient values exactly 0, any NaN/inf in grads,
+    and the scaler's current scale (fp16_scaler only)."""
+    ...
+
+if __name__ == "__main__":
+    # run every mode with shrink=1.0, then with shrink=1e-3; save the logs as JSON;
+    # plot loss vs step, one line per mode, one panel per shrink value.
+    ...
+```
+
+Hints:
+
+- `torch.manual_seed(0)` before building the model, and a separate `torch.Generator().manual_seed(1)` for batch sampling, so every mode sees identical weights and batches.
+- Autocast: `with torch.autocast(device, dtype=torch.float16 or torch.bfloat16):` around the forward pass and loss, nothing for fp32. Compute the loss on `logits.float()`.
+- "Shrink" means `backward()` on `loss * shrink`. Log the *unshrunk* loss.
+- `torch.amp.GradScaler(device)` for `fp16_scaler`, and the `scale / step / update` pattern from The Idea. Create it with `enabled=(mode == "fp16_scaler")` and you can use the same code path for every mode.
+- The zero-gradient fraction: after backward, count `(p.grad == 0).sum()` over all parameters, divided by the total parameter count. In fp32 this is a fraction of a percent (a few parameters genuinely get no gradient, like embedding rows for characters missing from the batch). Watch it in fp16.
+- On the Mac, use `"mps"`; on the Spark, `"cuda"`. If MPS errors on some op, fall back to `"cpu"`, which supports bf16 autocast but is slower.
+
+</Task>
+
+<Task id="t6" title="Repeat on the Spark, and try tf32" agent="review">
+
+Copy the folder to the Spark and run `train.py` with `device="cuda"`. The loss curves should have the same shape as on your Mac (the exact numbers will differ; different kernels round differently).
+
+Then measure matmul speed in each format on the Spark's GPU: a 4096 × 4096 matmul in fp32 (`set_float32_matmul_precision` set to `"highest"`), fp32 with tf32 allowed (`"high"`), fp16 and bf16. Time it properly: warm up, `torch.cuda.synchronize()` before reading the clock, average many iterations, and convert to TFLOP/s (a matmul of n × n by n × n is 2n³ operations). Have an agent review the benchmark for timing mistakes before you trust it. Compare with the spec sheet.
+
+</Task>
+
+<DoneWhen>
+
+- Your decoder matches PyTorch on all 65,536 fp16 and all 65,536 bf16 patterns, and you have the gap plot.
+- You've seen inf and NaN come out of fp16 softmax, attention logits and a loss sum, and fixed the softmax.
+- You have loss curves for fp32, fp16, fp16 with scaler and bf16, with and without the shrink, and the zero-gradient fraction for each.
+- You can explain, from your own plots, why bf16 needs no scaler.
+
+</DoneWhen>
+
+## Measure
+
+Write your predictions in the last column first.
+
+| Measurement | fp32 | fp16 | fp16 + scaler | bf16 | Your prediction |
+| --- | --- | --- | --- | --- | --- |
+| Final loss, shrink = 1 | | | | | |
+| Final loss, shrink = 10⁻³ | | | | | |
+| Zero-grad fraction at step 0, shrink = 10⁻³ | | | | | |
+| First step with NaN (if any) | | | | | |
+
+And from the enumeration:
+
+| Count | fp16 | bf16 |
+| --- | --- | --- |
+| Finite values | | |
+| ±inf | | |
+| NaN patterns | | |
+| Gap just above 1.0 | | |
+| Gap just above 1,000 | | |
+
+Reference numbers from my run, on an M4 Pro Mac with PyTorch 2.14 and the MPS backend, 600 steps:
+
+| Measurement | fp32 | fp16 | fp16 + scaler | bf16 |
+| --- | --- | --- | --- | --- |
+| Final loss, shrink = 1 | 1.66 | 1.67 | 1.68 | 1.68 |
+| Final loss, shrink = 10⁻³ | 1.68 | **6.94** | 1.68 | 1.67 |
+| Zero-grad fraction, step 0, shrink = 10⁻³ | 0.13% | **46%** | 0.13% | 0.13% |
+| Final loss, shrink = 10⁻⁴ | 1.70 | **34.3** | 1.71 | 1.71 |
+
+What the numbers should tell you:
+
+**Without the shrink, everything trains.** For a 0.8M-parameter model, fp16 without a scaler is fine. Its gradients mostly sit above 6 × 10⁻⁸. That's an honest result: fp16's underflow problem grows with model size, depth and batch size, so it bites in real training runs, not necessarily in toy ones. The four curves should be almost on top of each other; small differences are rounding noise, not a real quality gap.
+
+**With the shrink, fp16 without a scaler dies and the others don't notice.** Shrinking the loss by 1,000 moves every gradient down by about 10 binades, and almost half of them fall below fp16's smallest subnormal. With half the gradient missing (and the rest distorted), AdamW pushes the weights in a direction that's not downhill, and the loss *rises* above where it started. The GradScaler's 65,536 puts the gradients back, so fp16 + scaler matches fp32. bf16 matches fp32 with no help at all, because a gradient of 10⁻⁹ is nowhere near its edge.
+
+**fp32 shifted a little at shrink 10⁻⁴** (1.70 vs 1.66). That's most likely not a precision problem: it's Adam's ε (10⁻⁸) no longer being negligible next to gradients that small, so Adam's updates really did change. Which is a good reminder that "scale-invariant" was an approximation.
+
+**Enumeration.** fp16 has 63,488 finite values, 2 infinities and 2,046 NaN patterns (every pattern with exponent all ones and a nonzero mantissa: 2 signs × 1,023). bf16 has 65,280 finite, 2 infinities, 254 NaNs. Gap above 1.0: fp16 0.000977 (2⁻¹⁰), bf16 0.0078 (2⁻⁷). Gap above 1,000: fp16 0.5, bf16 4. Above 60,000: fp16 32, bf16 256.
+
+**On the Spark**, the matmul benchmark should show bf16 and fp16 well above fp32, with tf32 in between; the exact ratios depend on the chip, so compare with NVIDIA's published numbers for GB10 and note that headline figures are often quoted with sparsity, which a dense matmul doesn't get.
+
+## Break It
+
+**1. Make the whole model fp16.** Replace autocast with `model.half()`, so weights, gradients and Adam's state are all fp16. On my run the loss was NaN by step 100. One reason: Adam's default ε = 10⁻⁸ rounds to exactly 0 in fp16, and its squared-gradient average underflows, so the update divides by zero. Raise ε to 10⁻⁴ and it lives longer: on my run it stalled around 2.86 and then went NaN by step 300 anyway. Every piece of "keep the optimizer in fp32" is in that failure.
+
+**2. Make the whole model bf16, with a small learning rate.** `model.bfloat16()` keeps running (bf16 has range), but now the weights themselves are bf16, so small updates stagnate. At lr 3 × 10⁻³ it barely hurt (1.69 vs 1.68 with autocast). At lr 3 × 10⁻⁴ the gap opened: 2.31 for pure bf16 against 2.16 for autocast bf16. The smaller the updates relative to the weights, the more of them round away. That's what fp32 master weights (or stochastic rounding) are for.
+
+**3. Remove the 1/√d from attention and blow up the activations.** Delete the `/ math.sqrt(...)` in `Block.forward` and multiply the embedding output by, say, 20. Train in fp16 with the scaler. Watch the scaler's scale: it will keep halving (each halving is a skipped step), because the overflow is now in the forward pass, which loss scaling can't fix. Then train the same broken model in bf16. Does it survive? It may still train badly (unscaled logits make softmax very peaky), but it shouldn't produce inf.
+
+**4. Compare floats with ==.** In `decode.py`'s tests, check `decode(...)["value"] == 0.1` for the fp32 pattern of 0.1. It's False. Why? (Your decoder returns a Python float, which is fp64, holding the exact fp32 value 0.100000001490116...) Now check `0.1 + 0.2 == 0.3` in fp64 and in `np.float32`. Explain the different answers in one sentence each.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What's the difference between fp16 and bf16, and why did training move to bf16?</summary>
+
+Both are 16 bits: 1 sign bit, then exponent and mantissa. fp16 has 5 exponent bits and 10 mantissa bits: about 3 significant digits, but a range of only 6 × 10⁻⁵ to 65,504 (down to 6 × 10⁻⁸ with subnormals). bf16 has 8 exponent bits and 7 mantissa bits: only about 2 significant digits, but the same range as fp32, 10⁻³⁸ to 3.4 × 10³⁸. It's literally the top half of an fp32. Training moved to bf16 because the failures of fp16 are range failures: small gradients underflow to zero and big activations or sums overflow to inf. That forced loss scaling, a dynamic multiplier with skipped steps and its own bugs. bf16 has no range problem in practice, so you drop the scaler, and its lower precision is lost in the noise of mini-batch gradients as long as master weights, optimizer state and sums stay fp32.
+
+</details>
+
+<details>
+<summary>2. Why does the precision of a float depend on the number's size? What goes wrong because of it?</summary>
+
+A float stores a fixed number of significant binary digits and an exponent, like scientific notation. Between each pair of powers of two there are the same number of values (2^mantissa bits), so the gap between neighbours doubles every time the number doubles. Relative precision is roughly constant; absolute precision gets worse as numbers grow. Things that go wrong: adding a small number to a big one rounds the small one away (weight updates stagnate, long sums stall: 0.01 added a thousand times in bf16 gave 4.0); subtracting two nearly equal numbers leaves mostly rounding error (catastrophic cancellation, which is why variance and norms are computed carefully in fp32); and addition stops being associative, so parallel reductions give slightly different results run to run.
+
+</details>
+
+<details>
+<summary>3. Walk through mixed precision training. What lives in which format, and why?</summary>
+
+The weights of record are fp32, because small updates would round away in 16 bits. Each step, a bf16 copy of the weights feeds the forward and backward passes, because tensor cores run 16-bit matmuls many times faster and activations take half the memory. Inside each matmul the products are summed in fp32, otherwise long dot products stall. Range- or rounding-sensitive ops (softmax, log, exp, layer norm, the loss, reductions) run in fp32; autocast keeps that list. Gradients are converted to fp32 for the optimizer, and Adam's m and v are fp32, because squared gradients underflow in fp16 and are too coarse in bf16, and ε = 1e-8 would round to 0 in fp16. With fp16 instead of bf16 you also multiply the loss by a dynamic scale before backward and divide it out (checking for inf and skipping the step) before the update.
+
+</details>
+
+<details>
+<summary>4. How does a dynamic loss scaler work, and why does it skip steps?</summary>
+
+Multiply the loss by S before backward. Backprop is linear in the loss, so every gradient comes out S times bigger, which lifts small gradients out of fp16's underflow zone. Before the optimizer step, divide the gradients by S in fp32. If S is too big, some gradients overflow to inf; the scaler checks for inf or NaN after every backward, and if it finds any it skips the optimizer step (so no inf reaches the weights) and halves S. After a run of clean steps (2,000 by default in PyTorch) it doubles S again. So it automatically sits near the largest safe scale. Skipped steps are normal early in training and occasionally later; a scale that keeps collapsing means something is overflowing in the forward pass, which scaling can't fix.
+
+</details>
+
+<details>
+<summary>5. You scale training from one GPU to a thousand and from 1B to 100B parameters. What changes about numerics?</summary>
+
+More things get summed: bigger matmuls (longer dot products), bigger batches, and gradient all-reduces across a thousand GPUs. Each sum in a narrow format loses more as it gets longer, so reductions (especially the gradient all-reduce) need fp32 accumulation, or at least careful bf16 with fp32 at the end. Activations and attention logits tend to grow in large models, so overflow risks show up that a small model never sees; recipes add things like QK-norm, z-loss on the logits, and careful initialisation. Rare events become common: with a thousand GPUs and months of training, a single inf or NaN somewhere will happen, and one NaN spreads to every GPU through the all-reduce in one step, so you need detection, skipping or rollback to a checkpoint. And the pressure to go to fp8 grows with scale (twice the matmul throughput and half the memory traffic again), which brings back per-tensor or per-block scaling, the same range-management problem fp16 had, now handled by libraries like Transformer Engine.
+
+</details>
+
+## Go Deeper
+
+- **David Goldberg, "What Every Computer Scientist Should Know About Floating-Point Arithmetic"**, ACM Computing Surveys, 1991. The classic. Rounding, ULPs, cancellation, and why IEEE made the choices it did. Read the first half; the proofs are optional.
+- **Paulius Micikevicius et al., "Mixed Precision Training"** (ICLR 2018, [arXiv:1710.03740](https://arxiv.org/abs/1710.03740)). The paper that introduced fp32 master weights and loss scaling. Look at the gradient histogram figure: it's the whole underflow argument in one picture.
+- **Dhiraj Kalamkar et al., "A Study of BFLOAT16 for Deep Learning Training"** ([arXiv:1905.12322](https://arxiv.org/abs/1905.12322), 2019). Evidence that bf16 trains as well as fp32 across many model types without loss scaling.
+- **Paulius Micikevicius et al., "FP8 Formats for Deep Learning"** ([arXiv:2209.05433](https://arxiv.org/abs/2209.05433), 2022). Defines E4M3 and E5M2 and the per-tensor scaling recipe for training.
+- **PyTorch docs, "Automatic Mixed Precision"** ([pytorch.org/docs/stable/amp.html](https://pytorch.org/docs/stable/amp.html)). The autocast op lists (which ops go to fp32) and the GradScaler details, including how to unscale before gradient clipping.
+- **NVIDIA Transformer Engine documentation**, especially the "Using FP8 with Transformer Engine" guide. How amax history and delayed scaling work in practice.
+- **Charles Severance, "IEEE 754: An Interview with William Kahan"**, IEEE Computer, 1998. The history from the man who made it, including the fight over gradual underflow.
+- **Nicholas J. Higham, _Accuracy and Stability of Numerical Algorithms_** (SIAM, 2nd edition 2002). The reference book if you ever need to know exactly how much error a summation or a dot product accumulates.
+
+## Connections
+
+This lesson explains where the "2 bytes per parameter" in [How much memory does a model need?](/lessons/memory-math/) comes from, and it's the float half of [Quantization](/lessons/quantization/), which picks up fp8 and fp4 for inference along with the integer formats. The max-subtraction trick for softmax is the seed of [FlashAttention](/lessons/flash-attention/)'s online softmax.
+
+Next comes [Why training needs so much memory](/lessons/training-memory/), which takes the mixed-precision recipe from this lesson (fp32 master weights, fp32 Adam state, bf16 compute) and adds up the bytes: why a model that needs 2 bytes per parameter to serve needs about 16 to train. After that, [Train a tiny LM](/lessons/tiny-lm/) and [Distributed training](/lessons/distributed-training/) are where the gradient all-reduce and its precision start to matter.

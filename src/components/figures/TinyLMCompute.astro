@@ -1,0 +1,122 @@
+---
+// Training compute calculator: params N and tokens D -> 6·N·D FLOPs -> hours at a chosen MFU on a
+// chosen peak. Also: measured tokens/s -> MFU. Usage: <TinyLMCompute />
+---
+<div class="tlc" data-fig="tinylm-compute">
+  <div class="ctl">
+    <label>params N <input type="range" min="0" max="20" step="1" value="8" data-in="n" /> <output data-out="n">124M</output></label>
+    <label>tokens D <input type="range" min="0" max="24" step="1" value="10" data-in="d" /> <output data-out="d">2.5B</output></label>
+  </div>
+  <div class="ctl">
+    <label>MFU <input type="range" min="5" max="70" step="5" value="40" data-in="mfu" /> <output data-out="mfu">40%</output></label>
+    <label>peak TFLOP/s <input type="range" min="0" max="2" step="1" value="0" data-in="hw" /> <output data-out="hw">Spark 125</output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-chin>Set D = 20 × N (Chinchilla)</button>
+  </div>
+
+  <div class="tlc-chain mono" data-out="chain"></div>
+
+  <dl class="tlc-out">
+    <div><dt class="label">Total compute</dt><dd><span class="readout big" data-out="flops">-</span></dd></div>
+    <div><dt class="label">Wall clock</dt><dd><span class="readout big" data-out="time">-</span></dd></div>
+    <div><dt class="label">Tokens / second</dt><dd><span class="readout" data-out="tps">-</span></dd></div>
+    <div><dt class="label">Tokens per param</dt><dd><span class="readout" data-out="ratio">-</span></dd></div>
+  </dl>
+  <p class="tlc-note" data-out="note"></p>
+
+  <div class="tlc-rev">
+    <span class="label">Reverse it: what MFU did I get?</span>
+    <div class="ctl">
+      <label>measured tokens/s <input type="number" min="1" step="1000" value="40000" data-in="meas" /></label>
+      <span>→ MFU <span class="readout" data-out="mfuout">-</span></span>
+    </div>
+  </div>
+</div>
+
+<style>
+  .tlc .ctl label { flex-wrap: wrap; }
+  .tlc input[type='number'] {
+    width: 110px; font-family: var(--mono); font-size: 13px; background: var(--paper); color: var(--ink);
+    border: 1px solid var(--rule); padding: 4px 6px;
+  }
+  .tlc-chain { margin-top: 14px; font-size: 11.5px; letter-spacing: 0.02em; text-transform: none; color: var(--ink-2); line-height: 1.7; word-break: break-word; }
+  .tlc-out { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 20px; margin: 14px 0 0; }
+  .tlc-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .tlc-out dt { font-size: 10.5px; }
+  .tlc-out dd { margin: 2px 0 0; }
+  .tlc-out .big { font-size: 20px; }
+  .tlc-note { font-size: 15px; line-height: 1.5; color: var(--ink-2); margin: 12px 0 0; }
+  .tlc-rev { margin-top: 16px; padding-top: 10px; border-top: 1px dashed var(--rule); }
+  .tlc-rev .label { font-size: 10.5px; color: var(--blue); }
+  .tlc-rev .ctl { margin-top: 6px; }
+</style>
+
+<script>
+  // log-spaced choices
+  const NS_ = [10e6, 15e6, 20e6, 30e6, 45e6, 60e6, 85e6, 100e6, 124e6, 160e6, 200e6, 250e6, 350e6, 500e6, 700e6, 1e9, 1.5e9, 2e9, 3e9, 5e9, 7e9];
+  const DS = [0.1e9, 0.15e9, 0.2e9, 0.3e9, 0.5e9, 0.7e9, 1e9, 1.5e9, 2e9, 2.2e9, 2.5e9, 3e9, 4e9, 5e9, 7e9, 10e9, 15e9, 20e9, 30e9, 50e9, 70e9, 100e9, 140e9, 200e9, 300e9];
+  // Peak dense BF16. Spark is the upper-bound estimate used across this site, not a measured number.
+  const HW: [string, number][] = [['Spark 125', 125e12], ['A100 312', 312e12], ['H100 989', 989e12]];
+
+  const si = (x: number, unit = '') => {
+    const u: [number, string][] = [[1e18, 'E'], [1e15, 'P'], [1e12, 'T'], [1e9, 'G'], [1e6, 'M'], [1e3, 'k']];
+    for (const [v, s] of u) if (x >= v) { const y = x / v; return `${y >= 100 ? y.toFixed(0) : y >= 10 ? y.toFixed(1) : y.toFixed(2)} ${s}${unit}`; }
+    return `${x.toFixed(1)} ${unit}`;
+  };
+  const cnt = (x: number) => (x >= 1e9 ? `${+(x / 1e9).toFixed(2)}B` : `${+(x / 1e6).toFixed(0)}M`);
+  const dur = (s: number) => {
+    if (s < 120) return `${s.toFixed(0)} s`;
+    if (s < 7200) return `${(s / 60).toFixed(0)} min`;
+    if (s < 3 * 86400) return `${(s / 3600).toFixed(1)} h`;
+    if (s < 400 * 86400) return `${(s / 86400).toFixed(1)} days`;
+    return `${(s / 86400 / 365).toFixed(1)} years`;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="tinylm-compute"]').forEach((root) => {
+    const q = <T extends Element>(sel: string) => root.querySelector<T>(sel)!;
+    const inp = (k: string) => q<HTMLInputElement>(`[data-in="${k}"]`);
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+
+    const render = () => {
+      const N = NS_[+inp('n').value], D = DS[+inp('d').value];
+      const mfu = +inp('mfu').value / 100;
+      const [hwName, peak] = HW[+inp('hw').value];
+      const F = 6 * N * D;
+      const eff = peak * mfu;
+      const secs = F / eff;
+      const tps = eff / (6 * N);
+      out('n').textContent = cnt(N);
+      out('d').textContent = cnt(D);
+      out('mfu').textContent = `${Math.round(mfu * 100)}%`;
+      out('hw').textContent = hwName;
+      out('flops').textContent = `${F.toExponential(2).replace('e+', ' × 10^')}`;
+      out('time').textContent = dur(secs);
+      out('tps').textContent = si(tps).trim();
+      out('ratio').textContent = (D / N).toFixed(D / N < 10 ? 1 : 0);
+      out('chain').textContent =
+        `6 × ${cnt(N)} × ${cnt(D)} = ${F.toExponential(2)} FLOPs · ` +
+        `${(peak / 1e12).toFixed(0)} TFLOP/s × ${Math.round(mfu * 100)}% = ${(eff / 1e12).toFixed(1)} TFLOP/s achieved · ` +
+        `${F.toExponential(2)} ÷ ${eff.toExponential(2)} = ${secs.toExponential(2)} s`;
+      const r = D / N;
+      let note = '';
+      if (r < 5) note = 'Far fewer than 20 tokens per parameter: the model is undertrained for its size. For the same compute, a smaller model on more tokens would usually reach a lower loss.';
+      else if (r <= 40) note = 'Near the Chinchilla ratio (~20 tokens per parameter): roughly the lowest loss this much compute can buy, if you only care about training cost.';
+      else note = 'Well past 20 tokens per parameter. "Wasteful" for training compute, but common on purpose (Llama 3 8B saw ~15T tokens): a small model trained long is cheaper to serve.';
+      if (secs > 3 * 86400 && peak <= 125e12) note += ' On one Spark this is more than a long weekend; shrink D for a first run.';
+      out('note').textContent = note;
+      const meas = Math.max(0, +inp('meas').value || 0);
+      out('mfuout').textContent = `${((meas * 6 * N) / peak * 100).toFixed(1)}%`;
+    };
+
+    root.querySelectorAll<HTMLInputElement>('input').forEach((i) => i.addEventListener('input', render));
+    q<HTMLButtonElement>('[data-chin]').addEventListener('click', () => {
+      const N = NS_[+inp('n').value];
+      let best = 0;
+      DS.forEach((d, i) => { if (Math.abs(Math.log(d / (20 * N))) < Math.abs(Math.log(DS[best] / (20 * N)))) best = i; });
+      inp('d').value = String(best);
+      render();
+    });
+    render();
+  });
+</script>

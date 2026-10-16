@@ -1,0 +1,190 @@
+---
+// One coding episode, stepped through the agent-environment loop.
+// Each step: the model reads the context (observation so far), emits one tool call (the action),
+// the environment runs it in the sandbox and returns a result (the next observation) and a reward.
+// Reward is 0 until submit, when the hidden tests run.
+// Usage: <RLEnvEpisode />
+---
+<div class="rlep" data-fig="rlenv-episode">
+  <svg viewBox="0 0 640 210" role="img" aria-label="Agent and environment boxes with action and observation arrows, highlighting the current half of the loop">
+    <defs>
+      <marker id="rlep-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink-2)" />
+      </marker>
+      <marker id="rlep-arr-b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" style="fill:var(--blue)" />
+      </marker>
+    </defs>
+    <rect x="12" y="40" width="190" height="120" class="fill-paper" stroke-width="1.2" data-box="agent" />
+    <text x="107" y="66" text-anchor="middle" class="strong">AGENT</text>
+    <text x="107" y="84" text-anchor="middle">POLICY = THE LLM</text>
+    <text x="107" y="112" text-anchor="middle" data-el="agent1">reads context</text>
+    <text x="107" y="130" text-anchor="middle" data-el="agent2">writes a tool call</text>
+
+    <rect x="438" y="40" width="190" height="120" class="fill-paper" stroke-width="1.2" data-box="env" />
+    <text x="533" y="66" text-anchor="middle" class="strong">ENVIRONMENT</text>
+    <text x="533" y="84" text-anchor="middle">REPO + SANDBOX</text>
+    <text x="533" y="112" text-anchor="middle" data-el="env1">runs the tool</text>
+    <text x="533" y="130" text-anchor="middle" data-el="env2">returns result</text>
+
+    <line x1="204" y1="70" x2="434" y2="70" stroke-width="1.4" data-arrow="act" />
+    <text x="319" y="60" text-anchor="middle" data-el="actlabel">ACTION</text>
+    <line x1="434" y1="130" x2="204" y2="130" stroke-width="1.4" data-arrow="obs" />
+    <text x="319" y="150" text-anchor="middle" data-el="obslabel">OBSERVATION + REWARD</text>
+
+    <text x="12" y="22" class="strong" data-el="stepline">STEP 0</text>
+    <text x="628" y="22" text-anchor="end" data-el="flags">terminated=F  truncated=F</text>
+    <text x="12" y="196" data-el="rew">REWARD THIS STEP 0</text>
+    <text x="628" y="196" text-anchor="end" data-el="tok">CONTEXT ~0 TOKENS</text>
+  </svg>
+
+  <div class="rlep-panes">
+    <div class="rlep-pane">
+      <div class="label">What the model sees (its context)</div>
+      <ol class="rlep-ctx" data-el="ctx"></ol>
+    </div>
+    <div class="rlep-pane">
+      <div class="label">This step</div>
+      <div class="rlep-kv"><span class="label">Action</span><pre data-el="action"></pre></div>
+      <div class="rlep-kv"><span class="label">Env returns</span><pre data-el="result"></pre></div>
+    </div>
+  </div>
+  <p class="rlep-note" aria-live="polite" data-el="note"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="back">← Back</button>
+    <button class="btn" type="button" data-act="step">Step →</button>
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <span>step <span class="readout" data-out="t">0</span> / max 12</span>
+  </div>
+</div>
+
+<style>
+  .rlep svg { width: 100%; }
+  .rlep-panes { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 14px; margin-top: 12px; }
+  .rlep-pane { border: 1px solid var(--rule); background: var(--paper); padding: 10px 12px; min-width: 0; }
+  .rlep-ctx { list-style: none; margin: 8px 0 0; padding: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; color: var(--ink-2); }
+  .rlep-ctx li { padding: 4px 6px; border-left: 2px solid var(--rule); margin-top: 4px; overflow-wrap: anywhere; }
+  .rlep-ctx li.new { border-left-color: var(--blue); background: var(--blue-wash); color: var(--ink); }
+  .rlep-ctx li b { color: var(--blue); font-weight: 600; }
+  .rlep-kv { margin-top: 8px; }
+  .rlep-kv pre { margin: 4px 0 0; padding: 8px; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; background: var(--paper-2); border: 1px solid var(--rule); white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink); min-height: 3em; }
+  .rlep-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 4.5em; }
+  @media (max-width: 640px) { .rlep-panes { grid-template-columns: 1fr; } }
+</style>
+
+<script>
+  type Step = {
+    action: string; result: string; ctxAdd: string[]; reward: number; done: boolean; note: string; tok: number;
+  };
+  const RESET: Step = {
+    action: 'env.reset(seed=7)',
+    result: 'fresh copy of the repo in a new sandbox;\nfirst observation = task text + file list',
+    ctxAdd: [
+      '<b>system</b> You are a coding agent. Tools: view_file, write_file, run_tests, submit.',
+      '<b>task</b> "median() returns the wrong value for even-length lists. Fix it."',
+      '<b>files</b> stats.py, test_stats.py',
+    ],
+    reward: 0, done: false, tok: 180,
+    note: 'reset() picks a task, builds a clean sandbox from a snapshot, and returns the first observation. The model has seen nothing else: no repo contents yet, no hidden tests, ever.',
+  };
+  const STEPS: Step[] = [
+    {
+      action: 'view_file("stats.py")',
+      result: 'def median(xs):\n    s = sorted(xs)\n    return s[len(s) // 2]',
+      ctxAdd: ['<b>call</b> view_file stats.py', '<b>result</b> def median(xs): s = sorted(xs); return s[len(s)//2]'],
+      reward: 0, done: false, tok: 260,
+      note: 'The action is a tool call the model wrote as text (really, tokens). The environment parses it, reads the file inside the sandbox, and returns the contents. Reward for this step: 0. Nothing is finished.',
+    },
+    {
+      action: 'run_tests()',
+      result: '2 passed, 1 failed\nFAIL test_even: median([1,2,3,4])\n  expected 2.5, got 3',
+      ctxAdd: ['<b>call</b> run_tests', '<b>result</b> 2 passed, 1 failed: test_even expected 2.5 got 3'],
+      reward: 0, done: false, tok: 330,
+      note: 'run_tests runs the visible tests only. These are a tool the model can use to check itself. They are not the reward. Running code takes real time (here, a process start plus the tests), which is why environments care about latency.',
+    },
+    {
+      action: 'write_file("stats.py",\n  "...if n % 2 == 0:\n     return (s[n//2-1] + s[n//2]) / 2 ...")',
+      result: 'ok (wrote 6 lines)',
+      ctxAdd: ['<b>call</b> write_file stats.py (6 lines)', '<b>result</b> ok'],
+      reward: 0, done: false, tok: 420,
+      note: 'The environment state changed: a file in the sandbox is different now. The observation the model gets back is tiny, just "ok". The model has to remember what it wrote, because it lives in its context, not in the observation.',
+    },
+    {
+      action: 'run_tests()',
+      result: '3 passed',
+      ctxAdd: ['<b>call</b> run_tests', '<b>result</b> 3 passed'],
+      reward: 0, done: false, tok: 450,
+      note: 'Visible tests pass. A model that stopped trusting here would be tempted to submit. Whether that is enough depends on the hidden tests, which it cannot see.',
+    },
+    {
+      action: 'submit()',
+      result: 'hidden tests: 7 / 8 passed\nFAIL test_empty: median([]) should raise ValueError\nreward = 0.875',
+      ctxAdd: ['<b>call</b> submit', '<b>episode over</b> reward 0.875'],
+      reward: 0.875, done: true, tok: 470,
+      note: 'submit ends the episode (terminated=True). Only now does the environment run the hidden tests, in a fresh process, and turn the result into one number. That number is all the training algorithm learns from for this whole trajectory.',
+    },
+  ];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="rlenv-episode"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const el = (k: string) => q<SVGTextElement & HTMLElement>(`[data-el="${k}"]`);
+    const act = q<SVGLineElement>('[data-arrow="act"]');
+    const obs = q<SVGLineElement>('[data-arrow="obs"]');
+    const agentBox = q<SVGRectElement>('[data-box="agent"]');
+    const envBox = q<SVGRectElement>('[data-box="env"]');
+    const playBtn = q<HTMLButtonElement>('[data-act="play"]');
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let t = 0; // 0 = after reset
+    let timer: number | undefined;
+
+    function render() {
+      const all = [RESET, ...STEPS];
+      const cur = all[t];
+      const ctx = el('ctx') as unknown as HTMLOListElement;
+      ctx.replaceChildren();
+      all.slice(0, t + 1).forEach((s, i) => {
+        s.ctxAdd.forEach((line) => {
+          const li = document.createElement('li');
+          li.innerHTML = line;
+          if (i === t) li.className = 'new';
+          ctx.append(li);
+        });
+      });
+      el('action').textContent = cur.action;
+      el('result').textContent = cur.result;
+      el('note').textContent = cur.note;
+      el('stepline').textContent = t === 0 ? 'RESET' : `STEP ${t}`;
+      el('flags').textContent = `terminated=${cur.done ? 'T' : 'F'}  truncated=F`;
+      el('rew').textContent = `REWARD THIS STEP ${cur.reward}`;
+      el('tok').textContent = `CONTEXT ~${cur.tok} TOKENS`;
+      el('actlabel').textContent = t === 0 ? 'RESET()' : 'ACTION: ' + cur.action.split('(')[0].toUpperCase();
+      el('obslabel').textContent = cur.done ? 'FINAL OBS + REWARD ' + cur.reward : 'OBSERVATION + REWARD 0';
+      act.setAttribute('class', 'blue');
+      act.setAttribute('marker-end', 'url(#rlep-arr-b)');
+      obs.setAttribute('class', 'blue');
+      obs.setAttribute('marker-end', 'url(#rlep-arr-b)');
+      if (t === 0) { act.setAttribute('class', 'ink dash'); act.setAttribute('marker-end', 'url(#rlep-arr)'); }
+      agentBox.setAttribute('class', t === 0 ? 'fill-paper' : 'fill-wash');
+      envBox.setAttribute('class', 'fill-wash');
+      el('env1').textContent = t === 0 ? 'builds sandbox' : cur.done ? 'runs hidden tests' : 'runs the tool';
+      el('env2').textContent = cur.done ? 'computes reward' : 'returns result';
+      q<HTMLElement>('[data-out="t"]').textContent = String(t);
+      q<HTMLButtonElement>('[data-act="back"]').disabled = t === 0;
+      q<HTMLButtonElement>('[data-act="step"]').disabled = t === STEPS.length;
+    }
+    function stop() { if (timer) clearInterval(timer); timer = undefined; playBtn.setAttribute('aria-pressed', 'false'); playBtn.textContent = 'Play'; }
+    q('[data-act="step"]').addEventListener('click', () => { stop(); if (t < STEPS.length) t++; render(); });
+    q('[data-act="back"]').addEventListener('click', () => { stop(); if (t > 0) t--; render(); });
+    q('[data-act="reset"]').addEventListener('click', () => { stop(); t = 0; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer) { stop(); return; }
+      if (reduce) { t = STEPS.length; render(); return; }
+      if (t >= STEPS.length) t = 0;
+      playBtn.setAttribute('aria-pressed', 'true'); playBtn.textContent = 'Pause';
+      render();
+      timer = window.setInterval(() => { t++; render(); if (t >= STEPS.length) stop(); }, 1800);
+    });
+    render();
+  });
+</script>

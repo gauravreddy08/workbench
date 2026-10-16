@@ -1,0 +1,668 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import EnvelopeCalculator from '../components/figures/EnvelopeCalculator.astro';
+
+## Today
+
+- Answer "how does your solution scale?" with a five-step method you can run out loud, in any interview, on any system.
+- Turn "queries per day" into GPUs, gigabytes and dollars with nothing but powers of ten and a handful of numbers you now carry in your head.
+- Work three estimates end to end: your cross-encoder ranker serving search, embeddings for a billion web pages, and the KV cache of a chat product at N users.
+- Say which resource breaks first (compute, memory bandwidth, memory size, network, CPU, money) and what you'd change at 10× and 100×.
+- Estimate your ranker's capacity on paper, load-test it on the Spark, and keep an estimation journal so your guesses get measurably better.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the numbers), [Waiting vs working](/lessons/waiting-vs-working/) (Little's law), [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bytes per token, compute vs memory bound). Rough time: one evening for the idea and the paper estimates, one session on the Spark for the load test.
+
+## The Problem
+
+The interview is going well. You've described your ranker: a <Term w="cross-encoder">A model that reads the query and one document together, in one forward pass, and outputs a relevance score. Accurate, but you pay a full forward pass for every query-document pair.</Term> that re-scores the top candidates from a cheaper retrieval stage. You explained the training data, the loss, the NDCG gains. Then the interviewer leans back.
+
+"Nice. So how does it scale?"
+
+And there's nothing. Not a wrong answer, just no place to start. Scale to what? More users? More documents? Is the question about the GPU? The database? You say something about "horizontal scaling" and "we could add more GPUs", and you both know that's a vibe, not an answer.
+
+Here's what a strong answer sounds like, in about ninety seconds:
+
+> "Let me put numbers on it. Say 10 million queries a day. A day is about 10⁵ seconds, so that's about 100 queries a second on average, and maybe 300 at peak. Each query re-ranks 100 candidates at about 256 tokens each, so 300 × 100 × 256 is roughly 10 million tokens a second. The model is BERT-base sized, about 10⁸ parameters, so about 2 × 10⁸ FLOPs per token. That's 2 × 10¹⁵ FLOPs a second: 2 petaFLOPs. An H100 does about 10¹⁵ on paper and maybe 40% of that for real, so about five H100s, call it eight with headroom and a spare. Compute breaks first. Memory and network are nowhere close. At 10× traffic I'd first cut the candidate count with a cheaper stage before buying 50 GPUs, because candidates are a multiplier on everything."
+
+None of that is clever. Every step is multiplication by a number you could look up, and most of them you already know. What the strong candidate has is not a better brain. It's a **method** and a **stock of numbers**. That's this lesson.
+
+<Origin year="1945" title="Fermi and the scraps of paper">
+
+At the Trinity test in July 1945, Enrico Fermi stood about 16 kilometres from the first atomic bomb with a handful of torn paper. When the blast wave arrived, he dropped the scraps and watched how far they were pushed sideways: about two and a half metres. From that, and some quick arithmetic in his head, he announced the explosion was roughly equivalent to 10,000 tons of TNT. The official measurement, which took instruments and weeks, came out at around 20,000. He was off by a factor of two, using paper.
+
+Fermi made a habit of this, and taught it: how many piano tuners are there in Chicago? Nobody knows, but you know roughly how many people live there, how many households have a piano, how often one gets tuned, and how many a tuner can do in a day. Multiply, and you're within a factor of a few. These became known as Fermi problems. In the 1980s Jon Bentley brought the habit to programmers in his *Programming Pearls* column "The Back of the Envelope", and in 2009 Jeff Dean put "Numbers Everyone Should Know" on a slide at Google and followed it with exactly this kind of estimate for system designs. The interview question you dread is a Fermi problem with a server in it.
+
+</Origin>
+
+## The Idea
+
+### What "scale" actually means
+
+"How does it scale?" is a vague question with a precise meaning hiding inside it: **as the load grows, which resource runs out first, at what load, and what do you do about it?**
+
+Every machine has a few things it can run out of. A GPU can do only so many multiply-adds per second. Memory holds only so many bytes, and moves only so many bytes per second. A network card pushes only so many bits. CPU cores parse and tokenize only so fast. And the company can spend only so much money. Your system is a pipe through all of these at once, and the narrowest one sets the limit. That narrowest one is the <Term w="bottleneck">The single resource that fills up first as load grows. Making anything else faster does nothing until you widen this one.</Term>.
+
+So the job isn't to say "it scales" or "it doesn't". The job is to name the bottleneck, put a number on where it hits, and say what you'd change. Here's the method that gets you there.
+
+<Figure n="001" title="THE FIVE STEPS" caption="The same five steps for every system. Steps 1 and 3 are where most people skip; step 5 is the part interviewers actually want to hear.">
+<svg viewBox="0 0 560 300" role="img" aria-label="Five steps: clarify the load, find the resources, do the arithmetic, compare against capacity, say what breaks and what changes">
+  <rect x="10" y="10" width="190" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="30" class="strong">1 · CLARIFY THE LOAD</text>
+  <text x="22" y="46">what, how much, how spiky</text>
+  <text x="215" y="30">QPS avg + peak · read:write</text>
+  <text x="215" y="46">data size · growth per year</text>
+  <rect x="10" y="66" width="190" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="86" class="strong">2 · LIST THE RESOURCES</text>
+  <text x="22" y="102">what can run out</text>
+  <text x="215" y="86">compute · memory size · mem bandwidth</text>
+  <text x="215" y="102">disk · network · CPU · money</text>
+  <rect x="10" y="122" width="190" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="142" class="strong">3 · DO THE ARITHMETIC</text>
+  <text x="22" y="158">powers of ten, out loud</text>
+  <text x="215" y="142">load × cost per request</text>
+  <text x="215" y="158">= demand per second, per resource</text>
+  <rect x="10" y="178" width="190" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="198" class="strong">4 · COMPARE</text>
+  <text x="22" y="214">against one machine</text>
+  <text x="215" y="198">demand ÷ capacity = machines</text>
+  <text x="215" y="214">biggest ratio = the bottleneck</text>
+  <rect x="10" y="234" width="190" height="56" class="fill-paper" stroke-width="1.5" />
+  <text x="22" y="254" class="strong">5 · WHAT BREAKS, WHAT</text>
+  <text x="22" y="270" class="strong">CHANGES AT 10× / 100×</text>
+  <text x="215" y="262">the fix for the bottleneck</text>
+  <text x="215" y="278">then: what breaks next</text>
+  <line x1="105" y1="54" x2="105" y2="66" class="ink" stroke-width="1.2" />
+  <line x1="105" y1="110" x2="105" y2="122" class="ink" stroke-width="1.2" />
+  <line x1="105" y1="166" x2="105" y2="178" class="ink" stroke-width="1.2" />
+  <line x1="105" y1="222" x2="105" y2="234" class="ink" stroke-width="1.2" />
+  <path d="M 200 262 L 540 262" class="blue dash" stroke-width="1" fill="none" />
+  <path d="M 540 262 L 540 32 L 520 32" class="blue dash" stroke-width="1" fill="none" />
+  <text x="534" y="150" text-anchor="end" class="blue-t">×10, REPEAT</text>
+</svg>
+</Figure>
+
+Let's take them one at a time, then run all five on three real problems.
+
+### Step 1: clarify the load
+
+Before you compute anything, pin down what's coming in. Ask, or state an assumption out loud. Interviewers like either; they hate neither happening. Four questions cover almost everything.
+
+**How many requests, on average and at peak?** The unit everyone uses is <Term w="QPS">Queries (or requests) per second. The rate at which work arrives.</Term>. People quote load per day ("10 million searches a day") because that's what dashboards show, but machines fail per second, so you convert. And you never size for the average. Traffic follows people: it rises during the day in each time zone and falls at night. For a consumer product, the busiest hour is typically 2 to 3 times the daily average; for anything triggered by events (a launch, a news spike, a batch job that fires at midnight) it can be 10× or more. The ratio between the busiest rate and the average is the <Term w="peak factor">Peak load divided by average load. Size for the peak; 2-3× is a common assumption for daily human traffic, 10× for spiky traffic. Ask, or state yours.</Term>.
+
+**What's the mix?** Reads and writes cost different things. A search engine is almost all reads. A logging pipeline is almost all writes. A chat product writes every message and reads the whole conversation back on every turn. The <Term w="read:write ratio">How many reads happen per write. Decides whether you optimise for caching and replicas (read-heavy) or for fast appends and batching (write-heavy).</Term> tells you which half of the system to worry about.
+
+**How big is each thing, and how many are there?** Size per request (tokens, bytes) and total stored data (number of items × bytes per item). Most mistakes in estimates are here: someone forgets that a "document" for the ranker is 256 tokens, not one ID.
+
+**How fast is it growing?** A system that's fine today and grows 2× per year is 10× bigger in a bit over three years. That's why "what happens at 10×?" isn't hypothetical; it's the next design review.
+
+### Step 2: list what can run out
+
+For each request, ask: what does it consume? The list is short, and it's the same list for every system.
+
+| Resource | Measured in | One unit runs out when... |
+| --- | --- | --- |
+| Compute | FLOP/s (GPU), core-seconds (CPU) | the math units are busy all the time |
+| Memory size | GB | the working set doesn't fit |
+| Memory bandwidth | GB/s | every step waits on bytes from memory |
+| Disk | IOPS, MB/s, TB | too many random reads, or too much data |
+| Network | Gbit/s, round trips | the card is full, or chains of calls add up |
+| Money | $/month | someone in finance notices |
+
+A <Term w="FLOP">One floating-point operation: a multiply or an add. A multiply-add counts as 2. FLOP/s (FLOPS) is how many per second; a modern GPU does around 10¹⁴ to 10¹⁵.</Term> is the unit of compute. For a neural network there's one rule worth knowing by heart: a forward pass costs about **2 FLOPs per parameter per token** (one multiply, one add, for every weight the token passes through). Training costs about 6, because the backward pass is roughly twice the forward. This is the "2N" rule from the scaling-laws papers, and it's how you go from "a 110M-parameter model" to a number of GPUs in one line.
+
+You met the compute-versus-bandwidth split in [Why ~17 tokens per second?](/lessons/bandwidth-bound/). LLM decoding reads every weight for one token at a time, so it waits on memory. Your ranker is the opposite: one query sends 100 candidate pairs of 256 tokens each through the model together, so 25,600 tokens share every weight read. That's a huge amount of math per byte. Like prefill, it's **compute-bound**. Knowing which kind of workload you have tells you which bar to watch.
+
+### Step 3: the arithmetic, with powers of ten
+
+You don't need a calculator. You need to stop carrying digits. Round every number to one significant figure and a power of ten, multiply the leading digits, add the exponents. 3 × 10² times 2.5 × 10⁴ is "3 times 2.5 is about 8, 2 plus 4 is 6", so 8 × 10⁶. Being off by 20% in each step is fine. The answer you need is the <Term w="order of magnitude">The power of ten a number is closest to. 300 and 700 are both "hundreds"; 300 and 3,000 differ by an order of magnitude. Estimates aim to land in the right one.</Term>: is this one machine, ten machines, or a thousand?
+
+A few conversions do most of the work:
+
+| Fact | Exact | Use |
+| --- | --- | --- |
+| Seconds in a day | 86,400 | **≈ 10⁵**. So 1 million/day ≈ 10/s (really 11.6) |
+| Seconds in a month | ≈ 2.6 million | ≈ 2.5 × 10⁶ |
+| Seconds in a year | ≈ 31.5 million | ≈ 3 × 10⁷ (π × 10⁷ if you like) |
+| 2¹⁰ | 1,024 | ≈ 10³. So KiB ≈ KB, GiB ≈ GB (7% off) |
+| Hours in a month | ≈ 730 | for $/hour → $/month |
+| Doubling every year | | ≈ 10× in 3.3 years; 1,000× in 10 |
+
+The 10⁵ trick underestimates by about 15%. If that 15% would change your decision, the estimate was too close to call anyway and you'd say "this is borderline; I'd measure".
+
+<Predict id="qps">
+Your team's search product does 50 million queries a day. Peak is 3× average. Without a calculator: how many queries per second must the ranker handle at peak?
+<Fragment slot="answer">
+
+50 million is 5 × 10⁷. Divide by 10⁵ seconds: 5 × 10² = 500 per second on average. Times 3: about **1,500 QPS** at peak. The exact answer is 50,000,000 ÷ 86,400 × 3 ≈ 1,736. You were 14% low, which changes nothing about the design: it's thousands, not tens or millions.
+
+</Fragment>
+</Predict>
+
+### Step 4: compare against what one machine can do
+
+Now divide demand by capacity. That needs the second half of your stock: what one machine, one disk, one card can do. These are approximate, vary with hardware, and are all you need to land in the right order of magnitude.
+
+| Thing | Rough capacity |
+| --- | --- |
+| One CPU core, compiled code | ~10⁹ simple operations/s |
+| One CPU core, pure Python | ~10⁷ simple operations/s |
+| One CPU core, fast tokenizer (Rust) | ~10⁶ tokens/s (I measured 1.15 M on an M4 Pro, one thread) |
+| Server RAM | 128 GB - 2 TB per box; 50-500 GB/s |
+| NVMe SSD | 5-7 GB/s sequential; 10⁵-10⁶ random reads/s; a few TB to tens of TB |
+| Spinning disk | ~150 MB/s; ~100 random reads/s |
+| Network card | 10-100 Gbit/s = 1.25-12.5 GB/s (bits ÷ 8!) |
+| Round trip, same datacenter / cross-continent | ~0.5 ms / ~150 ms |
+| H100 (spec sheet) | ~10¹⁵ FLOP/s dense BF16, 80 GB, 3.35 TB/s |
+| DGX Spark (spec sheet) | ~10¹⁴ FLOP/s BF16 at most, 128 GB, 273 GB/s |
+| Cloud H100 rental | ~$2-3 per GPU-hour (market prices move; check) |
+| Object storage (S3 standard) | ~$0.02 per GB-month |
+
+Two corrections always apply. First, you never get the spec-sheet peak. For model inference, getting 30-50% of peak FLOPs is decent; that fraction is often called <Term w="MFU">Model FLOPs utilization: the FLOPs your model actually needs per second divided by the hardware's peak. 40% is good for inference; small models and small batches get much less.</Term>. Use 40% unless you've measured. Second, you never run a machine at 100%. Queueing theory (the subject of [p99 and load testing](/lessons/tail-latency/)) says waiting time explodes as utilization approaches 100%, so size for about 60-70% busy at peak and keep a spare for when one dies. That margin is <Term w="headroom">Spare capacity you deliberately leave unused, so latency stays sane at peak and a failed machine doesn't take you down.</Term>.
+
+### Step 5: what breaks first, and what changes at 10× and 100×
+
+The resource with the biggest demand-to-capacity ratio is the bottleneck. Then say what you'd do about it, and, the part that sounds senior, what breaks *next* once you've fixed it. At 10× you usually add machines. At 100× adding machines gets expensive enough that you change the design: cut the work per request, cache, precompute, or approximate.
+
+That's the whole method. Now run it.
+
+### Worked example 1: your ranker, from queries to GPUs
+
+Assumptions, stated out loud: 10 million queries a day, 3× peak factor, 100 candidates re-ranked per query, 256 tokens per query-document pair, a BERT-base-sized cross-encoder (110M parameters, about 86M of them outside the embedding table, which is a lookup and costs no FLOPs). Follow the multiplications down.
+
+<Figure n="002" title="QUERIES PER DAY TO GPUS" caption="Each box is one multiplication. Every number in the chain is a lever: halve the candidates and the GPU count halves. This is why the chain, not the final number, is the useful thing to show an interviewer.">
+<svg viewBox="0 0 560 420" role="img" aria-label="A chain of multiplications from 10 million queries per day to about five H100 GPUs">
+  <rect x="150" y="10" width="260" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="280" y="32" text-anchor="middle" class="strong">10⁷ QUERIES / DAY</text>
+  <line x1="280" y1="44" x2="280" y2="72" class="ink" stroke-width="1.2" />
+  <text x="296" y="62">÷ 10⁵ s/day  × 3 peak</text>
+  <rect x="150" y="72" width="260" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="94" text-anchor="middle" class="strong">≈ 300 QPS AT PEAK</text>
+  <line x1="280" y1="106" x2="280" y2="134" class="ink" stroke-width="1.2" />
+  <text x="296" y="124">× 100 candidates</text>
+  <rect x="150" y="134" width="260" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="156" text-anchor="middle" class="strong">3 × 10⁴ PAIRS / S</text>
+  <line x1="280" y1="168" x2="280" y2="196" class="ink" stroke-width="1.2" />
+  <text x="296" y="186">× 256 tokens / pair</text>
+  <rect x="150" y="196" width="260" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="218" text-anchor="middle" class="strong">≈ 10⁷ TOKENS / S</text>
+  <line x1="280" y1="230" x2="280" y2="258" class="ink" stroke-width="1.2" />
+  <text x="296" y="248">× 2 × 10⁸ FLOP / token (2N)</text>
+  <rect x="150" y="258" width="260" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="280" text-anchor="middle" class="strong">2 × 10¹⁵ FLOP / S</text>
+  <line x1="280" y1="292" x2="280" y2="320" class="ink" stroke-width="1.2" />
+  <text x="296" y="310">÷ 4 × 10¹⁴ per H100 (40% of peak)</text>
+  <rect x="150" y="320" width="260" height="40" class="fill-blue" />
+  <text x="280" y="345" text-anchor="middle" style="fill:var(--paper);font-weight:600">≈ 5 H100 · OR ≈ 40 SPARKS</text>
+  <line x1="280" y1="360" x2="280" y2="384" class="ink dash" stroke-width="1" />
+  <text x="280" y="402" text-anchor="middle">+ HEADROOM (70% BUSY) + 1 SPARE ≈ 8 H100</text>
+  <line x1="40" y1="150" x2="140" y2="150" class="blue" stroke-width="1" />
+  <text x="40" y="140" class="blue-t">LEVERS</text>
+  <line x1="40" y1="212" x2="140" y2="212" class="blue" stroke-width="1" />
+  <line x1="40" y1="274" x2="140" y2="274" class="blue" stroke-width="1" />
+  <line x1="40" y1="150" x2="40" y2="274" class="blue" stroke-width="1" />
+</svg>
+</Figure>
+
+Read the steps the way you'd say them:
+
+1. **Load.** 10⁷ per day ÷ 10⁵ seconds = 100 QPS average. Times 3: 300 QPS at peak.
+2. **Pairs.** Each query is 100 forward-pass rows, so 3 × 10⁴ pairs per second.
+3. **Tokens.** × 256 ≈ 8 × 10⁶, call it 10⁷ tokens per second. (In my test on the Mac, a query plus a 230-word snippet came out at 243 tokens, so 256 is the right ballpark.)
+4. **FLOPs.** 2 × 86M ≈ 1.7 × 10⁸ FLOPs per token for the weights, plus a bit for attention. Attention's extra cost per token is about 4 × layers × width × sequence length: 4 × 12 × 768 × 256 ≈ 10⁷, under 10% of the total at 256 tokens. Round to 2 × 10⁸. Total: 10⁷ × 2 × 10⁸ = 2 × 10¹⁵ FLOP/s.
+5. **Compare.** An H100's dense BF16 peak is about 10¹⁵ FLOP/s on its spec sheet. At 40%, 4 × 10¹⁴. So 2 × 10¹⁵ ÷ 4 × 10¹⁴ = 5 H100s. With headroom (run them 70% busy) and one spare: 8. A Spark's compute peak is about 8× lower than an H100's (its BF16 figure is derived from NVIDIA's FP4 marketing number; see the [bandwidth lesson](/lessons/bandwidth-bound/)), so about 40 Sparks.
+
+Now check the other resources, quickly, because that's how you know compute really is the bottleneck. **Memory size:** the model is 220 MB in BF16. Activations for one query's batch are around 25,600 tokens × 768 wide × a dozen live values × 2 bytes, roughly half a gigabyte. Little's law from [Waiting vs working](/lessons/waiting-vs-working/) says the number of queries in the building at once is arrival rate × time each spends there: 300/s × 0.1 s = 30 in flight, which is about 15-20 GB spread across the fleet. Fine. **Network:** each query brings 100 documents × 256 tokens × ~4 bytes of text per token ≈ 100 KB. × 300 QPS = 30 MB/s, about 0.25 Gbit/s, on a 10-25 Gbit/s card. Nothing. **Latency:** one query is 25,600 tokens × 2 × 10⁸ = 5 × 10¹² FLOPs. At 4 × 10¹⁴ FLOP/s that's about 13 ms on an H100. On a Spark at ~5 × 10¹³ effective, about 100 ms. Ask yourself whether that's inside your latency budget, because adding Sparks doesn't make one query faster.
+
+**What breaks first:** GPU compute, by a factor of a hundred over everything else.
+
+**At 10× (100M queries/day):** 50 H100s plus headroom, $100k+ a month at rental prices. Doable, but you'd first look at the levers. Candidates is the biggest: if a cheaper stage (a small bi-encoder, or a distilled MiniLM cross-encoder) narrows 100 down to 20 before the big model, that's 5× fewer FLOPs. Shorter pairs (truncate documents to 128 tokens) is 2×. A smaller model is 2-8×. Caching scores for repeated queries can be big, because search queries follow a <Term w="Zipf distribution">A pattern where a few items are extremely common and a long tail is rare. The 10th most popular query is searched about 1/10th as often as the 1st. Caches love it.</Term>: a small number of popular queries make up a large share of traffic.
+
+**At 100× (a billion a day, real web-search scale):** 500 H100s just for the ranker, a million dollars a month. Nobody runs a full cross-encoder over 100 candidates at that scale. The design changes: multi-stage cascades, heavy distillation, aggressive caching, and the big model only on the top few results.
+
+<Predict id="ranker-cpu">
+Same ranker, but traffic is only 100,000 queries a day, and someone suggests running it on a 32-core CPU box instead of a GPU. A CPU core does maybe 10¹¹ FLOP/s with vector instructions on a good day, but call the whole box about 10¹² FLOP/s achieved. Does it keep up?
+<Fragment slot="answer">
+
+100,000/day = 10⁵ ÷ 10⁵ = 1 QPS average, 3 at peak. FLOPs per query: 5 × 10¹² (from above). Demand: 3 × 5 × 10¹² = 1.5 × 10¹³ FLOP/s. The box does about 10¹². So no: it's 15× short at peak, and worse, one query alone takes 5 seconds. The GPU wins not because the load is big but because a single query is big. Drop to MiniLM-L6 (about 8× fewer FLOPs per token) and 50 candidates and it's 16× less work: now one query is about 0.3 s and the box roughly keeps up at 3 QPS. Try it in the calculator below.
+
+</Fragment>
+</Predict>
+
+### Feel it: a calculator for the ranker
+
+Here's the same chain, wired up. Drag queries per day from a thousand to ten billion and watch all five bars move right together. The one that crosses the 100% line first is your bottleneck. Then change the shape of the work (candidates, tokens, model, hardware) and watch the *order* of the bars change. That re-ordering is what "it depends" actually means.
+
+<Figure n="003" title="WHAT SATURATES FIRST" caption="Each bar is demand divided by what one node can supply, on a log scale. The model's assumptions (2N FLOPs per token, ~1M tokens/s per CPU core, 4 bytes of text per token, a 100 ms budget for Little's law) are rough and printed in the source; the shape is the point." wide>
+<EnvelopeCalculator />
+</Figure>
+
+Things to try:
+
+- Default settings, then switch to **1× H100**. Same bottleneck, about 8× fewer nodes.
+- Drop queries to **1k** a day. Every bar is near zero. "How does it scale?" has an honest answer here: one box, and it's bored.
+- Pick **MiniLM-L6**, **10 candidates**, **64 tokens**, on the H100. Now compute isn't the wall at all; with so little math per query, CPU work (tokenizing, request handling) and memory bandwidth catch up. This happens in real systems: a GPU at 15% utilization because the Python process feeding it is pegged.
+- **Qwen3 0.6B** with **1024 tokens** on a Spark: look at "one query, alone". It goes red. No number of nodes fixes a single query that takes longer than your latency budget.
+- Pick the **CPU box** and slide queries up from 1k. Where does it stop being enough?
+
+### Worked example 2: embeddings for a billion web pages
+
+TinyFish-shaped question: "We want semantic search over a billion pages. How much storage, and where does it live?"
+
+**Load.** 10⁹ pages. One embedding vector per page to start. A typical embedding model outputs 768 numbers.
+
+**Arithmetic.** The size of one vector depends on how you store each number:
+
+| Format | Bytes per vector (768-dim) | × 10⁹ pages |
+| --- | --- | --- |
+| float32 | 3,072 | 3 TB |
+| bfloat16 / float16 | 1,536 | 1.5 TB |
+| int8 (quantized) | 768 | 770 GB |
+| binary (1 bit per dim) | 96 | 96 GB |
+| product quantization, 64 codes | 64 | 64 GB |
+
+<Term w="Quantization">Storing each number with fewer bits than it was computed in, accepting a small loss in accuracy for a big drop in size. int8 stores each value in one byte instead of four.</Term> is what moves you down this table. <Term w="product quantization">A compression trick for vectors: split each vector into chunks (say 64), and replace each chunk by the ID of its nearest "typical chunk" from a learned codebook. 64 one-byte IDs instead of 3 KB.</Term> squeezes a vector to tens of bytes at some cost in search quality.
+
+<Figure n="004" title="ONE BILLION VECTORS VS ONE MACHINE" caption="Log scale. Full-precision vectors are a few TB: one SSD, but a dozen machines' worth of RAM. Compressed codes fit in the RAM of one box. Which line you need to be under depends on whether you search from memory or from disk.">
+<svg viewBox="0 0 560 250" role="img" aria-label="Bars for one billion vectors in five formats, compared with the RAM of a Spark, a 1 TB RAM server, and an 8 TB SSD">
+  <line x1="140" y1="200" x2="540" y2="200" class="ink" stroke-width="1" />
+  <line x1="140" y1="20" x2="140" y2="200" class="ink" stroke-width="1" />
+  <text x="140" y="216" text-anchor="middle">10 GB</text>
+  <text x="273" y="216" text-anchor="middle">100 GB</text>
+  <text x="406" y="216" text-anchor="middle">1 TB</text>
+  <text x="539" y="216" text-anchor="end">10 TB</text>
+  <text x="340" y="240" text-anchor="middle">TOTAL SIZE, 10⁹ VECTORS × 768 DIMS (LOG)</text>
+  <text x="130" y="44" text-anchor="end">FLOAT32</text>
+  <rect x="140" y="32" width="331" height="16" class="fill-blue" />
+  <text x="130" y="76" text-anchor="end">BF16</text>
+  <rect x="140" y="64" width="291" height="16" class="fill-blue" />
+  <text x="130" y="108" text-anchor="end">INT8</text>
+  <rect x="140" y="96" width="251" height="16" class="fill-wash" stroke-width="1" />
+  <text x="130" y="140" text-anchor="end">BINARY</text>
+  <rect x="140" y="128" width="131" height="16" class="fill-wash" stroke-width="1" />
+  <text x="130" y="172" text-anchor="end">PQ · 64 B</text>
+  <rect x="140" y="160" width="107" height="16" class="fill-wash" stroke-width="1" />
+  <line x1="287" y1="20" x2="287" y2="200" class="ink dash" stroke-width="1" />
+  <text x="291" y="190" class="strong">SPARK RAM</text>
+  <line x1="406" y1="20" x2="406" y2="200" class="ink dash" stroke-width="1" />
+  <text x="410" y="140" class="strong">1 TB RAM BOX</text>
+  <line x1="526" y1="20" x2="526" y2="200" class="blue dash" stroke-width="1" />
+  <text x="522" y="190" text-anchor="end" class="blue-t">8 TB SSD</text>
+  <text x="477" y="44">3 TB</text>
+  <text x="437" y="76">1.5 TB</text>
+</svg>
+</Figure>
+
+**Compare.** 1.5 TB in bf16 sits on a single SSD easily. In RAM it's a dozen Sparks' worth, or two large servers. And it's usually more than one vector per page: pages are long, embedding models take maybe 512 tokens, so if the average page is 2,000 tokens you chunk it into about 4 pieces. That's 4 × 10⁹ vectors and 6 TB in bf16. Plus the search index on top: an <Term w="HNSW">Hierarchical Navigable Small World: a popular approximate-search index that links each vector to a few dozen near neighbours, so a search hops through a graph instead of scanning everything. The links cost extra memory per vector.</Term> graph with 32 neighbours per vector adds 32 × 4 bytes = 128 bytes per vector, which for int8 vectors is a sixth extra.
+
+**What about searching it?** A brute-force search compares the query against every vector. That's reading all 1.5 TB per query. Even at an H100's 3.35 TB/s that's half a second per query, and the data doesn't fit on one H100 anyway. At 100 QPS it's hopeless. That's why <Term w="approximate nearest neighbour">Search that finds most of the closest vectors while looking at only a tiny fraction of them, by using an index (a graph or clusters). Trades a little recall for 100-1000× less work.</Term> search exists; it's the subject of [Nearest neighbors at scale](/lessons/vector-search/).
+
+**What about computing them?** This is the surprise. 10⁹ pages × 2,000 tokens = 2 × 10¹² tokens. With a BERT-base-sized embedder at 2 × 10⁸ FLOPs per token, that's 4 × 10²⁰ FLOPs. At 4 × 10¹⁴ FLOP/s per H100: 10⁶ GPU-seconds, about 280 GPU-hours. Under a thousand dollars of rented time. (On one Spark at ~5 × 10¹³: about 90 days. Rent the cluster.) The expensive part was never computing the embeddings; it's **keeping them in RAM, forever, with replicas**.
+
+**And fetching the pages?** One step further back. Crawling a billion pages in a day is 10⁹ ÷ 10⁵ = 10⁴ pages per second. If each fetch takes about 1 second end to end (DNS, TLS, a slow server), Little's law says you need 10⁴ × 1 = 10,000 fetches in flight at all times. That's not a bandwidth problem (10⁴ × 100 KB = 1 GB/s, a single fast network card), it's a *concurrency* problem, exactly the one [Waiting vs working](/lessons/waiting-vs-working/) solves.
+
+**What breaks first:** memory size, if you insist on holding full vectors in RAM. **At 10×:** compress (int8, PQ), keep only the compressed codes in RAM and full vectors on SSD for re-scoring, and shard across machines. **At 100×:** a <Term w="shard">One slice of a dataset that is split across machines, each holding a fraction. A query asks every shard and merges the answers.</Term> count in the hundreds, and the cost per query of asking every shard becomes the next wall.
+
+### Worked example 3: the KV cache at N concurrent users
+
+"We serve Llama 3.1 8B for a chat product. How many users per GPU?"
+
+**Load.** Users don't hold a GPU all day; they hold it while a response is being generated. Little's law turns the arrival rate into concurrency: if 10 messages arrive per second at peak and each response takes 15 seconds to stream (300 tokens at 20 tokens per second), then 10 × 15 = **150 responses are generating at any moment**. Each one has its whole conversation (say 4,000 tokens on average) in the <Term w="KV cache">The stored keys and values for every past token in every layer, so attention doesn't recompute them. Each conversation has its own, and it's read in full at every decode step.</Term>.
+
+**Arithmetic.** From the [bandwidth lesson](/lessons/bandwidth-bound/): Llama 3.1 8B stores 2 (K and V) × 32 layers × 8 KV heads × 128 dims × 2 bytes = 128 KiB per token. × 4,096 tokens = 512 MiB per conversation. × 150 = 75 GiB (80 GB) of cache, plus 16 GB of weights.
+
+**Compare.** Two different walls, and which one you hit depends on the hardware.
+
+<Figure n="005" title="WHICH WALL FIRST" caption="Llama 3.1 8B, bf16, 4K tokens of context per user. On an H100 you run out of memory long before bandwidth; on the Spark, memory would hold 200 users but bandwidth can keep only about 20 of them at a usable speed.">
+<svg viewBox="0 0 560 250" role="img" aria-label="Users per device limited by memory size and by memory bandwidth, for a DGX Spark and an H100">
+  <text x="10" y="20" class="strong">CONCURRENT USERS AT 4K CONTEXT</text>
+  <text x="10" y="58" class="strong">DGX SPARK</text>
+  <text x="10" y="74">128 GB · 273 GB/s</text>
+  <text x="150" y="52">FIT IN MEMORY</text>
+  <rect x="250" y="40" width="104" height="16" class="fill-wash" stroke-width="1" />
+  <text x="360" y="52">≈ 208</text>
+  <text x="150" y="80">AT ≥10 TOK/S</text>
+  <rect x="250" y="68" width="11" height="16" class="fill-blue" />
+  <text x="267" y="80" class="strong">≈ 21 · LIMIT</text>
+  <text x="10" y="138" class="strong">H100 SXM</text>
+  <text x="10" y="154">80 GB · 3.35 TB/s</text>
+  <text x="150" y="132">FIT IN MEMORY</text>
+  <rect x="250" y="120" width="60" height="16" class="fill-blue" />
+  <text x="316" y="132" class="strong">≈ 119 · LIMIT</text>
+  <text x="150" y="160">AT ≥10 TOK/S</text>
+  <rect x="250" y="148" width="297" height="16" class="fill-wash" stroke-width="1" />
+  <text x="541" y="160" text-anchor="end">≈ 594</text>
+  <line x1="250" y1="30" x2="250" y2="180" class="ink" stroke-width="1" />
+  <line x1="250" y1="180" x2="550" y2="180" class="ink" stroke-width="1" />
+  <text x="250" y="196" text-anchor="middle">0</text>
+  <text x="400" y="196" text-anchor="middle">300</text>
+  <text x="550" y="196" text-anchor="end">600</text>
+  <text x="10" y="226">MEMORY: (CAPACITY − 16 GB WEIGHTS) ÷ 0.54 GB PER USER</text>
+  <text x="10" y="242">BANDWIDTH: STEP = (16 GB + N × 0.54 GB) ÷ BW, MUST BE ≤ 100 MS</text>
+</svg>
+</Figure>
+
+On an **H100**, after 16 GB of weights there's about 64 GB left, which holds about 119 users at 512 MiB each. Bandwidth isn't the problem: each decode step reads 16 + 64 = 80 GB in 24 ms, so everyone gets about 40 tokens per second. **Memory size** breaks first. 150 users needs two H100s.
+
+On a **Spark**, memory would hold 208 users. But every step reads the weights *plus every user's cache*. To give each user 10 tokens per second, a step must take at most 100 ms, so at most 27 GB read per step: 16 GB of weights and room for only about 21 users' caches. **Bandwidth** breaks first. 150 users needs about 8 Sparks, not 1.
+
+<Predict id="kv-10x">
+Traffic grows 10×: 1,500 responses generating at once, still 4K context. Before any clever tricks, how many H100s? Then name two changes that cut that number without buying GPUs.
+<Fragment slot="answer">
+
+1,500 × 0.54 GB ≈ 800 GB of KV cache. At about 64 GB of cache per H100, that's about 13 H100s (and more with headroom). Ways to cut it: **store the cache in fp8** (1 byte per value instead of 2: half the memory, twice the users); **shorter context** (summarise or truncate old turns: at 2K tokens, double the users); **share common prefixes** (every conversation starts with the same system prompt; store it once, see [prefix caching](/lessons/prefix-caching/)); a model with fewer KV heads or a smaller cache design. What doesn't help: a faster GPU with the same memory. Memory size was the wall.
+
+</Fragment>
+</Predict>
+
+### Saying it out loud: the interview script
+
+The arithmetic is half of it. The other half is narrating so the interviewer can follow, correct your assumptions, and see your judgement. Here's a script. Practise it until it's boring.
+
+1. **Restate and scope.** "So we're asking how the ranking service holds up as search traffic grows. Can I assume we're talking about serving, not training?"
+2. **State the load, with numbers, and invite correction.** "I'll assume 10 million queries a day, peaking at 3× average, 100 candidates per query, 256 tokens each. Tell me if any of those are way off."
+3. **Name the resources before computing.** "The things that can run out are GPU compute, GPU memory, network and CPU for tokenizing. I expect compute to dominate, because a cross-encoder runs a full forward pass per pair. Let me check."
+4. **Do the chain, rounding hard, out loud.** "A day is about 10⁵ seconds, so 100 QPS, 300 at peak... " Write each line on the whiteboard. Units on every number.
+5. **Compare to one machine, then add headroom.** "An H100 does about 4 × 10¹⁴ real FLOPs a second, so 5 GPUs. I'd run them at 70% and keep a spare: 8."
+6. **Sanity-check the others in one sentence each.** "Memory: the model is 200 MB, fine. Network: 30 MB/s, fine. Latency: 13 ms per query on one H100, inside budget."
+7. **Say what breaks first, then 10× and 100×.** "Compute breaks first. At 10× I'd shrink candidates with a cheap first stage before buying 50 GPUs. At 100× the design changes: cascade, distill, cache."
+8. **Say how you'd check.** "And before committing, I'd load-test one GPU to replace my 40% assumption with a measured number."
+
+Step 8 is the one people skip and the one that makes you sound like an engineer instead of a calculator. Estimates are hypotheses. Which is what the Build section is for.
+
+## Build It
+
+Everything goes in `~/workbench/envelope/` on the Spark. You'll estimate your ranker's capacity on paper, measure the real ceiling, load-test it, and write down how wrong you were. If your own cross-encoder isn't easy to load outside the training code, use a public stand-in: `cross-encoder/ms-marco-MiniLM-L6-v2` (22M parameters, a classic search re-ranker) or `BAAI/bge-reranker-base` (278M, XLM-RoBERTa base). Both load with the `CrossEncoder` class in `sentence-transformers`; check its docs if the API has moved.
+
+<Task id="t0" title="Set up the folder, the stand-in model, and the journal" agent="ok">
+
+```bash
+mkdir -p ~/workbench/envelope && cd ~/workbench/envelope
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch sentence-transformers fastapi uvicorn httpx numpy
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+```
+
+On the Spark, check that the installed `torch` actually sees the GPU (ARM64 + Blackwell wheels can be picky; NVIDIA's container images are the safe route if `cuda.is_available()` is False).
+
+Then create the estimation journal. This file outlives the lesson. Every estimate you make from now on, at work or in practice, goes in here with the measured number next to it once you have one.
+
+```markdown
+# journal.md
+
+| date | question | key assumptions | estimate | measured | ratio (meas/est) | what I missed |
+| --- | --- | --- | --- | --- | --- | --- |
+```
+
+</Task>
+
+<Task id="t1" title="Estimate the ranker on paper, three loads" agent="hands">
+
+No calculator, no Figure 003. Paper, or a blank text file. For your actual ranker (or the stand-in), at **1,000**, **100,000**, and **10 million** queries a day:
+
+1. Write your assumptions: peak factor, candidates per query, tokens per pair, parameter count (look it up; subtract the embedding table, which is vocab size × hidden size).
+2. Write the chain: QPS at peak → pairs/s → tokens/s → FLOP/s.
+3. Compare against **one Spark**, using 125 TFLOP/s × 40% as your capacity guess, and against one H100.
+4. For each load: how many Sparks, what breaks first, and how long one query takes alone.
+5. Write one sentence on what you'd change at 10× the largest load.
+
+Only then open Figure 003, set the same values, and check your arithmetic. Disagree by more than 2×? Find out which step. Put all three estimates in the journal with "measured" blank.
+
+</Task>
+
+<Task id="t2" title="Measure the real ceiling: matmul, then the model" agent="hands">
+
+Your estimate leaned on two guesses: the Spark's peak, and the 40%. Replace both with measurements.
+
+First, the hardware ceiling. This one is boilerplate; type it, run it:
+
+```python
+# ceiling.py
+import time, torch
+n = 8192
+a = torch.randn(n, n, device="cuda", dtype=torch.bfloat16)
+b = torch.randn(n, n, device="cuda", dtype=torch.bfloat16)
+for _ in range(3):
+    a @ b
+torch.cuda.synchronize()
+t = time.perf_counter()
+reps = 20
+for _ in range(reps):
+    a @ b
+torch.cuda.synchronize()
+dt = (time.perf_counter() - t) / reps
+print(f"{2 * n**3 / dt / 1e12:.1f} TFLOP/s bf16")
+```
+
+That number is the best your GPU does on the friendliest possible workload. It's your real peak, not the spec sheet's.
+
+Now the part that teaches: the model. Write a benchmark that scores one query's worth of pairs at a time and reports achieved FLOP/s.
+
+```python
+# model_bench.py
+import time, torch
+from sentence_transformers import CrossEncoder
+
+def make_pairs(n_pairs: int, doc_words: int) -> list[tuple[str, str]]:
+    """Fake but realistic-length (query, document) pairs."""
+    ...
+
+def time_one_query(model, pairs, reps: int = 20) -> float:
+    """Seconds to score all pairs in ONE predict call (batch_size=len(pairs)).
+    Warm up first. Remember GPU work is asynchronous: predict() returns numpy,
+    which forces a sync, but check that's true for your version."""
+    ...
+
+def flops_per_query(n_pairs: int, tokens: int, non_emb_params: float, layers: int, d: int) -> float:
+    """2N per token for weights + 4 * layers * d * tokens per token for attention."""
+    ...
+
+if __name__ == "__main__":
+    # Sweep candidates in [1, 10, 50, 100, 200] at ~256 tokens per pair.
+    # For each: ms per query, pairs/s, achieved TFLOP/s, and achieved / ceiling (your MFU).
+    # Also count real tokens per pair with model.tokenizer, don't assume 256.
+    ...
+```
+
+Hints: `CrossEncoder(name, device="cuda", max_length=256)`; `model.predict(pairs, batch_size=len(pairs))`. Try `model.model.half()` or `.to(torch.bfloat16)` and see whether it helps.
+
+For calibration, on my M4 Pro Mac the MiniLM-L6 stand-in scored 100 pairs of 243 tokens in about 150 ms on the GPU (MPS), about 4 TFLOP/s achieved, and about 310 ms on the CPU. The Spark should be much faster; how much is what you're measuring.
+
+</Task>
+
+<Task id="t3" title="Wrap it in a tiny server" agent="ok">
+
+Boilerplate. One endpoint: a query and a list of documents in, scores out. One model, one lock, so requests take turns on the GPU (that's honest for one GPU and makes the queueing visible).
+
+```python
+# serve.py
+import asyncio, time
+from fastapi import FastAPI
+from pydantic import BaseModel
+from sentence_transformers import CrossEncoder
+
+MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"  # or your own
+model = CrossEncoder(MODEL, device="cuda", max_length=256)
+gpu = asyncio.Lock()
+app = FastAPI()
+
+class RankReq(BaseModel):
+    query: str
+    docs: list[str]
+
+@app.post("/rank")
+async def rank(req: RankReq):
+    pairs = [(req.query, d) for d in req.docs]
+    async with gpu:
+        t = time.perf_counter()
+        scores = await asyncio.to_thread(model.predict, pairs, batch_size=len(pairs))
+        gpu_ms = (time.perf_counter() - t) * 1e3
+    return {"scores": [float(s) for s in scores], "gpu_ms": gpu_ms}
+```
+
+Run with `uvicorn serve:app --host 0.0.0.0 --port 8090 --workers 1 --backlog 2048`. Keep it running in its own terminal and watch `nvidia-smi dmon -s u` (GPU utilization each second) in another.
+
+</Task>
+
+<Task id="t4" title="Load-test it with an open-loop generator" agent="review">
+
+Write a load generator that sends requests at a **fixed arrival rate**, whether or not earlier ones have finished. Real users don't wait for each other. A generator that waits for each response before sending the next one (a "closed loop") quietly slows down when the server does, and hides exactly the queueing you're trying to see. That self-deception has a name, <Term w="coordinated omission">When a load tester waits for slow responses before sending more, it stops measuring during the worst moments, so its latency numbers look far better than what users would feel.</Term>, and [p99 and load testing](/lessons/tail-latency/) goes deep on it.
+
+```python
+# load.py
+import asyncio, random, time, httpx, numpy as np
+
+async def one(client, url, payload, scheduled: float, out: list):
+    """Send one request. Latency counts from when it was SCHEDULED to be sent,
+    not when it actually left, so a backed-up client still shows the delay."""
+    ...
+
+async def run_at(rate_qps: float, seconds: float, url: str, payload: dict) -> dict:
+    """Open loop: compute send times with exponential gaps (mean 1/rate),
+    sleep until each, fire off one() as a task without awaiting it.
+    At the end, await everything and return achieved_qps, p50, p99, errors."""
+    ...
+
+if __name__ == "__main__":
+    # payload: one query + 100 docs of ~230 words (reuse make_pairs).
+    # Step the rate: 0.25x, 0.5x, 0.75x, 1x, 1.25x of your PREDICTED max QPS for one GPU.
+    # 30 s per step. Print a row per step.
+    ...
+```
+
+Run it from the Mac over Tailscale or from the Spark itself (the second takes the network out of the picture; try both and see whether it matters, which your estimate already predicted). Then let an agent review it, specifically: is it really open-loop, and does latency start at the scheduled time?
+
+</Task>
+
+<Task id="t5" title="Close the loop in the journal" agent="hands">
+
+For each estimate from t1, fill in "measured" and "ratio". Then answer in the "what I missed" column, in one line each: Which assumption was furthest off? Was the bottleneck the one you predicted? If you measured 30% instead of 40%, does that change the 10M/day answer by enough to matter?
+
+Then add three new estimates from your actual week, unrelated to this ranker, and come back to fill them in when you can. Ideas: how long your next training run takes (tokens × 6N ÷ measured FLOP/s), how big your eval set's cached embeddings are, how much your team's API calls to an LLM provider cost per month.
+
+</Task>
+
+<DoneWhen>
+
+- Your journal has the three paper estimates and their measured counterparts, with ratios.
+- You know your Spark's measured bf16 matmul ceiling and your ranker's MFU at 100 candidates.
+- You have a load-test table with a clear knee, and you can say what resource was saturated there (GPU util from `nvidia-smi`, CPU from `htop`).
+- You can give the 90-second "how does it scale?" answer for your ranker, from memory, with your own measured numbers in it.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. "Predicted" comes from t1 before you measure anything.
+
+| Quantity | Predicted | Measured | Ratio |
+| --- | --- | --- | --- |
+| bf16 matmul ceiling, Spark (TFLOP/s) | 125 (spec, upper bound) | | |
+| Tokens per pair (real) | 256 | | |
+| One query, 100 pairs (ms) | | | |
+| Achieved TFLOP/s at 100 pairs / MFU | 50 / 40% | | |
+| Max QPS, one Spark, p99 under 300 ms | | | |
+| GPU util at that rate | | | |
+| Sparks needed for 10M/day | | | |
+
+What the numbers should look like, and why:
+
+**The matmul ceiling will be under the spec sheet.** The Spark's BF16 number is derived from a sparse FP4 marketing figure, and even well-understood GPUs rarely sustain more than 70-80% of peak on a big matmul. Whatever you get, use it as the 100% for MFU from now on.
+
+**MFU will depend heavily on model size and batch.** A small model like MiniLM-L6 (width 384) does small matrix multiplies, and small matmuls can't fill a big GPU; there's also fixed overhead per call (Python, kernel launches, tokenization) that's the same whether the model is big or small. Expect MFU at 1 candidate to be terrible and at 100+ candidates to be much better. A bigger model (BERT-base, bge-reranker-base) should get closer to your 40% guess. If MFU keeps rising as you add candidates, you're watching the GPU go from "starved" to "busy".
+
+**The load test should show a knee.** Below the knee, latency is flat and close to the one-query time. As offered load passes roughly 70-80% of 1 ÷ (one-query time), p99 rises sharply; past 100% it grows without limit because the queue never drains, and achieved QPS flattens at the maximum. Check Little's law at a rate below the knee: achieved QPS × mean latency should equal the average number of requests in flight, which with one GPU lock should be under 1.
+
+**The ratio is the point.** If your prediction for max QPS was within 2× of the measurement, that's a good estimate. If it was off by 5× or more, one assumption is badly wrong, and finding it is worth more than the measurement itself. The usual culprits: MFU far below 40% (small model), CPU or Python overhead you didn't count, or real tokens per pair much larger than you assumed (long documents not truncated).
+
+## Break It
+
+**1. Size for the average.** Run the load generator at your predicted *average* QPS for 60 s, then at 3× that for 30 s (the peak), then back. Watch p99 during the burst and how long it takes to recover afterward. If the peak rate is above what one GPU can do, the queue grows for 30 s and then takes a while to drain even after the burst ends. Average-sized systems don't fail on average days.
+
+**2. Let one long document in.** Set `max_length=1024` and make one of the 100 documents in each query 1,000 words long. Measure ms per query. Batches are padded to their longest member, so one long document makes all 100 rows cost 1,024 tokens, and attention's share grows with length on top of that. Expect several times slower for one bad document in a hundred. Fixes: truncate, or sort pairs by length and batch similar lengths together.
+
+**3. Starve the GPU.** Switch to MiniLM-L6 with 5 candidates per query and 64-token pairs, and run the load test. Watch `nvidia-smi` and `htop` together. GPU utilization stays low while one CPU core is pinned: tokenizing, JSON parsing and Python overhead are now the bottleneck. This is the CPU bar in Figure 003 crossing the compute bar. The fix isn't a bigger GPU; it's more CPU workers or batching several queries per forward pass.
+
+**4. Find the errors.** This estimate has five mistakes. Find all five before reading the list.
+
+> "We store 1B vectors of 768 float32s, so 768 GB. We get 100M queries a day, that's about 100 QPS. Each query reads 1 KB from 10 shards over a 10 Gbps network, which is 10 GB/s of capacity, so we're fine. Replication isn't needed for an estimate."
+
+<details>
+<summary>The five mistakes</summary>
+
+1. float32 is 4 bytes, so 768 × 4 × 10⁹ = 3 TB, not 768 GB.
+2. 100M/day ÷ 10⁵ = 1,000 QPS, not 100 (off by a factor of 10 from dropping a zero).
+3. No peak factor: size for 2-3× average, so 2,000-3,000 QPS.
+4. 10 Gbps is 10 gigabits: 1.25 GB/s, not 10 GB/s. Bits versus bytes is the most common factor-of-8 error there is.
+5. Replication is part of the estimate: you need at least 2-3 copies for availability, which multiplies storage and cost.
+
+</details>
+
+## Explain It Back
+
+Answer out loud, in plain words, as if an interviewer asked. Then check.
+
+1. **"How does your ranker scale?" Give the 90-second answer.**
+
+<details>
+<summary>Model answer</summary>
+
+I'll put numbers on it. Assume 10 million queries a day: a day is about 10⁵ seconds, so 100 QPS average, about 300 at peak. Each query scores 100 candidates at about 256 tokens, so 300 × 100 × 256 ≈ 10⁷ tokens a second. A BERT-base cross-encoder costs about 2 × 10⁸ FLOPs per token, so 2 × 10¹⁵ FLOP/s. An H100 does about 10¹⁵ peak and 40% of that in practice, so 5 GPUs, 8 with headroom and a spare. Memory is tiny (a 200 MB model), network is about 30 MB/s, and one query takes about 13 ms, so compute is the bottleneck by far. At 10×, I'd shrink the candidate set with a cheaper first stage and cache popular queries before buying 50 GPUs, because candidates multiply everything. At 100×, the design changes: multi-stage cascade, distilled models, and the cross-encoder only on the final few. And I'd load-test one GPU to replace my 40% with a measured number.
+
+</details>
+
+2. **Why is your cross-encoder compute-bound when LLM decoding is memory-bound? What does that change about how you scale them?**
+
+<details>
+<summary>Model answer</summary>
+
+It's about how many tokens share each read of the weights. In decoding, each step produces one token per sequence, so you read all the weights to do 2 FLOPs per weight per sequence: very little math per byte, and you wait on memory. A cross-encoder scores 100 pairs of 256 tokens in one forward pass, so 25,600 tokens share every weight read: thousands of FLOPs per byte, far past the point where the math units become the limit. So for the ranker, you scale by counting FLOPs and buying compute (or cutting tokens). For decoding, you scale by counting bytes per step, batching more users to share weight reads, and watching the KV cache, which each user reads separately.
+
+</details>
+
+3. **How much storage for embeddings of a billion web pages? Where should they live?**
+
+<details>
+<summary>Model answer</summary>
+
+768 dimensions × 2 bytes (bf16) ≈ 1.5 KB per vector, × 10⁹ = 1.5 TB; float32 doubles it to 3 TB. If pages are chunked into about four pieces each, multiply by four: 6 TB. That fits on one or two SSDs but is a dozen machines' worth of RAM, before replicas. Searching it by brute force means reading all of it per query, which is impossible at any real QPS, so you use an approximate index. The practical design: compress to int8 or product-quantized codes (64-768 bytes per vector) held in RAM across shards, keep the full vectors on SSD for re-scoring the top results, and replicate for availability. Computing them is cheap by comparison: about 300 H100-hours for 2,000 tokens a page.
+
+</details>
+
+4. **A chat product on Llama 3.1 8B gets 10 messages a second at peak. How many GPUs, and what limits it?**
+
+<details>
+<summary>Model answer</summary>
+
+Little's law first: if each response streams for about 15 seconds, 10 per second × 15 s = 150 generating at once. Each has, say, 4K tokens of context. The KV cache is 128 KiB per token for this model, so 512 MiB per conversation and about 80 GB for 150 of them, plus 16 GB of weights. On an H100 (80 GB), about 64 GB is free for cache, roughly 119 conversations, so memory size is the wall and you need 2 GPUs (3 with headroom). Bandwidth isn't the issue there: a full step reads 80 GB in about 24 ms, so 40 tokens/s each. On a Spark it flips: 128 GB would hold 200 conversations, but at 273 GB/s each step reading weights plus all caches is too slow past about 20 users at 10 tokens/s, so bandwidth is the wall and you'd need about 8. To fit more: fp8 KV cache, shorter context, shared prefixes.
+
+</details>
+
+5. **An interviewer says: "Assume it's a billion users." What's the first thing you do, and why?**
+
+<details>
+<summary>Model answer</summary>
+
+Turn users into a rate, because machines fail per second, not per user. A billion users isn't a billion requests per second: ask or assume how many are active daily (say 20%, so 200 million) and how many requests each makes a day (say 5), which gives 10⁹ requests a day ≈ 10⁴ per second, and 3 × 10⁴ at peak. Then ask what each request costs in each resource and go through the method. Saying this out loud does two things: it shows the interviewer the scale is tractable (tens of thousands per second is big, but it's a known kind of big), and it lets them correct the assumptions that matter before you build on them.
+
+</details>
+
+## Go Deeper
+
+- **Jon Bentley, *Programming Pearls*, 2nd edition (1999), Column 7: "The Back of the Envelope"**. The original essay for programmers. Short, funny, full of estimates (including the Rule of 72 and Little's law) and a plea to sanity-check everything.
+- **Jeff Dean, "Designs, Lessons and Advice from Building Large Distributed Systems"** (LADIS 2009 keynote). Where "Numbers Everyone Should Know" became famous, followed immediately by worked back-of-envelope designs. Watch how he uses them, not just the table.
+- **Simon Eskildsen, *Napkin Math*** ([github.com/sirupsen/napkin-math](https://github.com/sirupsen/napkin-math)). A modern, measured table of system numbers (memory, SSD, network, cloud costs) with the benchmark code to reproduce them, plus a newsletter of worked problems. The best place to refresh your cheat-sheet.
+- **Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 1**. "Describing load" and "Describing performance": how to pick the load parameters that matter (the Twitter fan-out example) and why percentiles beat averages.
+- **Alex Xu, *System Design Interview: An Insider's Guide*, chapter 2, "Back-of-the-envelope estimation"**. Interview-shaped: the powers-of-two table, availability numbers, and a worked QPS and storage estimate. Then read the rest of the book's designs for practice problems.
+- **Jared Kaplan et al., "Scaling Laws for Neural Language Models"** (OpenAI, 2020). Where the "2N FLOPs per token forward, 6N for training" accounting is laid out. Section 2.1 is the part you need.
+- **Jacob Austin et al., *How to Scale Your Model*** (Google DeepMind, 2025, [jax-ml.github.io/scaling-book](https://jax-ml.github.io/scaling-book/)). Back-of-envelope for ML hardware, taken all the way: rooflines, memory, communication, and how to estimate training and inference cost on real accelerators.
+- **Carol Chen, "Transformer Inference Arithmetic"** (kipp.ly, 2022). A compact walk through KV cache sizes, FLOPs and memory-bound versus compute-bound for transformer inference, exactly the arithmetic of worked example 3.
+
+## Connections
+
+This lesson is arithmetic over things you've already learned. [How slow is slow?](/lessons/latency-numbers/) is where the capacity table came from. [Waiting vs working](/lessons/waiting-vs-working/) gave you Little's law, which turned up three times here: in-flight queries, concurrent chats, and crawler concurrency. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) is the compute-versus-bandwidth split that decides which bar to watch.
+
+Next, [p99 and load testing](/lessons/tail-latency/) takes the knee in your load test seriously: why latency explodes near 100% utilization and how to measure it without lying. [Load balancers and state](/lessons/load-balancing/) is what you need once "8 H100s" becomes 8 servers. [Nearest neighbors at scale](/lessons/vector-search/) answers worked example 2's search problem, [How much memory does a model need?](/lessons/memory-math/) does example 3's memory math in more depth, and [batching](/lessons/batching/) is the main lever for both the ranker's small-model problem and the KV-bound chat server.

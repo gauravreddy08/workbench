@@ -1,0 +1,266 @@
+---
+// An LRU cache (with optional TTL) fed by a Zipf-distributed request stream over 200 keys.
+// Top: the live stream (hits filled, misses outlined) and the cache contents, most recent first.
+// Bottom: hit rate vs cache size for the current skew and TTL (3,000 requests from an empty
+// cache, fixed seed), with the "ideal" curve of a cache that always holds the top-k keys.
+---
+<div class="csim" data-fig="cache-sim">
+  <svg class="csim-live" viewBox="0 0 640 200" role="img" aria-label="Live request stream and the contents of an LRU cache"></svg>
+  <div class="ctl">
+    <label>Skew <input type="range" min="0" max="15" value="10" data-k="skew" /> <output data-o="skew">1.0</output></label>
+    <label>Size <input type="range" min="1" max="100" value="20" data-k="size" /> <output data-o="size">20</output></label>
+    <label>TTL <input type="range" min="0" max="2000" step="50" value="0" data-k="ttl" /> <output data-o="ttl">off</output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="step">Step</button>
+    <button class="btn" type="button" data-act="burst">+500</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+  </div>
+  <p class="csim-read">
+    Requests <span class="readout" data-r="n">0</span> ·
+    hits <span class="readout" data-r="h">0</span> ·
+    misses <span class="readout" data-r="m">0</span> ·
+    evictions <span class="readout" data-r="e">0</span> ·
+    expired <span class="readout" data-r="x">0</span> ·
+    hit rate <span class="readout" data-r="hr">-</span>
+  </p>
+  <svg class="csim-curve" viewBox="0 0 640 230" role="img" aria-label="Hit rate against cache size"></svg>
+  <p class="csim-read" data-r="why"></p>
+</div>
+
+<style>
+  .csim-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+  .csim-curve { margin-top: 14px !important; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const N = 200;
+  const CURVE_REQ = 3000;
+  const SIZES = [1, 2, 3, 4, 6, 8, 10, 13, 16, 20, 25, 30, 35, 40, 50, 60, 70, 80, 90, 100];
+
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function zipfCdf(s: number) {
+    const w: number[] = [];
+    let tot = 0;
+    for (let k = 1; k <= N; k++) { const x = 1 / Math.pow(k, s); w.push(x); tot += x; }
+    const p = w.map((x) => x / tot);
+    const cdf: number[] = [];
+    let c = 0;
+    for (const x of p) { c += x; cdf.push(c); }
+    return { p, cdf };
+  }
+
+  function sample(cdf: number[], u: number) {
+    let lo = 0, hi = cdf.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (cdf[mid] < u) lo = mid + 1; else hi = mid; }
+    return lo + 1; // keys are popularity ranks 1..N
+  }
+
+  class Sim {
+    map = new Map<number, number>(); // key -> time it was written; insertion order = LRU..MRU
+    t = 0; hits = 0; misses = 0; evictions = 0; expired = 0;
+    lastKey = 0; lastOutcome = ''; lastEvicted = 0;
+    constructor(public cap: number, public ttl: number) {}
+    req(key: number) {
+      this.t++;
+      this.lastKey = key; this.lastEvicted = 0;
+      const w = this.map.get(key);
+      if (w !== undefined && (this.ttl === 0 || this.t - w < this.ttl)) {
+        this.map.delete(key); this.map.set(key, w); // move to MRU end; TTL counts from the write
+        this.hits++; this.lastOutcome = 'hit';
+        return;
+      }
+      if (w !== undefined) { this.map.delete(key); this.expired++; this.lastOutcome = 'exp'; }
+      else this.lastOutcome = 'miss';
+      this.misses++;
+      this.map.set(key, this.t);
+      if (this.map.size > this.cap) {
+        const lru = this.map.keys().next().value as number;
+        this.map.delete(lru); this.evictions++; this.lastEvicted = lru;
+      }
+    }
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="cache-sim"]').forEach((root) => {
+    const live = root.querySelector<SVGSVGElement>('.csim-live')!;
+    const curve = root.querySelector<SVGSVGElement>('.csim-curve')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-act="play"]')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const st = { skew: 1.0, size: 20, ttl: 0 };
+    let z = zipfCdf(st.skew);
+    let sim = new Sim(st.size, st.ttl);
+    let rand = rng(7);
+    let hist: string[] = [];
+    let timer = 0;
+
+    function step() {
+      sim.req(sample(z.cdf, rand()));
+      hist.push(sim.lastOutcome);
+      if (hist.length > 50) hist.shift();
+    }
+
+    function reset() {
+      z = zipfCdf(st.skew);
+      sim = new Sim(st.size, st.ttl);
+      rand = rng(7);
+      hist = [];
+      drawLive();
+      drawCurve();
+    }
+
+    function drawLive() {
+      live.replaceChildren();
+      live.append(el('text', { x: 10, y: 18, class: 'strong' }, 'REQUEST STREAM'));
+      live.append(el('text', { x: 630, y: 18, 'text-anchor': 'end' }, 'NEWEST →'));
+      const X0 = 10, W = 12.4;
+      for (let i = 0; i < 50; i++) {
+        const o = hist[hist.length - 50 + i];
+        const x = X0 + i * W;
+        if (!o) { live.append(el('rect', { x, y: 28, width: 9, height: 22, class: 'ink dash', 'stroke-width': 0.6, opacity: 0.35 })); continue; }
+        if (o === 'hit') live.append(el('rect', { x, y: 28, width: 9, height: 22, class: 'fill-blue' }));
+        else {
+          live.append(el('rect', { x: x + 0.5, y: 28.5, width: 8, height: 21, class: 'ink', 'stroke-width': 1 }));
+          if (o === 'exp') live.append(el('line', { x1: x + 0.5, y1: 49.5, x2: x + 8.5, y2: 28.5, class: 'ink', 'stroke-width': 1 }));
+        }
+      }
+      let msg = 'PRESS PLAY OR STEP';
+      if (sim.t) {
+        const what = sim.lastOutcome === 'hit' ? 'HIT' : sim.lastOutcome === 'exp' ? 'EXPIRED → MISS' : 'MISS';
+        msg = `#${sim.t}: KEY ${sim.lastKey} · ${what}` + (sim.lastEvicted ? ` · EVICTED KEY ${sim.lastEvicted}` : '');
+      }
+      live.append(el('text', { x: 10, y: 70, class: sim.lastOutcome === 'hit' ? 'blue-t' : '' }, msg));
+
+      live.append(el('text', { x: 10, y: 100, class: 'strong' }, `CACHE · ${sim.map.size}/${st.size} · MOST RECENT FIRST`));
+      const keys = [...sim.map.keys()].reverse();
+      const show = keys.slice(0, 20);
+      const CW = 30.5;
+      for (let i = 0; i < 20; i++) {
+        const row = i < 10 ? 0 : 1, col = i % 10;
+        const x = 10 + col * (CW + 2) + 0, y = 110 + row * 40;
+        const k = show[i];
+        if (i >= st.size) break;
+        if (k === undefined) {
+          live.append(el('rect', { x, y, width: CW, height: 32, class: 'fill-paper dash', 'stroke-width': 0.8 }));
+          continue;
+        }
+        const isLast = k === sim.lastKey && i === 0;
+        const cls = isLast && sim.lastOutcome === 'hit' ? 'fill-wash' : 'fill-paper';
+        live.append(el('rect', { x, y, width: CW, height: 32, class: cls, 'stroke-width': isLast ? 2 : 1, style: isLast ? 'stroke:var(--blue)' : '' }));
+        live.append(el('text', { x: x + CW / 2, y: y + 20, 'text-anchor': 'middle', class: k <= 10 ? 'strong' : '' }, String(k)));
+      }
+      const rx = 10 + 10 * (CW + 2) + 12;
+      if (keys.length > 20) live.append(el('text', { x: rx, y: 130 }, `+${keys.length - 20} MORE`));
+      live.append(el('text', { x: rx, y: 150 }, 'LOW NUMBER = POPULAR'));
+      if (sim.lastEvicted) {
+        live.append(el('text', { x: rx, y: 176, class: 'blue-t' }, `OUT: KEY ${sim.lastEvicted} (LRU)`));
+      } else if (sim.lastOutcome === 'exp') {
+        live.append(el('text', { x: rx, y: 176, class: 'blue-t' }, `KEY ${sim.lastKey} HAD EXPIRED`));
+      }
+
+      const n = sim.hits + sim.misses;
+      r('n').textContent = String(n);
+      r('h').textContent = String(sim.hits);
+      r('m').textContent = String(sim.misses);
+      r('e').textContent = String(sim.evictions);
+      r('x').textContent = String(sim.expired);
+      r('hr').textContent = n ? (sim.hits / n).toFixed(3) : '-';
+    }
+
+    function lruRate(cap: number) {
+      const s = new Sim(cap, st.ttl);
+      const rr = rng(11);
+      for (let i = 0; i < CURVE_REQ; i++) s.req(sample(z.cdf, rr()));
+      return s.hits / CURVE_REQ;
+    }
+
+    function drawCurve() {
+      curve.replaceChildren();
+      const X0 = 52, X1 = 620, Y0 = 190, Y1 = 26;
+      const xs = (k: number) => X0 + ((k - 1) / 99) * (X1 - X0);
+      const ys = (h: number) => Y0 - h * (Y0 - Y1);
+      curve.append(el('text', { x: 10, y: 14, class: 'strong' }, 'HIT RATE VS CACHE SIZE'));
+      for (const h of [0, 0.25, 0.5, 0.75, 1]) {
+        curve.append(el('line', { x1: X0, y1: ys(h), x2: X1, y2: ys(h), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+        curve.append(el('text', { x: X0 - 8, y: ys(h) + 4, 'text-anchor': 'end' }, h.toFixed(2)));
+      }
+      for (const k of [1, 25, 50, 75, 100]) curve.append(el('text', { x: xs(k), y: Y0 + 18, 'text-anchor': 'middle' }, String(k)));
+      curve.append(el('text', { x: X1, y: Y0 + 34, 'text-anchor': 'end' }, `CACHE SIZE (OF ${N} KEYS) →`));
+
+      // ideal: always holding the k most popular keys, no TTL
+      let c = 0;
+      const ideal: string[] = [];
+      for (let k = 1; k <= 100; k++) { c += z.p[k - 1]; ideal.push(`${k === 1 ? 'M' : 'L'}${xs(k).toFixed(1)} ${ys(c).toFixed(1)}`); }
+      curve.append(el('path', { d: ideal.join(' '), class: 'ink dash', 'stroke-width': 1 }));
+
+      const pts = SIZES.map((k) => [k, lruRate(k)] as [number, number]);
+      curve.append(el('path', { d: pts.map(([k, h], i) => `${i ? 'L' : 'M'}${xs(k).toFixed(1)} ${ys(h).toFixed(1)}`).join(' '), class: 'blue', 'stroke-width': 1.6 }));
+
+      const cur = lruRate(st.size);
+      const topk = z.p.slice(0, st.size).reduce((a, b) => a + b, 0);
+      curve.append(el('line', { x1: xs(st.size), y1: Y1, x2: xs(st.size), y2: Y0, class: 'blue dash', 'stroke-width': 1 }));
+      curve.append(el('circle', { cx: xs(st.size), cy: ys(cur), r: 4, class: 'fill-blue' }));
+      const lx = st.size > 60 ? xs(st.size) - 8 : xs(st.size) + 8;
+      const anchor = st.size > 60 ? 'end' : 'start';
+      curve.append(el('text', { x: lx, y: Math.min(Y0 - 8, ys(cur) + 18), 'text-anchor': anchor, class: 'blue-t' }, `LRU ${cur.toFixed(2)}`));
+      curve.append(el('text', { x: lx, y: Math.max(Y1 + 10, ys(topk) - 8), 'text-anchor': anchor }, `TOP-${st.size} ${topk.toFixed(2)}`));
+
+      curve.append(el('line', { x1: 400, y1: 206, x2: 424, y2: 206, class: 'blue', 'stroke-width': 1.6 }));
+      curve.append(el('text', { x: 430, y: 210 }, 'LRU'));
+      curve.append(el('line', { x1: 470, y1: 206, x2: 494, y2: 206, class: 'ink dash', 'stroke-width': 1 }));
+      curve.append(el('text', { x: 500, y: 210 }, 'IDEAL TOP-K'));
+
+      let why = `With skew ${st.skew.toFixed(1)}, the ${st.size} most popular of ${N} keys get ${(topk * 100).toFixed(0)}% of requests. LRU gets ${(cur * 100).toFixed(0)}% from a cold start over ${CURVE_REQ} requests: it pays one compulsory miss per distinct key, and keeps some unpopular keys that happened to be requested recently. `;
+      if (st.skew < 0.3) why += 'With almost no skew every key is equally likely, so hit rate is roughly size / keys: caching barely helps.';
+      else if (st.ttl > 0) why += `TTL ${st.ttl} requests: even hot keys are thrown away and refetched, which caps the hit rate below the no-TTL curve.`;
+      else why += 'Notice the curve: the first few slots buy the most. Doubling a cache that is already big buys little.';
+      r('why').textContent = why;
+    }
+
+    function setPlaying(on: boolean) {
+      playBtn.setAttribute('aria-pressed', String(on));
+      playBtn.textContent = on ? 'Pause' : 'Play';
+      clearInterval(timer);
+      if (on) timer = window.setInterval(() => { step(); drawLive(); }, 110);
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        const k = inp.dataset.k!;
+        const o = root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+        if (k === 'skew') { st.skew = +inp.value / 10; o.textContent = st.skew.toFixed(1); }
+        if (k === 'size') { st.size = +inp.value; o.textContent = inp.value; }
+        if (k === 'ttl') { st.ttl = +inp.value; o.textContent = st.ttl ? `${st.ttl} req` : 'off'; }
+        reset();
+      });
+    });
+    root.querySelector('[data-act="step"]')!.addEventListener('click', () => { setPlaying(false); step(); drawLive(); });
+    root.querySelector('[data-act="burst"]')!.addEventListener('click', () => { for (let i = 0; i < 500; i++) step(); drawLive(); });
+    root.querySelector('[data-act="reset"]')!.addEventListener('click', () => { setPlaying(false); reset(); });
+    playBtn.addEventListener('click', () => {
+      if (reduce) { for (let i = 0; i < 50; i++) step(); drawLive(); return; }
+      setPlaying(playBtn.getAttribute('aria-pressed') !== 'true');
+    });
+    reset();
+  });
+</script>

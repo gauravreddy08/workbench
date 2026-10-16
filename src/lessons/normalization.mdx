@@ -1,0 +1,774 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import NormRipple from '../components/figures/NormRipple.astro';
+
+## Today
+
+- Look at any table (a spreadsheet, a CSV, a Postgres table someone else made) and point at the exact facts that are stored more than once, and the bugs that copying invites.
+- Say what a functional dependency is in one plain sentence, and use it to explain 1NF, 2NF, 3NF and BCNF without reciting definitions.
+- Pick keys on purpose: primary, foreign, natural, surrogate, and know which one breaks when an email address changes.
+- Take a messy CSV of your own experiment runs, find its contradictions with SQL, design a clean schema with constraints that refuse bad data, migrate into it, and rebuild the original view with joins.
+- Decide when to break the rules on purpose (dashboards, warehouses, caches, document stores, JSON columns), and say what you pay for it: staleness.
+
+Prerequisites: basic SQL (`SELECT`, `WHERE`, `GROUP BY`, `JOIN` at the "I've written one" level). Everything runs in SQLite, which ships with macOS and Python. Rough time: one evening.
+
+## The Problem
+
+Your team keeps eval results in a shared sheet. One row per metric per run: run id, who ran it, their email, the model, its parameter count, the dataset and its version, the metric, the value. It started as twenty rows. It's now a few thousand, exported to `runs.csv` every week so a notebook can plot it.
+
+Then three small things happen in the same month.
+
+Sam changes his email address when his name gets updated in the company directory. Someone does a find-and-replace on the sheet, but only on the rows that were visible after a filter. Now Sam has two emails, and the notebook that groups by email shows him as two people.
+
+Priya registers a new dataset, `tf-clicks v1`, with 40,000 labeled pairs. She wants it in the sheet so people know it exists. But every row in the sheet is a metric of a run, and nobody has run anything on it yet. There is no row to put it in. She sends a Slack message instead, which nobody will find in three months.
+
+Then someone cleans up failed runs. One of them was the only run ever done with `ce-deberta-v3-large`. The rows go, and with them the only place anyone wrote down that model is 435M parameters.
+
+None of these is anyone's fault. They are the table's fault. The sheet stores each fact many times, or only as a side effect of storing some other fact, and so every edit is a chance to make it disagree with itself. You've probably met this at work under its official name. The fix is called <Term w="normalization">Designing tables so that each fact is stored in exactly one place. Mostly done by splitting one wide table into several narrower ones linked by ids.</Term>, and the idea is older than almost everything else you use.
+
+<Origin year="1970" title="Ted Codd and the shared data bank">
+
+In the 1960s, a database was a tangle of records linked by pointers. IBM's IMS (built partly for the Apollo program's parts lists) stored data as trees, and programs found things by walking those trees step by step: go to this supplier, follow the pointer to its first part, then the next. If someone reorganised how the data was stored, every program that walked it broke.
+
+Edgar F. "Ted" Codd, a mathematician at IBM's San Jose lab, proposed something radical in June 1970, in "A Relational Model of Data for Large Shared Data Banks" (Communications of the ACM). Store everything as plain tables of values. No pointers. Programs say *what* rows they want, and the system works out *how* to find them. In that paper he also said each cell should hold one simple value, not a nested table, and called that "normal form".
+
+A year later, in "Further Normalization of the Data Base Relational Model" (1971), he noticed that even flat tables could store a fact in many places, and he named the three kinds of trouble that causes: insertion, update and deletion anomalies. He defined second and third normal form to rule them out, and in 1974, with Raymond Boyce, a slightly stricter version, now called Boyce-Codd normal form. Codd later joked that he picked the word "normalization" because Nixon was in the news "normalizing" relations with China. Everything in this lesson comes from those few papers.
+
+</Origin>
+
+## The Idea
+
+### Three ways a table lies
+
+The three stories above are the three anomalies, and they are worth naming because you'll start seeing them everywhere.
+
+An <Term w="anomaly">A way a table's design lets it end up wrong or lets a fact get lost, even when every individual edit was reasonable.</Term> is not a bug in any query. It's a bug in the *shape* of the table.
+
+<Figure n="001" title="THREE ANOMALIES" caption="Update: the same fact is stored in many rows, so a change has to find every copy, and missing one leaves two answers. Insert: a fact can only be stored alongside some other fact, so you can't record it alone. Delete: removing one fact silently removes another that happened to live in the same rows.">
+<svg viewBox="0 0 680 230" role="img" aria-label="Three panels showing an update anomaly, an insert anomaly, and a delete anomaly">
+  <rect x="0.5" y="10.5" width="209" height="209" class="fill-paper" stroke-width="1" />
+  <text x="12" y="32" class="strong">UPDATE</text>
+  <text x="12" y="48">CHANGE PRIYA'S EMAIL</text>
+  <rect x="12" y="60" width="62" height="18" class="ink" stroke-width="1" /><text x="18" y="73">run-101</text>
+  <rect x="78" y="60" width="120" height="18" class="fill-wash" stroke-width="1" /><text x="84" y="73">priya.r@tf.io</text>
+  <rect x="12" y="82" width="62" height="18" class="ink" stroke-width="1" /><text x="18" y="95">run-101</text>
+  <rect x="78" y="82" width="120" height="18" class="fill-wash" stroke-width="1" /><text x="84" y="95">priya.r@tf.io</text>
+  <rect x="12" y="104" width="62" height="18" class="ink" stroke-width="1" /><text x="18" y="117">run-103</text>
+  <rect x="78" y="104" width="120" height="18" class="fill-wash" stroke-width="1" /><text x="84" y="117">priya.r@tf.io</text>
+  <rect x="12" y="126" width="62" height="18" class="ink" stroke-width="1" /><text x="18" y="139">run-103</text>
+  <rect x="78" y="126" width="120" height="18" class="ink dash" stroke-width="1.5" /><text x="84" y="139" class="strong">priya@tf.io</text>
+  <rect x="12" y="148" width="62" height="18" class="ink" stroke-width="1" /><text x="18" y="161">run-105</text>
+  <rect x="78" y="148" width="120" height="18" class="fill-wash" stroke-width="1" /><text x="84" y="161">priya.r@tf.io</text>
+  <text x="12" y="190" class="blue-t">4 CHANGED, 1 MISSED</text>
+  <text x="12" y="206" class="blue-t">= TWO EMAILS, WHICH IS TRUE?</text>
+
+  <rect x="235.5" y="10.5" width="209" height="209" class="fill-paper" stroke-width="1" />
+  <text x="247" y="32" class="strong">INSERT</text>
+  <text x="247" y="48">NEW DATASET, NO RUNS YET</text>
+  <rect x="247" y="60" width="46" height="18" class="ink" stroke-width="1" /><text x="252" y="73">RUN</text>
+  <rect x="295" y="60" width="56" height="18" class="ink" stroke-width="1" /><text x="300" y="73">METRIC</text>
+  <rect x="353" y="60" width="80" height="18" class="ink" stroke-width="1" /><text x="358" y="73">DATASET</text>
+  <rect x="247" y="82" width="46" height="18" class="ink dash" stroke-width="1.5" /><text x="266" y="95" class="strong">?</text>
+  <rect x="295" y="82" width="56" height="18" class="ink dash" stroke-width="1.5" /><text x="319" y="95" class="strong">?</text>
+  <rect x="353" y="82" width="80" height="18" class="fill-wash" stroke-width="1" /><text x="358" y="95">clicks v1</text>
+  <text x="247" y="130">KEY IS RUN + METRIC.</text>
+  <text x="247" y="146">NO RUN, NO KEY, NO ROW.</text>
+  <text x="247" y="190" class="blue-t">THE FACT HAS NOWHERE</text>
+  <text x="247" y="206" class="blue-t">TO LIVE</text>
+
+  <rect x="470.5" y="10.5" width="209" height="209" class="fill-paper" stroke-width="1" />
+  <text x="482" y="32" class="strong">DELETE</text>
+  <text x="482" y="48">DROP THE ONLY DEBERTA RUN</text>
+  <rect x="482" y="60" width="56" height="18" class="ink" stroke-width="1" /><text x="487" y="73">run-300</text>
+  <rect x="540" y="60" width="72" height="18" class="ink" stroke-width="1" /><text x="545" y="73">deberta-l</text>
+  <rect x="614" y="60" width="54" height="18" class="fill-wash" stroke-width="1" /><text x="620" y="73">435M</text>
+  <rect x="482" y="82" width="56" height="18" class="ink" stroke-width="1" /><text x="487" y="95">run-300</text>
+  <rect x="540" y="82" width="72" height="18" class="ink" stroke-width="1" /><text x="545" y="95">deberta-l</text>
+  <rect x="614" y="82" width="54" height="18" class="fill-wash" stroke-width="1" /><text x="620" y="95">435M</text>
+  <rect x="482" y="104" width="56" height="18" class="ink" stroke-width="1" /><text x="487" y="117">run-300</text>
+  <rect x="540" y="104" width="72" height="18" class="ink" stroke-width="1" /><text x="545" y="117">deberta-l</text>
+  <rect x="614" y="104" width="54" height="18" class="fill-wash" stroke-width="1" /><text x="620" y="117">435M</text>
+  <line x1="478" y1="69" x2="672" y2="69" class="ink" stroke-width="1.5" />
+  <line x1="478" y1="91" x2="672" y2="91" class="ink" stroke-width="1.5" />
+  <line x1="478" y1="113" x2="672" y2="113" class="ink" stroke-width="1.5" />
+  <text x="482" y="146">3 METRIC ROWS GONE.</text>
+  <text x="482" y="190" class="blue-t">SO IS "DEBERTA-L IS 435M",</text>
+  <text x="482" y="206" class="blue-t">ITS ONLY COPY</text>
+</svg>
+</Figure>
+
+All three have one root cause, and it fits in a sentence you can carry around: **the table mixes several kinds of thing into one row**. A row in our sheet is simultaneously "a metric value", "a run", "a person", "a model" and "a dataset". Each of those things has its own facts, and they've been glued together and copied wherever the glue went.
+
+Play with it. Click a cell in the flat sheet below and every other cell that holds the same fact lights up: those are the rows you'd have to edit together. Change one row only and watch the sheet start contradicting itself. Then switch to the normalized version and make the same edit.
+
+<Figure n="002" title="WHERE DOES A FACT LIVE?" caption="Flat sheet: Priya's email is written in 7 rows, and a model's size in every row that used it. Changing one copy leaves the others disagreeing (dashed). Normalized: each fact sits in one row of its own table, and runs refer to it by id (the arrows). The same edit is one write, and there is no second copy to contradict it." wide>
+<NormRipple />
+</Figure>
+
+Notice which cell in the flat sheet was already fine: the metric value. It lives in exactly one row, because the row *is* that fact (this run, this metric, this number). Everything else in the row is a passenger. Normalization is the process of giving each passenger a seat of its own.
+
+### "If you know X, you know Y"
+
+To do that on purpose rather than by eye, you need one tool, and it's simpler than its name. A <Term w="functional dependency">A rule about your data of the form "if you know X, you know Y": any two rows that agree on X must agree on Y. Written X → Y.</Term> is a rule of the form: if you know this, you know that.
+
+- If you know the `run_id`, you know which model it used. Every row with `run-101` must say the same model.
+- If you know the `author_email`, you know the author's name and team.
+- If you know the `model_name`, you know its parameter count.
+- If you know the run *and* the metric name, you know the metric value. Knowing only the run isn't enough: run 101 has three different values.
+
+It's written `run_id → model_name`, read "run_id determines model_name". The left side is the <Term w="determinant">The "if you know this" side of a functional dependency. The columns that pin down some other column.</Term>.
+
+Two things to notice. First, these rules are facts about the *world*, not about the data you happen to have. Maybe today every model in the sheet with 33M params is a MiniLM, but that doesn't mean `model_params → model_name`; tomorrow someone trains a 33M e5. You decide dependencies by asking "could two rows ever legitimately disagree on this?", not by running a query. Queries can only *disprove* a dependency (find two rows that disagree), never prove one.
+
+Second, every anomaly in Figure 001 is a dependency being stored badly. `author_email → author_name` is true, but the table stores the pair once per metric row, so the rule is enforced by nothing but human care.
+
+<Figure n="003" title="THE DEPENDENCY MAP OF RUNS.CSV" caption="Each arrow reads: if you know the left, you know the right. Only metric_value needs the whole key (run plus metric). Everything in the middle column depends on half the key, and everything in the right column depends on something that isn't a key at all. Each of those arrows is a copy waiting to go stale." wide>
+<svg viewBox="0 0 680 340" role="img" aria-label="Functional dependencies of the flat runs table">
+  <defs>
+    <marker id="norm-arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="220" y="20" class="blue-t">NEEDS ONLY run_id (HALF THE KEY)</text>
+  <text x="480" y="20" class="blue-t">NEEDS A NON-KEY COLUMN</text>
+  <rect x="6" y="40" width="140" height="102" class="ink dash" stroke-width="1" />
+  <text x="12" y="36" class="strong">KEY</text>
+  <rect x="16" y="52" width="120" height="26" class="fill-wash" stroke-width="1" /><text x="76" y="69" text-anchor="middle" class="strong">run_id</text>
+  <rect x="16" y="102" width="120" height="26" class="fill-wash" stroke-width="1" /><text x="76" y="119" text-anchor="middle" class="strong">metric_name</text>
+
+  <rect x="220" y="40" width="170" height="26" class="fill-paper" stroke-width="1" /><text x="305" y="57" text-anchor="middle">started_at, lr, bs, tags</text>
+  <rect x="220" y="100" width="170" height="26" class="fill-paper" stroke-width="1" /><text x="305" y="117" text-anchor="middle">author_email</text>
+  <rect x="220" y="160" width="170" height="26" class="fill-paper" stroke-width="1" /><text x="305" y="177" text-anchor="middle">model_name</text>
+  <rect x="220" y="220" width="170" height="26" class="fill-paper" stroke-width="1" /><text x="305" y="237" text-anchor="middle">dataset_name, version</text>
+  <rect x="220" y="294" width="170" height="26" class="fill-wash" stroke-width="1" /><text x="305" y="311" text-anchor="middle" class="strong">metric_value</text>
+  <text x="400" y="311">NEEDS THE WHOLE KEY: FINE</text>
+
+  <rect x="480" y="100" width="190" height="26" class="fill-paper" stroke-width="1" /><text x="575" y="117" text-anchor="middle">author_name, author_team</text>
+  <rect x="480" y="160" width="190" height="26" class="fill-paper" stroke-width="1" /><text x="575" y="177" text-anchor="middle">model_family, params</text>
+  <rect x="480" y="220" width="190" height="26" class="fill-paper" stroke-width="1" /><text x="575" y="237" text-anchor="middle">dataset_rows</text>
+
+  <path d="M136,65 C180,65 180,53 218,53" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M136,65 C180,65 180,113 218,113" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M136,65 C180,65 180,173 218,173" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M136,65 C180,65 180,233 218,233" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M146,130 C190,130 180,307 218,307" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M390,113 L478,113" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M390,173 L478,173" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+  <path d="M390,233 L478,233" class="blue" stroke-width="1.2" marker-end="url(#norm-arr3)" />
+</svg>
+</Figure>
+
+### Keys, said plainly
+
+A <Term w="key" label="key (candidate key)">A smallest set of columns that pins down a whole row: if you know these, you know everything else in it. A table can have more than one.</Term> is a dependency that reaches everything: a set of columns that, once you know them, tells you every other column in the row. In the flat sheet, `run_id` alone isn't a key (run 101 has three rows), but `(run_id, metric_name)` is. The one you pick to be *the* identity of a row is the <Term w="primary key">The key the table officially uses to identify rows. The database refuses duplicates and empty values in it.</Term>, and the database will refuse two rows with the same one.
+
+Now keep that in mind and look back at Figure 003. The middle column depends on *half* the key. The right column depends on something that isn't a key at all. That's the whole theory of normal forms, as two complaints about arrows.
+
+### The normal forms, as one rule applied four times
+
+Each normal form is a stricter version of the same promise: **every fact lives in exactly one place**. Each one removes a specific kind of copy, and with it a specific anomaly. You don't need to memorise them as definitions. You need to recognise the copy each one forbids.
+
+**First normal form (1NF): one value per cell, and rows you can tell apart.** Our sheet has a `tags` column holding `bm25-negs;hardneg`. That cell is a list hiding inside one value. To find runs tagged `hardneg` you write `tags LIKE '%hardneg%'`, which also matches a tag someone later calls `hardneg-v2`. You can't put a constraint on "each tag is one of these eight", can't index it, can't count tags without string surgery. The 1NF fix is to give the list its own table: `run_tags(run_id, tag)`, one row per tag. The same rule forbids <Term w="repeating groups">Columns that are really a list spread sideways, like metric1_name, metric1_value, metric2_name, metric2_value. Adding a fifth metric means changing the table.</Term> like `metric1_name, metric1_value, metric2_name, ...`. A value is <Term w="atomic">Treated as one indivisible value by the database. "Atomic" is relative to how you query it: a date is atomic until you constantly need just the month.</Term> when you never need to look inside it to answer your questions.
+
+**Second normal form (2NF): every column depends on the whole key, not part of it.** The key is `(run_id, metric_name)`, but `model_name` depends on `run_id` alone. So the model is written once per metric: three times for run 101. The anomaly is a run that disagrees with itself (two of its rows say MiniLM-L12, one says L6). The fix: move the run-level facts into `runs`, keyed by `run_id` alone, and leave `metrics(run_id, metric_name, value)` with only the column that needs the whole key. A table whose key is a single column can't violate 2NF, since there is no "part" of the key to depend on.
+
+**Third normal form (3NF): non-key columns depend on the key and nothing else.** Now `runs` has `run_id → model_name → model_params`. The params depend on the key only *through* another column. That's a <Term w="transitive dependency">A dependency that goes through a middle column: the key determines B, and B determines C. C then gets copied wherever B appears.</Term>, and it's why every run of MiniLM-L12 repeats "33M". Same with `author_email → author_name, author_team` and `(dataset_name, dataset_version) → dataset_rows`. The fix: `authors`, `models`, `datasets` tables, and `runs` holds only a pointer to each. This is where the insert and delete anomalies disappear too. A dataset with no runs is a row in `datasets`, with no run needed. Deleting the only DeBERTa run leaves the `models` row alone.
+
+There's an old summary of 2NF and 3NF together, from Bill Kent's 1983 guide: every non-key column must depend on **the key, the whole key, and nothing but the key**. (People like to add "so help me Codd".)
+
+**Boyce-Codd normal form (BCNF): if you know X, you know Y, only when X is a key.** 3NF has a loophole: it only polices *non-key* columns. Here's a case it misses. Say each eval harness has one owner, and each owner maintains exactly one dataset's harness. You record sign-offs in a table `signoffs(model, dataset, owner)`: each model on each dataset is signed off by one owner. The dependencies are `(model, dataset) → owner` and `owner → dataset`. Both `(model, dataset)` and `(model, owner)` are keys, so every column is part of some key, and 3NF is satisfied. But `owner → dataset` means "Lena owns msmarco" is copied into every one of Lena's sign-off rows, and you can't record that Lena owns msmarco until she's signed off a model. Same anomalies, new disguise. BCNF closes the loophole: the left side of every dependency must be a key. The fix is `owners(owner, dataset)` and `signoffs(model, owner)`.
+
+BCNF has a price worth knowing about. After that split, the rule "one owner per model per dataset" is no longer something a single `UNIQUE` constraint can enforce, because model and dataset are now in different tables. You'd need a trigger or application code. This is the one place where the "more normal" design is not strictly better, and textbooks call it losing <Term w="dependency preservation">Whether every rule about your data can still be checked inside a single table after you split it. BCNF sometimes gives this up; 3NF never has to.</Term>. In practice, most people aim for 3NF and check that it's also BCNF, which it usually is.
+
+There are higher normal forms (4NF, 5NF) for rarer cases. The one worth one sentence: if you stored a run's tags *and* the GPUs it ran on in one table `(run_id, tag, gpu)`, you'd need a row for every tag-GPU combination, though the two lists have nothing to do with each other. 4NF says: two independent lists go in two tables. Kent's guide covers both in a few pages.
+
+<Figure n="004" title="FROM ONE SHEET TO SIX TABLES" caption="Each step removes one kind of copy. 1NF pulls the list out of the tags cell. 2NF separates what depends on the run from what depends on run plus metric. 3NF pulls out the things that depend on the author, the model and the dataset, leaving runs with three ids that point at them." wide>
+<svg viewBox="0 0 680 440" role="img" aria-label="Decomposition of the flat table through 1NF, 2NF, and 3NF">
+  <text x="10" y="40" class="strong">FLAT</text>
+  <rect x="110" y="14" width="560" height="66" class="fill-paper" stroke-width="1" />
+  <text x="122" y="32" class="strong">runs.csv</text>
+  <text x="122" y="50">run_id · metric_name · metric_value · started_at · lr · bs · tags</text>
+  <text x="122" y="68">author_name · author_email · author_team · model_* · dataset_*</text>
+
+  <text x="10" y="122" class="strong">1NF</text>
+  <text x="10" y="138">ONE VALUE</text>
+  <text x="10" y="152">PER CELL</text>
+  <rect x="110" y="100" width="390" height="56" class="fill-paper" stroke-width="1" />
+  <text x="122" y="120" class="strong">flat</text>
+  <text x="122" y="140">everything above, minus tags</text>
+  <rect x="510" y="100" width="160" height="56" class="fill-wash" stroke-width="1" />
+  <text x="522" y="120" class="strong">run_tags</text>
+  <text x="522" y="140">run_id · tag</text>
+
+  <text x="10" y="200" class="strong">2NF</text>
+  <text x="10" y="216">WHOLE KEY</text>
+  <rect x="110" y="178" width="300" height="70" class="fill-paper" stroke-width="1" />
+  <text x="122" y="198" class="strong">runs</text>
+  <text x="122" y="216">run_id · started_at · lr · bs</text>
+  <text x="122" y="234">author_* · model_* · dataset_*</text>
+  <rect x="420" y="178" width="150" height="70" class="fill-wash" stroke-width="1" />
+  <text x="432" y="198" class="strong">metrics</text>
+  <text x="432" y="216">run_id · name</text>
+  <text x="432" y="234">value</text>
+  <rect x="580" y="178" width="90" height="70" class="fill-paper" stroke-width="1" />
+  <text x="588" y="198" class="strong">run_tags</text>
+  <text x="588" y="216">run_id</text>
+  <text x="588" y="234">tag</text>
+
+  <text x="10" y="292" class="strong">3NF</text>
+  <text x="10" y="308">NOTHING BUT</text>
+  <text x="10" y="322">THE KEY</text>
+  <rect x="110" y="270" width="300" height="70" class="fill-wash" stroke-width="1" />
+  <text x="122" y="290" class="strong">runs</text>
+  <text x="122" y="308">run_id · started_at · lr · bs</text>
+  <text x="122" y="326">author_id · model_id · dataset_id</text>
+  <rect x="420" y="270" width="150" height="70" class="fill-paper" stroke-width="1" />
+  <text x="432" y="290" class="strong">metrics</text>
+  <text x="432" y="308">run_id · name</text>
+  <text x="432" y="326">value</text>
+  <rect x="580" y="270" width="90" height="70" class="fill-paper" stroke-width="1" />
+  <text x="588" y="290" class="strong">run_tags</text>
+  <text x="588" y="308">run_id</text>
+  <text x="588" y="326">tag</text>
+  <rect x="110" y="372" width="180" height="58" class="fill-wash" stroke-width="1" />
+  <text x="122" y="392" class="strong">authors</text>
+  <text x="122" y="410">author_id · email</text>
+  <text x="122" y="424">name · team</text>
+  <rect x="300" y="372" width="180" height="58" class="fill-wash" stroke-width="1" />
+  <text x="312" y="392" class="strong">models</text>
+  <text x="312" y="410">model_id · name</text>
+  <text x="312" y="424">family · params</text>
+  <rect x="490" y="372" width="180" height="58" class="fill-wash" stroke-width="1" />
+  <text x="502" y="392" class="strong">datasets</text>
+  <text x="502" y="410">dataset_id · name</text>
+  <text x="502" y="424">version · n_rows</text>
+  <line x1="170" y1="340" x2="170" y2="372" class="blue" stroke-width="1.2" />
+  <line x1="260" y1="340" x2="390" y2="372" class="blue" stroke-width="1.2" />
+  <line x1="350" y1="340" x2="580" y2="372" class="blue" stroke-width="1.2" />
+  <text x="180" y="360" class="blue-t">FK</text>
+</svg>
+</Figure>
+
+<Predict id="norm-email">
+
+In the build you'll generate 600 runs (about 1,760 rows) and change Priya's email. How many rows does the `UPDATE` touch in the flat table, and how many in the normalized one? Now scale up to 200,000 runs. Roughly how long does each update take?
+
+<Fragment slot="answer">
+
+Flat: one write per row Priya appears in. With the generator's seed, that's 611 rows at 600 runs and about 210,000 rows at 200,000 runs. Normalized: exactly 1 row, at any scale, because her email lives in one row of `authors`. On my Mac (SQLite 3.53 via Python), the big flat update took about half a second; the normalized one about half a millisecond, which is mostly the cost of committing. The flat version gets slower as the table grows. The normalized one doesn't care how many runs she's done.
+
+The more important difference isn't the time. It's that the flat version is only correct if your `WHERE` clause finds every copy, and Sam's half-updated email in the data shows how often that goes wrong.
+
+</Fragment>
+</Predict>
+
+### Foreign keys: the arrows, enforced
+
+Once runs only store `author_id`, something has to guarantee that the id points at a real author. That's a <Term w="foreign key">A column whose values must exist as a key in another table. The database refuses an insert that points at nothing, and refuses to delete a row others still point at (unless told what to do instead).</Term>: `runs.author_id REFERENCES authors(author_id)`. The database now refuses a run whose author doesn't exist, and refuses to delete an author who still has runs. You can tell it what to do instead: `ON DELETE CASCADE` means "delete their runs too" (right for `metrics`, which mean nothing without their run), `ON DELETE RESTRICT` means "refuse" (right for `authors`). This guarantee is called <Term w="referential integrity">The promise that every reference points at something that exists. No orphans.</Term>.
+
+This is where "good schemas make bugs impossible instead of just unlikely" becomes literal. A <Term w="constraint">A rule the database checks on every write and refuses to break: NOT NULL, UNIQUE, CHECK, PRIMARY KEY, FOREIGN KEY.</Term> is a dependency you've told the database about. `UNIQUE(email)` is the database enforcing `email → author`. `PRIMARY KEY (run_id, name)` on `metrics` is the database enforcing "one value per metric per run". `CHECK (params_m > 0)` stops someone pasting "33M" into a number column. Code review catches some bad writes. A constraint catches all of them, forever, including the ones from the notebook someone runs at 2 a.m.
+
+### Natural or surrogate keys
+
+Which column should identify an author? The obvious choice is the email: it's unique, everyone has one. A key that is a real-world fact like that is a <Term w="natural key">A key made of real data that means something outside the database: an email, an ISBN, a dataset name plus version.</Term>.
+
+The trouble is in the first story. Emails change. If `authors` is keyed by email and `runs` stores the email as a foreign key, Sam's email change becomes an update of every run that points at him: the update anomaly is back, now with a constraint that blocks the change halfway (you'll hit exactly this in Break It). The usual fix is a <Term w="surrogate key">A meaningless id the database makes up (1, 2, 3 or a UUID) purely to identify a row. It never needs to change, because it doesn't mean anything.</Term>: `author_id INTEGER PRIMARY KEY`. It means nothing, so nothing in the world can make it change. You keep the email as `UNIQUE`, so it still can't be duplicated, but nothing points at it.
+
+The rule of thumb: use a surrogate key for things whose identifying facts can change (people, models that get renamed, companies). A natural key is fine when it's truly permanent, or when the row is defined by it: `metrics(run_id, name)` is naturally identified by "this run, this metric", and inventing a `metric_row_id` adds nothing. `datasets` gets a surrogate id but also `UNIQUE(name, version)`, so the natural identity is still enforced.
+
+### Joins are the price
+
+The normalized schema has no row that looks like the original sheet. To get it back you join: metrics to runs, runs to authors, models and datasets. A <Term w="join">Combining rows from two tables where a column matches, like metrics.run_id = runs.run_id. It's how normalized data gets reassembled into the view you want to read.</Term> is the price you pay for storing each fact once. You trade a little work at read time for correctness at write time.
+
+How big is that price? Smaller than people fear, as long as the columns you join on have an <Term w="index">A sorted lookup structure (usually a B-tree) on one or more columns, so the database can find matching rows without scanning the whole table.</Term> (primary keys always do; for foreign keys you usually add one yourself). Looking up one run with all its author, model and dataset details is five index lookups, each a few microseconds. Scanning everything for a dashboard costs about the same either way, because the time goes to reading 600,000 metric rows, not to matching them up with six authors. You'll measure both. The [indexes lesson](/lessons/indexes/) is where the "why" lives.
+
+Where joins *do* hurt: many-table joins over billions of rows in an analytics query, joins across machines (the data for each side lives on different servers and has to cross the network), and the read path of a page that must render in 5 ms. That's when you start thinking about breaking the rules.
+
+### When to denormalize on purpose
+
+<Term w="denormalization">Deliberately storing a fact in more than one place (or precomputing a join) to make reads faster or simpler, and accepting the work of keeping copies in sync.</Term> is not the absence of design. It's normalizing first, then copying on purpose, with a plan for keeping the copies right. Some places where that's the correct call:
+
+**Read-heavy dashboards.** Your eval dashboard runs the same "best nDCG per model per dataset" query every time anyone opens it, and new runs land a few times an hour. Computing it once and storing the result is a <Term w="materialized view">A stored copy of a query's result, kept as a real table. Reading it is instant, but it's only as fresh as the last time it was refreshed.</Term>. Postgres has them built in (`CREATE MATERIALIZED VIEW`, then `REFRESH MATERIALIZED VIEW` when you want it updated). SQLite doesn't, so you'll build one by hand, which is more instructive anyway.
+
+**Warehouses and star schemas.** Analytics databases (BigQuery, Snowflake, Redshift, DuckDB) are built for scanning huge tables, and they usually store data column by column, so a wide table with repeated strings compresses well and costs little. The classic layout is a <Term w="star schema">A warehouse layout with one big "fact" table of events or measurements in the middle, and "dimension" tables of descriptive attributes around it, which are deliberately left denormalized.</Term>: one central table of measurements (each eval result), surrounded by wide descriptive tables (models, datasets, people, dates). The dimension tables are deliberately unnormalized: `dim_model` might carry family, size, base checkpoint and owning team all in one row, even though team really depends on the owner. Nobody updates these in place; they're rebuilt by a pipeline from the normalized source.
+
+<Figure n="005" title="A STAR SCHEMA FOR EVALS" caption="The fact table in the middle is long and narrow: one row per measurement, mostly ids and numbers. The dimension tables around it are short and wide, and they repeat things on purpose (a model's team, a date's week and quarter) so analysts can filter and group without chains of joins. They are rebuilt from the normalized source, never edited by hand.">
+<svg viewBox="0 0 680 330" role="img" aria-label="Star schema with a fact table and four dimension tables">
+  <rect x="250" y="112" width="180" height="104" class="fill-wash" stroke-width="1.2" />
+  <text x="262" y="132" class="strong">fact_eval</text>
+  <text x="262" y="152">run_key · model_key</text>
+  <text x="262" y="168">dataset_key · author_key</text>
+  <text x="262" y="184">date_key · metric</text>
+  <text x="262" y="204" class="blue-t">value</text>
+
+  <rect x="20" y="16" width="200" height="74" class="fill-paper" stroke-width="1" />
+  <text x="32" y="36" class="strong">dim_model</text>
+  <text x="32" y="54">model_key · name · family</text>
+  <text x="32" y="72">params · base · team</text>
+
+  <rect x="460" y="16" width="200" height="74" class="fill-paper" stroke-width="1" />
+  <text x="472" y="36" class="strong">dim_dataset</text>
+  <text x="472" y="54">dataset_key · name</text>
+  <text x="472" y="72">version · n_rows · domain</text>
+
+  <rect x="20" y="240" width="200" height="74" class="fill-paper" stroke-width="1" />
+  <text x="32" y="260" class="strong">dim_author</text>
+  <text x="32" y="278">author_key · name · email</text>
+  <text x="32" y="296">team · manager · org</text>
+
+  <rect x="460" y="240" width="200" height="74" class="fill-paper" stroke-width="1" />
+  <text x="472" y="260" class="strong">dim_date</text>
+  <text x="472" y="278">date_key · day · week</text>
+  <text x="472" y="296">month · quarter</text>
+
+  <line x1="220" y1="70" x2="250" y2="125" class="blue" stroke-width="1.2" />
+  <line x1="460" y1="70" x2="430" y2="125" class="blue" stroke-width="1.2" />
+  <line x1="220" y1="260" x2="250" y2="205" class="blue" stroke-width="1.2" />
+  <line x1="460" y1="260" x2="430" y2="205" class="blue" stroke-width="1.2" />
+  <text x="340" y="250" text-anchor="middle">ONE ROW PER MEASUREMENT</text>
+  <text x="340" y="104" text-anchor="middle">WIDE, REPEATED ON PURPOSE ↖ ↗</text>
+</svg>
+</Figure>
+
+**Caches.** A Redis key holding a rendered leaderboard is denormalized data with an expiry date. Same trade, same staleness problem; the [caching lesson](/lessons/caching/) is about managing it.
+
+**Document stores.** In MongoDB or a JSON blob in S3, you usually <Term w="embed">Store related data inside the parent document (a run's metrics as a list inside the run) instead of in a separate table. One read gets everything.</Term> things that are always read together and change together: a run's metrics belong inside the run document. Things that are shared and change independently (the author's email) are still better referenced by id, or you've rebuilt the flat sheet in JSON. Martin Kleppmann's chapter on data models is the best treatment of where that line sits.
+
+**History that should not change.** This one is subtle and important. An invoice stores the price *at the time of sale*, even though the product table has a price, because the invoice is supposed to remember the past. If your runs table stores "which version of the dataset was used", that's not a copy of a changing fact; it's a fact about the run. Copying is only an anomaly when the copies are *supposed* to agree. Append-only logs of things that happened (eval results, events, traces) rarely have update anomalies, because nobody updates them.
+
+### JSON columns, the pragmatic middle
+
+Hyperparameters are awkward. A LoRA run has `r` and `alpha`; a distillation run has a temperature and a teacher; next month's runs will have something you haven't thought of. A column per hyperparameter means a schema change per experiment. The textbook-normal alternative is a table `params(run_id, key, value)`, one row per hyperparameter. It's called <Term w="EAV" label="EAV (entity-attribute-value)">Storing data as rows of (thing, attribute name, value) instead of columns. Flexible, but every value becomes text and every question becomes a self-join.</Term>, and MLflow's tracking database does exactly this. It works, but every value is a string, and "runs where lr = 3e-5 and r = 16" becomes a join of the table with itself.
+
+Modern databases offer a middle: a JSON column. `runs.config` holds `{"lr": 3e-5, "lora": {"r": 16}}`, and the database can reach inside it (`config->>'$.lora.r'` in SQLite, `config->'lora'->>'r'` in Postgres, where the `jsonb` type can also be indexed). The rule for when it's fine:
+
+- Put things in JSON that you mostly read back whole, that vary between rows, and that nothing else depends on (no `if you know X you know Y` hiding inside).
+- Keep things as real columns if you join on them, enforce rules on them, or filter on them constantly.
+- When a JSON field turns out to be hot (everyone filters by `lora.r`), promote it: a <Term w="generated column">A column the database computes from other columns in the same row, like pulling a field out of JSON. It can be indexed like a normal column.</Term> pulls it out, and you index that.
+
+Normalization tells you where facts *should* live. JSON columns are an honest way to say "this part I haven't designed yet, and I'm choosing not to".
+
+### Staleness, the bill for every copy
+
+Every denormalized copy has the same failure: it can be out of date. A materialized view refreshed every 15 minutes is, on average, several minutes behind, and in the worst case almost a full interval plus however long the refresh takes.
+
+<Figure n="006" title="WHEN THE DASHBOARD IS LYING" caption="Writes land in the base tables at any time. The materialized view only learns about them when a refresh finishes. Between a write and the end of the next refresh, the dashboard shows the old answer. A write that lands just after a refresh read its snapshot waits almost a whole interval, plus the next refresh's duration.">
+<svg viewBox="0 0 680 200" role="img" aria-label="Timeline of writes and materialized view refreshes showing stale windows">
+  <text x="10" y="64" class="strong">WRITES</text>
+  <text x="10" y="116" class="strong">DASHBOARD</text>
+  <line x1="110" y1="60" x2="670" y2="60" class="ink" stroke-width="1" />
+  <circle cx="170" cy="60" r="4" class="fill-blue" />
+  <circle cx="215" cy="60" r="4" class="fill-blue" />
+  <circle cx="262" cy="60" r="4" class="fill-blue" />
+  <circle cx="390" cy="60" r="4" class="fill-blue" />
+  <circle cx="462" cy="60" r="4" class="fill-blue" />
+  <circle cx="600" cy="60" r="4" class="fill-blue" />
+  <line x1="110" y1="112" x2="670" y2="112" class="ink" stroke-width="1" />
+  <rect x="170" y="102" width="184" height="20" class="fill-wash" stroke-width="1" />
+  <text x="262" y="116" text-anchor="middle">STALE</text>
+  <rect x="390" y="102" width="164" height="20" class="fill-wash" stroke-width="1" />
+  <text x="472" y="116" text-anchor="middle">STALE</text>
+  <rect x="600" y="102" width="70" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="130" y="128" width="24" height="10" class="fill-blue" />
+  <rect x="330" y="128" width="24" height="10" class="fill-blue" />
+  <rect x="530" y="128" width="24" height="10" class="fill-blue" />
+  <text x="142" y="156" text-anchor="middle">REFRESH</text>
+  <text x="342" y="156" text-anchor="middle">REFRESH</text>
+  <text x="542" y="156" text-anchor="middle">REFRESH</text>
+  <line x1="154" y1="172" x2="354" y2="172" class="blue" stroke-width="1" />
+  <line x1="154" y1="167" x2="154" y2="177" class="blue" stroke-width="1" />
+  <line x1="354" y1="167" x2="354" y2="177" class="blue" stroke-width="1" />
+  <text x="254" y="192" text-anchor="middle" class="blue-t">INTERVAL</text>
+  <text x="440" y="192" class="blue-t">WORST CASE ≈ INTERVAL + REFRESH TIME</text>
+</svg>
+</Figure>
+
+Your options, from simplest to most work: refresh on a timer and print "updated 4 min ago" on the dashboard (honest, and usually enough); refresh right after each batch of writes; or keep the copy updated incrementally with <Term w="triggers">Small pieces of code the database runs automatically when a row is inserted, updated or deleted. Can keep a summary table in sync with every write.</Term>, so each insert also bumps the summary. Incremental is fresher and fiddlier: every write gets slower, and a bug in the trigger is a silent wrong number. The question to ask isn't "how fresh can I make it" but "how stale is acceptable for the person reading it", which is a product question, not a database one.
+
+## Build It
+
+Everything goes in `~/workbench/normalization/`. You need only Python 3 and the `sqlite3` command, both already on your Mac and on the Spark. A Postgres variant is at the end, optional.
+
+<Task id="t0" title="Generate the messy runs sheet" agent="ok">
+
+This writes `runs.csv`: one row per (run, metric), with the kind of drift a real shared sheet picks up. It's seeded, so your numbers will match mine.
+
+```python
+# make_runs.py: write runs.csv, a deliberately messy flat log of experiment runs.
+# One row per (run, metric). Usage: python3 make_runs.py [n_runs] [out.csv]
+import csv, random, sys
+from datetime import datetime, timedelta
+
+N_RUNS = int(sys.argv[1]) if len(sys.argv) > 1 else 600
+OUT = sys.argv[2] if len(sys.argv) > 2 else "runs.csv"
+rng = random.Random(7)
+
+AUTHORS = [  # name, email, team, weight
+    ("Priya Raman",  "priya@example.com",  "ranking", 14),
+    ("Sam Okafor",   "sam@example.com",    "ranking", 8),
+    ("Lena Fischer", "lena@example.com",   "search",  5),
+    ("Diego Alvarez","diego@example.com",  "search",  4),
+    ("Mei Tanaka",   "mei@example.com",    "infra",   3),
+    ("Alex Kim",     "alex@example.com", "ranking", 6),
+]
+MODELS = [  # name, family, params, weight
+    ("ce-minilm-l6",       "cross-encoder", "22M",  10),
+    ("ce-minilm-l12",      "cross-encoder", "33M",  12),
+    ("ce-bge-reranker-base","cross-encoder","278M",  6),
+    ("bi-e5-small",        "bi-encoder",    "33M",   5),
+    ("bi-e5-base",         "bi-encoder",    "110M",  4),
+]
+RARE_MODEL = ("ce-deberta-v3-large", "cross-encoder", "435M")  # exactly one run
+DATASETS = [  # name, version, rows, weight
+    ("msmarco-dev",  "v1", 6980, 8),
+    ("msmarco-dev",  "v2", 6980, 6),
+    ("tf-queries",   "2026-05", 12000, 5),
+    ("tf-queries",   "2026-08", 15400, 6),
+    ("beir-nfcorpus","v1", 323, 2),
+]
+METRICS = ["ndcg@10", "mrr@10", "recall@100", "p50_ms"]
+TAGS = ["hardneg", "bm25-negs", "fp16", "bf16", "distill", "lora", "baseline", "sweep"]
+
+def pick(items):
+    return rng.choices(items, weights=[x[-1] for x in items])[0]
+
+rows = []
+t0 = datetime(2026, 3, 1, 9, 0)
+for i in range(1, N_RUNS + 1):
+    started = t0 + timedelta(minutes=int(i * 330 * 600 / N_RUNS) + rng.randint(0, 50))
+    a_name, a_email, a_team, _ = pick(AUTHORS)
+    m_name, m_family, m_params, _ = pick(MODELS)
+    if i == N_RUNS // 2:
+        m_name, m_family, m_params = RARE_MODEL
+    d_name, d_ver, d_rows, _ = pick(DATASETS)
+
+    # --- the drift a real shared sheet accumulates ---
+    if a_name == "Sam Okafor" and started > datetime(2026, 6, 1) and rng.random() < 0.85:
+        a_email = "sam.okafor@example.com"          # half-finished email change
+    if m_name == "ce-minilm-l12" and rng.random() < 0.06:
+        m_params = "33.4M"                           # someone "corrected" it in a few rows
+    if m_name == "ce-minilm-l6" and rng.random() < 0.03:
+        m_name = "CE-MiniLM-L6"                      # same model, different spelling
+    if d_name == "msmarco-dev" and d_ver == "v2" and rng.random() < 0.05:
+        d_rows = 6890                                # typo copied forward
+    if a_name == "Lena Fischer" and rng.random() < 0.04:
+        a_team = "ranking"                           # moved teams? or a mistake?
+
+    lr = rng.choice(["1e-5", "2e-5", "3e-5", "5e-5"])
+    bs = rng.choice([16, 32, 64])
+    tags = ";".join(sorted(rng.sample(TAGS, rng.randint(0, 3))))
+    base = {"ce": 0.36, "bi": 0.31}[m_name.lower()[:2]] + (0.03 if "hardneg" in tags else 0)
+    n_metrics = rng.randint(2, 4)
+    for metric in METRICS[:n_metrics]:
+        if metric == "p50_ms":
+            val = round(rng.uniform(4, 40), 1)
+        elif metric == "recall@100":
+            val = round(min(0.99, base + 0.5 + rng.gauss(0, 0.02)), 4)
+        else:
+            val = round(base + rng.gauss(0, 0.02), 4)
+        rows.append({
+            "run_id": f"run-{i:05d}", "started_at": started.isoformat(timespec="minutes"),
+            "author_name": a_name, "author_email": a_email, "author_team": a_team,
+            "model_name": m_name, "model_family": m_family, "model_params": m_params,
+            "dataset_name": d_name, "dataset_version": d_ver, "dataset_rows": d_rows,
+            "lr": lr, "batch_size": bs, "tags": tags,
+            "metric_name": metric, "metric_value": val,
+        })
+
+with open(OUT, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=list(rows[0]))
+    w.writeheader()
+    w.writerows(rows)
+print(f"wrote {len(rows)} rows for {N_RUNS} runs to {OUT}")
+```
+
+Run it, then load the CSV as-is into a SQLite table called `flat`:
+
+```bash
+python3 make_runs.py                 # wrote 1763 rows for 600 runs to runs.csv
+sqlite3 flat.db ".import --csv runs.csv flat"
+sqlite3 flat.db ".mode box" "SELECT * FROM flat LIMIT 4"
+```
+
+Check `SELECT typeof(metric_value) FROM flat LIMIT 1`. The `sqlite3` on my Mac (3.54) creates the columns with no type, so numbers come in as numbers. Older versions make every column `TEXT`, and then `MAX(metric_value)` compares strings. If you see `text`, wrap numeric columns in `CAST(... AS REAL)` in this task's queries.
+
+</Task>
+
+<Task id="t1" title="Find the anomalies with queries" agent="hands">
+
+Before you look: write down every dependency you believe should hold in this data (Figure 003 is a good start). Each one is a suspect. A query can't prove a dependency, but it can catch one being broken: group by the "if you know" side and count how many different "you know" values appear.
+
+Here's the shape for one of them:
+
+```sql
+-- If you know the author's name, you should know their email.
+SELECT author_name,
+       COUNT(DISTINCT author_email)       AS n,
+       group_concat(DISTINCT author_email) AS emails
+FROM flat
+GROUP BY author_name
+HAVING n > 1;
+```
+
+Write the same check for every dependency on your list: name → team, run → model, run → dataset, model → params, (dataset, version) → rows. Then three more questions that need a little more thought:
+
+1. Are there two `model_name` values that are really the same model? (Hint: `lower()`.)
+2. How many rows would `UPDATE flat SET author_email = ... WHERE author_name = 'Priya Raman'` touch? Use `SELECT COUNT(*)` first, then run the update and check with `SELECT changes();`.
+3. The insert anomaly: write the `INSERT` that would record "dataset `tf-clicks v1` exists, 40,000 rows" in `flat`. What do you have to put in `run_id`, `model_name`, `metric_value`? What would that fake row do to an `AVG(metric_value)` dashboard?
+4. The delete anomaly: find the model with exactly one run (`GROUP BY model_name HAVING COUNT(DISTINCT run_id) = 1`), delete that run's rows inside a transaction, ask what its parameter count is, then `ROLLBACK`.
+
+For each conflict you find, also write one line on what the *truth* probably is. For some it's obvious. For Lena's team, it isn't: 4% of her rows say `ranking`. Did she move teams, or is it a typo? The flat sheet cannot tell you, and that's the point: once the copies disagree, the information about which one is right is gone.
+
+</Task>
+
+<Task id="t2" title="Design the schema, with constraints that say no" agent="hands">
+
+Write `schema.sql` by hand. Use your dependency list: each determinant that isn't the key of the whole sheet becomes its own table. You should end up with about six tables. Requirements, which are also your test cases:
+
+- Every table has a primary key. Decide for each one: natural or surrogate, and write a comment saying why.
+- Every reference is a `FOREIGN KEY`. Decide `ON DELETE` for each: what should happen to a run's metrics if the run is deleted? To an author's runs if the author is deleted?
+- The database itself refuses: two authors with the same email; two models whose names differ only by case; two datasets with the same name and version; two values for the same metric of the same run; a parameter count that isn't a positive number; a model family that isn't `cross-encoder` or `bi-encoder`.
+- Store `params` as a number (millions), not the string `"33M"`.
+
+SQLite pieces you'll want, all real (check [sqlite.org](https://www.sqlite.org/lang_createtable.html) for details):
+
+```sql
+PRAGMA foreign_keys = ON;   -- OFF by default in SQLite, per connection!
+
+CREATE TABLE example (
+  id      INTEGER PRIMARY KEY,                 -- a surrogate key
+  name    TEXT NOT NULL UNIQUE COLLATE NOCASE, -- unique, ignoring case
+  size_m  REAL NOT NULL CHECK (size_m > 0),
+  parent  INTEGER NOT NULL REFERENCES parents(id) ON DELETE RESTRICT,
+  UNIQUE (name, size_m)                        -- multi-column uniqueness
+) STRICT;                                      -- refuse wrong types (SQLite 3.37+)
+```
+
+Also add an index on each foreign key column in your runs table. SQLite indexes primary keys and `UNIQUE` columns for you, but not foreign keys.
+
+Then try to break your own schema: write five `INSERT`s that should fail and check that each one does, with the error you expected.
+
+</Task>
+
+<Task id="t3" title="Migrate the data, deciding what's true" agent="review">
+
+Write `migrate.py` that reads `runs.csv` and fills your schema. The mechanical part is easy. The interesting part is that the CSV contradicts itself, and the migration is where you have to decide, once, what's true. Shape:
+
+```python
+# migrate.py
+import csv, sqlite3
+
+def load_rows(path: str) -> list[dict]: ...
+
+def canonical_author(rows_for_author: list[dict]) -> tuple[str, str]:
+    """(email, team) for one person. Which email wins: the newest? the most common?"""
+    ...
+
+def canonical_model(rows_for_model: list[dict]) -> tuple[str, str, float]:
+    """(name, family, params_m). Merge case variants. Pick one param count."""
+    ...
+
+def main(csv_path: str, db_path: str) -> None:
+    con = sqlite3.connect(db_path)
+    con.execute("PRAGMA foreign_keys = ON")
+    con.executescript(open("schema.sql").read())
+    # 1. parents first: authors, models, datasets (remember the id each got)
+    # 2. runs: one per distinct run_id, pointing at the ids from step 1
+    # 3. run_tags: split the tags cell
+    # 4. metrics: one per CSV row
+    # all inside one transaction: `with con:` commits on success, rolls back on error
+    ...
+```
+
+Write your decisions as comments at the top of the file (newest email wins because..., `33M` because...). This is real work in every migration you'll ever do, and it's always a judgment call, which is why it should happen once, in code, rather than every time someone reads the sheet.
+
+Expected counts with the default seed, if you merged the case variants: 6 authors, 6 models, 5 datasets, 600 runs, 889 run tags, 1,763 metric rows. Then have an agent review your migration for anything that would silently drop or duplicate rows.
+
+</Task>
+
+<Task id="t4" title="Rebuild the original view with joins" agent="hands">
+
+Write a `CREATE VIEW runs_flat AS SELECT ...` that joins your tables back into exactly the columns of `runs.csv`. A plain view is just a saved query: nothing is stored, it runs every time you select from it.
+
+Hints:
+
+- Start from `metrics` (one row per CSV row) and join outwards: `metrics JOIN runs USING (run_id) JOIN authors USING (author_id) ...`.
+- Tags need to go back into one `;`-joined cell: a subquery with `group_concat(tag, ';')`. Sort the tags first if you want them to match the CSV's order.
+- Your params are numbers now; format them back with `printf('%gM', params_m)` if you want an exact match.
+
+Then prove it: `SELECT COUNT(*) FROM runs_flat` must be 1,763. Load the CSV into a scratch table, apply the same cleaning decisions with `UPDATE`s, and check that `SELECT ... FROM runs_flat EXCEPT SELECT ... FROM cleaned` returns zero rows, both ways round.
+
+</Task>
+
+<Task id="t5" title="A materialized dashboard, and watch it go stale" agent="hands">
+
+The dashboard shows, for each model and dataset: number of runs, best and mean `ndcg@10`, and the author of the best run. Write that query against the normalized tables.
+
+SQLite has no materialized views, so build one: a real table `dash_mv` created from the query, and a `refresh()` function that empties and refills it inside one transaction (so a reader never sees it half-empty).
+
+```python
+def refresh(con) -> float:
+    """Rebuild dash_mv from the base tables in one transaction. Return seconds taken."""
+    ...
+```
+
+Then the staleness experiment:
+
+1. Refresh, read the row for `ce-minilm-l12` on `tf-queries 2026-08`.
+2. Insert a new run on that pair with an `ndcg@10` higher than the current best.
+3. Read `dash_mv` again: the new best isn't there. Read the live query: it is.
+4. Refresh. Now they agree.
+
+Last, add a `refreshed_at` value (a one-row table, or a column) and print "updated N seconds ago" with every read. That one line is most of what makes a stale dashboard acceptable.
+
+</Task>
+
+<Task id="t6" title="Add a JSON config column and promote a hot field" agent="explain">
+
+Add `config TEXT CHECK (json_valid(config))` to `runs` and fill it with a few hyperparameters per run (move `lr` and `batch_size` in, and give the runs tagged `lora` a nested `{"lora": {"r": 16, "alpha": 32}}`). Then:
+
+```sql
+SELECT run_id FROM runs WHERE config->>'$.lora.r' = 16;
+EXPLAIN QUERY PLAN SELECT run_id FROM runs WHERE config->>'$.lora.r' = 16;   -- a full scan
+
+ALTER TABLE runs ADD COLUMN lora_r INTEGER GENERATED ALWAYS AS (config->>'$.lora.r') VIRTUAL;
+CREATE INDEX runs_lora_r ON runs(lora_r);
+EXPLAIN QUERY PLAN SELECT run_id FROM runs WHERE lora_r = 16;                -- uses the index
+```
+
+(`->>` needs SQLite 3.38 or newer; `json_extract(config, '$.lora.r')` does the same on older ones.) Ask an agent to explain what "VIRTUAL" means here versus "STORED", but write the queries yourself.
+
+</Task>
+
+<Task id="t7" title="Optional: the same thing in Postgres on the Spark" agent="review">
+
+If you have Docker on the Spark: `docker run --rm -d --name pg -e POSTGRES_PASSWORD=pw -p 5432:5432 postgres:17`, then `docker exec -it pg psql -U postgres`. Port your schema (`INTEGER PRIMARY KEY` becomes `GENERATED ALWAYS AS IDENTITY`; `COLLATE NOCASE` becomes a unique index on `lower(name)`; foreign keys are always on). Then use the real thing:
+
+```sql
+CREATE MATERIALIZED VIEW dash_mv AS SELECT ...;
+CREATE UNIQUE INDEX ON dash_mv (model_id, dataset_id);
+REFRESH MATERIALIZED VIEW CONCURRENTLY dash_mv;   -- readers keep seeing the old copy meanwhile
+```
+
+`CONCURRENTLY` needs that unique index, and it's slower than a plain refresh, but a plain refresh locks out readers while it runs. Check the Postgres docs for your version. Have an agent review your port.
+
+</Task>
+
+<DoneWhen>
+
+- Your anomaly queries find all five planted conflicts (two emails, two param counts, a case variant, two row counts, two teams) plus the insert and delete anomalies.
+- `schema.sql` refuses every bad insert you wrote, and you can say which dependency each constraint enforces.
+- `migrate.py` produces the expected counts, and its decisions are written down at the top.
+- `runs_flat` matches the cleaned CSV row for row (`EXCEPT` both ways is empty).
+- You've watched `dash_mv` show an old answer, and you print how old it is.
+
+</DoneWhen>
+
+## Measure
+
+Run each measurement at 600 runs and again at 200,000 (`python3 make_runs.py 200000 big.csv`, then the same load and migration). Time queries with `time.perf_counter()` in Python, best of 5 runs.
+
+| Measurement | Flat, 600 | Normalized, 600 | Flat, 200k | Normalized, 200k | Your prediction |
+| --- | --- | --- | --- | --- | --- |
+| Rows touched by Priya's email change | | | | | |
+| Time for that update (incl. commit) | | | | | |
+| Database file size | | | | | |
+| Dashboard query (live) | | | | | |
+| Dashboard, read from `dash_mv` | — | | — | | |
+| `refresh()` time | — | | — | | |
+| One run, all its details, by `run_id` | | | | | |
+| Number of model groups on the dashboard | | | | | |
+
+My numbers, Apple Silicon Mac, Python 3.14 with SQLite 3.53, at 200,000 runs (600,037 rows). Yours will differ; the shape shouldn't.
+
+| Measurement | Flat | Normalized |
+| --- | --- | --- |
+| Email change | 210,118 rows, 517 ms | 1 row, 0.5 ms |
+| File size | 101 MB (CSV: 92 MB) | 76 MB |
+| Dashboard, live | 168 ms | 157 ms |
+| Dashboard from `dash_mv` | — | 0.02 ms |
+| `refresh()` | — | 154 ms |
+| One run by id | 33 ms (no index) | 0.01 ms |
+| Model × dataset groups | 31 | 26 |
+
+What the numbers should tell you:
+
+**The update is the headline.** Writes in the flat table scale with how often a fact is repeated. Writes in the normalized one don't. At 600 runs both are fast and the difference doesn't matter for speed; it matters for correctness. At 200k runs, the flat email change rewrites a third of the table.
+
+**The join was nearly free.** The live dashboard took about the same time either way. Both versions have to read every `ndcg@10` row; matching each to one of six models is cheap next to that. If you expected the join to be much slower, that's the useful surprise. Joins get expensive when both sides are huge and unindexed, not when a big table points at small ones.
+
+**The flat dashboard is wrong.** 31 groups instead of 26: `CE-MiniLM-L6` and `ce-minilm-l6` are counted as different models, so each of its five datasets appears twice, with the runs split between them. Nobody would notice in a chart with 31 bars. The normalized version can't produce this, because `COLLATE NOCASE UNIQUE` refused the duplicate during migration.
+
+**Size: smaller, but not dramatically.** The repeated strings in the flat table are short, and the normalized tables add indexes and repeat `run_id` in `metrics` and `run_tags`. At 600 runs the two files are about the same size (around 300 KB each). Normalization is about correctness first. The savings get large when the repeated things are big (long descriptions, configs) or many.
+
+**The one-run lookup is mostly an index story.** 33 ms vs 0.01 ms isn't normalization; it's that the flat table has no index on `run_id`. Add one (`CREATE INDEX ON flat(run_id)`) and rerun: the flat lookup should drop to a few microseconds too. Keep that in mind whenever someone shows you a benchmark: check what they're actually comparing.
+
+**The materialized view is thousands of times faster to read, and that number is useless on its own.** Pair it with how often you refresh and what that costs. At 154 ms per refresh, refreshing every minute costs 0.25% of one core. Refreshing on every write would make each insert 154 ms slower, which is when you'd reach for triggers or incremental updates.
+
+## Break It
+
+**1. Forget `PRAGMA foreign_keys = ON`.** Open a fresh `sqlite3 norm.db` and run `INSERT INTO runs VALUES ('run-x', '2026-01-01', 999, 1, 1, 1e-5, 32);` (adjust to your columns). It succeeds: author 999 doesn't exist, and SQLite didn't check. Foreign key enforcement is off by default in SQLite, for backwards compatibility, and it's set per connection, so every script and every notebook has to turn it on. Now turn it on, retry, and watch it fail. Then run `PRAGMA foreign_key_check;` to find any orphans that slipped in while it was off. (Postgres and MySQL's InnoDB enforce foreign keys by default, so this is a SQLite trap specifically, but "the rule exists and isn't checked" happens everywhere: a session that switched checks off for a bulk load, a rule enforced only in one service's code.)
+
+**2. Use the email as the key.** Make a copy of your schema where `authors` is keyed by `email` and `runs.author_email REFERENCES authors(email)`. Migrate, then change Sam's email in `authors`. With foreign keys on, it fails: `FOREIGN KEY constraint failed`, because 132 runs point at the old value. You can add `ON UPDATE CASCADE` and the database will rewrite all 132 for you, which works, but notice what you've built: the update anomaly, automated. That's the case for surrogate keys in one experiment.
+
+**3. Over-normalize into EAV.** Move every run attribute into `run_attrs(run_id, key, value TEXT)`: model, dataset, lr, batch size, everything. Now write "best `ndcg@10` per model, for runs with lr = 3e-5 and batch size 32". Count the self-joins. Check what `'3e-5' = 3e-5` gives you when everything is text. EAV is maximally flexible and minimally checkable: no types, no foreign keys, no `NOT NULL` for the attributes that matter. Normalization says one fact in one place, not "as many tables as possible".
+
+**4. Let the dashboard drift.** Insert 1,000 new runs (generate them with a different seed and migrate only the new ones) and don't refresh. Compare `dash_mv` to the live query: the counts are off by 1,000 runs' worth and the "best" column may be wrong. Now add a `refreshed_at` check that raises if the copy is older than 10 minutes. This is the whole job of a cache: a copy, plus a rule for when the copy is too old to trust.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What is normalization, and what goes wrong without it?</summary>
+
+Designing tables so each fact is stored in exactly one place. Without it, a fact gets copied into every row that mentions it, and you get three kinds of bug. Update anomalies: changing the fact means finding every copy, and missing one leaves the table contradicting itself. Insert anomalies: you can't record a fact unless some unrelated fact exists to share its row (a dataset with no runs yet). Delete anomalies: deleting one thing deletes another whose only copy happened to be in the same rows (the last run of a model takes the model's size with it). The fix is to split the table so each kind of thing (runs, authors, models, datasets, metric values) gets its own table, linked by keys.
+
+</details>
+
+<details>
+<summary>2. Explain 2NF and 3NF using an experiment-tracking table.</summary>
+
+Take a table with one row per run per metric, so the key is (run_id, metric_name). 2NF says every column must depend on the whole key. The model a run used depends only on run_id, so it gets repeated once per metric, and a run can end up disagreeing with itself. Fix: a runs table keyed by run_id, and a metrics table with just (run_id, metric_name, value). 3NF says non-key columns must depend only on the key, not on another non-key column. In runs, the model's parameter count depends on the model, not the run, so every run of that model repeats it. Fix: a models table, and runs stores model_id. The one-liner: every column depends on the key, the whole key, and nothing but the key. BCNF tightens it to "the left side of every dependency must be a key", which catches the rarer case where a non-key column determines part of a key.
+
+</details>
+
+<details>
+<summary>3. Natural or surrogate key for a users table, and why?</summary>
+
+Surrogate: an integer or UUID that means nothing. Users' natural identifiers (email, username, phone) change, and if other tables reference them, every change has to touch every reference, which is the update anomaly again, now across tables. With a surrogate, the email is just a unique column on one row, and changing it is one write. Keep a UNIQUE constraint on the email so the natural identity is still enforced. Natural keys are fine when the identifier truly never changes or the row is defined by it, like (run_id, metric_name) for a metric value, or when using it saves joins in a table nobody updates.
+
+</details>
+
+<details>
+<summary>4. The eval results table hits a billion rows and the leaderboard query takes 40 seconds. What do you do?</summary>
+
+First find out why: EXPLAIN the query. If it's scanning when it should seek, add the right index (on metric name and model, say). If it's a genuine full aggregation, stop recomputing it on every page load: precompute it into a materialized view or summary table and refresh it on a schedule or incrementally, and show how old it is. If the readers are analysts running many different aggregations, move the data to a columnar warehouse with a star schema: a narrow fact table of results and wide dimension tables, partitioned by date so most queries read a fraction of it. The normalized database stays the source of truth for writes; the copies are rebuilt from it. The trade at every step is freshness and extra write work for read speed, so the first question is how stale the leaderboard is allowed to be.
+
+</details>
+
+<details>
+<summary>5. When is a copied, denormalized value correct rather than just fast?</summary>
+
+When it records a different fact from the original, usually a fact about the past. An order stores the price at the time of sale, even though products have a current price, because the order must not change when the price does. A run stores which dataset version it used. An event log records the user's plan at the moment of the event. Copies are only anomalies when they're supposed to stay equal to the source. If they're snapshots, they're supposed to differ, and normalizing them away would destroy history. The test is: if the source changes, should this copy change too? If no, it's not a copy, it's its own fact.
+
+</details>
+
+## Go Deeper
+
+- **E. F. Codd, "A Relational Model of Data for Large Shared Data Banks"**, Communications of the ACM 13(6), 1970. Short and surprisingly readable. Section 1 is the motivation (programs breaking when storage changes), and normal form shows up in section 1.4.
+- **E. F. Codd, "Further Normalization of the Data Base Relational Model"** (IBM Research Report RJ909, 1971; published 1972 in R. Rustin, ed., _Data Base Systems_). Where 2NF, 3NF and the insertion, update and deletion anomalies are first named.
+- **William Kent, "A Simple Guide to Five Normal Forms in Relational Database Theory"**, Communications of the ACM 26(2), 1983. The best short explanation of all five normal forms ever written, with examples instead of algebra. Read this before any textbook chapter.
+- **Martin Kleppmann, _Designing Data-Intensive Applications_**, chapter 2 ("Data Models and Query Languages") on normalization versus documents and when to embed, and chapter 3 for star schemas and column-oriented storage.
+- **Ralph Kimball and Margy Ross, _The Data Warehouse Toolkit_**. The standard reference for star schemas and dimensional modeling, and the clearest argument for why warehouses denormalize.
+- **Silberschatz, Korth and Sudarshan, _Database System Concepts_**, the chapter on relational database design. The formal version: closures of functional dependencies, the BCNF decomposition algorithm, and why BCNF can lose dependency preservation.
+- **SQLite docs: [Foreign Key Support](https://www.sqlite.org/foreignkeys.html), [STRICT Tables](https://www.sqlite.org/stricttables.html), [JSON functions](https://www.sqlite.org/json1.html)**, and **PostgreSQL docs: [Materialized Views](https://www.postgresql.org/docs/current/rules-materializedviews.html)**. The exact behavior of everything you used in the build.
+- **MLflow's tracking schema**, in the MLflow source: `models.py` under `mlflow/store/tracking/` `dbmodels/` (check the current layout). A real experiment-tracking schema: normalized runs and experiments, EAV-style `params` and `tags`, and a separate `latest_metrics` table that is denormalization on purpose, kept so the UI doesn't have to scan every metric step.
+
+## Connections
+
+This lesson is the "shape" half of databases. [Indexes and B-trees](/lessons/indexes/) is the "speed" half: why the joins here were cheap, and why the flat lookup without an index wasn't. [Transactions](/lessons/transactions/) covers what kept your migration and your `refresh()` all-or-nothing, and what happens when two people edit the same row at once. [Why not a JSON file?](/lessons/why-databases/) is the step before this one: why the sheet should be a database at all.
+
+The staleness problem from the last section is the whole subject of [Caching and Redis](/lessons/caching/): a cache is a denormalized copy with an expiry date, and every lesson here about "how old is this copy, and who checks" applies there with more traffic.

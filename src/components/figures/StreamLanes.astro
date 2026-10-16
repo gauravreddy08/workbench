@@ -1,0 +1,246 @@
+---
+// Three ways to get tokens to a client, on one shared timeline.
+// Top lane: when the model produces each token. Below: when a polling client, an SSE client and a
+// WebSocket client first see it. Poll interval and token gap are sliders; "proxy buffering" makes
+// a buffering proxy sit in front of the SSE lane. Counters show requests, bytes and average wait.
+---
+<div class="sl" data-fig="stream-lanes">
+  <div class="ctl sl-modes" role="group" aria-label="Polling style">
+    <button class="btn" type="button" data-poll="short" aria-pressed="true">Short poll</button>
+    <button class="btn" type="button" data-poll="long" aria-pressed="false">Long poll</button>
+    <button class="btn" type="button" data-buf aria-pressed="false">Proxy buffering</button>
+    <button class="btn" type="button" data-play>Play</button>
+  </div>
+  <svg class="sl-svg" viewBox="0 0 640 300" role="img" aria-label="Timeline of tokens produced by the model and seen by three kinds of client"></svg>
+  <div class="ctl">
+    <label>POLL INTERVAL <input type="range" data-k="iv" min="50" max="2000" step="50" value="500" /><output>500 ms</output></label>
+    <label>TOKEN GAP <input type="range" data-k="gap" min="20" max="200" step="10" value="60" /><output>60 ms</output></label>
+  </div>
+  <div class="sl-table" aria-live="polite">
+    <span class="h">LANE</span><span class="h">REQUESTS</span><span class="h">BYTES ≈</span><span class="h">AVG WAIT</span><span class="h">FIRST SEEN</span>
+    <span class="n" data-r="pname">POLLING</span><span class="readout" data-r="preq"></span><span class="readout" data-r="pbytes"></span><span class="readout" data-r="pwait"></span><span class="readout" data-r="pfirst"></span>
+    <span class="n">SSE</span><span class="readout" data-r="sreq"></span><span class="readout" data-r="sbytes"></span><span class="readout" data-r="swait"></span><span class="readout" data-r="sfirst"></span>
+    <span class="n">WEBSOCKET</span><span class="readout" data-r="wreq"></span><span class="readout" data-r="wbytes"></span><span class="readout" data-r="wwait"></span><span class="readout" data-r="wfirst"></span>
+  </div>
+</div>
+
+<style>
+  .sl-svg { width: 100%; margin-top: 10px; }
+  .sl .ctl label { flex-wrap: wrap; }
+  .sl .ctl input[type='range'] { max-width: 100%; }
+  .sl-table {
+    display: grid; grid-template-columns: 1.3fr 1fr 1fr 1fr 1fr; gap: 4px 10px; margin-top: 16px;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); letter-spacing: 0.04em;
+  }
+  .sl-table .h { color: var(--ink-3); font-size: 10px; border-bottom: 1px solid var(--rule); padding-bottom: 3px; }
+  .sl-table .n { color: var(--ink); }
+  @media (max-width: 480px) { .sl-table { font-size: 10px; gap: 4px 6px; } .sl-table .h { font-size: 9px; } }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const N = 24;        // tokens in the reply
+  const PREFILL = 300; // ms before the first token (reading the prompt)
+  const D = 10;        // one-way network delay, ms
+
+  // Rough byte costs, from a localhost run with httpx and uvicorn (see the Measure section).
+  // A browser sends far bigger headers (cookies, user agent), so real polling costs more.
+  const POLL_UP = 160, POLL_DOWN = 140, POLL_TOK = 25;
+  const SSE_UP = 140, SSE_HDR = 170, SSE_TOK = 35;
+  const WS_UP = 220, WS_HDR = 130, WS_TOK = 15;
+
+  type Lane = { seen: number[]; reqs: number[]; bytes: number; open?: [number, number] };
+
+  function produce(gap: number): number[] {
+    return Array.from({ length: N }, (_, i) => PREFILL + i * gap);
+  }
+
+  function shortPoll(prod: number[], iv: number): Lane {
+    const seen: number[] = new Array(N).fill(0);
+    const reqs: number[] = [0];
+    let bytes = POLL_UP + POLL_DOWN;
+    let got = 0;
+    for (let t = iv; got < N; t += iv) {
+      reqs.push(t);
+      bytes += POLL_UP + POLL_DOWN;
+      const atServer = t + D;
+      while (got < N && prod[got] <= atServer) { seen[got] = atServer + D; got++; bytes += POLL_TOK; }
+    }
+    return { seen, reqs, bytes };
+  }
+
+  function longPoll(prod: number[]): Lane {
+    const seen: number[] = new Array(N).fill(0);
+    const reqs: number[] = [];
+    let bytes = 0, got = 0, send = 0;
+    while (got < N) {
+      reqs.push(send);
+      bytes += POLL_UP + POLL_DOWN;
+      const arrive = send + D;
+      const reply = Math.max(arrive, prod[got]); // server holds the request until a token exists
+      while (got < N && prod[got] <= reply) { seen[got] = reply + D; got++; bytes += POLL_TOK; }
+      send = reply + D; // client re-asks the moment the answer lands
+    }
+    return { seen, reqs, bytes };
+  }
+
+  function sse(prod: number[], buffered: boolean): Lane {
+    const end = prod[N - 1] + D;
+    const seen = prod.map((p) => (buffered ? end + D : p + D));
+    return { seen, reqs: [0], bytes: SSE_UP + SSE_HDR + N * SSE_TOK, open: [0, end + D] };
+  }
+
+  function ws(prod: number[]): Lane {
+    const seen = prod.map((p) => p + D);
+    return { seen, reqs: [0], bytes: WS_UP + WS_HDR + N * WS_TOK, open: [0, prod[N - 1] + D] };
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, parent: Element) {
+    const e = document.createElementNS(NS, tag);
+    for (const [a, v] of Object.entries(attrs)) e.setAttribute(a, String(v));
+    parent.appendChild(e);
+    return e;
+  }
+
+  const ms = (v: number) => (v >= 1000 ? (v / 1000).toFixed(2) + ' s' : Math.round(v) + ' ms');
+  const kb = (b: number) => (b >= 1000 ? (b / 1000).toFixed(1) + ' kB' : b + ' B');
+
+  document.querySelectorAll<HTMLElement>('[data-fig="stream-lanes"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.sl-svg')!;
+    const inputs = [...root.querySelectorAll<HTMLInputElement>('input[data-k]')];
+    const pollBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-poll]')];
+    const bufBtn = root.querySelector<HTMLButtonElement>('[data-buf]')!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-play]')!;
+    const ivInput = inputs.find((i) => i.dataset.k === 'iv')!;
+    let pollMode = 'short';
+    let buffered = false;
+    let raf = 0;
+
+    const val = (k: string) => parseFloat(inputs.find((i) => i.dataset.k === k)!.value);
+    const set = (k: string, v: string) => (root.querySelector(`[data-r="${k}"]`)!.textContent = v);
+
+    function draw(now = Infinity) {
+      const iv = val('iv'), gap = val('gap');
+      inputs.forEach((i) => (i.nextElementSibling!.textContent = i.value + ' ms'));
+      ivInput.disabled = pollMode === 'long';
+      ivInput.parentElement!.style.opacity = pollMode === 'long' ? '0.35' : '1';
+
+      const prod = produce(gap);
+      const lanes: [string, Lane][] = [
+        [pollMode === 'short' ? 'POLL' : 'LONG POLL', pollMode === 'short' ? shortPoll(prod, iv) : longPoll(prod)],
+        [buffered ? 'SSE+PROXY' : 'SSE', sse(prod, buffered)],
+        ['WEBSOCKET', ws(prod)],
+      ];
+
+      const end = Math.max(...lanes.map(([, l]) => Math.max(...l.seen, ...l.reqs))) + 60;
+      const W = 640, left = 82, right = 10, top = 16, laneH = 62;
+      const H = top + laneH * 4 + 28;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      svg.replaceChildren();
+      const x = (t: number) => left + (t / end) * (W - left - right);
+
+      // time grid
+      const axisY = top + laneH * 4;
+      const step = [100, 200, 250, 500, 1000, 2000].find((s) => end / s <= 7) ?? 5000;
+      for (let s = 0; s <= end; s += step) {
+        el('line', { x1: x(s), x2: x(s), y1: top, y2: axisY, style: 'stroke:var(--rule)', 'stroke-width': 1 }, svg);
+        el('text', { x: x(s), y: axisY + 16, 'text-anchor': 'middle' }, svg).textContent = s >= 1000 ? s / 1000 + 's' : s + 'ms';
+      }
+      el('line', { x1: left, x2: W - right, y1: axisY, y2: axisY, class: 'ink', 'stroke-width': 1 }, svg);
+
+      // model lane
+      const my = top + laneH / 2;
+      el('text', { x: 0, y: my + 4, class: 'strong' }, svg).textContent = 'MODEL';
+      el('line', { x1: left, x2: W - right, y1: my, y2: my, style: 'stroke:var(--ink-3)', 'stroke-width': 1 }, svg);
+      el('rect', { x: x(0), y: my - 4, width: Math.max(1, x(PREFILL) - x(0)), height: 8, class: 'fill-paper', 'stroke-width': 1 }, svg);
+      if (x(PREFILL) - x(0) > 44) el('text', { x: (x(0) + x(PREFILL)) / 2, y: my - 9, 'text-anchor': 'middle' }, svg).textContent = 'PREFILL';
+      prod.forEach((p) => {
+        if (p > now) return;
+        el('rect', { x: x(p) - 2.5, y: my - 2.5, width: 5, height: 5, class: 'fill-blue' }, svg);
+      });
+
+      // client lanes
+      lanes.forEach(([name, l], li) => {
+        const y = top + laneH * (li + 1) + laneH / 2;
+        el('text', { x: 0, y: y + 4, class: 'strong' }, svg).textContent = name;
+        el('line', { x1: left, x2: W - right, y1: y, y2: y, style: 'stroke:var(--rule)', 'stroke-width': 1 }, svg);
+        // open connection bar
+        if (l.open) {
+          const [a, b] = l.open;
+          el('rect', { x: x(a), y: y - 15, width: Math.max(1, x(Math.min(b, now)) - x(a)), height: 4, class: 'fill-wash', 'stroke-width': 0.8 }, svg);
+        }
+        // request ticks
+        l.reqs.forEach((r) => {
+          if (r > now) return;
+          el('line', { x1: x(r), x2: x(r), y1: y - 18, y2: y - 8, class: 'ink', 'stroke-width': 1.2 }, svg);
+        });
+        // wait segments and seen marks
+        l.seen.forEach((s, i) => {
+          const p = prod[i];
+          if (p > now) return;
+          const segEnd = Math.min(s, now);
+          el('line', { x1: x(p), x2: x(segEnd), y1: y + 3 + (i % 3) * 3, y2: y + 3 + (i % 3) * 3, class: 'blue', 'stroke-width': 1, 'stroke-dasharray': '2 2' }, svg);
+          if (s <= now) el('rect', { x: x(s) - 2.5, y: y - 2.5, width: 5, height: 5, class: 'fill-wash', 'stroke-width': 1 }, svg);
+        });
+      });
+
+      // legend
+      const ly = H - 2;
+      el('line', { x1: left, x2: left, y1: ly - 10, y2: ly, class: 'ink', 'stroke-width': 1.2 }, svg);
+      el('text', { x: left + 6, y: ly }, svg).textContent = 'REQUEST';
+      el('rect', { x: left + 76, y: ly - 7, width: 5, height: 5, class: 'fill-blue' }, svg);
+      el('text', { x: left + 86, y: ly }, svg).textContent = 'MADE';
+      el('rect', { x: left + 132, y: ly - 7, width: 5, height: 5, class: 'fill-wash', 'stroke-width': 1 }, svg);
+      el('text', { x: left + 142, y: ly }, svg).textContent = 'SEEN';
+      el('line', { x1: left + 186, x2: left + 206, y1: ly - 4, y2: ly - 4, class: 'blue', 'stroke-dasharray': '2 2' }, svg);
+      el('text', { x: left + 212, y: ly }, svg).textContent = 'WAIT';
+      el('rect', { x: left + 256, y: ly - 6, width: 18, height: 4, class: 'fill-wash', 'stroke-width': 0.8 }, svg);
+      el('text', { x: left + 280, y: ly }, svg).textContent = 'OPEN CONNECTION';
+
+      // counters (always for the full run)
+      const keys = ['p', 's', 'w'];
+      lanes.forEach(([, l], i) => {
+        const k = keys[i];
+        const waits = l.seen.map((s, j) => s - prod[j]);
+        set(k + 'req', String(l.reqs.length));
+        set(k + 'bytes', kb(l.bytes));
+        set(k + 'wait', ms(waits.reduce((a, b) => a + b, 0) / waits.length));
+        set(k + 'first', ms(Math.min(...l.seen)));
+      });
+      set('pname', pollMode === 'short' ? 'SHORT POLL' : 'LONG POLL');
+      return end;
+    }
+
+    function play() {
+      cancelAnimationFrame(raf);
+      const end = draw();
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+      const t0 = performance.now();
+      const tick = (t: number) => {
+        const now = t - t0; // real time: one simulated ms per real ms
+        draw(now);
+        if (now < end) raf = requestAnimationFrame(tick);
+        else draw();
+      };
+      raf = requestAnimationFrame(tick);
+    }
+
+    pollBtns.forEach((b) =>
+      b.addEventListener('click', () => {
+        pollMode = b.dataset.poll!;
+        pollBtns.forEach((o) => o.setAttribute('aria-pressed', String(o === b)));
+        cancelAnimationFrame(raf);
+        draw();
+      }),
+    );
+    bufBtn.addEventListener('click', () => {
+      buffered = !buffered;
+      bufBtn.setAttribute('aria-pressed', String(buffered));
+      cancelAnimationFrame(raf);
+      draw();
+    });
+    playBtn.addEventListener('click', play);
+    inputs.forEach((i) => i.addEventListener('input', () => { cancelAnimationFrame(raf); draw(); }));
+    draw();
+  });
+</script>

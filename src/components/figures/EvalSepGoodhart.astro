@@ -1,0 +1,153 @@
+---
+// Goodhart's law, as a toy. 300 candidate outputs (prompts, checkpoints, answers). Each has real
+// quality r and a "hack" h (padding, keywords, flattery) that the proxy metric rewards and true
+// quality punishes. Optimization pressure p moves the population: real gains saturate, the hack
+// keeps growing because it is the cheapest way to raise the proxy.
+//   true  = r - 0.32 h^2
+//   proxy = r + 0.9 h + noise
+// Toy model with fixed seeds, not data. Usage: <EvalSepGoodhart />
+---
+<div class="esg" data-fig="evalsep-goodhart">
+  <svg viewBox="0 0 640 330" role="img" aria-label="Scatter of measured score against true quality, with a line chart of both averages as optimization pressure rises"></svg>
+  <div class="ctl">
+    <label>optimization pressure <input type="range" min="0" max="100" step="1" value="0" data-k="p" /> <output data-o="p">0</output></label>
+    <button class="btn" type="button" data-t="top" aria-pressed="true">Highlight top 10% by score</button>
+  </div>
+  <p class="esg-read">
+    avg score <span class="readout" data-r="proxy">-</span> ·
+    avg true quality <span class="readout" data-r="true">-</span> ·
+    correlation <span class="readout" data-r="corr">-</span> ·
+    true quality of the top 10% <span class="readout" data-r="top">-</span>
+  </p>
+</div>
+
+<style>
+  .esg .ctl label { flex-wrap: wrap; }
+  .esg-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const N = 300;
+
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function gauss(r: () => number) {
+    const u = Math.max(1e-9, r()), v = r();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  const R = rng(7);
+  const zr = Array.from({ length: N }, () => gauss(R));
+  const zh = Array.from({ length: N }, () => gauss(R));
+  const zn = Array.from({ length: N }, () => gauss(R));
+
+  function pop(p: number) {
+    const mr = 1.2 * (1 - Math.exp(-3 * p));
+    const pts = [];
+    for (let i = 0; i < N; i++) {
+      const r = mr + 0.6 * zr[i];
+      const h = Math.max(0, 2.4 * p + 0.45 * zh[i]);
+      pts.push({ proxy: r + 0.9 * h + 0.35 * zn[i], true: r - 0.32 * h * h });
+    }
+    return pts;
+  }
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+  function corr(xs: number[], ys: number[]) {
+    const mx = mean(xs), my = mean(ys);
+    let sxy = 0, sxx = 0, syy = 0;
+    for (let i = 0; i < xs.length; i++) { const dx = xs[i] - mx, dy = ys[i] - my; sxy += dx * dy; sxx += dx * dx; syy += dy * dy; }
+    return sxy / Math.sqrt(sxx * syy);
+  }
+  function stats(p: number) {
+    const pts = pop(p);
+    const order = pts.map((_, i) => i).sort((a, b) => pts[b].proxy - pts[a].proxy);
+    const top = new Set(order.slice(0, N / 10));
+    return {
+      pts, top,
+      proxy: mean(pts.map((q) => q.proxy)),
+      true: mean(pts.map((q) => q.true)),
+      corr: corr(pts.map((q) => q.proxy), pts.map((q) => q.true)),
+      topTrue: mean([...top].map((i) => pts[i].true)),
+    };
+  }
+  const curve = Array.from({ length: 51 }, (_, i) => stats(i / 50));
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="evalsep-goodhart"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const pIn = root.querySelector<HTMLInputElement>('[data-k="p"]')!;
+    const topBtn = root.querySelector<HTMLButtonElement>('[data-t="top"]')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+
+    // scatter panel
+    const S = { x: 44, y: 20, w: 330, h: 260, x0: -2, x1: 6.5, y0: -5, y1: 3 };
+    const sx = (v: number) => S.x + ((Math.min(S.x1, Math.max(S.x0, v)) - S.x0) / (S.x1 - S.x0)) * S.w;
+    const sy = (v: number) => S.y + S.h - ((Math.min(S.y1, Math.max(S.y0, v)) - S.y0) / (S.y1 - S.y0)) * S.h;
+    // line panel
+    const L = { x: 420, y: 20, w: 205, h: 260, y0: -1.2, y1: 3.6 };
+    const lx = (p: number) => L.x + p * L.w;
+    const ly = (v: number) => L.y + L.h - ((v - L.y0) / (L.y1 - L.y0)) * L.h;
+
+    function draw() {
+      const p = Number(pIn.value) / 100;
+      root.querySelector<HTMLElement>('[data-o="p"]')!.textContent = String(pIn.value);
+      const st = stats(p);
+      const showTop = topBtn.getAttribute('aria-pressed') === 'true';
+      svg.replaceChildren();
+
+      // scatter frame and axes
+      svg.append(el('rect', { x: S.x, y: S.y, width: S.w, height: S.h, class: 'fill-paper', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: S.x, y1: sy(0), x2: S.x + S.w, y2: sy(0), class: 'ink dash', 'stroke-width': 0.8 }));
+      svg.append(el('text', { x: S.x + S.w / 2, y: S.y + S.h + 22, 'text-anchor': 'middle', class: 'strong' }, 'MEASURED SCORE (PROXY) →'));
+      const yl = el('text', { x: 14, y: S.y + S.h / 2, 'text-anchor': 'middle', class: 'strong', transform: `rotate(-90 14 ${S.y + S.h / 2})` }, 'TRUE QUALITY →');
+      svg.append(yl);
+      for (const q of st.pts.map((q, i) => ({ ...q, i }))) {
+        const isTop = showTop && st.top.has(q.i);
+        const c = el('circle', { cx: sx(q.proxy), cy: sy(q.true), r: isTop ? 3.2 : 2.3 });
+        c.setAttribute('style', isTop ? 'fill:var(--blue);stroke:none' : 'fill:var(--ink-3);stroke:none;opacity:0.55');
+        svg.append(c);
+      }
+
+      // line panel
+      svg.append(el('rect', { x: L.x, y: L.y, width: L.w, height: L.h, class: 'fill-paper', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: L.x, y1: ly(0), x2: L.x + L.w, y2: ly(0), class: 'ink dash', 'stroke-width': 0.8 }));
+      const path = (f: (s: (typeof curve)[number]) => number) => curve.map((s, i) => `${i ? 'L' : 'M'}${lx(i / 50).toFixed(1)},${ly(f(s)).toFixed(1)}`).join(' ');
+      svg.append(el('path', { d: path((s) => s.proxy), class: 'blue', 'stroke-width': 1.8 }));
+      svg.append(el('path', { d: path((s) => s.true), class: 'ink', 'stroke-width': 1.5 }));
+      svg.append(el('text', { x: L.x + L.w - 4, y: ly(curve[50].proxy) + 14, 'text-anchor': 'end', class: 'blue-t' }, 'AVG SCORE'));
+      svg.append(el('text', { x: L.x + L.w - 4, y: ly(curve[50].true) - 8, 'text-anchor': 'end', class: 'strong' }, 'AVG TRUE'));
+      svg.append(el('line', { x1: lx(p), y1: L.y, x2: lx(p), y2: L.y + L.h, class: 'blue dash', 'stroke-width': 1 }));
+      svg.append(el('circle', { cx: lx(p), cy: ly(st.proxy), r: 3.5, class: 'fill-blue' }));
+      const dot = el('circle', { cx: lx(p), cy: ly(st.true), r: 3.5 });
+      dot.setAttribute('style', 'fill:var(--ink);stroke:none');
+      svg.append(dot);
+      svg.append(el('text', { x: L.x + L.w / 2, y: L.y + L.h + 22, 'text-anchor': 'middle', class: 'strong' }, 'PRESSURE →'));
+
+      r('proxy').textContent = st.proxy.toFixed(2);
+      r('true').textContent = st.true.toFixed(2);
+      r('corr').textContent = st.corr.toFixed(2);
+      r('top').textContent = st.topTrue.toFixed(2);
+    }
+
+    pIn.addEventListener('input', draw);
+    topBtn.addEventListener('click', () => {
+      topBtn.setAttribute('aria-pressed', String(topBtn.getAttribute('aria-pressed') !== 'true'));
+      draw();
+    });
+    draw();
+  });
+</script>

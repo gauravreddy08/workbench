@@ -1,0 +1,740 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import RLEnvEpisode from '../components/figures/RLEnvEpisode.astro';
+import RLEnvSignal from '../components/figures/RLEnvSignal.astro';
+
+## Today
+
+- Explain the reinforcement learning loop in plain words: agent, environment, observation, action, reward, episode, policy.
+- Read and write the Gymnasium `reset` / `step` interface, and say why it returns both `terminated` and `truncated`.
+- Map that loop onto an LLM doing a coding task: what the policy, the actions, the episode and the reward actually are.
+- List what a coding environment contains (task, starting repo, sandbox, tools, stop rules, reward, metadata) and why each piece is there.
+- Build a 20-task coding environment with a real sandbox, run three baselines through it (no-op, random, an LLM), and measure how fast it resets, steps and runs in parallel.
+
+Prerequisites: [What is a container, really?](/lessons/containers/) for the sandbox part, and [Processes, threads and the GIL](/lessons/processes-threads-gil/) for what a subprocess is. [Queues](/lessons/queues/) and [Back-of-envelope](/lessons/back-of-envelope/) help with the throughput section. Rough time: one evening to read, one to build.
+
+## The Problem
+
+You want a model to get better at fixing bugs. You have the model, and you have a training algorithm (PPO, GRPO, whatever). What you don't have is anything for the model to practise on.
+
+Practice, for a model, means this: give it a bug, let it poke at the code, let it try a fix, and tell it how well it did. Then do that again. Thousands of times per training step, for weeks. Every attempt needs a clean copy of the code, a safe place to run whatever the model writes, a way to score the result that the model can't fake, and it has to happen fast enough that a cluster of GPUs isn't sitting idle waiting for unit tests.
+
+That thing, the practice arena, is the environment. The posting for Anthropic's Code RL team lists "design RL environments" as core work, not a side task, and after this lesson you should see why. A training run can only teach what its environments can measure. If an environment is too easy, the model learns nothing. If it's broken, the model learns to exploit the bug. If it's slow, you can afford ten times less practice.
+
+<Origin year="2016" title="One interface for every world">
+
+Through the early 2010s, every RL paper came with its own simulator code, its own conventions for "what happened this step", and its own scoring. Comparing two papers meant reimplementing both. The Arcade Learning Environment (Bellemare et al., 2013) helped by wrapping dozens of Atari games behind one interface, and DeepMind's DQN used it to learn many games with one algorithm.
+
+In 2016 OpenAI released Gym: a Python library where every task, from balancing a pole to walking a simulated robot, was an object with two methods, `reset()` and `step(action)`. That tiny contract is why "environment" became a thing you can build, ship and swap. When OpenAI stopped maintaining Gym, the Farama Foundation took it over as Gymnasium (2022), and in that transition `step` started returning two separate "done" flags, `terminated` and `truncated`, to fix a subtle bug that had been in many published results.
+
+The next jump came from code. HumanEval (Chen et al., 2021) scored generated functions by running hidden unit tests. SWE-bench (Jimenez et al., 2023) turned real GitHub issues and their test suites into tasks. Once a test suite can say "yes, this fixed it" automatically, a coding task stops being a benchmark question and becomes a world a model can practise in.
+
+</Origin>
+
+## The Idea
+
+### The loop: someone acts, the world answers
+
+Think of learning to play a new board game with no rulebook. You make a move. The game changes. Sometimes, at the end, you win or lose. Over many games you figure out which moves tend to lead to winning.
+
+That is all of reinforcement learning, and it needs exactly two parties:
+
+- The <Term w="agent">The thing that makes decisions. In classic RL, a small neural net; for us, the language model.</Term>: the one making moves.
+- The <Term w="environment">Everything that isn't the agent: the world it acts in, which takes an action, updates itself, and reports back what happened.</Term>: everything else. The board, the rules, the opponent, the scorekeeper.
+
+They take turns. The environment shows the agent an <Term w="observation">What the agent is shown about the world right now. Often only part of the full state: a screen, a sensor reading, a tool's output.</Term>. The agent picks an <Term w="action">One move the agent makes: push left, press a button, call a tool, emit a token.</Term>. The environment applies it, moves to a new state, and returns the next observation plus a <Term w="reward">A number the environment hands back after each action. Higher is better. It is the only signal of "good" the agent ever gets.</Term>. Repeat until the game ends. One full run from start to end is an <Term w="episode">One complete attempt, from a fresh start until the task ends or time runs out. Also called a rollout or trajectory.</Term>.
+
+<Figure n="001" title="THE AGENT-ENVIRONMENT LOOP" caption="The agent only ever sends actions; the environment only ever sends observations and rewards. One pass around the loop is one step. Lay the steps out in a line and you have an episode.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Agent and environment exchanging actions, observations and rewards, with an episode laid out as a sequence below">
+  <defs>
+    <marker id="rl1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--blue)" /></marker>
+  </defs>
+  <rect x="40" y="30" width="170" height="110" class="fill-wash" stroke-width="1.2" />
+  <text x="125" y="72" text-anchor="middle" class="strong">AGENT</text>
+  <text x="125" y="92" text-anchor="middle">policy π</text>
+  <text x="125" y="110" text-anchor="middle">picks an action</text>
+  <rect x="430" y="30" width="170" height="110" class="fill-paper" stroke-width="1.2" />
+  <text x="515" y="72" text-anchor="middle" class="strong">ENVIRONMENT</text>
+  <text x="515" y="92" text-anchor="middle">hidden state s</text>
+  <text x="515" y="110" text-anchor="middle">applies the rules</text>
+  <line x1="212" y1="58" x2="426" y2="58" class="blue" stroke-width="1.4" marker-end="url(#rl1-a)" />
+  <text x="319" y="50" text-anchor="middle" class="blue-t">ACTION aₜ</text>
+  <line x1="426" y1="112" x2="212" y2="112" class="blue" stroke-width="1.4" marker-end="url(#rl1-a)" />
+  <text x="319" y="132" text-anchor="middle" class="blue-t">OBSERVATION oₜ₊₁ · REWARD rₜ₊₁</text>
+  <text x="20" y="190" class="strong">ONE EPISODE</text>
+  <g>
+    <rect x="20" y="204" width="54" height="30" class="fill-paper" stroke-width="1" /><text x="47" y="223" text-anchor="middle">o₀</text>
+    <rect x="80" y="204" width="54" height="30" class="fill-wash" stroke-width="1" /><text x="107" y="223" text-anchor="middle">a₀</text>
+    <rect x="140" y="204" width="54" height="30" class="fill-paper" stroke-width="1" /><text x="167" y="223" text-anchor="middle">o₁ r₁</text>
+    <rect x="200" y="204" width="54" height="30" class="fill-wash" stroke-width="1" /><text x="227" y="223" text-anchor="middle">a₁</text>
+    <rect x="260" y="204" width="54" height="30" class="fill-paper" stroke-width="1" /><text x="287" y="223" text-anchor="middle">o₂ r₂</text>
+    <text x="345" y="223" text-anchor="middle">· · ·</text>
+    <rect x="376" y="204" width="54" height="30" class="fill-wash" stroke-width="1" /><text x="403" y="223" text-anchor="middle">aₜ</text>
+    <rect x="436" y="204" width="80" height="30" class="fill-paper" stroke-width="1" /><text x="476" y="223" text-anchor="middle">oₜ₊₁ rₜ₊₁</text>
+    <rect x="522" y="204" width="98" height="30" class="fill-blue" /><text x="571" y="223" text-anchor="middle" style="fill:var(--paper)">END</text>
+  </g>
+  <line x1="20" y1="252" x2="20" y2="262" class="ink" stroke-width="1" /><line x1="20" y1="257" x2="620" y2="257" class="ink" stroke-width="1" /><line x1="620" y1="252" x2="620" y2="262" class="ink" stroke-width="1" />
+  <text x="320" y="282" text-anchor="middle">RESET() STARTS IT · TERMINATED OR TRUNCATED ENDS IT</text>
+</svg>
+</Figure>
+
+Two details in that picture matter more than they look.
+
+**The environment has state the agent can't see.** A chess engine sees the whole board, but most agents don't. A robot sees through one camera. A coding model sees only the files it chose to open and the outputs of commands it chose to run. The full state (every file in the repo, the hidden tests, the random seed) lives inside the environment. What crosses the arrow is the observation, which is usually a small, chosen slice of it.
+
+**The reward is the only definition of "good".** The agent doesn't know what you meant. It knows which numbers came back. If the number can go up without the task getting done, the agent will eventually find that path. Keep that in mind for the whole lesson; it's what [Rewards and verifiers](/lessons/verifiers-rewards/) is about.
+
+### The policy is the agent's habit
+
+The agent's decision rule has a name: the <Term w="policy">The agent's rule for choosing actions: given what it has observed, a probability for each possible action. Written π(a | o).</Term>. It is a function from "what I've seen" to "how likely I am to do each thing next". A policy for a pole-balancing cart might say "pole leaning left: push left with probability 0.9". Training is the process of changing the policy so that actions which led to high reward become more likely, and actions which led to low reward become less likely.
+
+Notice that a policy gives *probabilities*, not one fixed answer. That randomness is useful: it's how the agent tries things it hasn't tried before. Two episodes on the same task with the same policy can play out differently, and comparing them is how the learner finds out what worked.
+
+The environment's job, by contrast, has nothing to do with learning. It never updates itself and doesn't know there's a neural net on the other side. It is a referee and a world simulator, and it should behave identically no matter who is playing.
+
+### The Gym contract: reset and step
+
+Here's the whole interface, as Gymnasium defines it. This shape is worth memorising because nearly every RL codebase speaks it or something very close to it.
+
+```python
+import gymnasium as gym
+
+env = gym.make("CartPole-v1")           # balance a pole on a cart
+obs, info = env.reset(seed=42)          # start a fresh episode
+
+total = 0.0
+while True:
+    action = env.action_space.sample()  # a random policy: push left or right
+    obs, reward, terminated, truncated, info = env.step(action)
+    total += reward
+    if terminated or truncated:
+        break
+print("episode return:", total)
+env.close()
+```
+
+- `reset(seed=...)` throws away whatever happened and starts a new episode. It returns the first observation and an `info` dict for debugging extras. The seed makes the episode's randomness repeatable.
+- `step(action)` applies one action and returns five things: the next observation, the reward for that step, two end flags, and `info`.
+- The sum of rewards over an episode is the <Term w="return">The total reward collected over one episode. What the agent is really trying to maximise.</Term>. In CartPole the environment pays +1 for every step the pole stays up, so the return is just "how long did you last".
+
+Why two end flags? Because an episode can end for two very different reasons.
+
+<Figure n="002" title="TWO WAYS AN EPISODE ENDS" caption="Terminated means the task itself reached an end state: the pole fell, the agent submitted. Truncated means you, the environment designer, cut it off: a step limit or a time budget. A learner must treat them differently, because a truncated episode might have gone on to succeed.">
+<svg viewBox="0 0 640 210" role="img" aria-label="Two timelines: one ending in terminated, one ending in truncated at a step limit">
+  <text x="10" y="30" class="strong">A</text>
+  <rect x="30" y="16" width="70" height="24" class="fill-wash" stroke-width="1" /><text x="65" y="32" text-anchor="middle">RESET</text>
+  <g>
+    <rect x="108" y="16" width="44" height="24" class="fill-paper" stroke-width="1" /><text x="130" y="32" text-anchor="middle">step</text>
+    <rect x="158" y="16" width="44" height="24" class="fill-paper" stroke-width="1" /><text x="180" y="32" text-anchor="middle">step</text>
+    <rect x="208" y="16" width="44" height="24" class="fill-paper" stroke-width="1" /><text x="230" y="32" text-anchor="middle">step</text>
+  </g>
+  <rect x="260" y="16" width="130" height="24" class="fill-blue" /><text x="325" y="32" text-anchor="middle" style="fill:var(--paper)">TERMINATED</text>
+  <text x="400" y="26">the world reached an end:</text>
+  <text x="400" y="42">pole fell · agent called submit</text>
+
+  <text x="10" y="110" class="strong">B</text>
+  <rect x="30" y="96" width="70" height="24" class="fill-wash" stroke-width="1" /><text x="65" y="112" text-anchor="middle">RESET</text>
+  <g>
+    <rect x="108" y="96" width="44" height="24" class="fill-paper" stroke-width="1" /><text x="130" y="112" text-anchor="middle">step</text>
+    <rect x="158" y="96" width="44" height="24" class="fill-paper" stroke-width="1" /><text x="180" y="112" text-anchor="middle">step</text>
+    <text x="230" y="112" text-anchor="middle">· · ·</text>
+    <rect x="258" y="96" width="60" height="24" class="fill-paper" stroke-width="1" /><text x="288" y="112" text-anchor="middle">step N</text>
+  </g>
+  <line x1="326" y1="84" x2="326" y2="132" class="ink dash" stroke-width="1.2" />
+  <text x="326" y="148" text-anchor="middle">LIMIT</text>
+  <rect x="334" y="96" width="120" height="24" class="fill-paper" stroke-width="1.4" /><text x="394" y="112" text-anchor="middle" class="strong">TRUNCATED</text>
+  <text x="464" y="106">you cut it off:</text>
+  <text x="464" y="122">max steps · wall clock</text>
+  <text x="10" y="190">CARTPOLE-V1: +1 PER STEP, TRUNCATED AT 500 STEPS. A PERFECT POLICY IS ALWAYS TRUNCATED, NEVER TERMINATED.</text>
+</svg>
+</Figure>
+
+Old Gym returned a single `done` flag, and learners treated every `done` as "the future is worth zero from here". For a pole that fell, that's true. For a pole that was perfectly balanced when the clock ran out, it's a lie: the agent gets taught that balancing well leads to a dead end. Splitting the flag lets the learner say "the episode stopped, but the world didn't end". For coding: `submit` is termination; hitting the 30-tool-call limit or the token budget is truncation. Your environment should report which one happened, even if your first trainer ignores the difference.
+
+### Now make the agent a language model
+
+Everything above was built for robots and Atari. Here is the translation to a model fixing a bug.
+
+| RL word | Classic (CartPole) | LLM coding agent |
+| --- | --- | --- |
+| Policy | small neural net | the language model itself: its next-token probabilities |
+| Observation | 4 numbers (cart position, angle...) | text: the task, plus every tool result so far |
+| Action | push left / right | a tool call, like `run_tests()`, written as tokens (or, zoomed in, each single token) |
+| Step | one physics tick | one model turn plus one tool execution |
+| Episode | until the pole falls | one conversation: task in, many tool calls, submit or time out |
+| Reward | +1 every step | usually one number at the very end, from running hidden tests |
+
+Three things change, and each one matters for the environment you build.
+
+**The action space is enormous.** A cart has two buttons. A language model can write any string. Most of those strings are not valid tool calls, so the environment has to parse what the model wrote and handle garbage gracefully (return an error message as the observation, don't crash). There are two equally correct ways to zoom in: treat every <Term w="token">The unit a language model reads and writes: a word, part of a word, or a symbol. The model outputs one at a time.</Term> as an action (so the policy is literally the next-token distribution), or treat each complete tool call as one action. Training algorithms usually compute their math per token. Environments are almost always written per tool call, because that's where the world changes.
+
+**The observation is cumulative.** CartPole shows you the current state and nothing else. A model sees its whole conversation, so the "observation" at step 10 includes the task, nine tool calls and nine results. The environment returns only the new piece each step, and the <Term w="harness">The code around the model that builds its prompt, parses its tool calls, sends them to the environment and appends results. See the agent harness lesson.</Term> appends it to the context. That's why context length grows every step, and why [Managing context](/lessons/context-management/) is a separate skill.
+
+**The reward is sparse.** CartPole pays out every tick. A coding task usually pays nothing until the end, then one number: did the fix work? The model has to figure out which of its 20 actions deserved the credit. That is called the <Term w="credit assignment">Working out which earlier actions caused a later reward. Hard when the only reward arrives at the very end of a long episode.</Term> problem, and it's why long tasks are hard to learn ([What makes a task long-horizon?](/lessons/long-horizon/)). An environment can help with intermediate signals, but every extra signal is another thing the model can learn to game. Most coding RL starts with a single end-of-episode score.
+
+Step through one episode and watch what the model actually sees at each point.
+
+<Figure n="003" title="ONE CODING EPISODE, STEP BY STEP" caption="Each step, the model reads its whole context and writes one tool call; the environment runs it and sends back a result. Reward is zero at every step until submit, when the hidden tests run. Watch how small each observation is compared to the context it lands in." wide>
+
+<RLEnvEpisode />
+
+</Figure>
+
+Notice what the model never sees: the hidden tests. It saw a visible test fail, fixed it, saw the visible tests pass, and submitted. The hidden tests also checked the empty-list case, which nobody mentioned. Reward 0.875. That one number, attached to the whole trajectory, is the entire lesson the training step takes from this episode.
+
+<Predict id="visible-hidden">
+
+Why keep two sets of tests, visible and hidden? Why not just reward the model for making the visible tests pass?
+
+<Fragment slot="answer">
+
+Because the model can change anything in its sandbox, including the visible tests. If reward came from the tests it can see and edit, the cheapest way to raise reward is to delete the failing test or make it `assert True`. Hidden tests live outside the sandbox, get copied in (or run against the final files) only after the episode ends, and the model never has a chance to read or edit them. Visible tests are a tool for the model; hidden tests are the referee. The same idea shows up in [Why evals are separate](/lessons/why-evals-are-separate/): the thing you optimise against can't be the thing you're measured by.
+
+</Fragment>
+</Predict>
+
+### What's inside a coding environment
+
+Open the box. A coding environment is not one thing; it's seven, and each exists because skipping it breaks training in a specific way.
+
+<Figure n="004" title="ANATOMY OF ONE CODING TASK" caption="The top four are what the model touches. The bottom three are the environment's private business: how the episode ends, how it is scored, and the bookkeeping that lets you filter, debug and check for contamination later.">
+<svg viewBox="0 0 640 400" role="img" aria-label="Stacked parts of a coding environment, split into what the model sees and what stays hidden">
+  <rect x="120" y="14" width="500" height="372" class="fill-paper" stroke-width="1.2" />
+  <text x="132" y="34" class="strong">ONE ENVIRONMENT INSTANCE</text>
+  <g>
+    <rect x="132" y="46" width="476" height="40" class="fill-wash" stroke-width="1" />
+    <text x="144" y="64" class="strong">TASK SPEC</text><text x="144" y="79">the issue text or prompt: "median() is wrong for even lists"</text>
+    <rect x="132" y="92" width="476" height="40" class="fill-wash" stroke-width="1" />
+    <text x="144" y="110" class="strong">STARTING STATE</text><text x="144" y="125">repo at a pinned commit, deps installed, baked into an image</text>
+    <rect x="132" y="138" width="476" height="40" class="fill-wash" stroke-width="1" />
+    <text x="144" y="156" class="strong">SANDBOX</text><text x="144" y="171">where code runs: container, no network, CPU / memory / time caps</text>
+    <rect x="132" y="184" width="476" height="40" class="fill-wash" stroke-width="1" />
+    <text x="144" y="202" class="strong">TOOLS</text><text x="144" y="217">view_file · write_file · run_tests · submit (or a bash shell)</text>
+  </g>
+  <g>
+    <rect x="132" y="240" width="476" height="40" class="fill-paper" stroke-width="1" />
+    <text x="144" y="258" class="strong">TERMINATION</text><text x="144" y="273">submit → terminated · max steps / tokens / wall clock → truncated</text>
+    <rect x="132" y="286" width="476" height="40" class="fill-paper" stroke-width="1" />
+    <text x="144" y="304" class="strong">REWARD FUNCTION</text><text x="144" y="319">hidden tests run after submit → fraction passed (or 0 / 1)</text>
+    <rect x="132" y="332" width="476" height="40" class="fill-paper" stroke-width="1" />
+    <text x="144" y="350" class="strong">METADATA</text><text x="144" y="365">id · source + date · difficulty · ref solution · image digest</text>
+  </g>
+  <line x1="108" y1="46" x2="108" y2="224" class="blue" stroke-width="1.2" />
+  <line x1="108" y1="46" x2="114" y2="46" class="blue" stroke-width="1.2" /><line x1="108" y1="224" x2="114" y2="224" class="blue" stroke-width="1.2" />
+  <text x="100" y="130" text-anchor="end" class="blue-t">MODEL</text>
+  <text x="100" y="146" text-anchor="end" class="blue-t">TOUCHES</text>
+  <line x1="108" y1="240" x2="108" y2="372" class="ink" stroke-width="1.2" />
+  <line x1="108" y1="240" x2="114" y2="240" class="ink" stroke-width="1.2" /><line x1="108" y1="372" x2="114" y2="372" class="ink" stroke-width="1.2" />
+  <text x="100" y="300" text-anchor="end" class="strong">MODEL</text>
+  <text x="100" y="316" text-anchor="end" class="strong">NEVER SEES</text>
+</svg>
+</Figure>
+
+**Task spec.** What the model is told. For real-world tasks this is often an issue as a user wrote it, vague and all, because that's the skill you want. Keep it honest: if the spec doesn't mention a requirement, a hidden test that checks it is testing mind-reading. The 0.875 episode above is arguably that bug: nobody said what `median([])` should do.
+
+**Starting state.** The exact repo, at an exact commit, with exact dependency versions, already installed. "Clone the repo and `pip install`" is not a starting state, because it changes when a package publishes a new version. This gets baked into a container image once, so that `reset()` is "start a container from that image", not "rebuild the world".
+
+**Sandbox.** Where model-written code runs. The model will write infinite loops, fork bombs, `rm -rf /`, and code that tries to reach the internet. It isn't malicious; it's a policy exploring, which is worse, because it will try everything eventually. More on this below.
+
+**Tools.** The model's hands. A small set (view, write, run tests, submit) makes episodes easy to read and grade. A full bash shell is more realistic and more dangerous. Tool *outputs* need care too: truncate long outputs, return errors as text instead of crashing, and make sure no tool can reach the hidden tests.
+
+**Termination.** When the episode stops: on submit, or after a cap on steps, tokens or wall-clock time. Without caps, one confused episode can loop for hours while the rest of the batch waits for it. Remember [tail latency](/lessons/tail-latency/): a training step finishes when its *slowest* episode does.
+
+**Reward function.** Turns the final state into a number. Here: fraction of hidden tests passed. Real setups often use 0 or 1 (all tests pass or not) to stop the model from collecting partial credit for easy tests. The design of this function is a whole lesson on its own ([Rewards and verifiers](/lessons/verifiers-rewards/)).
+
+**Metadata.** Everything you'll want later: where the task came from and when (for contamination), a difficulty estimate, a known-good reference solution, the image digest. Without metadata you can't answer "why did reward jump on Tuesday?".
+
+### Same seed, same world
+
+An environment is a measuring instrument. If you run the same actions twice and get different rewards, you can't tell a better model from a lucky one. So an environment should be <Term w="deterministic">Same inputs, same outputs, every time. Here: the same seed and the same sequence of actions always produce the same observations and the same reward.</Term>: fix the seed, replay the same actions, get the same observations and the same reward.
+
+Code environments break this in boring ways, and each one shows up as noisy reward:
+
+- **Unpinned dependencies.** `pip install requests` today and next month install different code. Pin exact versions, build the image once, and record its digest.
+- **Network.** Tests that hit the internet pass or fail with the weather. Turn the network off in the sandbox; it's also a safety win.
+- **Time and randomness.** Tests that use today's date, `random` without a seed, or Python's hash randomisation for set ordering. Fix `PYTHONHASHSEED`, seed RNGs, or fake the clock.
+- **Flaky tests.** Tests that depend on thread timing or a timeout that's tight on a busy machine. The cure is empirical: run the reference solution many times and drop any task whose reward isn't identical every time.
+
+That last idea generalises into the most useful check in the whole lesson. For every task, before it enters the pool: **the untouched starting state must score 0, and the reference solution must score 1, every time.** SWE-bench encodes the same rule: a task's `FAIL_TO_PASS` tests must fail before the fix and pass after it, and its `PASS_TO_PASS` tests must pass both times. A task that fails either check can't teach anything true.
+
+### Fast resets, many at once
+
+Here's where [the numbers](/lessons/latency-numbers/) come in. Make up a modest training setup and do the arithmetic.
+
+<Predict id="sandboxes">
+
+Each training step samples 256 tasks, 8 attempts each. An episode makes about 20 tool calls, and about half of them run code that takes around 2 seconds (tests in a real repo). Ignore model time for now. If you ran episodes one after another, how long would one training step's environment work take? How many sandboxes would you need running at once to finish it in under a minute?
+
+<Fragment slot="answer">
+
+256 × 8 = 2,048 episodes. Each spends about 10 × 2 s = 20 s running code. Serially: 2,048 × 20 s ≈ 41,000 s, about **11 hours per training step**. To finish in 60 s you need about 41,000 / 60 ≈ 700 sandboxes busy at once, and in practice more, because model generation time sits between tool calls and holds the sandbox while it waits. This is [Little's law](/lessons/queues/): sandboxes in use = episodes started per second × seconds each one lives. If each sandbox needs 1 GB of RAM, that's most of a terabyte of memory just for environments. Approximate, but the shape is right: environments are a distributed system, not a script.
+
+</Fragment>
+</Predict>
+
+Three consequences fall out:
+
+**Reset has to be cheap.** If `reset()` clones a repo and installs dependencies, it costs minutes. If it starts a container from a pre-built image, it costs roughly a second or less (measure your own; it depends heavily on the runtime and image). If it copies a directory, it's a millisecond. You'll measure the last one today.
+
+**Steps have to be cheap, and bounded.** A tool call that reads a file should cost microseconds. A test run costs a process start plus the tests, and needs a hard timeout, because the 99th-percentile episode decides when the batch finishes.
+
+**Everything runs in parallel.** Environments must not share state: no shared temp directory, no fixed port number, no global "current task". Each instance owns its own sandbox and can be created and destroyed independently. You'll test this by running 8 at once and checking you get exactly the same rewards as running them one by one.
+
+### The signal lives in the middle
+
+Which tasks should go into the pool? The intuition: not too easy, not impossible. The math makes it sharp.
+
+Many modern methods, GRPO among them, sample several attempts at the same task and judge each attempt *relative to its siblings*: an attempt is "good" if it scored above the group's average. If all eight attempts pass, every attempt is exactly average. Same if all eight fail. Either way, every attempt's <Term w="advantage">How much better one attempt did than expected (here, than the group average). Positive pushes its actions up, negative pushes them down, zero does nothing.</Term> is zero, and the update learns nothing from that task. You paid for 8 sandboxes and 8 generations for zero gradient.
+
+If the model solves a task with probability p and you take k attempts, the chance that the group has at least one pass and at least one fail is 1 − pᵏ − (1 − p)ᵏ. Play with it.
+
+<Figure n="005" title="WHERE THE LEARNING SIGNAL LIVES" caption="The blue curve is the chance that a group of k attempts contains both a success and a failure, which is when group-relative methods get a gradient. Near p = 0 and p = 1 it collapses. More attempts widen the useful band, at a proportional cost.">
+
+<RLEnvSignal />
+
+</Figure>
+
+<Predict id="two-percent">
+
+Your model passes a hard task 2% of the time, and you sample 8 attempts. What fraction of groups for that task carry any signal? What if the pass rate is 50%?
+
+<Fragment slot="answer">
+
+At p = 0.02: 0.98⁸ ≈ 0.851 of groups are all-fail, 0.02⁸ is negligible, so only about **15%** of groups are useful. At p = 0.5: 1 − 2 × 0.5⁸ ≈ **99%**. The same compute buys you roughly six times more signal from the medium task. That's why task pools are filtered by difficulty: estimate each task's pass rate with the current model (or a slightly weaker one), and keep the ones in roughly the 10-90% band. As the model improves, tasks drift toward "always solved" and should be retired, and harder ones promoted. Difficulty is a property of the task *and the model*, so the filter has to be re-run.
+
+</Fragment>
+</Predict>
+
+Where do tasks come from? A few sources, each with a catch:
+
+- **Real history.** Mine merged pull requests that fixed an issue and added a test (the SWE-bench recipe). Realistic, but scarce, messy, and public.
+- **Synthetic breakage.** Take working code with good tests, break it on purpose (delete a line, flip a condition, have a model introduce a plausible bug), and ask for the fix. Unlimited and cheap, but the bugs can feel artificial.
+- **Written from scratch.** Humans or models write a spec, a stub and hidden tests, which is what you'll do today at small scale. Controlled, but the tests are only as good as their author.
+
+### Contamination: did it learn, or remember?
+
+A model trained on the public internet has probably read GitHub. If your task is "fix issue #1234 in a popular library", the model may have seen the very commit that fixed it. Solving that task measures memory, not skill, and training on it rewards recall. That is <Term w="contamination">When the answers to a task (or the task itself) were in the model's training data, so a high score may come from remembering instead of solving.</Term>.
+
+Signs: the model writes the exact upstream patch, with the maintainer's variable names, without opening the files first. Or pass rates are high on old tasks and collapse on tasks created after the model's training cutoff. Mitigations, roughly in order of strength: prefer tasks created after the model's data cutoff (record the date in metadata, that's what it's for), rewrite or perturb public tasks so the memorised answer no longer fits, use private code, and compare pass rates on old vs new slices.
+
+There's a second, sneakier kind: contamination *within* the environment. If the hidden tests are readable from inside the sandbox (a test file left on disk, a path in an error message), a policy that explores will find them. That isn't memorisation, it's the environment leaking its answer key. You'll make this happen in Break It.
+
+### Running code you didn't write
+
+The model's code is untrusted. Not because the model is hostile, but because the training loop rewards whatever works, and a policy sampling thousands of variants will eventually try every strange thing. The sandbox's job is to make sure the worst possible episode costs you one episode and nothing more.
+
+<Figure n="006" title="LAYERS OF A SANDBOX" caption="Each layer stops a different class of accident. Process limits stop runaway loops and huge files. A container gives the code its own filesystem and cuts the network. A separate kernel (gVisor, a microVM, a VM) is what you add when you stop trusting the shared kernel itself.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Three nested sandbox layers with what each one prevents">
+  <rect x="10" y="12" width="380" height="266" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="32" class="strong">VM / MICROVM / GVISOR</text>
+  <text x="22" y="48">own kernel</text>
+  <rect x="34" y="62" width="334" height="198" class="fill-paper" stroke-width="1.2" />
+  <text x="46" y="82" class="strong">CONTAINER</text>
+  <text x="46" y="98">own filesystem · net off · mem + pid caps</text>
+  <rect x="58" y="112" width="288" height="128" class="fill-wash" stroke-width="1.2" />
+  <text x="70" y="132" class="strong">SUBPROCESS + LIMITS</text>
+  <text x="70" y="150">wall-clock timeout</text>
+  <text x="70" y="166">CPU seconds (RLIMIT_CPU)</text>
+  <text x="70" y="182">max file size (RLIMIT_FSIZE)</text>
+  <text x="70" y="198">own session, minimal env vars</text>
+  <rect x="200" y="206" width="120" height="24" class="fill-blue" /><text x="260" y="222" text-anchor="middle" style="fill:var(--paper)">MODEL'S CODE</text>
+  <text x="410" y="150" class="strong">STOPS</text>
+  <text x="410" y="168">infinite loops, giant outputs</text>
+  <line x1="346" y1="164" x2="404" y2="164" class="ink dash" stroke-width="1" />
+  <text x="410" y="92" class="strong">STOPS</text>
+  <text x="410" y="110">rm -rf on the host, network</text>
+  <text x="410" y="126">calls, fork bombs, memory blowup</text>
+  <line x1="368" y1="96" x2="404" y2="96" class="ink dash" stroke-width="1" />
+  <text x="410" y="36" class="strong">STOPS</text>
+  <text x="410" y="54">kernel exploits, escapes</text>
+  <line x1="390" y1="40" x2="404" y2="40" class="ink dash" stroke-width="1" />
+</svg>
+</Figure>
+
+Today you'll build the inner layer with Python's `subprocess` and `resource` modules, then wrap it in a container. The inner layer alone is good enough to experiment with on your own tasks, and not good enough for model-written code at scale: a subprocess can still read your home directory and open sockets. On macOS it's weaker still. On my Mac, `resource.setrlimit(RLIMIT_AS, ...)` raised `ValueError` instead of capping memory, so memory caps need Linux or a container. That's one more reason the real thing runs in [containers](/lessons/containers/) on Linux, with cgroups doing the resource accounting.
+
+## Build It
+
+Everything goes in `~/workbench/rlenv/`. Standard library only, except the LLM baseline, which needs one SDK. The design target: `env = CodeEnv(tasks); obs, info = env.reset(seed); obs, r, term, trunc, info = env.step(action)`, the Gymnasium shape, with actions as dicts like `{"tool": "write_file", "path": "solution.py", "content": "..."}`.
+
+<Task id="t0" title="Write the task pool" agent="ok">
+
+Each task is a stub file the model must complete, a reference solution, a couple of visible tests, and a set of hidden tests. Keep them small: one function each, pure Python, no imports beyond the standard library. Store them as one `tasks.json` (or one folder per task, if you prefer).
+
+```python
+# tasks.py: three examples of the format; aim for ~20 total
+TASKS = [
+    {
+        "id": "median",
+        "prompt": "Implement median(xs). Even-length lists return the mean of the two middle values. Empty list raises ValueError.",
+        "stub": "def median(xs):\n    raise NotImplementedError\n",
+        "ref":  "def median(xs):\n    if not xs:\n        raise ValueError('empty')\n    s = sorted(xs); n = len(s)\n    return s[n//2] if n % 2 else (s[n//2-1] + s[n//2]) / 2\n",
+        "visible": ["assert median([3, 1, 2]) == 2"],
+        "hidden": [
+            "assert median([3, 1, 2]) == 2",
+            "assert median([1, 2, 3, 4]) == 2.5",
+            "assert median([5]) == 5",
+            "import pytest_raises_free as _\n",  # placeholder: see note below
+        ],
+        "meta": {"source": "handwritten", "created": "2026-10", "difficulty": None},
+    },
+    # "rle_encode", "roman_to_int", "merge_intervals", "is_balanced_brackets", "lru_cache_class", ...
+]
+```
+
+That last hidden test is deliberately broken: there's no such module. Leave it in for now. Your validation step (t3) must catch it.
+
+For error cases, a test can be a small block: `"try:\n    median([])\nexcept ValueError:\n    pass\nelse:\n    raise AssertionError"`.
+
+An agent can draft the other ~17 tasks. Ask for a spread: a few trivial ones (reverse a string), most medium (parse a duration string like `"1h30m"`, merge overlapping intervals, a tiny LRU cache class), and two or three genuinely fiddly ones (an expression evaluator with precedence, a diff of two lists). 4-10 hidden tests each, with edge cases the prompt actually mentions. You will check every one of them in t3, so a sloppy draft costs you nothing but time.
+
+</Task>
+
+<Task id="t1" title="A subprocess sandbox with hard limits" agent="hands">
+
+One function that runs a command in a directory and can't hang, can't run forever on CPU, and can't write a giant file.
+
+```python
+# sandbox.py
+import os, resource, subprocess, sys
+
+def _limits(cpu_s: int, fsize_bytes: int) -> None:
+    """Runs in the child just before exec. Set RLIMIT_CPU and RLIMIT_FSIZE (soft = hard),
+    and call os.setsid() so the child gets its own process group."""
+    ...
+
+def run(cmd: list[str], cwd: str, timeout_s: float = 10, cpu_s: int = 5,
+        fsize_bytes: int = 1 << 20) -> dict:
+    """Run cmd in cwd with a minimal environment (PATH only, PYTHONHASHSEED=0,
+    PYTHONDONTWRITEBYTECODE=1). Return {"rc", "stdout", "stderr", "timed_out", "seconds"}.
+    Truncate stdout/stderr to the last ~4,000 characters."""
+    ...
+```
+
+Hints:
+
+- `subprocess.run(..., preexec_fn=..., env=..., capture_output=True, text=True, timeout=...)`. On timeout it raises `subprocess.TimeoutExpired`: catch it and return `timed_out=True`.
+- `timeout` is wall-clock time (catches `time.sleep(1e9)`). `RLIMIT_CPU` is CPU time (catches `while True: pass` even if the wall clock is generous). You want both. Think about which one fires first for each.
+- When a child is killed by `RLIMIT_CPU`, `rc` is negative (the signal number). Record it; it makes debugging easier.
+- Test it with three tiny scripts: one that prints, one with `while True: pass`, one with `time.sleep(100)`. On my Mac the busy loop with `cpu_s=2` came back in about 2.7 s of wall time on a heavily loaded machine.
+
+</Task>
+
+<Task id="t2" title="The environment: reset, step, four tools" agent="hands">
+
+```python
+# env.py
+import json, os, random, shutil, sys, tempfile
+from sandbox import run
+
+RUNNER = r'''
+# A tiny test runner, executed inside the sandbox: exec solution.py, then each test
+# in a fresh copy of its namespace; print one JSON line {"passed": p, "total": n}.
+'''
+
+class CodeEnv:
+    def __init__(self, tasks: list[dict], max_steps: int = 12):
+        ...
+
+    def reset(self, seed: int | None = None, task_id: str | None = None) -> tuple[str, dict]:
+        """Pick a task (by id, or with random.Random(seed)), make a fresh temp dir,
+        write solution.py (the stub) and test_visible.py into it. Write the hidden tests
+        to a SEPARATE temp location the sandbox's cwd does not contain.
+        Return (first observation text, info={"task_id": ...})."""
+        ...
+
+    def step(self, action: dict) -> tuple[str, float, bool, bool, dict]:
+        """Tools: view_file(path), write_file(path, content), run_tests() (visible only),
+        submit() (hidden tests, reward = passed / total, terminated=True).
+        Bad or unknown actions return an error string as the observation, reward 0.
+        After max_steps without submit: truncated=True, reward 0."""
+        ...
+
+    def close(self) -> None:
+        """Delete this instance's temp dirs."""
+        ...
+```
+
+Decisions you have to make, and should be able to defend:
+
+- **Paths.** `view_file("../../etc/passwd")` should not work. Resolve the path and refuse anything outside the task directory.
+- **Where hidden tests live.** Not in the working directory. Pass their path to the runner as an argument, or better, copy them in only at submit time into a fresh directory along with the final `solution.py`.
+- **What `submit` runs against.** A fresh process, so nothing the model did during `run_tests` (a monkeypatched module, a leftover file) carries into scoring.
+- **Truncated reward.** 0 is the simple answer. Some setups still score the final state on truncation. Pick one and write down why.
+
+</Task>
+
+<Task id="t3" title="Validate every task: stub scores 0, reference scores 1, always" agent="hands">
+
+Write `validate.py`. For every task: `reset(task_id=...)`, submit immediately and assert reward 0. Then `reset`, write the reference solution, submit, and assert reward 1.0. Do the reference run 5 times and assert the reward is identical every time. Print a table of failures.
+
+Your broken `median` hidden test should fail here (the reference can't pass a test that imports a missing module). Fix it. If any agent-drafted task fails, fix the task, not the validator. When everything passes, you have an environment you can trust as a measuring instrument.
+
+</Task>
+
+<Task id="t4" title="Two dumb baselines: no-op and random" agent="ok">
+
+These are your floor. Any learning system must beat them, and if a dumb policy scores well, your reward is broken.
+
+```python
+# baselines.py
+import random
+from env import CodeEnv
+from tasks import TASKS
+
+def noop_policy(obs, rng):
+    return {"tool": "submit"}
+
+def random_policy(obs, rng):
+    """Random tool calls, with random small edits: sometimes view a file, sometimes run tests,
+    sometimes write `return 0` / `return None` / `return xs` bodies, sometimes submit."""
+    choice = rng.choice(["view", "tests", "write", "submit"])
+    if choice == "view":   return {"tool": "view_file", "path": "solution.py"}
+    if choice == "tests":  return {"tool": "run_tests"}
+    if choice == "submit": return {"tool": "submit"}
+    body = rng.choice(["return 0", "return None", "return ''", "return []", "return args[0]"])
+    return {"tool": "write_file", "path": "solution.py",
+            "content": f"def _f(*args, **kw):\n    {body}\n"}  # deliberately wrong name
+
+def run_episode(env, policy, seed):
+    rng = random.Random(seed)
+    obs, info = env.reset(seed=seed)
+    steps = 0
+    while True:
+        obs, r, term, trunc, info = env.step(policy(obs, rng))
+        steps += 1
+        if term or trunc:
+            return {"task": env.task["id"], "reward": r, "steps": steps, "truncated": trunc}
+
+if __name__ == "__main__":
+    env = CodeEnv(TASKS)
+    for name, pol in [("noop", noop_policy), ("random", random_policy)]:
+        eps = [run_episode(env, pol, s) for s in range(100)]
+        print(name, "mean reward", sum(e["reward"] for e in eps) / len(eps))
+```
+
+Both should score 0, or very close. If the random policy gets a nonzero score on some task, look at that task's hidden tests: they probably accept a trivial answer (a function that returns `0` passing `assert f([]) == 0`).
+
+</Task>
+
+<Task id="t5" title="An LLM baseline agent" agent="review">
+
+Now a real policy. Wire a model to your environment with tool calling. Any provider works; here's the shape with the Anthropic Python SDK (`pip install anthropic`, key in `ANTHROPIC_API_KEY`; check the SDK docs if anything has moved).
+
+```python
+# llm_agent.py
+import anthropic, json
+from env import CodeEnv
+from tasks import TASKS
+
+client = anthropic.Anthropic()
+MODEL = "claude-opus-5-5"   # swap for a cheaper model if you like; check current pricing
+
+TOOLS = [
+    {"name": "view_file", "description": "Read a file in the task directory.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Overwrite a file with new content.",
+     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                      "required": ["path", "content"]}},
+    {"name": "run_tests", "description": "Run the visible tests.", "input_schema": {"type": "object", "properties": {}}},
+    {"name": "submit", "description": "Submit your solution. Ends the episode.", "input_schema": {"type": "object", "properties": {}}},
+]
+
+def llm_episode(env: CodeEnv, task_id: str) -> dict:
+    obs, info = env.reset(task_id=task_id)
+    messages = [{"role": "user", "content": obs}]
+    while True:
+        resp = client.messages.create(model=MODEL, max_tokens=4000, tools=TOOLS,
+                                      output_config={"effort": "low"}, messages=messages)
+        messages.append({"role": "assistant", "content": resp.content})
+        calls = [b for b in resp.content if b.type == "tool_use"]
+        if not calls:
+            ...  # the model stopped without submitting: treat as submit, or nudge it once
+        results = []
+        for c in calls:
+            obs, r, term, trunc, info = env.step({"tool": c.name, **c.input})
+            results.append({"type": "tool_result", "tool_use_id": c.id, "content": str(obs)})
+            if term or trunc:
+                return {"task": task_id, "reward": r, "truncated": trunc, "turns": ...}
+        messages.append({"role": "user", "content": results})
+```
+
+Run every task 3 times. Log the full transcript of each episode to a JSONL file: you'll want to read them. Budget: 20 tasks × 3 runs × roughly 5 turns is about 300 calls with short contexts. Estimate the cost from `resp.usage` after the first few episodes and stop if it's more than you meant to spend.
+
+Then have an agent review your loop for bugs that would make the baseline unfair: tool results returned in separate messages, an exception in `step` that kills the episode instead of becoming an observation, episodes that never close their temp dirs.
+
+</Task>
+
+<Task id="t6" title="Measure latency and run 8 episodes in parallel" agent="hands">
+
+Write `bench.py`:
+
+1. Median and p99 of `reset()` over 200 calls.
+2. Median of `view_file`, `write_file`, `run_tests` and `submit` over 50 calls each.
+3. 64 reference-solution episodes (write ref, submit) run serially, then with 8 workers. Use `ThreadPoolExecutor(8)`: each worker owns its own `CodeEnv`, and the real work happens in child processes, so the GIL isn't the bottleneck here ([why](/lessons/processes-threads-gil/)).
+4. Assert the parallel run's rewards equal the serial run's, task by task. If they don't, two environments are sharing something.
+
+</Task>
+
+<Task id="t7" title="Move the sandbox into a container" agent="explain">
+
+Write `sandbox_docker.run(...)` with the same signature as `sandbox.run`, that executes the command inside a throwaway container with the task directory mounted. The flags that matter (all standard `docker run` options; check `docker run --help` on your version):
+
+```bash
+docker run --rm \
+  --network none \
+  --memory 512m --cpus 1 --pids-limit 128 \
+  --read-only --tmpfs /tmp \
+  --user 1000:1000 \
+  -v "$TASK_DIR":/work -w /work \
+  python:3.12-slim python -I runner.py
+```
+
+Each flag maps to a row in Figure 006: no network, a memory cap, a CPU cap, a cap on the number of processes (fork bombs), a read-only root filesystem with a scratch `/tmp`, and a non-root user. Swap it in behind a flag, rerun `validate.py`, then rerun `bench.py` and compare the `submit` latency. Do this part on the Spark (Linux, native containers) if Docker Desktop on the Mac is awkward. An agent can explain any flag or error, but write the function yourself.
+
+</Task>
+
+<DoneWhen>
+
+- `validate.py` passes for all ~20 tasks: stub scores 0, reference scores 1.0, five times in a row.
+- No-op and random baselines score about 0; the LLM baseline scores something in between, and you've read at least five of its transcripts, including a failure.
+- `bench.py` prints reset and step latencies, and the 8-way parallel run matches the serial rewards exactly.
+- A `while True: pass` solution is killed and scores 0, without stalling the other episodes.
+- You can point at each of the seven parts in Figure 004 in your own code.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Run each timing twice, keep the faster.
+
+| Measurement | Prediction | Mac (subprocess) | Spark (subprocess) | Spark (container) |
+| --- | --- | --- | --- | --- |
+| `reset()` median | | | | |
+| `view_file` median | | | | |
+| `run_tests` median | | | | |
+| `submit` median | | | | |
+| 64 ref episodes, serial | | | | |
+| 64 ref episodes, 8 workers | | | | |
+| No-op mean reward | | | | |
+| Random mean reward | | | | |
+| LLM mean reward (3 runs × 20) | | | | |
+| LLM: tasks with 3/3, 0/3, mixed | | | | |
+
+<Predict id="where-time">
+
+Before you run `bench.py`: which is slower, `reset()` or `submit()`, and by roughly how much? What dominates `submit`?
+
+<Fragment slot="answer">
+
+`submit` by about a hundred times. `reset()` is a temp directory and two small files: around a millisecond. `submit` starts a fresh Python process, and starting the interpreter dwarfs running a handful of asserts. Reading a file through `view_file` is tens of microseconds, so the tools that run code cost thousands of times more than the ones that don't.
+
+</Fragment>
+</Predict>
+
+Reference numbers from my prototype of this environment, on an M-series Mac, Python 3.14. One honest caveat: the machine was very heavily loaded when I measured (load average above 70, from many other jobs), so treat these as upper bounds and the *ratios* as the point.
+
+| Measurement | Measured |
+| --- | --- |
+| `reset()` (temp dir + 2 files) | ~0.9 ms |
+| `view_file` | ~40 µs |
+| `submit` (new Python process + 4 asserts) | ~110 ms |
+| Bare `python3 -I -c pass` via `subprocess` | ~100 ms (expect a few tens of ms on an idle machine; check yours) |
+| `while True: pass` solution, `RLIMIT_CPU` = 2 s | killed, reward 0, ~2.7 s wall |
+| No-op policy | 0.0 |
+| Reference solution | 1.0 |
+
+What the numbers should tell you:
+
+**Running code is the cost.** Nearly all of an episode's environment time is process starts and test runs. That is why real environments care about warm interpreters, test selection, and fast container starts, and why the model's choice to call `run_tests` ten times is a throughput question, not just a style question.
+
+**Parallelism should be close to linear.** With 8 workers and the work happening in separate processes, 64 episodes should take about an eighth of the serial time, as long as you have 8 free cores. My loaded-machine runs were too noisy to quote; yours on an idle Spark should be clean. If you get much less than 8x, look for something shared: one temp directory, a lock, a single-threaded bottleneck in your harness.
+
+**The container column will be slower per call.** Starting a container per `submit` adds its own startup on top of Python's. Real systems keep one container alive per episode and `exec` into it, so the container cost is paid once at `reset`, not once per step. Measure both ways if you have time.
+
+**The LLM baseline tells you about your pool, not just the model.** Look at the "3/3, 0/3, mixed" row. Tasks the model always solves teach it nothing (Figure 005); tasks it never solves teach nothing either, unless the failure is your bug. Read the 0/3 transcripts first. Some will be genuinely hard; some will be a spec that didn't say what the hidden tests check.
+
+## Break It
+
+**1. Leak the answer key.** Move the hidden tests into the task directory as `test_hidden.py`, and write a "policy" that does `view_file("test_hidden.py")`, then writes a solution that special-cases each asserted input. It scores 1.0 without implementing anything general. A real policy doesn't need to be clever to find this; it just needs to call `view_file` on every file it's shown, which it will. Lesson: anything in the sandbox is part of the observation, whether you meant it or not.
+
+**2. Fake the score.** Use a runner that `exec`s the solution in the same process as the tests and prints a JSON line at the end, as the stub in t2 suggests. Then submit either of these:
+
+```python
+class X:
+    __eq__ = lambda self, other: True   # equal to everything
+def median(xs):
+    return X()
+```
+
+```python
+import json, os
+print(json.dumps({"passed": 4, "total": 4}), flush=True)
+os._exit(0)   # exit before the real tests run
+```
+
+On my prototype both scored a perfect 1.0. The first beats `==`-based asserts; the second forges the runner's output. Neither solves anything. This is <Term w="reward hacking">When a policy raises its reward by exploiting how the reward is computed instead of doing the task. Not a model bug: the optimiser doing exactly what it was told.</Term> in its purest form, and fixing it properly (run tests in a separate process from the solution, compare with type checks, read results from a file the solution can't write, never parse stdout the solution controls) is the starting point of [Rewards and verifiers](/lessons/verifiers-rewards/). Patch your runner against both, and keep the two exploits as regression tests.
+
+**3. Make it nondeterministic.** Add a hidden test that depends on set iteration order (`assert list(f({"b", "a"})) == ["a", "b"]`) and remove `PYTHONHASHSEED=0` from the sandbox env. Run `validate.py`'s five-repeat check. Depending on the strings, it can pass on some runs and fail on others. Now imagine that across 2,048 episodes: a fraction of your reward is coin flips, and the model is being trained on noise. Put the seed back, and fix the test, since it's checking an accident of implementation rather than behaviour.
+
+**4. Share state between environments.** Change `reset()` to use a fixed directory, `/tmp/rlenv-work`, instead of a fresh temp dir. Run `bench.py`'s parallel section. The parallel rewards no longer match the serial ones: one episode's `write_file` lands in another's directory, and some episodes are scored on someone else's code. Everything still "runs", and nothing errors. That's what makes this bug expensive at scale.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What is an RL environment? Describe it to someone who has never heard of RL.</summary>
+
+It's the world an agent practises in, plus a referee. You give it an action; it updates its internal state, shows you what changed (an observation), and hands you a number saying how good that was (a reward). It starts fresh on `reset()` and runs until the task ends or you cut it off. The environment doesn't learn. It just has to be a faithful, repeatable, cheap world, and its reward has to mean what you think it means, because the agent will optimise exactly that number.
+
+</details>
+
+<details>
+<summary>2. Map the RL vocabulary onto an LLM fixing a bug. What are the policy, action, observation, episode and reward?</summary>
+
+The policy is the model: given its context, it produces a probability distribution over next tokens. Actions are its tool calls (or, at the finest grain, individual tokens). Observations are the tool results that get appended to its context, starting with the task text. An episode is one whole conversation, from task to submit or timeout. The reward usually arrives once, at the end, from running hidden tests on the final code. That sparsity makes credit assignment hard: the model has to work out which of many actions mattered.
+
+</details>
+
+<details>
+<summary>3. Why does Gymnasium return both terminated and truncated?</summary>
+
+They mean different things for the future. Terminated means the task really ended (the agent submitted, the pole fell), so there's no more reward to come. Truncated means you stopped it artificially, for example at a step limit, and the episode might have continued and succeeded. Learners that estimate future value need to treat a truncated episode's last state as still having future value, not zero. Mixing them up teaches the agent that doing well until the time limit is worthless. For coding, submit is termination; running out of turns or tokens is truncation.
+
+</details>
+
+<details>
+<summary>4. How does this scale? You need 2,000 episodes per training step, each about a minute of tool time. What do you have to build?</summary>
+
+At one minute each, serially that's about 33 hours per step, so you need on the order of 1,000+ sandboxes alive at once to keep a step to a couple of minutes (Little's law: concurrent = rate × duration). That means: pre-built images per task so reset is "start a container", not "install dependencies"; one long-lived container per episode with exec for each tool call; hard per-step and per-episode timeouts, because the slowest episode decides when the batch finishes; no shared state between instances; a scheduler that packs containers onto a fleet of machines and restarts the ones that die; and memory and CPU caps so one runaway episode can't starve its neighbours. Then measure the tail: p99 episode time, not the mean.
+
+</details>
+
+<details>
+<summary>5. How do you pick which tasks go into the training pool, and why not just use the hardest ones?</summary>
+
+Validate first: the starting state must score 0 and the reference solution 1, every time, or the task is broken. Then calibrate difficulty against the current model: run it several times per task and keep tasks it solves sometimes but not always, roughly 10-90%. Group-relative methods like GRPO only learn from groups where some attempts pass and some fail; at a 2% pass rate with 8 attempts, about 85% of groups are all-fail and teach nothing. As the model improves, re-run the filter, retire solved tasks and add harder ones. Also check for contamination: prefer tasks created after the model's training cutoff, and be suspicious of tasks it solves without looking at the code.
+
+</details>
+
+## Go Deeper
+
+- **Richard Sutton and Andrew Barto, _Reinforcement Learning: An Introduction_ (2nd ed., 2018)**, free at [incompleteideas.net/book/the-book-2nd.html](http://incompleteideas.net/book/the-book-2nd.html). Chapter 3 defines the agent-environment interface, returns and episodes. The original source of this whole vocabulary, and very readable.
+- **OpenAI, _Spinning Up in Deep RL_, "Part 1: Key Concepts in RL"** at [spinningup.openai.com](https://spinningup.openai.com/). The fastest clear tour of states vs observations, policies, trajectories and returns, with just enough math.
+- **[Gymnasium documentation](https://gymnasium.farama.org/)**, especially the `Env` API reference and the page on handling time limits, which explains terminated vs truncated with the bootstrapping example.
+- **Greg Brockman et al., "OpenAI Gym" (2016)**, arXiv:1606.01540. Four pages. Worth it for the design reasoning behind `reset`/`step`, and as a reminder of how small the interface that unified a field was.
+- **Carlos Jimenez et al., "SWE-bench: Can Language Models Resolve Real-World GitHub Issues?" (2023)**, arXiv:2310.06770. How to turn real repos and issues into tasks with fail-to-pass tests, and every practical problem that came with it.
+- **Mark Chen et al., "Evaluating Large Language Models Trained on Code" (2021)**, arXiv:2107.03374. The HumanEval paper; the section on sandboxing generated code is a short, sober list of what can go wrong.
+- **Zhihong Shao et al., "DeepSeekMath" (2024)**, arXiv:2402.03300, which introduces GRPO, and **DeepSeek-AI, "DeepSeek-R1" (2025)**, arXiv:2501.12948, which scales RL with rule-based, verifiable rewards. Read them for why group-relative advantages make task difficulty matter so much.
+- **Lilian Weng, "Reward Hacking in Reinforcement Learning" (2024)**, on lilianweng.github.io. A thorough survey of how policies exploit rewards, including in coding environments. The bridge to the next lesson.
+
+## Connections
+
+This lesson leans on [What is a container, really?](/lessons/containers/) for the sandbox, [Processes, threads and the GIL](/lessons/processes-threads-gil/) for why threads are fine for driving subprocess-based episodes, and [Queues](/lessons/queues/) and [Back-of-envelope](/lessons/back-of-envelope/) for sizing a sandbox fleet. The "visible tests vs hidden tests" split is the same idea as [Why evals are separate](/lessons/why-evals-are-separate/).
+
+It sets up the rest of this track. [Rewards and verifiers](/lessons/verifiers-rewards/) starts from the two exploits in Break It and asks how to build a reward that survives an optimiser. [RL with verifiable rewards](/lessons/grpo/) puts a training algorithm on top of this environment and makes Figure 005 bite. [What makes a task long-horizon?](/lessons/long-horizon/) stretches episodes from 5 steps to 100 and watches credit assignment fall apart, and [Managing context](/lessons/context-management/) deals with the observation that keeps growing. And the loop in your `llm_agent.py` is a tiny version of the [agent harness](/lessons/agent-harness/).

@@ -1,0 +1,33 @@
+---
+// Static: a radix tree of cached prefixes (SGLang's RadixAttention).
+// Edges are token runs of any length; nodes carry a ref count and a last-used time.
+// Eviction removes the oldest unreferenced leaf first, so shared stems survive.
+type N = { x: number; y: number; w: number; label: string; meta: string; kind?: 'busy' | 'evict' | 'root' };
+const nodes: Record<string, N> = {
+  root: { x: 20, y: 130, w: 70, label: 'ROOT', meta: '', kind: 'root' },
+  A: { x: 130, y: 60, w: 150, label: 'SYS PROMPT A', meta: '2,048 TOK · REF 2' },
+  B: { x: 130, y: 210, w: 150, label: 'SYS PROMPT B', meta: '1,800 TOK · REF 0' },
+  q1: { x: 330, y: 20, w: 130, label: 'USER: Q1', meta: 'REF 1 · NOW', kind: 'busy' },
+  t1: { x: 330, y: 90, w: 130, label: 'TURN 1 + REPLY', meta: 'REF 1 · NOW', kind: 'busy' },
+  q3: { x: 330, y: 210, w: 130, label: 'USER: Q3', meta: 'REF 0 · 9 MIN AGO', kind: 'evict' },
+  t2: { x: 500, y: 90, w: 120, label: 'TURN 2', meta: 'REF 1 · NOW', kind: 'busy' },
+};
+const edges = [['root', 'A'], ['root', 'B'], ['A', 'q1'], ['A', 't1'], ['t1', 't2'], ['B', 'q3']];
+const H = 40;
+---
+<svg viewBox="0 0 640 290" role="img" aria-label="A radix tree of cached token prefixes with reference counts; the oldest unreferenced leaf is evicted first">
+  {edges.map(([a, b]) => {
+    const p = nodes[a], c = nodes[b];
+    return <path d={`M${p.x + p.w},${p.y + H / 2} C${p.x + p.w + 24},${p.y + H / 2} ${c.x - 24},${c.y + H / 2} ${c.x},${c.y + H / 2}`} class="ink" stroke-width="1" />;
+  })}
+  {Object.values(nodes).map((n) => (
+    <g>
+      <rect x={n.x} y={n.y} width={n.w} height={H} class={n.kind === 'busy' ? 'fill-wash' : n.kind === 'evict' ? 'fill-paper dash' : 'fill-paper'} stroke-width={n.kind === 'evict' ? 1.5 : 1} />
+      <text x={n.x + 8} y={n.y + (n.meta ? 17 : 25)} class="strong">{n.label}</text>
+      {n.meta && <text x={n.x + 8} y={n.y + 32} class={n.kind === 'busy' ? 'blue-t' : ''}>{n.meta}</text>}
+    </g>
+  ))}
+  <line x1="395" y1="250" x2="395" y2="264" class="blue" stroke-width="1" />
+  <text x="330" y="278" class="blue-t">EVICT FIRST: LEAF, REF 0, OLDEST</text>
+  <text x="130" y="276">A STAYS: CHILDREN IN USE</text>
+</svg>

@@ -1,0 +1,196 @@
+---
+// The DPO loss for one preference pair, as a function of the two numbers it actually sees:
+//   a = log πθ(y_w|x) − log π_ref(y_w|x)   (how much the policy moved the chosen answer)
+//   b = log πθ(y_l|x) − log π_ref(y_l|x)   (how much it moved the rejected one)
+// loss = −log σ(β (a − b)). Left: shading over the (a, b) plane (darker = larger loss = stronger
+// push), the current point, and the gradient-descent step direction. Right: loss vs margin a − b.
+// Usage: <DPOLossSurface />
+---
+<div class="dls" data-fig="dpo-loss-surface">
+  <div class="dls-plots">
+  <svg viewBox="0 0 290 330" role="img" aria-label="DPO loss over the chosen and rejected log-ratio plane, with the current point and the gradient step">
+    <text x="40" y="16" class="strong">LOSS OVER (a, b)</text>
+    <g data-layer="heat"></g>
+    <rect x="40" y="24" width="240" height="240" class="ink" stroke-width="1" />
+    <line x1="160" y1="24" x2="160" y2="264" class="ink dash" stroke-width="0.8" />
+    <line x1="40" y1="144" x2="280" y2="144" class="ink dash" stroke-width="0.8" />
+    <line x1="40" y1="264" x2="280" y2="24" class="blue" stroke-width="1" />
+    <text x="274" y="120" text-anchor="end" class="blue-t">a = b</text>
+    <text x="274" y="134" text-anchor="end" class="blue-t">LOSS = ln 2</text>
+    <text x="46" y="256">BOTH FELL</text>
+    <text x="274" y="256" text-anchor="end">CHOSEN UP</text>
+    <text x="274" y="243" text-anchor="end">REJECTED DOWN</text>
+    <text x="46" y="38">WRONG WAY</text>
+    <line data-el="arrow" x1="0" y1="0" x2="0" y2="0" class="blue" stroke-width="2" marker-end="url(#dls-head)" />
+    <circle data-el="pt" cx="160" cy="144" r="5" class="fill-blue" />
+    <text x="160" y="282" text-anchor="middle">a: CHOSEN LOG-RATIO →</text>
+    <text x="40" y="282">−6</text>
+    <text x="280" y="282" text-anchor="end">+6</text>
+    <text x="28" y="144" text-anchor="middle" transform="rotate(-90 28 144)">b: REJECTED LOG-RATIO →</text>
+    <text x="36" y="30" text-anchor="end">+6</text>
+    <text x="36" y="264" text-anchor="end">−6</text>
+    <text x="40" y="306">DARK = HIGH LOSS = BIG PUSH</text>
+    <text x="40" y="322">ARROW = DIRECTION OF ONE STEP</text>
+
+    <defs>
+      <marker id="dls-head" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+        <path d="M0,0 L8,4 L0,8 z" style="fill:var(--blue)" />
+      </marker>
+    </defs>
+  </svg>
+  <svg viewBox="290 0 270 330" role="img" aria-label="DPO loss against the margin a minus b for the current beta">
+    <text x="320" y="16" class="strong">LOSS VS MARGIN a − b</text>
+    <rect x="320" y="24" width="230" height="180" class="ink" stroke-width="1" />
+    <line data-el="ln2" x1="320" y1="0" x2="550" y2="0" class="ink dash" stroke-width="0.8" />
+    <text data-el="ln2t" x="546" y="0" text-anchor="end">ln 2</text>
+    <line x1="435" y1="24" x2="435" y2="204" class="ink dash" stroke-width="0.8" />
+    <path data-el="curve" d="" class="blue" stroke-width="1.5" />
+    <circle data-el="dot" cx="0" cy="0" r="4" class="fill-blue" />
+    <text x="320" y="220">−12</text>
+    <text x="435" y="220" text-anchor="middle">0</text>
+    <text x="550" y="220" text-anchor="end">+12</text>
+    <text x="316" y="34" text-anchor="end" data-el="ymax">4</text>
+    <text x="316" y="204" text-anchor="end">0</text>
+    <text x="320" y="246" class="strong">THE GRADIENT, IN WORDS</text>
+    <text x="320" y="264">raise log π(chosen) by w·lr</text>
+    <text x="320" y="280">lower log π(rejected) by w·lr</text>
+    <text x="320" y="296" data-el="wtxt">w = β·σ(−β(a−b)) = 0.050</text>
+    <text x="320" y="312">same direction everywhere;</text>
+    <text x="320" y="326">only the size changes</text>
+  </svg>
+  </div>
+  <div class="ctl">
+    <label>a (chosen) <input type="range" min="-6" max="6" step="0.1" value="0" data-in="a" /><output data-out="a">0.0</output></label>
+    <label>b (rejected) <input type="range" min="-6" max="6" step="0.1" value="0" data-in="b" /><output data-out="b">0.0</output></label>
+    <label>β <input type="range" min="0.02" max="1" step="0.01" value="0.1" data-in="beta" /><output data-out="beta">0.10</output></label>
+  </div>
+  <div class="ctl">
+    <span>try</span>
+    <button class="btn" type="button" data-p="0,0" aria-pressed="true">Step 0</button>
+    <button class="btn" type="button" data-p="1.5,-2" aria-pressed="false">Healthy</button>
+    <button class="btn" type="button" data-p="-2.5,-5.5" aria-pressed="false">Both fell</button>
+    <button class="btn" type="button" data-p="-1,1" aria-pressed="false">Wrong way</button>
+  </div>
+  <div class="ctl">
+    <span>margin a−b <span class="readout" data-out="h">-</span></span>
+    <span>implicit rewards β·a / β·b <span class="readout" data-out="rw">-</span></span>
+    <span>reward margin <span class="readout" data-out="rm">-</span></span>
+  </div>
+  <div class="ctl">
+    <span>P(chosen wins) σ(β(a−b)) <span class="readout" data-out="p">-</span></span>
+    <span>loss <span class="readout" data-out="loss">-</span></span>
+    <span>push w <span class="readout" data-out="w">-</span></span>
+  </div>
+</div>
+
+<style>
+  .dls-plots { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+  .dls-plots svg { flex: 1 1 260px; width: 100%; min-width: 0; }
+  .dls .ctl input[type='range'] { width: min(180px, 42vw); }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const sig = (z: number) => 1 / (1 + Math.exp(-z));
+  const softplus = (z: number) => (z > 30 ? z : Math.log1p(Math.exp(z)));
+  const N = 24; // grid cells per side
+  const X0 = 40, Y0 = 24, S = 240, R = 6; // plane spans [-R, R] on both axes
+  const ax = (a: number) => X0 + ((a + R) / (2 * R)) * S;
+  const by = (b: number) => Y0 + ((R - b) / (2 * R)) * S;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="dpo-loss-surface"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const inA = q<HTMLInputElement>('[data-in="a"]');
+    const inB = q<HTMLInputElement>('[data-in="b"]');
+    const inBeta = q<HTMLInputElement>('[data-in="beta"]');
+    const presets = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-p]'));
+    const heat = q<SVGGElement>('[data-layer="heat"]');
+    const cells: { el: SVGRectElement; h: number }[] = [];
+    const c = S / N;
+    for (let i = 0; i < N; i++)
+      for (let j = 0; j < N; j++) {
+        const el = document.createElementNS(NS, 'rect') as SVGRectElement;
+        el.setAttribute('x', (X0 + j * c).toFixed(2));
+        el.setAttribute('y', (Y0 + i * c).toFixed(2));
+        el.setAttribute('width', (c + 0.3).toFixed(2));
+        el.setAttribute('height', (c + 0.3).toFixed(2));
+        heat.appendChild(el);
+        const a = -R + (j + 0.5) * ((2 * R) / N);
+        const b = R - (i + 0.5) * ((2 * R) / N);
+        cells.push({ el, h: a - b });
+      }
+
+    const render = () => {
+      const a = Number(inA.value), b = Number(inB.value), beta = Number(inBeta.value);
+      const h = a - b;
+      // shading = 1 − σ(βh): the fraction of the maximum push still being applied
+      for (const cell of cells) {
+        const o = 1 - sig(beta * cell.h);
+        cell.el.setAttribute('style', `fill:var(--blue);fill-opacity:${(o * 0.75).toFixed(3)}`);
+      }
+      const px = ax(a), py = by(b);
+      q('[data-el="pt"]').setAttribute('cx', px.toFixed(1));
+      q('[data-el="pt"]').setAttribute('cy', py.toFixed(1));
+      // gradient descent moves a up and b down by the same amount w (times the learning rate)
+      const w = beta * sig(-beta * h);
+      // arrow length shows σ(−βh), the share of the maximum push (β sets the absolute size, see w)
+      const len = 6 + 64 * sig(-beta * h);
+      const d = len / Math.SQRT2;
+      const arrow = q('[data-el="arrow"]');
+      arrow.setAttribute('x1', px.toFixed(1));
+      arrow.setAttribute('y1', py.toFixed(1));
+      arrow.setAttribute('x2', (px + d).toFixed(1));
+      arrow.setAttribute('y2', (py + d).toFixed(1));
+
+      // right panel: loss vs margin for this β
+      const H = 12, L0 = 320, LW = 230, T0 = 24, TH = 180;
+      const ymax = Math.max(1, softplus(beta * H));
+      const lx = (m: number) => L0 + ((m + H) / (2 * H)) * LW;
+      const ly = (v: number) => T0 + TH - (v / ymax) * TH;
+      let path = '';
+      for (let k = 0; k <= 96; k++) {
+        const m = -H + (k / 96) * 2 * H;
+        path += `${k ? 'L' : 'M'}${lx(m).toFixed(1)},${ly(softplus(-beta * m)).toFixed(1)}`;
+      }
+      q('[data-el="curve"]').setAttribute('d', path);
+      const hc = Math.max(-H, Math.min(H, h));
+      q('[data-el="dot"]').setAttribute('cx', lx(hc).toFixed(1));
+      q('[data-el="dot"]').setAttribute('cy', ly(softplus(-beta * hc)).toFixed(1));
+      const y2 = ly(Math.LN2);
+      q('[data-el="ln2"]').setAttribute('y1', y2.toFixed(1));
+      q('[data-el="ln2"]').setAttribute('y2', y2.toFixed(1));
+      q('[data-el="ln2t"]').setAttribute('y', (y2 - 4).toFixed(1));
+      q('[data-el="ymax"]').textContent = ymax.toFixed(1);
+      q('[data-el="wtxt"]').textContent = `w = β·σ(−β(a−b)) = ${w.toFixed(3)}`;
+
+      const loss = softplus(-beta * h);
+      out('a').textContent = a.toFixed(1);
+      out('b').textContent = b.toFixed(1);
+      out('beta').textContent = beta.toFixed(2);
+      out('h').textContent = h.toFixed(1);
+      out('rw').textContent = `${(beta * a).toFixed(2)} / ${(beta * b).toFixed(2)}`;
+      out('rm').textContent = (beta * h).toFixed(2);
+      out('p').textContent = sig(beta * h).toFixed(3);
+      out('loss').textContent = loss.toFixed(3);
+      out('w').textContent = w.toFixed(3);
+    };
+
+    [inA, inB, inBeta].forEach((el) =>
+      el.addEventListener('input', () => {
+        presets.forEach((p) => p.setAttribute('aria-pressed', 'false'));
+        render();
+      }),
+    );
+    presets.forEach((btn) =>
+      btn.addEventListener('click', () => {
+        const [a, b] = btn.dataset.p!.split(',').map(Number);
+        inA.value = String(a);
+        inB.value = String(b);
+        presets.forEach((p) => p.setAttribute('aria-pressed', String(p === btn)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

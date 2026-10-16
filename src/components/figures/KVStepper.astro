@@ -1,0 +1,201 @@
+---
+// Step through generation one token at a time. Left: the K, V and Q vectors for each position in one
+// attention head of one layer, coloured by whether this step computed them, reused them from the
+// cache, or recomputed them for nothing. Right: the attention scores (lower triangle) computed this step.
+// Toggle the cache to see how much work a cache-free loop throws away.
+// Usage: <KVStepper />
+---
+<div class="kvs" data-fig="kv-stepper">
+  <svg viewBox="0 0 560 300" role="img" aria-label="A grid of key, value and query vectors per token position, and a triangle of attention scores, highlighting what each generation step computes">
+    <text x="10" y="14" class="strong">ONE LAYER · ONE HEAD</text>
+    <text x="10" y="30" data-el="mode">CACHE ON</text>
+    <g data-layer="toks"></g>
+    <text x="10" y="94" class="strong">K</text>
+    <text x="10" y="124" class="strong">V</text>
+    <text x="10" y="154" class="strong">Q</text>
+    <g data-layer="grid"></g>
+    <text x="400" y="14" class="strong">SCORES Q·K</text>
+    <text x="400" y="30">ROW = QUERY POS</text>
+    <g data-layer="att"></g>
+
+    <g transform="translate(10,206)">
+      <rect x="0" y="0" width="14" height="14" class="fill-blue" />
+      <text x="20" y="11">COMPUTED, USED</text>
+      <rect x="140" y="0" width="14" height="14" class="fill-wash" stroke-width="1" />
+      <text x="160" y="11">READ FROM CACHE</text>
+      <rect x="290" y="0" width="14" height="14" class="fill-paper" stroke-width="1" />
+      <line x1="290" y1="14" x2="304" y2="0" class="ink" stroke-width="1" />
+      <text x="310" y="11">RECOMPUTED, WASTED</text>
+      <rect x="0" y="22" width="14" height="14" class="fill-paper dash" stroke-width="1" />
+      <text x="20" y="33">NOT YET / NOT NEEDED</text>
+    </g>
+    <text x="10" y="270" class="strong" data-el="line1"></text>
+    <text x="10" y="288" data-el="line2"></text>
+  </svg>
+  <p class="kvs-note" aria-live="polite"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="step">Step →</button>
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <span>cache</span>
+    <button class="btn" type="button" data-c="1" aria-pressed="true">On</button>
+    <button class="btn" type="button" data-c="0" aria-pressed="false">Off</button>
+  </div>
+  <div class="ctl">
+    <span>seq length <span class="readout" data-out="t">0</span></span>
+    <span>K/V vectors made this step <span class="readout" data-out="kv">0</span></span>
+    <span>wasted, so far <span class="readout" data-out="waste">0</span></span>
+    <span>cache holds <span class="readout" data-out="mem">0 rows</span></span>
+  </div>
+</div>
+
+<style>
+  .kvs svg { width: 100%; }
+  .kvs-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 4.5em; }
+</style>
+
+<script>
+  const TOKS = ['The', 'cat', 'sat', 'on', 'the', 'mat', 'and', 'then', 'it', 'fell', 'fast', 'asleep'];
+  const P = 4; // prompt length
+  const N = TOKS.length;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  const reduce = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  // GPT-2 small: 12 layers x 12 heads x 64 dims x 2 (K,V) x 4 bytes (fp32) per token
+  const GPT2_BYTES_PER_TOK = 2 * 12 * 12 * 64 * 4;
+
+  type St = 'new' | 'cache' | 'waste' | 'none';
+  const cls = (s: St) => (s === 'new' ? 'fill-blue' : s === 'cache' ? 'fill-wash' : s === 'waste' ? 'fill-paper' : 'fill-paper dash');
+
+  document.querySelectorAll<HTMLElement>('[data-fig="kv-stepper"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const toksG = q<SVGGElement>('[data-layer="toks"]');
+    const gridG = q<SVGGElement>('[data-layer="grid"]');
+    const attG = q<SVGGElement>('[data-layer="att"]');
+    const note = q<HTMLElement>('.kvs-note');
+    const playBtn = q<HTMLButtonElement>('[data-act="play"]');
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const el = (k: string) => q<SVGTextElement>(`[data-el="${k}"]`);
+    let step = -1; // -1 = nothing yet; 0 = prefill; k>0 = decode step k
+    let cache = true;
+    let timer: number | undefined;
+
+    const X0 = 30, CW = 29; // token columns
+    const AX = 400, AC = 12; // attention triangle
+
+    const seqLen = () => (step < 0 ? 0 : step === 0 ? P : P + step);
+    // cumulative K/V vectors computed (per layer per head, K and V counted separately) and wasted
+    const totals = (upto: number, on: boolean) => {
+      let made = 0, waste = 0;
+      for (let s = 0; s <= upto; s++) {
+        const t = s === 0 ? P : P + s;
+        const m = s === 0 ? 2 * P : on ? 2 : 2 * t;
+        made += m;
+        waste += s === 0 ? 0 : on ? 0 : 2 * (t - 1);
+      }
+      return { made, waste };
+    };
+
+    const render = () => {
+      const t = seqLen();
+      toksG.replaceChildren();
+      gridG.replaceChildren();
+      attG.replaceChildren();
+      for (let i = 0; i < N; i++) {
+        const x = X0 + i * CW;
+        const isNew = step > 0 && i === t - 1;
+        const tx = mk('text', { x: x + 13, y: 64, 'text-anchor': 'middle', class: i < t ? (isNew ? 'blue-t' : 'strong') : '' }, TOKS[i]);
+        tx.setAttribute('transform', `rotate(-40 ${x + 13} 64)`);
+        toksG.appendChild(tx);
+        toksG.appendChild(mk('text', { x: x + 13, y: 76, 'text-anchor': 'middle' }, String(i)));
+      }
+      toksG.appendChild(mk('line', { x1: X0 + P * CW - 2, y1: 40, x2: X0 + P * CW - 2, y2: 168, class: 'ink dash', 'stroke-width': 1 }));
+      toksG.appendChild(mk('text', { x: X0 + P * CW + 4, y: 180 }, 'GENERATED →'));
+      toksG.appendChild(mk('text', { x: X0, y: 180 }, 'PROMPT'));
+
+      for (let i = 0; i < N; i++) {
+        const x = X0 + i * CW;
+        let kv: St = 'none', qq: St = 'none';
+        if (i < t) {
+          if (step === 0) { kv = 'new'; qq = i === t - 1 ? 'new' : 'waste'; }
+          else if (i === t - 1) { kv = 'new'; qq = 'new'; }
+          else if (cache) { kv = 'cache'; qq = 'none'; }
+          else { kv = 'waste'; qq = 'waste'; }
+        }
+        // In prefill the earlier queries are needed for the earlier rows' outputs at lower layers,
+        // so they are not waste there. Mark them as computed.
+        if (step === 0 && i < t - 1) qq = 'new';
+        for (const [row, s] of [[84, kv], [114, kv], [144, qq]] as [number, St][]) {
+          gridG.appendChild(mk('rect', { x, y: row, width: CW - 4, height: 16, class: cls(s), 'stroke-width': 1 }));
+          if (s === 'waste') gridG.appendChild(mk('line', { x1: x, y1: row + 16, x2: x + CW - 4, y2: row, class: 'ink', 'stroke-width': 1 }));
+        }
+      }
+
+      // attention scores: lower triangle N x N; this step computes row(s)
+      for (let r = 0; r < N; r++) {
+        for (let c = 0; c <= r; c++) {
+          let s: St = 'none';
+          if (r < t) {
+            if (step === 0) s = 'new';
+            else if (r === t - 1) s = 'new';
+            else s = cache ? 'none' : 'waste';
+          }
+          const x = AX + c * AC, y = 40 + r * AC;
+          attG.appendChild(mk('rect', { x, y, width: AC - 2, height: AC - 2, class: s === 'none' && r < t ? 'fill-paper' : cls(s), 'stroke-width': 0.8 }));
+          if (s === 'waste') attG.appendChild(mk('line', { x1: x, y1: y + AC - 2, x2: x + AC - 2, y2: y, class: 'ink', 'stroke-width': 0.8 }));
+        }
+      }
+
+      const on = totals(Math.max(step, 0), true);
+      const off = totals(Math.max(step, 0), false);
+      const mine = cache ? on : off;
+      const madeNow = step < 0 ? 0 : step === 0 ? 2 * P : cache ? 2 : 2 * t;
+      const wasteNow = step <= 0 ? 0 : cache ? 0 : 2 * (t - 1);
+      el('mode').textContent = cache ? 'CACHE ON' : 'CACHE OFF · RECOMPUTE EVERYTHING';
+      out('t').textContent = String(t);
+      out('kv').textContent = String(madeNow);
+      out('waste').textContent = String(step < 0 ? 0 : mine.waste);
+      out('mem').textContent = cache ? `${t} rows` : '0 rows';
+      if (step < 0) {
+        el('line1').textContent = 'PRESS STEP TO RUN PREFILL ON THE 4-TOKEN PROMPT';
+        el('line2').textContent = '';
+      } else {
+        el('line1').textContent = `TOTAL K/V MADE: ${mine.made}  (CACHE ON WOULD BE ${on.made}, OFF ${off.made})`;
+        el('line2').textContent = `AT 1,000 TOKENS: ON ≈ 2,000 · OFF ≈ 1,000,000 PER HEAD PER LAYER`;
+      }
+      const kib = (t * GPT2_BYTES_PER_TOK) / 1024;
+      if (step < 0) note.textContent = 'A 4-token prompt. Nothing has run yet.';
+      else if (step === 0) note.textContent = `Prefill: one forward pass over all ${P} prompt tokens computes K and V for every position at once and writes them to the cache. The last position’s output gives the first new token, “${TOKS[P]}”. Prefill looks the same with or without a cache.`;
+      else if (t >= N) note.textContent = cache
+        ? `Done. Each decode step made exactly one new K and one new V and read the rest. In full GPT-2 small (12 layers × 12 heads, fp32) this ${t}-token cache would be ${kib.toFixed(0)} KiB. Now switch the cache off and replay.`
+        : `Done. Without a cache, ${mine.waste} of the ${mine.made} K/V vectors were recomputed copies of ones that already existed, plus every Q, score, MLP and layer norm for those old positions. The waste grows with the square of the length.`;
+      else note.textContent = cache
+        ? `Decode step ${step}: feed only “${TOKS[t - 1]}” at position ${t - 1}. Compute its q, k, v; append k and v to the cache; score q against all ${t} cached keys (one row of the triangle); mix the ${t} values. Old queries are never needed again.`
+        : `Decode step ${step}: run the whole ${t}-token sequence again. Every old K, V and Q comes out bit-for-bit what it was last step (the causal mask guarantees it), and the whole triangle of scores is redone, to produce one new row.`;
+    };
+
+    const stop = () => { if (timer) clearInterval(timer); timer = undefined; playBtn.setAttribute('aria-pressed', 'false'); };
+    const last = N - P;
+    const stepOnce = () => { if (step < last) step++; else stop(); render(); };
+    q('[data-act="step"]').addEventListener('click', () => { stop(); stepOnce(); });
+    q('[data-act="reset"]').addEventListener('click', () => { stop(); step = -1; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer) return stop();
+      if (step >= last) step = -1;
+      if (reduce) { step = last; render(); return; }
+      playBtn.setAttribute('aria-pressed', 'true');
+      timer = window.setInterval(stepOnce, 700);
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-c]').forEach((b) => b.addEventListener('click', () => {
+      root.querySelectorAll('[data-c]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      cache = b.dataset.c === '1';
+      render();
+    }));
+    render();
+  });
+</script>

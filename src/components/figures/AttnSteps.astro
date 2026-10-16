@@ -1,0 +1,111 @@
+---
+// One query row of attention, step by step: raw q·k scores, scaled by 1/sqrt(d_head), causal mask,
+// softmax, then the weighted mix of value vectors. Toy numbers (d_head = 64, 2-D values for drawing).
+// Toggle scaling off to see softmax collapse onto one key.
+// Usage: <AttnSteps />
+---
+<div class="attst" data-fig="attn-steps">
+  <svg viewBox="0 0 360 300" role="img" aria-label="Bars for one query's attention scores at each stage of the computation" data-el="svg"></svg>
+  <div class="ctl">
+    <button class="btn" type="button" data-step="0" aria-pressed="true">1 q·k</button>
+    <button class="btn" type="button" data-step="1" aria-pressed="false">2 ÷√d</button>
+    <button class="btn" type="button" data-step="2" aria-pressed="false">3 mask</button>
+    <button class="btn" type="button" data-step="3" aria-pressed="false">4 softmax</button>
+    <button class="btn" type="button" data-step="4" aria-pressed="false">5 mix V</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-scale aria-pressed="true">Scaling on</button>
+    <span>max weight <span class="readout" data-el="max">-</span></span>
+  </div>
+</div>
+
+<style>
+  .attst svg { width: 100%; }
+</style>
+
+<script>
+  const TOK = ['<eot>', 'The', 'cat', 'sat', 'on', 'the'];
+  const Q = 3; // the query is "sat"
+  const RAW = [26, 6, 30, 14, 38, 9]; // toy q·k dot products for d_head = 64
+  const V = [[0.1, 0.2], [0.6, -0.3], [-0.5, 0.9], [0.3, 0.4], [0.9, 0.1], [-0.2, -0.8]];
+  const D = 64;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const CAPTION = [
+    'RAW SCORE = q_sat · k_j, ONE PER KEY',
+    'DIVIDE BY √64 = 8 (KEEPS SCORES ~UNIT SIZE)',
+    'FUTURE KEYS (j > i) SET TO −∞: CAUSAL MASK',
+    'SOFTMAX: WEIGHTS ≥ 0 THAT SUM TO 1',
+    'OUTPUT = Σ weight_j · v_j',
+  ];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="attn-steps"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('[data-el="svg"]')!;
+    const maxOut = root.querySelector<HTMLElement>('[data-el="max"]')!;
+    const scaleBtn = root.querySelector<HTMLButtonElement>('[data-scale]')!;
+    let step = 0, scale = true;
+
+    const compute = () => {
+      const s = RAW.map((r) => (scale ? r / Math.sqrt(D) : r));
+      const m = s.map((v, j) => (j > Q ? -Infinity : v));
+      const mx = Math.max(...m.filter((v) => isFinite(v)));
+      const e = m.map((v) => (isFinite(v) ? Math.exp(v - mx) : 0));
+      const z = e.reduce((a, b) => a + b, 0);
+      const w = e.map((v) => v / z);
+      const out = [0, 1].map((d) => w.reduce((a, wj, j) => a + wj * V[j][d], 0));
+      return { s, m, w, out };
+    };
+
+    const render = () => {
+      svg.replaceChildren();
+      const { s, m, w, out } = compute();
+      svg.appendChild(mk('text', { x: 6, y: 16, class: 'strong' }, `QUERY = "sat" (i = ${Q})`));
+      svg.appendChild(mk('text', { x: 6, y: 34 }, CAPTION[step]));
+      const vals = step === 0 ? RAW : step === 1 ? s : step === 2 ? m : w;
+      const isW = step >= 3;
+      const top = Math.max(...(isW ? [1] : RAW.map((r) => (step === 0 || !scale ? r : r / 8))));
+      const x0 = 70, bw = 260, y0 = 52, rh = 30;
+      TOK.forEach((t, j) => {
+        const y = y0 + j * rh;
+        svg.appendChild(mk('text', { x: x0 - 8, y: y + 15, 'text-anchor': 'end', class: j === Q ? 'strong' : '' }, `${t} ${j}`));
+        const v = vals[j];
+        if (!isFinite(v)) {
+          svg.appendChild(mk('rect', { x: x0, y: y + 3, width: bw, height: 18, class: 'fill-paper dash', 'stroke-width': 1 }));
+          svg.appendChild(mk('text', { x: x0 + 8, y: y + 16 }, '−∞  MASKED'));
+          return;
+        }
+        if (isW && j > Q) {
+          svg.appendChild(mk('text', { x: x0 + 4, y: y + 16 }, '0.00'));
+          return;
+        }
+        const width = Math.max(1, (v / top) * (bw - 50));
+        svg.appendChild(mk('rect', { x: x0, y: y + 3, width, height: 18, class: isW ? 'fill-blue' : 'fill-wash', 'stroke-width': 1 }));
+        svg.appendChild(mk('text', { x: x0 + width + 6, y: y + 16, class: 'blue-t' }, isW ? v.toFixed(2) : v.toFixed(step === 0 ? 0 : 2)));
+      });
+      if (step === 4) {
+        svg.appendChild(mk('text', { x: 6, y: 248, class: 'strong' }, `OUTPUT FOR "sat" = [${out[0].toFixed(2)}, ${out[1].toFixed(2)}]`));
+        svg.appendChild(mk('text', { x: 6, y: 266 }, 'v_j SHOWN IN 2-D; REAL v_j ARE 64-D'));
+        svg.appendChild(mk('text', { x: 6, y: 284 }, `MOSTLY v_cat [${V[2].join(', ')}] + v_eot [${V[0].join(', ')}]`));
+      }
+      const mxw = Math.max(...w);
+      maxOut.textContent = `${mxw.toFixed(2)} on "${TOK[w.indexOf(mxw)]}"`;
+    };
+
+    root.querySelectorAll<HTMLButtonElement>('[data-step]').forEach((b) => b.addEventListener('click', () => {
+      root.querySelectorAll('[data-step]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      step = Number(b.dataset.step); render();
+    }));
+    scaleBtn.addEventListener('click', () => {
+      scale = !scale;
+      scaleBtn.setAttribute('aria-pressed', String(scale));
+      scaleBtn.textContent = scale ? 'Scaling on' : 'Scaling off';
+      render();
+    });
+    render();
+  });
+</script>

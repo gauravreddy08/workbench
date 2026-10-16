@@ -1,0 +1,208 @@
+---
+// One GRPO step on one prompt: sample G answers, score each with a verifier, compute
+// group-relative advantages (r - mean) / std, and draw them as bars. A second panel shows a
+// batch of 24 prompts at the same pass rate and which groups carry any learning signal.
+// Usage: <GRPOGroupStep />
+---
+<div class="grs" data-fig="grpo-group-step">
+  <svg class="grs-main" viewBox="0 0 480 360" role="img" aria-label="G sampled answers to one arithmetic prompt, each with a verifier reward and a bar showing its advantage, positive to the right and negative to the left">
+    <g data-layer="main"></g>
+  </svg>
+  <p class="grs-note" aria-live="polite"></p>
+  <div class="ctl">
+    <label>G samples <input type="range" min="2" max="16" step="1" value="8" data-in="g" /> <output data-out="g">8</output></label>
+    <label>pass rate <input type="range" min="0" max="1" step="0.05" value="0.35" data-in="p" /> <output data-out="p">0.35</output></label>
+    <label>reward noise <input type="range" min="0" max="0.5" step="0.05" value="0" data-in="noise" /> <output data-out="noise">0.00</output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="resample">Resample group</button>
+    <button class="btn" type="button" data-act="std" aria-pressed="true">Divide by std</button>
+  </div>
+  <div class="ctl">
+    <span>correct <span class="readout" data-out="k">-</span></span>
+    <span>mean r <span class="readout" data-out="mean">-</span></span>
+    <span>std r <span class="readout" data-out="std">-</span></span>
+    <span>Σ|A| <span class="readout" data-out="push">-</span></span>
+  </div>
+  <svg class="grs-batch" viewBox="0 0 480 190" role="img" aria-label="A batch of 24 prompt groups; groups where every answer got the same reward are greyed out because they give no gradient">
+    <g data-layer="batch"></g>
+  </svg>
+  <div class="ctl">
+    <span>groups with signal <span class="readout" data-out="sig">-</span></span>
+    <span>expected 1 − p<sup>G</sup> − (1−p)<sup>G</sup> <span class="readout" data-out="exp">-</span></span>
+  </div>
+</div>
+
+<style>
+  .grs svg { width: 100%; display: block; }
+  .grs-batch { margin-top: 18px; }
+  .grs-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const RIGHT = 408;
+  const WRONG = [398, 418, 388, 428, 308, 4008, 412, 404, 448, 368];
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  // Box-Muller standard normal
+  const randn = () => {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  const stats = (r: number[]) => {
+    const m = r.reduce((s, x) => s + x, 0) / r.length;
+    const sd = Math.sqrt(r.reduce((s, x) => s + (x - m) ** 2, 0) / r.length);
+    return { m, sd };
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="grpo-group-step"]').forEach((root) => {
+    const q$ = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const M = q$<SVGGElement>('[data-layer="main"]');
+    const B = q$<SVGGElement>('[data-layer="batch"]');
+    const note = q$<HTMLElement>('.grs-note');
+    const out = (k: string) => q$<HTMLElement>(`[data-out="${k}"]`);
+    const gIn = q$<HTMLInputElement>('[data-in="g"]');
+    const pIn = q$<HTMLInputElement>('[data-in="p"]');
+    const nIn = q$<HTMLInputElement>('[data-in="noise"]');
+    const stdBtn = q$<HTMLButtonElement>('[data-act="std"]');
+    let useStd = true;
+
+    // Pre-draw uniforms so moving a slider changes the outcome smoothly instead of reshuffling.
+    const MAXG = 16, NB = 24;
+    let uMain: number[] = [], wMain: number[] = [], zMain: number[] = [];
+    let uBatch: number[][] = [], zBatch: number[][] = [];
+    const reroll = () => {
+      uMain = Array.from({ length: MAXG }, () => Math.random());
+      wMain = Array.from({ length: MAXG }, () => Math.floor(Math.random() * WRONG.length));
+      zMain = Array.from({ length: MAXG }, randn);
+      uBatch = Array.from({ length: NB }, () => Array.from({ length: MAXG }, () => Math.random()));
+      zBatch = Array.from({ length: NB }, () => Array.from({ length: MAXG }, randn));
+    };
+
+    const advantages = (r: number[]) => {
+      const { m, sd } = stats(r);
+      return r.map((x) => (useStd ? (x - m) / (sd + 1e-4) : x - m));
+    };
+
+    const render = () => {
+      const G = Number(gIn.value), p = Number(pIn.value), noise = Number(nIn.value);
+      out('g').textContent = String(G);
+      out('p').textContent = p.toFixed(2);
+      out('noise').textContent = noise.toFixed(2);
+
+      // ---- main panel: one prompt, G answers
+      const ok = uMain.slice(0, G).map((u) => u < p);
+      const r = ok.map((c, i) => (c ? 1 : 0) + noise * zMain[i]);
+      const A = advantages(r);
+      const { m, sd } = stats(r);
+      const k = ok.filter(Boolean).length;
+      M.replaceChildren();
+      M.appendChild(mk('text', { x: 8, y: 16, class: 'strong' }, 'PROMPT: 17 × 24 = ?'));
+      M.appendChild(mk('text', { x: 472, y: 16, 'text-anchor': 'end' }, 'VERIFIER: ANSWER == 408'));
+      const top = 34, rowH = Math.min(19, 290 / G);
+      const ax = 320, unit = 28; // px per unit of advantage; clamp at ±4
+      M.appendChild(mk('text', { x: 8, y: top + 2 }, 'SAMPLE'));
+      M.appendChild(mk('text', { x: 118, y: top + 2, 'text-anchor': 'end' }, 'REWARD'));
+      M.appendChild(mk('text', { x: ax, y: top + 2, 'text-anchor': 'middle' }, 'ADVANTAGE'));
+      M.appendChild(mk('text', { x: ax - 4 * unit, y: top + 2 }, '← DOWN'));
+      M.appendChild(mk('text', { x: ax + 4 * unit, y: top + 2, 'text-anchor': 'end' }, 'UP →'));
+      const y0 = top + 12;
+      M.appendChild(mk('line', { x1: ax, y1: y0, x2: ax, y2: y0 + rowH * G, class: 'ink', 'stroke-width': 1 }));
+      for (let i = 0; i < G; i++) {
+        const y = y0 + i * rowH, cy = y + rowH / 2;
+        const ans = ok[i] ? RIGHT : WRONG[wMain[i]];
+        const fs = rowH < 15 ? 9.5 : 11;
+        M.appendChild(mk('text', { x: 8, y: cy + 4, 'font-size': fs, class: ok[i] ? 'strong' : '' }, `o${i + 1}  ${ans}`));
+        M.appendChild(mk('text', { x: 118, y: cy + 4, 'font-size': fs, 'text-anchor': 'end', class: ok[i] ? 'blue-t' : '' }, r[i].toFixed(2)));
+        const a = Math.max(-4, Math.min(4, A[i]));
+        const w = Math.abs(a) * unit;
+        const h = Math.max(4, rowH - 6);
+        if (w > 0.5) {
+          M.appendChild(mk('rect', {
+            x: a >= 0 ? ax : ax - w, y: cy - h / 2, width: w, height: h,
+            class: a >= 0 ? 'fill-blue' : 'fill-wash', 'stroke-width': 1,
+          }));
+        } else {
+          M.appendChild(mk('text', { x: ax + 6, y: cy + 4, 'font-size': fs }, '0  no push'));
+        }
+        if (w > 0.5) {
+          const lx = a >= 0 ? ax + w + 4 : ax - w - 4;
+          M.appendChild(mk('text', { x: lx, y: cy + 4, 'font-size': fs, 'text-anchor': a >= 0 ? 'start' : 'end' }, (A[i] >= 0 ? '+' : '') + A[i].toFixed(2)));
+        }
+      }
+      // mean line on reward column legend
+      M.appendChild(mk('text', { x: 8, y: y0 + rowH * G + 18 }, `MEAN ${m.toFixed(2)}  STD ${sd.toFixed(2)}`));
+      M.appendChild(mk('text', { x: 472, y: y0 + rowH * G + 18, 'text-anchor': 'end' }, useStd ? 'A = (r − mean) / std' : 'A = r − mean'));
+
+      out('k').textContent = `${k}/${G}`;
+      out('mean').textContent = m.toFixed(2);
+      out('std').textContent = sd.toFixed(2);
+      out('push').textContent = A.reduce((s, x) => s + Math.abs(x), 0).toFixed(2);
+
+      if (noise === 0 && (k === 0 || k === G)) {
+        note.textContent = k === 0
+          ? `All ${G} answers wrong. Every reward is 0, the mean is 0, every advantage is 0. This prompt contributes nothing to the update: the model never found the right answer, so there is nothing to reinforce.`
+          : `All ${G} answers right. Every advantage is 0. The model already solves this prompt every time, so GRPO has nothing to push. Too easy is as useless as too hard.`;
+      } else if (noise > 0 && (k === 0 || k === G)) {
+        note.textContent = `Every answer has the same verdict, but the noise makes the rewards differ, so the bars are not zero. That push is pure noise: it reinforces whichever answer got a lucky draw. Dividing by a tiny std blows the noise up to full size.`;
+      } else {
+        const pos = useStd ? Math.sqrt((G - k) / k) : (G - k) / G;
+        const neg = useStd ? -Math.sqrt(k / (G - k)) : -k / G;
+        note.textContent = noise === 0
+          ? `${k} of ${G} correct. Each correct answer gets A = ${pos >= 0 ? '+' : ''}${pos.toFixed(2)}, each wrong one ${neg.toFixed(2)}. The rarer the success, the harder it is pushed up. The advantages always sum to zero: the group is graded on a curve.`
+          : `${k} of ${G} correct, with noise. Correct answers still lean right and wrong ones left, but now within each kind the bars wobble: the update partly chases noise.`;
+      }
+
+      // ---- batch panel: 24 groups at the same pass rate
+      B.replaceChildren();
+      B.appendChild(mk('text', { x: 8, y: 14, class: 'strong' }, `A BATCH OF ${NB} PROMPTS, ${G} SAMPLES EACH`));
+      B.appendChild(mk('text', { x: 472, y: 14, 'text-anchor': 'end' }, 'GREY = NO GRADIENT'));
+      const cols = 6, cw = 78, ch = 40, gx = 6, gy = 26;
+      let sig = 0;
+      for (let b = 0; b < NB; b++) {
+        const c = b % cols, rr = Math.floor(b / cols);
+        const x = gx + c * cw, y = gy + rr * ch;
+        const okb = uBatch[b].slice(0, G).map((u) => u < p);
+        const kb = okb.filter(Boolean).length;
+        const flat = kb === 0 || kb === G;
+        if (!flat) sig++;
+        B.appendChild(mk('rect', {
+          x, y, width: cw - 6, height: ch - 6,
+          class: flat ? 'fill-paper dash' : 'fill-wash', 'stroke-width': 1,
+          style: flat ? 'opacity:0.55' : '',
+        }));
+        // dots: filled = correct
+        const per = Math.min(G, 8);
+        const dx = (cw - 18) / per;
+        for (let j = 0; j < G; j++) {
+          const jx = x + 8 + (j % per) * dx + dx / 2 - 2, jy = y + 7 + Math.floor(j / per) * 8;
+          B.appendChild(mk('rect', { x: jx, y: jy, width: 5, height: 5, class: okb[j] ? 'fill-blue' : 'fill-paper', 'stroke-width': 0.8 }));
+        }
+        const label = flat ? (noise > 0 ? 'NOISE ONLY' : kb === 0 ? 'ALL WRONG' : 'ALL RIGHT') : `${kb}/${G}`;
+        B.appendChild(mk('text', { x: x + (cw - 6) / 2, y: y + 28, 'text-anchor': 'middle', 'font-size': 9.5, class: flat ? '' : 'blue-t' }, label));
+      }
+      out('sig').textContent = `${sig}/${NB}`;
+      const e = 1 - Math.pow(p, G) - Math.pow(1 - p, G);
+      out('exp').textContent = `${(e * 100).toFixed(0)}%`;
+    };
+
+    gIn.addEventListener('input', render);
+    pIn.addEventListener('input', render);
+    nIn.addEventListener('input', render);
+    q$<HTMLButtonElement>('[data-act="resample"]').addEventListener('click', () => { reroll(); render(); });
+    stdBtn.addEventListener('click', () => {
+      useStd = !useStd;
+      stdBtn.setAttribute('aria-pressed', String(useStd));
+      render();
+    });
+    reroll();
+    render();
+  });
+</script>

@@ -1,0 +1,10 @@
+---
+// "Why was this invented?" box. Usage: <Origin year="1999" title="The C10K problem">...</Origin>
+interface Props { year: string; title: string }
+const { year, title } = Astro.props;
+---
+<aside class="origin">
+  <div class="label"><span>Origin</span><span class="yr">{year}</span></div>
+  <h5>{title}</h5>
+  <slot />
+</aside>

@@ -1,0 +1,741 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import WaitingTimeline from '../components/figures/WaitingTimeline.astro';
+import WaitingLoop from '../components/figures/WaitingLoop.astro';
+
+## Today
+
+- Tell, for any piece of code, whether it is mostly **waiting** or mostly **working**, and why that one question decides whether threads, processes or async will help.
+- Say exactly what happens to a sync server when 100 people hit it at once (it doesn't crash; they stand in line), and exactly what async changes (it isn't a queue; it's one worker that never stands still).
+- Build a 40-line event loop out of Python generators and the OS's "tell me when this socket is ready" call, so `await` stops being magic.
+- Use Little's Law to answer "how many requests do I need in flight?" and "how many can one process hold?" with a number.
+- Build a real async load generator (you'll reuse it to benchmark Fireworks in [lesson 6](/lessons/baseline-vs-fireworks/)), then use it to watch a sync server stall, a thread pool cope, an async server shrug, and one planted `time.sleep` bring the async server to its knees.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (a network round trip is millions of CPU cycles) and [Processes, threads and the GIL](/lessons/processes-threads-gil/) (threads help with waiting; each one costs a stack). Python 3.11 or newer. Rough time: one evening for the idea and the toy loop, one for the servers and measurements.
+
+## The Problem
+
+You have a small FastAPI service at work that sits in front of an LLM. A user sends a question, your server calls the model API, waits about 2 seconds for the answer, and passes it back. On your laptop it feels instant enough. Then a teammate points a script at it with 50 requests in parallel, and the dashboard shows something strange: the first user waits 2 seconds, the tenth waits 20, the fiftieth waits 100. CPU usage is flat at about 1%. Nothing errored. The machine is doing almost nothing, and yet nobody is getting answers.
+
+When the diagnostic asked about this, your answer was: *"a 2-second request would take like 200 seconds and the server would probably crash. So we would use something like async, which can be in a queue or something."*
+
+The first half is exactly right, and it's worth saying why: with one worker, request number 100 waits behind 99 others, so it takes about 200 seconds. That's the whole problem in one sentence. Two pieces of the rest are the wrong picture, and they're worth fixing because they change what you'd do:
+
+- **It usually doesn't crash.** The requests aren't dropped, they're parked. The operating system holds incoming connections in a waiting line until the server is ready to pick them up, and they get served one by one. What you see is not an error page but latency that grows in a straight line. (It *can* start refusing connections when that line is full. You'll make that happen in Break It.)
+- **Async is not a queue.** There was already a queue: that's the problem. Async is a way for one worker to stop *standing at the oven*. When a request is waiting on the network, the worker sets it aside and starts on the next one, and comes back when the answer arrives.
+
+The rest of this lesson turns those two sentences into a mechanism you can build, measure and reason about.
+
+<Origin year="1999" title="The C10K problem">
+
+In 1999 a programmer named Dan Kegel wrote a web page with a blunt question: web servers now have the hardware to handle ten thousand clients at once, so why can't they? The common design at the time gave each connection its own process or thread, and at 10,000 connections the machines drowned: memory for 10,000 stacks, and the operating system spending its time switching between threads that mostly had nothing to do.
+
+His page, "The C10K problem", surveyed the alternative: one thread, many connections, and ask the kernel "which of these sockets has data for me right now?" The kernel interfaces for asking that question well arrived around then: `kqueue` on FreeBSD (2000) and `epoll` on Linux (2002). Servers built on them followed. nginx (2004) served huge numbers of connections from a handful of worker processes. Node.js (2009) made a single event loop the default way to write a server. Python got `asyncio` in 3.4 (2014) and the `async`/`await` keywords in 3.5 (2015). Everything in this lesson descends from that one page.
+
+</Origin>
+
+## The Idea
+
+### Waiting vs working
+
+Every piece of code spends its time doing one of two things. **Working**: the CPU is busy running your instructions (tokenizing text, multiplying matrices, parsing JSON). **Waiting**: the CPU has nothing to do because the answer has to come from somewhere slow (a disk, the network, a GPU, another server).
+
+Code that mostly works is called <Term w="CPU-bound">Its speed is limited by how fast the CPU can run it. A faster CPU or more cores (used in parallel) makes it faster.</Term>. Code that mostly waits is called <Term w="I/O-bound">Its speed is limited by waiting on input/output: network, disk, another service. A faster CPU changes almost nothing; it would just wait faster.</Term>. Lesson 3 already showed you the practical split: threads did nothing for the hashing job (working) and were magic for the page-fetching job (waiting).
+
+An LLM API call is about as waiting-heavy as code gets. Here's one call, drawn to scale.
+
+<Figure n="001" title="ONE LLM CALL, TO SCALE" caption="Your server's CPU does a fraction of a millisecond of work at each end. The other ~2,000 ms it is waiting for someone else's GPU.">
+
+<svg viewBox="0 0 640 210" role="img" aria-label="Timeline of one LLM call: tiny CPU work at each end, two seconds of waiting">
+  <text x="20" y="28" class="strong">YOUR SERVER, ONE REQUEST</text>
+  <rect x="20" y="44" width="600" height="34" class="fill-wash" stroke-width="1" />
+  <rect x="20" y="44" width="2" height="34" class="fill-blue" />
+  <rect x="618" y="44" width="2" height="34" class="fill-blue" />
+  <text x="320" y="66" text-anchor="middle" class="blue-t">WAITING ON THE NETWORK + THE MODEL · ~2,000 MS</text>
+  <line x1="20" y1="92" x2="620" y2="92" class="ink" stroke-width="1" />
+  <line x1="20" y1="88" x2="20" y2="96" class="ink" stroke-width="1" />
+  <line x1="320" y1="88" x2="320" y2="96" class="ink" stroke-width="1" />
+  <line x1="620" y1="88" x2="620" y2="96" class="ink" stroke-width="1" />
+  <text x="20" y="110" text-anchor="middle">0</text>
+  <text x="320" y="110" text-anchor="middle">1 S</text>
+  <text x="620" y="110" text-anchor="middle">2 S</text>
+  <line x1="21" y1="78" x2="70" y2="140" class="ink" stroke-width="1" />
+  <rect x="40" y="140" width="210" height="52" class="fill-paper" stroke-width="1" />
+  <text x="52" y="160" class="strong">WORK, START</text>
+  <text x="52" y="178">BUILD REQUEST, SEND · ~0.1 MS</text>
+  <line x1="619" y1="78" x2="560" y2="140" class="ink" stroke-width="1" />
+  <rect x="390" y="140" width="230" height="52" class="fill-paper" stroke-width="1" />
+  <text x="402" y="160" class="strong">WORK, END</text>
+  <text x="402" y="178">PARSE JSON, REPLY · ~0.5 MS</text>
+  <text x="320" y="130" text-anchor="middle">≈ 99.97% WAITING</text>
+</svg>
+
+</Figure>
+
+The work numbers are rough (they depend on payload size and framework), but the shape isn't: even if your handler did 5 ms of real work, it would still be waiting 99.75% of the time. From lesson 1: a 2-second wait is about 6 billion cycles of a 3 GHz core. The question this whole lesson answers is: **what does the worker do during those 6 billion cycles?**
+
+### Two chefs
+
+Picture a kitchen with one chef and a pizza oven. Each pizza takes 30 seconds to assemble and 10 minutes in the oven.
+
+The first chef assembles a pizza, puts it in the oven, and stands there watching it for ten minutes. Then he serves it and starts the next order. Ten orders take 100 minutes. Order number ten waits an hour and a half. He was never lazy and never confused; he just did nothing for 95% of his shift.
+
+The second chef assembles a pizza, puts it in the oven, and immediately starts the next one. When the oven timer dings, she pulls that pizza out, serves it, and goes back to whatever she was assembling. Ten orders take about 15 minutes. Same chef, same oven, same skill. She didn't work faster; she stopped waiting *in front of* things.
+
+There's a third option, which is hiring ten chefs who each stand at their own oven. That works too. It's what threads are. It's just expensive in chefs, and it stops scaling when you have 10,000 orders.
+
+Notice what the second chef is not: she isn't a queue. Orders still wait in line on the ticket rail in both kitchens. The difference is entirely in what the chef does while an oven is running.
+
+### What the first chef is doing, in machine terms
+
+When your Flask handler calls `requests.get(url)`, deep down Python calls `recv()` on a <Term w="socket">The operating system's handle for one network connection. Your program reads and writes bytes through it; the kernel does the actual networking.</Term> to read the reply. If the reply hasn't arrived yet, that call is <Term w="blocking">A call that doesn't return until its answer is ready. While it's stuck, the thread that made the call can't do anything else.</Term>: the kernel takes your thread off the CPU and marks it asleep until bytes arrive on that socket. The thread costs no CPU while it sleeps. But it also can't do anything else. If your server has one worker thread, your server can't do anything else.
+
+Meanwhile, more requests arrive. Before your code ever sees a connection, the kernel finishes the TCP handshake and puts the connection in the <Term w="listen backlog">A queue the kernel keeps for each listening socket: connections that are fully set up but that your program hasn't picked up with accept() yet. Its maximum length is set when the server starts (and capped by the OS).</Term>. When your worker finishes a request, it calls `accept()` and takes the next connection off that line. So the "200 seconds" is real, and the server isn't crashing. It's a single cashier with a very long line.
+
+<Figure n="002" title="WHERE THE REQUESTS ACTUALLY WAIT" caption="A sync server under load: one worker is blocked on the upstream call, everyone else waits in the kernel's line. Nothing is lost until the line overflows.">
+
+<svg viewBox="0 0 640 250" role="img" aria-label="Clients, kernel accept queue, one blocked worker, upstream LLM">
+  <defs>
+    <marker id="ww2-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink)" />
+    </marker>
+  </defs>
+  <text x="20" y="24" class="strong">CLIENTS</text>
+  <rect x="20" y="40" width="54" height="22" class="fill-paper" stroke-width="1" />
+  <rect x="20" y="70" width="54" height="22" class="fill-paper" stroke-width="1" />
+  <rect x="20" y="100" width="54" height="22" class="fill-paper" stroke-width="1" />
+  <rect x="20" y="130" width="54" height="22" class="fill-paper" stroke-width="1" />
+  <text x="47" y="172" text-anchor="middle">· · ·</text>
+  <line x1="78" y1="96" x2="128" y2="96" class="ink" stroke-width="1" marker-end="url(#ww2-a)" />
+  <rect x="134" y="40" width="200" height="112" class="ink dash" stroke-width="1" />
+  <text x="234" y="32" text-anchor="middle" class="strong">KERNEL · LISTEN BACKLOG</text>
+  <rect x="146" y="84" width="30" height="24" class="fill-wash" stroke-width="1" />
+  <rect x="182" y="84" width="30" height="24" class="fill-wash" stroke-width="1" />
+  <rect x="218" y="84" width="30" height="24" class="fill-wash" stroke-width="1" />
+  <rect x="254" y="84" width="30" height="24" class="fill-wash" stroke-width="1" />
+  <rect x="290" y="84" width="30" height="24" class="fill-wash" stroke-width="1" />
+  <text x="234" y="130" text-anchor="middle">WAITING, NOT FAILED</text>
+  <text x="234" y="176" text-anchor="middle">FULL? NEW CONNECTIONS</text>
+  <text x="234" y="190" text-anchor="middle">GET DROPPED OR REFUSED</text>
+  <line x1="338" y1="96" x2="384" y2="96" class="ink" stroke-width="1" marker-end="url(#ww2-a)" />
+  <text x="361" y="88" text-anchor="middle">accept()</text>
+  <rect x="390" y="60" width="110" height="72" class="fill-paper" stroke-width="1.5" />
+  <text x="445" y="84" text-anchor="middle" class="strong">WORKER</text>
+  <text x="445" y="102" text-anchor="middle">BLOCKED IN</text>
+  <text x="445" y="118" text-anchor="middle">recv()</text>
+  <line x1="504" y1="96" x2="548" y2="96" class="blue dash" stroke-width="1.5" marker-end="url(#ww2-a)" />
+  <rect x="552" y="60" width="72" height="72" class="fill-wash" stroke-width="1" />
+  <text x="588" y="92" text-anchor="middle" class="blue-t">LLM</text>
+  <text x="588" y="108" text-anchor="middle" class="blue-t">~2 S</text>
+  <text x="445" y="160" text-anchor="middle">CPU ≈ 0%</text>
+  <text x="20" y="228">REQUEST N FINISHES AT ≈ N × 2 S. LATENCY GROWS IN A STRAIGHT LINE.</text>
+</svg>
+
+</Figure>
+
+<Predict id="sync-50">
+
+One sync worker, 2-second upstream calls, 50 requests arrive at the same moment. What's the median latency, the worst latency, and the total time to finish all 50? Now the same 50 against 8 threads.
+
+<Fragment slot="answer">
+
+One worker serves them one at a time: they finish at 2, 4, 6 ... 100 seconds. Median about **50 s**, worst **100 s**, total **100 s**, throughput a flat 0.5 requests per second no matter how many arrive.
+
+With 8 threads, 8 go at once, so the 50 finish in 7 "waves" (50 / 8 rounded up): total about **14 s**, median about **8 s** (the 25th request is in wave 4), worst **14 s**. Throughput is 8 / 2 = 4 per second. More threads, more waves at once. Check yourself in the figure below.
+
+</Fragment>
+
+</Predict>
+
+Play with it. Start in **Sync × 1** and drag N. Then switch to **Threads × K** and drag K. Then **Async loop**. Leave the last slider at zero for now.
+
+<Figure n="003" title="N REQUESTS, THREE SERVERS" caption="All requests arrive at t = 0. Dashed: standing in line. Blue box: in progress, waiting on the upstream. Black: a blocking call that holds the worker. Try async with the time.sleep slider at 1 s." wide>
+
+<WaitingTimeline />
+
+</Figure>
+
+Three things to notice:
+
+- **Sync:** the staircase. Total time is N × request time. Throughput is fixed at 1 / request time, and it does not care how many people are waiting.
+- **Threads:** the staircase gets wider steps. With K threads you serve K at once, so throughput is K / request time. If K ≥ N, everyone finishes in about one request time. That's why threads are a perfectly good answer when N is in the tens or hundreds.
+- **Async:** everyone overlaps, with one worker. Total time is about one request time, whatever N is (in this model; you'll find the real limits in Measure).
+
+Now drag the time.sleep slider to 1 s in async mode. Everything collapses into something worse than the sync server: every request waits for every other request's sleep. Hold that thought until the section on traps.
+
+### What the second chef is doing, in machine terms
+
+For one thread to juggle many sockets, two things have to change.
+
+First, the socket calls must stop putting the thread to sleep. You set a socket to <Term w="non-blocking">A socket mode where recv() and send() never wait. If there's nothing to read yet, they return immediately with an error that means "try again later" (EAGAIN / BlockingIOError in Python).</Term> mode. Now `recv()` with no data returns immediately with "nothing yet" instead of sleeping.
+
+Second, you need a way to wait for *any* of many sockets without spinning in a loop asking each one "anything yet? anything yet?" (that would burn a whole core doing nothing). This is the operating system feature the C10K page was about. You hand the kernel a list of sockets you care about and say "put me to sleep until at least one of these is ready, then tell me which." Unix has had a basic version, `select()`, since the early 1980s. The scalable modern versions are <Term w="epoll">Linux's interface for watching many sockets at once. You register sockets once; each wait returns only the ones that are ready, so the cost doesn't grow with how many you're watching.</Term> on Linux and <Term w="kqueue">The BSD/macOS equivalent of epoll: register interest in many sockets and timers, then wait for whichever becomes ready first.</Term> on macOS. Python wraps all of them in the `selectors` module, so the same code runs on your Mac and on the Spark.
+
+<Figure n="004" title="BLOCKING VS ASKING THE KERNEL" caption="Left: one sleeping thread per connection. Right: one thread registers every socket with the kernel and sleeps once, for all of them.">
+
+<svg viewBox="0 0 640 270" role="img" aria-label="Thread-per-connection blocking versus one thread using epoll or kqueue">
+  <defs>
+    <marker id="ww4-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" style="fill:var(--blue)" />
+    </marker>
+  </defs>
+  <text x="20" y="24" class="strong">A · THREAD PER CONNECTION</text>
+  <rect x="20" y="44" width="76" height="40" class="fill-paper" stroke-width="1" />
+  <text x="58" y="68" text-anchor="middle">THREAD 1</text>
+  <rect x="20" y="96" width="76" height="40" class="fill-paper" stroke-width="1" />
+  <text x="58" y="120" text-anchor="middle">THREAD 2</text>
+  <rect x="20" y="148" width="76" height="40" class="fill-paper" stroke-width="1" />
+  <text x="58" y="172" text-anchor="middle">THREAD 3</text>
+  <line x1="96" y1="64" x2="150" y2="64" class="ink dash" stroke-width="1" />
+  <line x1="96" y1="116" x2="150" y2="116" class="ink dash" stroke-width="1" />
+  <line x1="96" y1="168" x2="150" y2="168" class="ink dash" stroke-width="1" />
+  <text x="158" y="68">recv(s1) ZZZ</text>
+  <text x="158" y="120">recv(s2) ZZZ</text>
+  <text x="158" y="172">recv(s3) ZZZ</text>
+  <text x="20" y="214">EACH WAITER = A STACK + A KERNEL THREAD</text>
+  <text x="20" y="230">10,000 WAITERS = 10,000 THREADS</text>
+  <line x1="300" y1="20" x2="300" y2="250" class="ink" stroke-width="1" style="stroke:var(--rule)" />
+  <text x="330" y="24" class="strong">B · ONE THREAD + READINESS</text>
+  <rect x="330" y="44" width="100" height="56" class="fill-blue" />
+  <text x="380" y="68" text-anchor="middle" style="fill:var(--paper);font-weight:600">ONE THREAD</text>
+  <text x="380" y="86" text-anchor="middle" style="fill:var(--paper)">EVENT LOOP</text>
+  <rect x="470" y="44" width="150" height="150" class="fill-wash" stroke-width="1" />
+  <text x="545" y="64" text-anchor="middle" class="blue-t">KERNEL</text>
+  <text x="545" y="80" text-anchor="middle" class="blue-t">EPOLL / KQUEUE</text>
+  <rect x="486" y="94" width="36" height="20" class="fill-paper" stroke-width="1" />
+  <text x="504" y="108" text-anchor="middle">s1</text>
+  <rect x="528" y="94" width="36" height="20" class="fill-blue" />
+  <text x="546" y="108" text-anchor="middle" style="fill:var(--paper)">s2</text>
+  <rect x="570" y="94" width="36" height="20" class="fill-paper" stroke-width="1" />
+  <text x="588" y="108" text-anchor="middle">s3</text>
+  <text x="545" y="140" text-anchor="middle">… s10,000</text>
+  <text x="545" y="176" text-anchor="middle">WATCHING ALL</text>
+  <line x1="430" y1="60" x2="466" y2="60" class="blue" stroke-width="1.5" marker-end="url(#ww4-a)" />
+  <text x="448" y="54" text-anchor="middle" style="font-size:9px">WAIT</text>
+  <line x1="466" y1="90" x2="434" y2="90" class="blue" stroke-width="1.5" marker-end="url(#ww4-a)" />
+  <text x="380" y="130" text-anchor="middle" class="blue-t">"s2 IS READY"</text>
+  <text x="330" y="214">EACH WAITER = AN ENTRY IN A KERNEL TABLE</text>
+  <text x="330" y="230">+ A SMALL PYTHON OBJECT</text>
+</svg>
+
+</Figure>
+
+With those two pieces, the second chef's routine is a loop:
+
+1. Run every task that's ready, each one until it would have to wait.
+2. When a task would wait on a socket, write down "this task wants socket 7" and move on.
+3. When no task is ready, ask the kernel to sleep until any watched socket (or timer) is ready.
+4. The kernel wakes you with "socket 7 is ready". Mark that task ready. Go to 1.
+
+That loop is the <Term w="event loop">A single loop that runs ready tasks one at a time and, when nothing is ready, sleeps until the OS reports that some socket or timer is ready. asyncio, Node.js and nginx are all built around one.</Term>. It never runs two tasks at the same moment. It just never sits idle while there's something it could be doing. This is <Term w="concurrency">Making progress on many things during the same stretch of time, by switching between them. Different from parallelism, which means literally running at the same instant on different cores.</Term> without <Term w="parallelism">Running several things at the same instant on different CPU cores. Async gives you none of this; it's one thread.</Term>, the distinction from lesson 3, in its purest form.
+
+Step through it.
+
+<Figure n="005" title="THE EVENT LOOP AS A RING" caption="Five tasks, one loop. Each task runs for a sliver, hits await, and parks with the OS. When nothing is ready, the loop sleeps in select() until the next wake-up. Watch the clock against the sequential total at the end.">
+
+<WaitingLoop />
+
+</Figure>
+
+### Pausing a function halfway
+
+There's one more piece. In step 2, "move on" means the task has to stop *in the middle of a function* and pick up later exactly where it left off, with all its local variables intact. Normal functions can't do that: they run to the end, and their stack frame is gone.
+
+Python has had pausable functions since 2001: <Term w="generators">Functions that contain yield. Calling one returns an object; each next() or send() runs the body until the next yield, then freezes it, locals and all, until you resume it.</Term>. A generator's frame lives on the heap (lesson 2), not the C stack, so it can be frozen and thawed at will. A <Term w="coroutine">A function that can pause partway through and be resumed later. In Python, an async def function; calling it gives you a coroutine object that does nothing until something drives it.</Term> in modern Python is the same machine with nicer syntax. `async def` makes a pausable function. `await x` means "if `x` isn't done yet, pause me here and pass a note up to whoever is running me." That "whoever" is the event loop. The note says what you're waiting for. The loop files the paused coroutine next to that socket or timer and runs someone else.
+
+So `await` is not "wait". It's "**I'm willing to be paused here.**" Code between two `await`s runs without interruption; nobody can take the CPU from you. That property is both async's great simplification (far fewer race conditions than threads, because switches only happen where you wrote `await`) and its great trap (if you never reach an `await`, nobody else runs).
+
+You'll build this machine yourself in Task 2: generators, a ready queue, a heap of timers and a `selectors` call, about 40 lines, and it will run real `async def` functions.
+
+### How does it scale: Little's Law
+
+Here's the tool for "how does it scale?" questions about servers. In 1961 John Little proved a rule that holds for any stable system where things arrive, stay a while and leave, regardless of the details:
+
+**in flight = throughput × latency**
+
+Written as <Term w="Little's Law">L = λW. The average number of items in a system equals the average arrival rate times the average time each spends inside. Holds for checkout lines, servers, GPUs and highways alike.</Term>, L = λ × W. A coffee shop that serves 2 customers a minute, where each spends 5 minutes inside, has about 10 customers inside at any moment. No assumptions about how they arrive.
+
+Now apply it. You want to serve **100 requests per second**, each one spends **2 seconds** waiting on the LLM. Then on average **200 requests are in flight** at every instant. That's not a choice. If your server can't hold 200 at once, it can't do 100 per second; the line grows until something gives.
+
+<Figure n="006" title="LITTLE'S LAW FOR AN LLM PROXY" caption="Throughput times latency gives the number you must hold at once. What each one costs to hold is where threads and coroutines differ.">
+
+<svg viewBox="0 0 640 260" role="img" aria-label="Arrivals at 100 per second, 2 seconds each, 200 in flight; memory per thread versus per task">
+  <defs>
+    <marker id="ww6-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink)" />
+    </marker>
+  </defs>
+  <text x="20" y="44" class="strong">λ = 100 / S</text>
+  <text x="20" y="60">ARRIVE</text>
+  <line x1="110" y1="50" x2="170" y2="50" class="ink" stroke-width="1" marker-end="url(#ww6-a)" />
+  <rect x="176" y="20" width="300" height="60" class="fill-wash" stroke-width="1" />
+  <text x="326" y="44" text-anchor="middle" class="blue-t">EACH STAYS W = 2 S</text>
+  <text x="326" y="64" text-anchor="middle" class="strong">L = λ × W = 200 IN FLIGHT</text>
+  <line x1="480" y1="50" x2="540" y2="50" class="ink" stroke-width="1" marker-end="url(#ww6-a)" />
+  <text x="550" y="44" class="strong">100 / S</text>
+  <text x="550" y="60">LEAVE</text>
+  <text x="20" y="120" class="strong">AT 10,000 IN FLIGHT, AS THREADS</text>
+  <rect x="20" y="132" width="600" height="20" class="fill-paper" stroke-width="1" />
+  <rect x="20" y="132" width="150" height="20" class="fill-blue" />
+  <text x="180" y="146">10,000 × ~38 KB RESIDENT ≈ 370 MB · 10,000 KERNEL THREADS</text>
+  <text x="20" y="190" class="strong">AT 10,000 IN FLIGHT, AS ASYNCIO TASKS</text>
+  <rect x="20" y="202" width="600" height="20" class="fill-paper" stroke-width="1" />
+  <rect x="20" y="202" width="4" height="20" class="fill-blue" />
+  <text x="32" y="216">10,000 × ~1 KB ≈ 10 MB · ONE KERNEL THREAD</text>
+  <text x="20" y="250">PER-WAITER COSTS MEASURED ON A MAC, PYTHON 3.14 (YOU'LL MEASURE YOURS)</text>
+</svg>
+
+</Figure>
+
+At 200 in flight, threads are fine. Two hundred threads is a normal day for a JVM or a gunicorn box, and you'll see that in Measure: a 200-thread Flask server handles 200 simultaneous 2-second calls in about 2.3 seconds, using about 65 MB. Don't let anyone tell you threads can't do I/O.
+
+The trouble is the next zero. An agent product where each request does several LLM calls, some streaming for 30 seconds, at a few hundred requests per second, needs **thousands to tens of thousands** in flight. Then the per-waiter cost decides everything. Each thread reserves a stack (8 MB of address space on Linux by default, though only the pages it touches cost real RAM, as lesson 2 showed), and the kernel has to keep it, schedule it and context-switch into it every time its socket wakes. On my Mac each idle Python thread cost about 38 KB of real memory (10,000 of them: 370 MB), and macOS caps one process at about 12,000 threads (`sysctl kern.num_taskthreads`). Each idle asyncio task cost about 0.9 KB. That's a 40× difference in memory and, more importantly, the difference between "the OS juggles 10,000 threads" and "one thread checks a list".
+
+### What eventually limits one async process
+
+Waiting is now nearly free. So the limit becomes the other thing: **working**. Each request still needs some CPU on the loop's one thread: parsing HTTP, building the upstream request, decoding JSON, the framework's own bookkeeping. Call that C milliseconds. One thread can do at most 1000 / C requests per second, regardless of how long each one waits. If C is 1 ms, the ceiling is about 1,000 requests per second, and by Little's Law that's about 2,000 in flight with 2-second calls. Past that, the loop is always busy, ready tasks pile up, and latency climbs again: you've turned an I/O-bound server into a CPU-bound one.
+
+Before you get there you may hit plainer limits: the number of open files a process is allowed (every socket is a file descriptor, and macOS defaults `ulimit -n` to 256), the listen backlog, the connection pool inside your HTTP client, and the rate limit of the API you're calling. The fix for the CPU limit is the boring one: run several processes (uvicorn `--workers 4`, or several containers behind a load balancer), each with its own loop. You'll find several of these limits by hand in Measure and Break It.
+
+### The traps
+
+Async has one rule: **never block the loop.** Every task shares one thread. Anything that holds that thread without reaching an `await` freezes every other request in the process, all at once. The common ways to break the rule:
+
+- `time.sleep(1)` instead of `await asyncio.sleep(1)`.
+- `requests.get(...)` (or `urllib`, or any sync HTTP SDK) inside `async def`. It's a blocking `recv()` on the loop's own thread.
+- A sync database driver (`psycopg2`, `sqlite3`, `pymongo`) inside `async def`.
+- Heavy CPU work inside `async def`: tokenizing a 200-page document, running a reranker on the CPU, a big `json.loads`, a regex over megabytes. It's not "waiting", but it holds the thread just the same.
+
+That's what the time.sleep slider in Figure 003 shows, and it's worse than sync. A sync server with one bad request has one slow request. An async server with one bad line has *every* request slow, because they all share the one thread that's stuck. Your p50 becomes your p99.
+
+**How to spot it.** Turn on asyncio's <Term w="debug mode">An asyncio setting that adds checks and logs a warning whenever a single step of a task holds the loop longer than loop.slow_callback_duration (default 0.1 s).</Term>: run with `PYTHONASYNCIODEBUG=1` in the environment, or `python -X dev`, or `asyncio.run(main(), debug=True)`. Any step that holds the loop longer than 100 ms gets logged as `Executing <Task ...> took 2.004 seconds`, with the task's name, so you know where to look. In production, the symptoms are: latency of *unrelated* requests spikes together, and CPU is either near zero (a blocking I/O call) or pinned at 100% of one core (blocking CPU work).
+
+**How to fix it.**
+
+- Use an async library for I/O: `httpx.AsyncClient` or `aiohttp` instead of `requests`, `asyncpg` or `psycopg`'s async mode instead of `psycopg2`, `await asyncio.sleep`. Most LLM SDKs ship an async client (`AsyncOpenAI`, `AsyncAnthropic`).
+- If you must call a blocking function you can't replace, push it to a thread: `result = await asyncio.to_thread(blocking_fn, arg)`. The loop keeps running; the blocking call sleeps on a worker thread, which is fine because sleeping threads release the GIL.
+- For heavy CPU work, threads don't help (the GIL, lesson 3). Send it to another process: `await loop.run_in_executor(process_pool, fn, arg)` with a `concurrent.futures.ProcessPoolExecutor`.
+
+**The FastAPI detail that surprises everyone.** In FastAPI, if you declare an endpoint with plain `def` instead of `async def`, FastAPI assumes it might block and runs it in a thread pool for you, so it doesn't freeze the loop. That pool has about 40 threads by default (it comes from the `anyio` library underneath). So a `def` endpoint that calls `requests.get` behaves like a 40-thread server: fine at 40 in flight, a staircase beyond. And an `async def` endpoint that calls `requests.get` is the worst of all: no thread pool, blocked loop. The rule: `async def` only if everything slow inside it is awaited; otherwise plain `def` and let the pool handle it. You'll measure all three.
+
+### Async spreads
+
+In 2015 Bob Nystrom wrote an essay, "What Color is Your Function?", about a property you'll feel immediately. Only an `async def` can `await`. So if a function deep in your code becomes async (say, the function that calls the LLM), every function that calls it must become `async def` and `await` it, and so must *their* callers, all the way up to the event loop. Async is "contagious" up the call chain. Sync code can't simply call async code (`asyncio.run` from inside a running loop is an error), and async code calling sync code is fine only if the sync code is quick.
+
+This is the real cost of async, and it's why mixing the two worlds is where most bugs live. The practical rule: decide at the edges. A web server, a load generator, an agent orchestrator: async from the top. A training script or a data-prep job: sync, with a thread pool or one `asyncio.run(...)` call at the point where you fan out network calls.
+
+### Fanning out inside one request
+
+Async isn't only for serving many users. It also helps one request that needs several independent waits. Three LLM calls one after another take 2 + 2 + 2 = 6 seconds. If they don't depend on each other, start them all and wait for all of them:
+
+```python
+async def answer(q: str):
+    # all three start now; total wait ≈ the slowest one, not the sum
+    async with asyncio.TaskGroup() as tg:
+        a = tg.create_task(llm(f"Summarize: {q}"))
+        b = tg.create_task(llm(f"Classify: {q}"))
+        c = tg.create_task(search(q))
+    return combine(a.result(), b.result(), c.result())
+```
+
+`asyncio.gather(x(), y(), z())` does the same thing and is still everywhere. `TaskGroup` (Python 3.11+) is the newer, safer form: if one task fails, it cancels the others instead of leaving them running in the background. Both turn "sum of the waits" into "max of the waits".
+
+### Backpressure, in one paragraph
+
+Once firing off 1,000 requests is one line of code, you'll do it by accident. The upstream API will rate-limit you, your connection pool will queue, and memory fills with half-finished work. The fix is to put a cap on how much you have in flight: `sem = asyncio.Semaphore(64)` and `async with sem:` around each call. That's <Term w="backpressure">Limiting how much work you accept or start, so a slow downstream pushes back on the producer instead of letting work pile up without bound.</Term> at its simplest: when the cap is full, new work waits its turn instead of piling onto the upstream. Your load generator uses exactly this to control concurrency. The [rate limits](/lessons/rate-limits/) lesson goes much deeper.
+
+## Build It
+
+Everything goes in one folder, `~/workbench/async/`. Make a virtual environment there, install the libraries, and raise the open-file limit in every terminal you use for this lesson (each connection is a file descriptor; macOS starts you at 256):
+
+```bash
+mkdir -p ~/workbench/async && cd ~/workbench/async
+python3 -m venv .venv && source .venv/bin/activate
+pip install fastapi uvicorn httpx flask requests gunicorn
+ulimit -n 10240
+```
+
+You'll want three terminals: one for the fake LLM, one for the server under test, one for the load generator.
+
+<Task id="t1" title="Run a fake LLM upstream" agent="ok">
+
+A stand-in for a model API: it waits like one (a 0.4 s time to first token, then 40 tokens at 40 ms each, 2.0 s total) and does no real work, so every number you measure later is about your server, not the model. It's async itself, which is why it can hold thousands of waiting requests without breaking a sweat. That will make sense by the end.
+
+```python
+# fake_llm.py: pretends to be an LLM API. Waits like one, does no real work.
+import asyncio, json, random
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+
+app = FastAPI()
+WORDS = "the a model token cache batch queue socket loop wait fast slow GPU memory".split()
+
+@app.get("/v1/complete")
+async def complete(ttft: float = 0.4, tokens: int = 40, tok_ms: float = 40):
+    # time to first token (prefill), then one token every tok_ms (decode)
+    await asyncio.sleep(ttft + tokens * tok_ms / 1000)
+    return {"text": " ".join(random.choices(WORDS, k=tokens)), "tokens": tokens}
+
+@app.get("/v1/stream")
+async def stream(ttft: float = 0.4, tokens: int = 40, tok_ms: float = 40):
+    async def events():
+        await asyncio.sleep(ttft)
+        for _ in range(tokens):
+            yield f"data: {json.dumps({'token': random.choice(WORDS)})}\n\n"
+            await asyncio.sleep(tok_ms / 1000)
+        yield "data: [DONE]\n\n"
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+```bash
+uvicorn fake_llm:app --port 8001 --log-level warning
+curl "http://127.0.0.1:8001/v1/complete"        # ~2 s, then JSON
+curl -N "http://127.0.0.1:8001/v1/stream"       # tokens trickle in
+```
+
+</Task>
+
+<Task id="t2" title="Build a toy event loop" agent="hands">
+
+Before you touch asyncio, build the machine it's made of. Make `toyloop.py` with no imports beyond `heapq`, `selectors`, `time`, `types` and `collections.deque`.
+
+The protocol between tasks and the loop is just tuples. A task pauses by yielding a note: `("sleep", seconds)`, `("read", sock)` or `("write", sock)`. These three helpers are given, because they're the trick that lets real `async def` functions talk to your loop. `@types.coroutine` turns a generator into something `await` accepts, so `await sleep(1)` inside an `async def` passes the yielded tuple straight up to whoever called `.send()`:
+
+```python
+import heapq, selectors, time, types
+from collections import deque
+
+ready = deque()                      # tasks that can run right now
+sleeping = []                        # heap of (wake_at, tiebreak, task)
+sel = selectors.DefaultSelector()    # kqueue on macOS, epoll on Linux
+
+@types.coroutine
+def sleep(seconds):
+    yield ("sleep", seconds)
+
+@types.coroutine
+def readable(sock):
+    yield ("read", sock)
+
+@types.coroutine
+def writable(sock):
+    yield ("write", sock)
+
+def spawn(coro):
+    ready.append(coro)
+
+def run():
+    # loop while anything is ready, sleeping, or registered with the selector
+    #   if nothing is ready:
+    #     work out how long until the earliest sleeper wakes (or None if none)
+    #     sel.select(timeout) -> for each ready key: unregister it, make key.data ready
+    #     move every sleeper whose time has come into ready
+    #   else:
+    #     pop a task, task.send(None) to run it until its next await
+    #     StopIteration means it finished
+    #     otherwise look at the (op, arg) it yielded and file the task:
+    #       sleep -> push onto the heap; read/write -> sel.register(sock, event, task)
+    ...
+```
+
+Hints: `sel.get_map()` is empty (falsy) when nothing is registered. Register with `selectors.EVENT_READ` or `EVENT_WRITE` and pass the task as `data`, so `key.data` hands it back. The heap needs a tiebreak counter, because two tasks with the same wake time would otherwise be compared, and coroutines can't be compared. Use `time.monotonic()`, never `time.time()`, for timers.
+
+Then two demos. First, five tasks that `await sleep(1 + i * 0.25)` and print when they start and finish. Second, the real thing: 50 tasks that each fetch from your fake LLM with a raw socket.
+
+```python
+async def fetch(i):
+    s = socket.socket()
+    s.setblocking(False)                 # never let the OS put us to sleep
+    try:
+        s.connect(("127.0.0.1", 8001))
+    except BlockingIOError:
+        pass                             # connecting in the background
+    await writable(s)                    # writable = connected
+    s.sendall(b"GET /v1/complete HTTP/1.0\r\nHost: localhost\r\n\r\n")
+    # TODO: loop: await readable(s), recv, stop when recv returns b"" (server closed)
+```
+
+<details>
+<summary>Reference run() (open only after yours works, or after 30 honest minutes)</summary>
+
+```python
+counter = 0
+
+def run():
+    global counter
+    while ready or sleeping or sel.get_map():
+        if not ready:
+            timeout = max(0.0, sleeping[0][0] - time.monotonic()) if sleeping else None
+            for key, _ in sel.select(timeout):
+                sel.unregister(key.fileobj)
+                ready.append(key.data)
+            while sleeping and sleeping[0][0] <= time.monotonic():
+                ready.append(heapq.heappop(sleeping)[2])
+            continue
+        task = ready.popleft()
+        try:
+            op, arg = task.send(None)
+        except StopIteration:
+            continue
+        if op == "sleep":
+            counter += 1
+            heapq.heappush(sleeping, (time.monotonic() + arg, counter, task))
+        elif op == "read":
+            sel.register(arg, selectors.EVENT_READ, task)
+        elif op == "write":
+            sel.register(arg, selectors.EVENT_WRITE, task)
+```
+
+</details>
+
+Now map each piece onto asyncio. `ready` is the loop's ready queue. `sleeping` is its timer heap (`loop.call_later`). `sel.select()` is the one place the whole program actually waits. `task.send(None)` is what an `asyncio.Task` does each time it's resumed. And `await` is nothing more than "yield a note up to the loop and freeze here". The real loop adds futures, cancellation, exceptions, callbacks and much more polish, but the skeleton is this.
+
+<DoneWhen>
+
+- The sleep demo finishes in about 2.0 s, not the 7.5 s it would take one after another.
+- 50 fetches against the fake LLM finish in about 2 s on one thread. (Mine: 2.01 s.)
+- You can point at the single line in your loop where the program actually waits, and say what it's waiting for.
+
+</DoneWhen>
+
+</Task>
+
+<Task id="t3" title="Write a sync server that calls the LLM" agent="hands">
+
+The server under test, written the way most people write it the first time. `sync_app.py`: a Flask app with one endpoint, `GET /chat`, that calls `http://127.0.0.1:8001/v1/complete` with `requests.get` (give it `timeout=60`; requests has no timeout by default and will wait forever), and returns `{"reply": <the text>}`. About ten lines.
+
+Run it with gunicorn's default <Term w="sync worker">gunicorn's default worker type: one process handling one request at a time, start to finish. -w sets how many such processes.</Term>, one process:
+
+```bash
+gunicorn -w 1 -b 127.0.0.1:8000 sync_app:app
+```
+
+Then hit it once with `curl` and confirm about 2 s. Nothing wrong yet. Nothing ever looks wrong with one request.
+
+</Task>
+
+<Task id="t4" title="Write the load generator" agent="hands">
+
+This is a real tool. You'll use it again in [lesson 6](/lessons/baseline-vs-fireworks/) to benchmark your Spark against Fireworks, so build it properly. `loadgen.py`:
+
+```bash
+python loadgen.py URL -n 200 -c 50        # 200 requests total, at most 50 in flight
+python loadgen.py URL -n 50 -c 50 --stream # read SSE, also record time to first token
+```
+
+It should print one summary like:
+
+```
+50 requests, 50 in flight, 0 errors, wall 2.08s, 24.0 req/s
+latency  p50 2.04s  p90 2.06s  p99 2.07s  max 2.07s
+```
+
+The shape:
+
+```python
+import argparse, asyncio, math, time
+import httpx
+
+def pct(sorted_xs, p): ...
+    # nearest-rank: the smallest value with at least p% of samples at or below it
+    # index = ceil(p/100 * n) - 1, clamped to [0, n-1]
+
+async def one(i, clients, url, sem, results, t0, stream): ...
+    # async with sem: time one request with time.perf_counter()
+    # stream mode: async with client.stream("GET", url) as r, then async for line in r.aiter_lines();
+    #   the first line starting with "data:" is your time to first token
+    # catch exceptions: count them as errors, don't crash the run
+    # append {"start", "latency", "ttft", "ok"} to results
+
+async def main(): ...
+    # argparse: url, -n, -c, --stream
+    # sem = asyncio.Semaphore(c)
+    # create the httpx.AsyncClient(s), then:
+    # async with asyncio.TaskGroup() as tg:
+    #     for i in range(n): tg.create_task(one(...))
+    # print the summary
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+Three things will bite you, and each one is a lesson:
+
+- **httpx's default timeout is 5 seconds.** Your sync server will make requests wait 100 s, and httpx will report them as errors, and your "latency" numbers will lie. Pass `timeout=httpx.Timeout(600)`.
+- **httpx's default pool is 100 connections.** Above that, requests silently wait for a free connection *inside your client*, and you'll be measuring your own queue. Set `limits=httpx.Limits(max_connections=...)` to match `-c`.
+- **One `AsyncClient` gets slow with hundreds of connections.** When I profiled 200 in flight through one client, most of the CPU went to the connection pool's own bookkeeping, and the client, not the server, became the bottleneck (latency 4.7 s for 2 s requests). Use one client per ~50 connections and hand them out round-robin (`clients[i % len(clients)]`). Lesson within the lesson: **always check your load generator's CPU** (`top`) before believing a benchmark.
+
+Point it at the fake LLM directly first. You should get `p50` about 2.0 s at `-c 20` and at `-c 500`.
+
+<DoneWhen>
+
+- `python loadgen.py http://127.0.0.1:8001/v1/complete -n 500 -c 500` reports zero errors and p50 around 2.0-2.5 s.
+- `--stream` against `/v1/stream` reports time to first token around 0.4-0.5 s.
+- You can say why the semaphore, and not the number of tasks, controls how many requests are in flight.
+
+</DoneWhen>
+
+</Task>
+
+<Task id="t5" title="Hammer the sync server, then add threads" agent="hands">
+
+With the sync server running, run the load generator at `-n 1 -c 1`, then `-n 5 -c 5`, `-n 10 -c 10`, `-n 20 -c 20`. Write down p50, max and wall time for each (results table below). Watch `top` while it runs: the gunicorn process should be near 0% CPU the whole time.
+
+Then restart gunicorn with threads. `--threads` switches it to the threaded worker, where each process has a pool of threads:
+
+```bash
+gunicorn -w 1 --threads 8 -b 127.0.0.1:8000 sync_app:app
+gunicorn -w 1 --threads 200 -b 127.0.0.1:8000 sync_app:app
+```
+
+Repeat at 20 and 100 for 8 threads, and at 200 for 200 threads. While the 200-thread version is loaded, check its memory and thread count: `ps -o rss= -p <pid>` and `ps -M <pid> | wc -l` on macOS (`ls /proc/<pid>/task | wc -l` on Linux).
+
+<DoneWhen>
+
+- One sync worker shows the staircase: wall time ≈ 2 s × N, throughput stuck at 0.5 req/s.
+- 8 threads shows waves of 8: 20 requests take about 6 s (3 waves).
+- 200 threads handles 200 at once in about 2.3 s, and you've written down how much memory it used.
+
+</DoneWhen>
+
+</Task>
+
+<Task id="t6" title="Rebuild it async" agent="hands">
+
+`async_app.py`: the same endpoint in FastAPI, written properly.
+
+- Create one `httpx.AsyncClient` for the whole app, not one per request (each new client means new connections and new TLS handshakes in real life). FastAPI's `lifespan` is the place: create it on startup, `await client.aclose()` on shutdown. Check the FastAPI docs for "Lifespan Events" for the exact shape; it's an `@asynccontextmanager` function passed as `FastAPI(lifespan=...)`.
+- Raise the client's connection limit (`httpx.Limits(max_connections=...)`) or it will cap you at 100 upstream calls in flight.
+- `async def chat()` that does `r = await client.get(UPSTREAM)` and returns the reply.
+
+```bash
+uvicorn async_app:app --port 8000 --log-level warning
+```
+
+Hit it at 20, 200 and 500 in flight. Then add two more endpoints to the same app, for the next measurements:
+
+- `/chat-def`: a plain `def` endpoint that calls `requests.get`. FastAPI will run it in its thread pool.
+- `/chat-bad`: an `async def` endpoint that does `time.sleep(2)` and then the proper `await client.get(...)`. The planted bug.
+
+<DoneWhen>
+
+- `/chat` at 200 in flight finishes in about 2-3 s from one process, at near-zero CPU.
+- `/chat-def` at 100 in flight shows waves of about 40.
+- You've predicted (in writing) what `/chat-bad` will do at 10 in flight before running it.
+
+</DoneWhen>
+
+</Task>
+
+<Task id="t7" title="Stream tokens back with SSE (optional)" agent="review">
+
+Your Fireworks benchmark will measure time to first token, so it's worth having a streaming server. Add `/chat-stream` to `async_app.py`: it opens `client.stream("GET", "http://127.0.0.1:8001/v1/stream")`, and returns a FastAPI `StreamingResponse(gen(), media_type="text/event-stream")`, where `gen()` is an `async def` generator that does `async for line in r.aiter_lines(): yield line + "\n"`. The upstream stream must stay open while you're yielding, so the `async with client.stream(...)` goes *inside* the generator.
+
+Measure with `loadgen.py --stream`. Time to first token should stay near 0.4 s even at 200 in flight, while total latency stays near 2 s. That gap, first token fast and the rest trickling, is what users feel, and it's what [the streaming lesson](/lessons/streaming/) is about. Have an agent review your generator for one classic bug: what happens to the upstream connection when the client disconnects halfway?
+
+</Task>
+
+## Measure
+
+Fill this in. My numbers are from a Mac (Python 3.14, everything on localhost, 2.0 s fake upstream); yours should be close in shape, if not to the decimal.
+
+| Server | In flight | Wall | p50 | Max | Your wall / p50 / max |
+|---|---|---|---|---|---|
+| fake LLM direct | 1,000 | 2.9 s | 2.5 s | 2.7 s | |
+| sync, 1 worker | 1 | 2.0 s | 2.0 s | 2.0 s | |
+| sync, 1 worker | 5 | 10.1 s | 6.0 s | 10.1 s | |
+| sync, 1 worker | 20 | 40.2 s | 20.1 s | 40.1 s | |
+| gunicorn, 8 threads | 20 | 6.1 s | 4.0 s | 6.1 s | |
+| gunicorn, 8 threads | 100 | 26.2 s | 14.1 s | 26.2 s | |
+| gunicorn, 200 threads | 200 | 2.3 s | 2.2 s | 2.3 s | |
+| FastAPI `async def` + httpx | 20 | 2.1 s | 2.1 s | 2.1 s | |
+| FastAPI `async def` + httpx | 200 | 3.0 s | 2.6 s | 3.0 s | |
+| FastAPI `def` + requests | 100 | 6.2 s | 4.1 s | 6.1 s | |
+| FastAPI `async def` + `time.sleep(2)` | 10 | 22.1 s | 22.1 s | 22.1 s | |
+
+How to read it:
+
+- **The sync rows are a straight line.** Wall time is 2 s × N, the median is half of that. There were no errors. That's the "it doesn't crash, it queues" claim, measured.
+- **8 threads is the sync line with 8 lanes.** 20 requests = 3 waves = 6 s. 100 requests = 13 waves = 26 s. The formula from the figure holds to within a few percent.
+- **200 threads is genuinely fine at 200.** Remember that. Threads aren't bad at waiting; they're expensive per waiter, and 200 isn't many.
+- **`def` + requests shows 40-wide waves.** 100 requests in 3 waves = 6 s. That's FastAPI's thread pool, and that's the number to remember when someone says "FastAPI handles sync endpoints fine."
+- **`time.sleep(2)` turned 10 concurrent requests into 22 seconds for everyone.** 10 × 2 s of loop-blocking plus one 2 s upstream wait. Note that the *best* request also took 22 s: every request waited for every other request's sleep. Look in the uvicorn log with `PYTHONASYNCIODEBUG=1` set: you'll see a line per request, `Executing <Task ...> took 2.006 seconds`.
+
+Then one more measurement, the one that answers lesson 3's closing question. Write `cost.py`: start N threads that each block on a `threading.Event().wait()`, and separately N asyncio tasks that each `await asyncio.Event().wait()`, and print how much the process's resident memory grew (`ps -o rss= -p <pid>` reports KB on both macOS and Linux). Try 1,000 and 10,000 of each, then 100,000 tasks.
+
+| Waiters | Threads, extra RSS | Tasks, extra RSS | Yours |
+|---|---|---|---|
+| 1,000 | ~37 MB (38 KB each) | ~0.9 MB (0.9 KB each) | |
+| 10,000 | ~370 MB | ~8.5 MB | |
+| 100,000 | refused (OS thread cap) | ~84 MB | |
+
+Try it on the Spark too. Linux allows far more threads than macOS, and each one reserves 8 MB of virtual address space, so watch `VIRT` in `htop` climb into the tens of GB while `RES` stays modest. That gap is lesson 2's "reserved isn't used" in action.
+
+## Break It
+
+**1. Overflow the line.** The listen backlog has a maximum length, and macOS caps it at 128 (`sysctl kern.ipc.somaxconn`; Linux's default has been 4096 since kernel 5.4). Point the load generator at your async server with `-n 1000 -c 1000`. On my Mac, depending on timing, anywhere from a handful to 434 of the 1,000 got `ConnectError: All connection attempts failed`. The server never crashed: the kernel's line was full, so it turned new connections away at the door. This is the one sense in which your diagnostic answer was right: a server under enough load does start failing, but the failure is at the door, not a crash inside, and the fix is a longer line, more processes, or a load balancer, not async alone.
+
+**2. Plant a blocking call and catch it.** Run `/chat-bad` under `PYTHONASYNCIODEBUG=1 uvicorn async_app:app --port 8000` and read the warnings. Then fix it three ways and measure each: replace `time.sleep(2)` with `await asyncio.sleep(2)`; with `await asyncio.to_thread(time.sleep, 2)`; and (for a CPU-bound stand-in, a loop that does a few hundred million additions) with a `ProcessPoolExecutor` via `loop.run_in_executor`. Which fix would you use for a slow tokenizer? For a legacy sync SDK?
+
+**3. Find the real ceiling of one process.** Push the async server to 500 and then 1,000 in flight and watch latency and `top`. On my machine, 500 through one `httpx.AsyncClient` *in the server* gave p50 7.7 s and one 500 error, while the fake upstream was still answering in 2 s. The cause was the same one you hit in the load generator: one client's connection pool doing bookkeeping over hundreds of connections. Splitting the server's upstream calls across 20 clients of 50 connections brought 500 in flight back to 2.5 s. When an async server gets slow with near-zero waiting, the loop is working: profile it (`python -m cProfile -s tottime`, or `py-spy top --pid`) and find what.
+
+**4. Forget the semaphore.** Remove the `async with sem:` from your load generator and run `-n 5000` against the fake LLM. Every request starts at once. Watch what happens to errors, file descriptors and memory. That's what an unbounded `gather` does to someone else's API, and why every client that talks to a rate-limited service needs a cap.
+
+## Explain It Back
+
+<details>
+<summary>1. A sync server with one worker gets 100 simultaneous requests that each wait 2 s on an LLM. What happens, exactly? Does it crash?</summary>
+
+Usually not. The kernel accepts the connections and holds them in the listen backlog. The worker takes one, blocks for 2 s in `recv()` waiting on the LLM, replies, takes the next. Request k finishes at about 2k seconds, so the last one takes about 200 s and the median about 100 s. Throughput is pinned at 0.5 requests per second and CPU is near zero. It only starts failing if the backlog fills (new connections get refused or dropped) or clients give up and time out first. The problem is latency growing in a straight line, not a crash.
+
+</details>
+
+<details>
+<summary>2. Someone says "async is basically a queue." Correct them in two sentences.</summary>
+
+A sync server already has a queue; requests wait in it because the one worker is stuck waiting on each request's network call. Async keeps one worker but lets it set a request aside whenever that request is waiting and work on others, resuming each when the OS says its data has arrived, so the waits overlap instead of adding up.
+
+</details>
+
+<details>
+<summary>3. Your LLM app makes 3 sequential API calls per request, 2 s each. What changes with asyncio.gather (or a TaskGroup)?</summary>
+
+If the three calls are independent, latency drops from the sum (6 s) to the slowest one (about 2 s), because all three are in flight at once. The cost moves elsewhere: each user request now holds 3 upstream calls at the same time, so by Little's Law you have 3× the upstream calls in flight for the same request rate, which you'll feel against the provider's concurrency and rate limits (and your semaphore). If call 2 needs call 1's output, `gather` can't help for those two; only the independent ones can overlap. Also, if one fails, `TaskGroup` cancels the others; plain `gather` by default lets them keep running.
+
+</details>
+
+<details>
+<summary>4. How many requests per second can one async Python process handle if each waits 2 s on an LLM? What eventually limits it?</summary>
+
+The waiting isn't the limit: by Little's Law, 100 req/s just means 200 in flight, and 1,000 req/s means 2,000, which costs a few MB of tasks. The limit is the *work*: each request needs some CPU on the loop's single thread (HTTP parsing, JSON, the framework, the HTTP client's pool). If that's around 1 ms, one process tops out near 1,000 req/s, and past that the loop is always busy and latency rises. Before that you may hit plainer walls: the file-descriptor limit (`ulimit -n`), the listen backlog, the HTTP client's connection pool, memory per connection, and above all the upstream provider's rate limits. Beyond one core's worth, run more processes (`--workers`) behind one port or a load balancer.
+
+</details>
+
+<details>
+<summary>5. A teammate moved an endpoint from def to async def "to make it faster", and under load it got much slower. Why, and how do you fix it?</summary>
+
+The endpoint still calls something blocking, probably `requests` or a sync DB driver. As a `def`, FastAPI ran it in a thread pool (about 40 threads), so 40 could wait at once. As an `async def`, it runs on the event loop itself, so each blocking call freezes the entire process, and every request waits for every other request's call. Fix: either switch the slow calls to async libraries (`httpx.AsyncClient`, `asyncpg`) and `await` them, or wrap them in `await asyncio.to_thread(...)`, or simply put it back to `def`. Confirm with `PYTHONASYNCIODEBUG=1`, which logs every step that holds the loop over 100 ms.
+
+</details>
+
+## Go Deeper
+
+- **Dan Kegel, "The C10K problem"** (kegel.com/c10k.html, 1999 and updated for years). The page that named the problem and surveyed every I/O strategy. Read it for the history, and for the realisation that nginx and asyncio are answers to the same question.
+- **David Beazley, "Python Concurrency From the Ground Up: LIVE!"** (PyCon 2015, on YouTube). In 45 minutes he live-codes a threaded server, shows exactly where it falls over, then builds an event loop from generators and `select`. Task 2 is a smaller version of this talk. Watch it after you've built yours.
+- **Python docs, "Developing with asyncio"** (docs.python.org, in the asyncio section). The official page on debug mode, slow-callback warnings, running blocking code, and the mistakes everyone makes. Short and practical.
+- **FastAPI docs, "Concurrency and async / await"** (fastapi.tiangolo.com/async/). The burger-restaurant explanation, and the authoritative statement of when to use `def` versus `async def` and what FastAPI does with each.
+- **Bob Nystrom, "What Color is Your Function?"** (journal.stuffwithstuff.com, 2015). The essay on why async spreads up the call chain, and what languages with green threads (Go) do differently. Will change how you see every async API.
+- **Brett Cannon, "How the heck does async/await work in Python 3.5?"** (2016 blog post). Walks from generators to `yield from` to `async`/`await`, in the order Python actually evolved. The bridge between your toy loop and the real thing.
+- **John D. C. Little, "A Proof for the Queuing Formula: L = λW"** (Operations Research, 1961). The original. Any good queueing intro will do too; the point is to believe the formula holds with almost no assumptions.
+- **Łukasz Langa, "import asyncio" video series** (EdgeDB's YouTube channel, 2020). Optional. A CPython core developer walking through the event loop, tasks and cancellation, at a good pace for someone who has just built a toy one.
+
+## Connections
+
+- Builds on [How slow is slow?](/lessons/latency-numbers/) (why a network call is "waiting"), [Where do my variables live?](/lessons/stack-and-heap/) (why every thread costs a stack, and why a paused coroutine's frame can live on the heap) and [Processes, threads and the GIL](/lessons/processes-threads-gil/) (why threads help with waiting and processes help with working).
+- Next, [Why ~17 tokens per second?](/lessons/bandwidth-bound/) turns the same waiting-vs-working question onto the GPU: during decoding, is it computing or waiting on memory?
+- In [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/) your `loadgen.py` becomes the benchmark client, and Little's Law tells you how much concurrency you need to fill a GPU.
+- Later: [Rate limits and backpressure](/lessons/rate-limits/), [p99 and load testing](/lessons/tail-latency/), and [Queues and logs](/lessons/queues/) (when the line should be a real queue with its own service).

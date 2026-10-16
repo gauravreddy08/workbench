@@ -1,0 +1,732 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import DiskWritePath from '../components/figures/DiskWritePath.astro';
+import DiskAtomicSave from '../components/figures/DiskAtomicSave.astro';
+
+## Today
+
+- Trace a single `f.write()` from your Python code to the flash chips, naming every place the bytes wait along the way, and say which of those places a crash wipes out.
+- Explain why `write()` returning means almost nothing about safety, what `fsync` actually promises, and why it costs 10x on Linux but 1,000x on a Mac.
+- Save a checkpoint so that no crash, at any moment, can leave you with a broken file: write to a temp file, fsync, rename, fsync the directory.
+- Describe, at cartoon level, how an SSD writes (pages, blocks, erase, the translation layer) and why random small writes cost more than they look.
+- Load model weights with `torch.load` and with memory-mapped safetensors, cold and warm, and explain every number, including the one where mmap loses.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the SSD numbers and the page cache mention) and ideally [Virtual memory and the OOM killer](/lessons/virtual-memory/) (pages, page faults, mmap). File descriptors came up in [Processes, threads and the GIL](/lessons/processes-threads-gil/). Rough time: one evening, plus half an hour on the Spark.
+
+## The Problem
+
+Your cross-encoder has been training for nine hours. Every 1,000 steps it calls `torch.save(model.state_dict(), "ckpt.pt")`. At step 37,000 the job gets preempted, or the Spark loses power, or you hit Ctrl-C twice in the wrong terminal. You restart from the checkpoint.
+
+```
+RuntimeError: PytorchStreamReader failed reading zip archive: failed finding central directory
+```
+
+The checkpoint is broken. Not the new one, *the* one: there was only ever one file called `ckpt.pt`, and the save that was in flight when the job died overwrote it halfway. Step 36,000 is gone and step 37,000 never finished. Nine hours, back to zero.
+
+That is the scary half of this lesson. Here is the puzzling half. You load an 8B model from safetensors and it "loads" in 40 milliseconds, which is impossible: 16 GB at 7 GB/s is over two seconds. Then you load it again in a fresh process and the first forward pass is fast, but on Monday morning the same load is slow again. And `torch.load` on a `.pt` file takes twice the RAM you expected.
+
+Both halves have the same root. Between `f.write()` and the bytes being on flash there are four layers of memory, each owned by someone different, each lying to the layer above it a little. The same layers, running backwards, decide how fast a model loads. Once you can see them, the checkpoint bug is obvious and so is the 40 ms load.
+
+<Origin year="2009" title="The ext4 zero-length file scandal">
+
+In early 2009 Ubuntu users testing the new ext4 filesystem started losing files after crashes. Not old files: config files that KDE and GNOME had just rewritten. After a reboot they existed, with the right name, and were zero bytes long.
+
+The programs were doing the classic thing: write the new contents to `config.tmp`, then `rename("config.tmp", "config")`. On the old ext3, that happened to be safe, because ext3 wrote the file's data to disk before it recorded the rename. ext4 had a new optimisation, <Term w="delayed allocation">The filesystem waits before deciding where on disk new data goes, often 30 seconds or more, so it can group writes into big contiguous chunks.</Term>, which held the data in memory for longer. The rename, a tiny metadata change, could reach the disk first. Crash in that window and you get the new name pointing at a file with no data.
+
+Ted Ts'o, the ext4 maintainer, pointed out that POSIX never promised the old behaviour: if you want data on disk, you call `fsync`. The applications were relying on luck. He was right, and he also added a heuristic to ext4 that forces the data out before such a rename, because millions of programs were never going to be fixed. A few years later researchers checked a dozen popular programs, including databases and version control systems, and found crash bugs of exactly this kind in almost all of them (Pillai et al., OSDI 2014). Saving a file correctly is genuinely hard, and nearly everyone gets it wrong the first time.
+
+</Origin>
+
+## The Idea
+
+### A file is a name, a number and some blocks
+
+Start with what a file is. On disk, a filesystem keeps three separate things:
+
+- The **data**: the bytes, stored in fixed-size <Term w="blocks">The unit a filesystem allocates disk space in, usually 4 KB. A 10 KB file takes three blocks.</Term> scattered wherever there was space.
+- An <Term w="inode">The filesystem's record for one file: its size, owner, permissions, timestamps, and the list of which blocks hold its data. Everything about the file except its name.</Term>: the record of where those blocks are, plus size, owner and timestamps.
+- A **directory entry**: a line in the directory saying "the name `ckpt.pt` means inode number 8812". A directory is itself a little file whose contents are a list of name-to-inode pairs.
+
+The name and the data are separate on purpose. Renaming a file only rewrites a directory entry. It does not move a single data byte, which is why renaming a 30 GB file is instant. Hold on to that: it is the trick that makes safe saving possible.
+
+Your program never touches any of this directly. It asks the <Term w="kernel">The core of the operating system. The one program allowed to talk to hardware directly. Everything else asks it to do things on its behalf.</Term>, through a <Term w="system call">A request from your program to the kernel, like "open this file" or "write these bytes". The CPU switches into a privileged mode, the kernel does the work, and switches back. Often shortened to syscall.</Term>. When you call `open("ckpt.pt", "wb")`, the kernel finds or creates the inode, sets up a record of the open file (which file, where you are in it, whether you can write), and hands back a small integer: the <Term w="file descriptor">A small number (0, 1, 2, 3...) that names an open file inside one process. 0, 1 and 2 are stdin, stdout and stderr, so your first file is usually 3.</Term>. Every later `write`, `read` and `close` passes that number.
+
+<Figure n="001" title="FROM A NUMBER TO THE BLOCKS" caption="Your process only holds a small integer. Everything it points at lives on the kernel side of the syscall boundary: the open-file record (with the current position), the inode (with the block list), and the directory entry that ties a name to the inode. Rename changes only the directory entry.">
+<svg viewBox="0 0 640 260" role="img" aria-label="A file descriptor in a process points across the syscall boundary to an open-file record, an inode, a directory entry and data blocks">
+  <defs>
+    <marker id="dk1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="10" y="30" width="205" height="210" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="52" class="strong">YOUR PROCESS</text>
+  <text x="22" y="72">f = open("ckpt.pt", "wb")</text>
+  <text x="22" y="88">f.fileno()  → 3</text>
+  <rect x="22" y="104" width="180" height="122" class="fill-paper" stroke-width="1" />
+  <text x="34" y="124" class="strong">FD TABLE</text>
+  <text x="34" y="146">0  stdin</text>
+  <text x="34" y="166">1  stdout</text>
+  <text x="34" y="186">2  stderr</text>
+  <text x="34" y="210" class="blue-t">3  ckpt.pt</text>
+  <line x1="232" y1="12" x2="232" y2="250" class="ink dash" stroke-width="1" />
+  <text x="226" y="22" text-anchor="end">USER</text>
+  <text x="238" y="22">KERNEL</text>
+  <line x1="120" y1="206" x2="256" y2="168" class="blue" stroke-width="1.2" marker-end="url(#dk1-arr)" />
+  <rect x="258" y="124" width="122" height="76" class="fill-paper" stroke-width="1.2" />
+  <text x="270" y="144" class="strong">OPEN FILE</text>
+  <text x="270" y="162">position: 0</text>
+  <text x="270" y="180">mode: write</text>
+  <rect x="404" y="30" width="150" height="58" class="fill-paper" stroke-width="1.2" />
+  <text x="416" y="50" class="strong">DIRECTORY</text>
+  <text x="416" y="70">ckpt.pt → #8812</text>
+  <rect x="404" y="124" width="150" height="76" class="fill-paper" stroke-width="1.2" />
+  <text x="416" y="144" class="strong">INODE #8812</text>
+  <text x="416" y="162">size, owner, times</text>
+  <text x="416" y="180">blocks: 91, 92, 517</text>
+  <line x1="380" y1="162" x2="402" y2="162" class="blue" stroke-width="1.2" marker-end="url(#dk1-arr)" />
+  <line x1="479" y1="88" x2="479" y2="122" class="blue" stroke-width="1.2" marker-end="url(#dk1-arr)" />
+  <rect x="574" y="110" width="58" height="24" class="fill-wash" stroke-width="1" />
+  <text x="603" y="126" text-anchor="middle">BLK 91</text>
+  <rect x="574" y="140" width="58" height="24" class="fill-wash" stroke-width="1" />
+  <text x="603" y="156" text-anchor="middle">BLK 92</text>
+  <rect x="574" y="170" width="58" height="24" class="fill-wash" stroke-width="1" />
+  <text x="603" y="186" text-anchor="middle">BLK 517</text>
+  <line x1="554" y1="162" x2="572" y2="152" class="blue" stroke-width="1.2" marker-end="url(#dk1-arr)" />
+  <text x="603" y="214" text-anchor="middle">DATA</text>
+  <text x="479" y="230" text-anchor="middle">ON DISK, VIA THE PAGE CACHE</text>
+</svg>
+</Figure>
+
+Crossing that boundary is not free. The CPU has to switch into kernel mode, the kernel checks your arguments, does the work and switches back. On my M4 Pro, an unbuffered one-byte `write` from Python costs about **1.8 µs**, most of which is the syscall and Python's own overhead. That is thousands of times more than appending a byte to a buffer in your own memory (about 40 ns). Which is why the first layer exists.
+
+### Layer 1: the buffer inside your process
+
+When you call `f.write(b"x")` on a file opened in binary mode, Python does not make a syscall. It copies your bytes into a <Term w="buffer">A chunk of memory where data is collected before being sent on, so many small writes become one big one.</Term> inside your own process. Only when that buffer fills up (on Python 3.14 the default is 128 KB; older versions used 8 KB, check `io.DEFAULT_BUFFER_SIZE`), or when you call `f.flush()` or `f.close()`, does Python make one real `write()` syscall with the whole chunk.
+
+So at this point your bytes are in your process's own RAM. If the process dies, they die with it. `torch.save` writes through a buffer like this too.
+
+### Layer 2: the page cache
+
+Now Python calls `write(3, buf, 131072)`. What does the kernel do? It does not wait for the SSD. It copies your bytes into the <Term w="page cache">The kernel's copy of file data, kept in otherwise-unused RAM. Reads are served from it when possible; writes land in it first and go to the disk later.</Term>, marks those pages <Term w="dirty">A page in the page cache that has been changed and not yet written to the disk. A clean page matches what's on disk and can be thrown away at any time.</Term>, and returns. `write()` succeeded. Your bytes are still only in RAM, now the kernel's RAM instead of yours.
+
+This is the single most important fact in the lesson: **`write()` returning success means "the kernel has a copy", not "it's on disk".** The kernel writes dirty pages to the drive later, in the background, a process called <Term w="writeback">The kernel's background job of writing dirty pages from the page cache to the disk. On Linux, pages typically get written within about 30 seconds of being dirtied.</Term>. On Linux, the defaults aim to write a dirty page within roughly 30 seconds (`/proc/sys/vm/dirty_expire_centisecs` is 3000 on a typical install; check yours), sooner if lots of memory is dirty.
+
+Why lie like this? Because it makes almost everything faster. Writes return in microseconds. Ten writes to the same block send only the last one to the drive. Small writes get merged into big ones, which the drive loves. And reading a file you just wrote comes straight from RAM.
+
+The page cache belongs to the kernel, not to you. That has a surprising consequence: **if your process is killed, data that already made it into the page cache survives.** The kernel keeps it and writes it back as if nothing happened. `kill -9` can only destroy what is still inside the process. A power cut is different: the page cache is RAM, and RAM forgets everything when the power goes.
+
+### Layer 3 and 4: the drive's cache, then the flash
+
+Even when the kernel does send your pages to the SSD, it is not done. Most SSDs have a small amount of their own DRAM, and they may acknowledge a write as soon as it lands there, before it has been programmed into the flash cells. That DRAM is also volatile. Expensive datacenter drives carry capacitors (<Term w="power-loss protection">Capacitors on an SSD that hold enough charge to finish writing the drive's cache to flash if the power suddenly goes. Common on datacenter drives, rare on consumer ones.</Term>) that hold enough energy to flush it if the power dies. Consumer drives usually don't.
+
+So there are four places your bytes can be, and only the last one survives a power cut. Play with it. Write a few chunks, flush, crash. Then try again with `fsync`. Then switch the OS to macOS and try `fsync` again.
+
+<Figure n="002" title="THE WRITE PATH" caption="Every chunk passes through four layers. Hollow blue means a dirty copy that only lives in RAM; grey is a clean cached copy; solid blue is on flash. kill -9 only wipes the top layer. A power cut wipes everything except flash. On a Mac, plain fsync stops at the drive's cache." wide>
+
+<DiskWritePath />
+
+</Figure>
+
+Things to try, and what each one teaches:
+
+- **Write three chunks, then kill -9.** Python flushed its buffer when it filled, so the chunks are in the page cache. They survive. Press wait: the dead process's data still reaches flash.
+- **Write one chunk, then kill -9.** It was still in the Python buffer. Lost, even though `f.write()` returned.
+- **Write, flush, power cut.** `write()` said success, and you lost everything anyway.
+- **Write two, then fsync without flushing.** `os.fsync` only covers what the kernel has. It cannot see Python's buffer. You must `f.flush()` first.
+
+### fsync: the only promise you get
+
+The call that turns "the kernel has a copy" into "it's on the disk" is <Term w="fsync">A system call that blocks until all of a file's dirty data and metadata have been written to the storage device, and the device says it is stable. The only standard way to know your data is durable.</Term>. It blocks until the kernel has written every dirty page of that file to the drive and the drive has said the data is stable. On Linux, that includes sending the drive a "flush your cache" command. Only when `fsync` returns without an error is the data <Term w="durable">Will survive a crash or power loss. The D in a database's ACID guarantees.</Term>.
+
+Its cousin <Term w="fdatasync">Like fsync, but skips metadata that isn't needed to read the data back, such as the last-modified time. Often a bit faster. Linux has it; macOS does not expose it in Python.</Term> skips metadata you don't need to read the data back (like the modified time), which can save a write. And `O_SYNC` / `O_DSYNC` flags on `open` make every write behave as if followed by fsync.
+
+The cost is that you now wait for the device. How long? It depends enormously on the drive and the OS. Here is what I measured on an M4 Pro MacBook (macOS, APFS, internal SSD), writing 1,000 × 4 KB blocks:
+
+| How | Per 4 KB write | Relative |
+| --- | --- | --- |
+| `write()` only | ~4 µs | 1x |
+| `write()` + `os.fsync()` | ~35-40 µs | ~10x |
+| `write()` + `fcntl(F_FULLFSYNC)` | ~3.9 ms | ~1,000x |
+
+The Mac row needs an explanation, and it is a real gotcha. **On macOS, `fsync` sends your data to the drive but does not tell the drive to flush its own cache.** It is the hollow-blue "drive cache" row in Figure 002. Apple's man page says so, and provides a separate `fcntl(fd, F_FULLFSYNC)` that goes all the way to flash. That is the expensive one. Databases like SQLite use it on macOS when asked to be fully durable. Python's `os.fsync` on macOS calls plain `fsync`.
+
+On Linux, `fsync` does include the cache flush (on any normal filesystem setup), so Linux `fsync` is the honest one and costs somewhere between tens of microseconds (datacenter NVMe with power-loss protection, which can safely acknowledge from its cache) and several milliseconds (consumer drives that really have to program flash). You'll measure the Spark in the Build.
+
+<Predict id="fsync-checkpoint">
+A training job saves a 2 GB checkpoint every 10 minutes. You add one `os.fsync` at the end of each save. Roughly how much does that slow training down? Now a different job: a logger that writes one 200-byte line per step at 50 steps per second and fsyncs after each line. How much time per second does it spend in fsync on a consumer SSD at ~3 ms per fsync?
+<Fragment slot="answer">
+
+The checkpoint: almost nothing. One fsync of 2 GB costs about as long as actually writing 2 GB to the SSD, call it 0.5-1 s at a few GB/s, and you only pay it every 10 minutes. Under 0.2% of training time. The bytes had to reach the drive eventually anyway; fsync just makes you wait for it once.
+
+The logger: 50 × 3 ms = 150 ms of every second, 15% of the step loop, spent waiting for 200-byte writes. fsync's cost is mostly **per call**, not per byte (a device round trip plus a cache flush), so many small fsyncs are the expensive pattern. Batch them: fsync every N lines, or every second, and decide how many lines you're willing to lose.
+
+</Fragment>
+</Predict>
+
+### Saving a file so no crash can break it
+
+Back to the broken checkpoint. `torch.save(obj, "ckpt.pt")` opens the file with `"wb"`, which <Term w="truncates">Cuts a file down to a given length, usually zero, throwing away its old contents.</Term> it to zero bytes immediately. Then it writes the new checkpoint over the next few seconds. Any crash in that window, even a plain `kill -9`, leaves you with half a file and no old one. I did exactly this to a 1 GB checkpoint on my Mac: killed 150 ms into the save, the file was 264 MB, and `torch.load` failed with the "central directory" error from the opening. The `.pt` format is a zip archive, and a zip's index lives at the very end, the part that was never written.
+
+The fix uses the fact from the start of the lesson: a rename only touches the directory entry, and POSIX promises that <Term w="rename">Changing the name a directory entry points at. On POSIX systems, renaming over an existing file replaces it atomically: anyone opening the name gets either the old file or the new one, never a mix.</Term> over an existing name is <Term w="atomic">Happens all at once or not at all, with no visible in-between state.</Term>. So the safe recipe is:
+
+1. Write the new checkpoint to a temporary file in the **same directory** (`ckpt.pt.tmp`). Rename only works atomically within one filesystem.
+2. `f.flush()`, then `os.fsync(f.fileno())`. Now the new data is durable, but has no official name.
+3. `os.replace("ckpt.pt.tmp", "ckpt.pt")`. The name now points at the new data, in one step. (`os.replace` is the Python spelling of `rename` that overwrites on every OS.)
+4. Open the **directory** and fsync it. The rename is a change to the directory's contents, and like any change it lives in the page cache until written. Without this, a power cut right after step 3 can bring you back to the old name.
+
+Step 2 is the one the 2009 ext4 programs skipped. Step 4 is the one almost everyone skips. Try every crash point in every recipe below.
+
+<Figure n="003" title="CRASH-SAFE SAVE" caption="Slide the crash point through each recipe and switch between kill -9 and a power cut. Writing in place breaks on both. Temp + rename survives kill -9 at every step but can still break on power loss. Only the full recipe is safe at every point; at worst you wake up on the old checkpoint, whole." wide>
+
+<DiskAtomicSave />
+
+</Figure>
+
+Notice the pattern. Against `kill -9`, rename alone is enough, because the page cache survives a dead process. Against power loss you need the fsyncs, because the page cache doesn't. Real training jobs die both ways: preemption and OOM kills are like `kill -9`; a node losing power or a kernel panic is like a power cut. You want the recipe that survives both.
+
+### Underneath: what the filesystem does about crashes
+
+A single `write` that grows a file changes several things on disk: the data blocks, the inode (new size, new block list), and a bitmap of which blocks are free. A crash halfway through could leave the inode pointing at blocks that also count as free, which corrupts the filesystem, not just your file. In the old days, the fix was a program called `fsck` that scanned the entire disk after every crash, which took hours on big disks.
+
+Modern filesystems avoid that with a <Term w="journal">A reserved area of the disk where the filesystem first writes down what it is about to change. After a crash it reads the journal and finishes (or ignores) half-done changes. Also called a write-ahead log.</Term>, the same idea databases call a <Term w="write-ahead log">Write a description of a change to a log, make that durable, and only then make the change in place. If you crash, the log tells you what to redo.</Term>.
+
+<Figure n="004" title="JOURNALING" caption="The filesystem writes its intended changes to the journal, then a commit record, and only then updates the real locations. A crash before the commit means the change never happened. A crash after it means the change is replayed on the next mount. Either way the filesystem is consistent; your file's data is a separate question.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Four journaling steps in a row with crash outcomes underneath">
+  <defs>
+    <marker id="dk4-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="10" y="30" width="138" height="78" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="50" class="strong">1 LOG</text>
+  <text x="22" y="70">"I will change</text>
+  <text x="22" y="86">inode, bitmap"</text>
+  <rect x="172" y="30" width="138" height="78" class="fill-blue" />
+  <text x="184" y="50" class="strong" style="fill:var(--paper)">2 COMMIT</text>
+  <text x="184" y="70" style="fill:var(--paper)">one small record,</text>
+  <text x="184" y="86" style="fill:var(--paper)">flushed to disk</text>
+  <rect x="334" y="30" width="138" height="78" class="fill-paper" stroke-width="1.2" />
+  <text x="346" y="50" class="strong">3 APPLY</text>
+  <text x="346" y="70">write the real</text>
+  <text x="346" y="86">inode + bitmap</text>
+  <rect x="496" y="30" width="134" height="78" class="fill-paper" stroke-width="1.2" />
+  <text x="508" y="50" class="strong">4 FREE</text>
+  <text x="508" y="70">journal space</text>
+  <text x="508" y="86">can be reused</text>
+  <line x1="148" y1="69" x2="170" y2="69" class="blue" stroke-width="1.2" marker-end="url(#dk4-arr)" />
+  <line x1="310" y1="69" x2="332" y2="69" class="blue" stroke-width="1.2" marker-end="url(#dk4-arr)" />
+  <line x1="472" y1="69" x2="494" y2="69" class="blue" stroke-width="1.2" marker-end="url(#dk4-arr)" />
+  <line x1="160" y1="20" x2="160" y2="160" class="ink dash" stroke-width="1" />
+  <text x="160" y="16" text-anchor="middle" class="strong">COMMIT POINT</text>
+  <line x1="10" y1="140" x2="150" y2="140" class="ink" stroke-width="1" />
+  <text x="10" y="160" class="strong">CRASH HERE</text>
+  <text x="10" y="178">journal entry has no</text>
+  <text x="10" y="194">commit: ignored.</text>
+  <text x="10" y="210">As if never started.</text>
+  <line x1="172" y1="140" x2="630" y2="140" class="blue" stroke-width="1" />
+  <text x="172" y="160" class="strong">CRASH ANYWHERE HERE</text>
+  <text x="172" y="178">on mount, committed entries are replayed from</text>
+  <text x="172" y="194">the journal, finishing the change. Replaying</text>
+  <text x="172" y="210">twice is harmless: same values, same places.</text>
+</svg>
+</Figure>
+
+Two details matter for you.
+
+**Most journals cover metadata, not your data.** ext4's default mode (`data=ordered`) journals the inode, bitmaps and directories, and makes sure a file's data blocks are written before the metadata that points to them is committed. It does not journal the contents of your checkpoint. The journal keeps the filesystem from being corrupted; it does not keep your file from being half-written. That's still your job, with the recipe above.
+
+**Some filesystems don't journal at all, they copy.** Apple's APFS, and Btrfs and ZFS on Linux, are <Term w="copy-on-write">Never overwrite data in place. Write the new version somewhere free, then switch one pointer to it. The switch is the atomic step.</Term>: they never overwrite a block in place. They write the new version to a free spot and then atomically swap a pointer. That's your temp-and-rename trick, built into the filesystem at the block level. The Spark's root filesystem is ext4 on a standard DGX OS install (check with `df -T /`); your Mac is APFS.
+
+### What an SSD actually does with a write
+
+One layer deeper. From [How slow is slow?](/lessons/latency-numbers/) you know an SSD is <Term w="NAND flash">The memory in SSDs. Each cell traps electric charge that stays without power. Reading senses the charge; writing pushes charge in; only erasing can take it out.</Term>, a random 4 KB read takes tens of microseconds, and the drive has a small computer inside. Here is why it needs one. Flash has three awkward rules:
+
+1. **You read and write in pages**, a few KB to 16 KB each.
+2. **You can only write a page that is empty.** You cannot overwrite a page in place. Writing (called <Term w="programming">Writing data into an erased flash page. Takes hundreds of microseconds to milliseconds, several times longer than a read.</Term>) is slow, roughly hundreds of µs to a couple of ms per page.
+3. **You can only empty pages a whole block at a time.** A block is hundreds of pages, several MB. An erase takes milliseconds. And each block survives only a limited number of erases (on the order of a thousand or a few thousand for common consumer flash) before it wears out.
+
+So what happens when the filesystem says "overwrite block 7"? The drive can't. Instead its <Term w="FTL">Flash translation layer. Firmware in the SSD that keeps a map from the addresses the computer uses to the physical flash pages where that data currently lives, and moves things around behind the scenes.</Term> writes the new data to any empty page, updates its map ("address 7 now lives at block 2, page 5"), and marks the old page as stale. The computer sees an ordinary disk where you can overwrite anything; underneath, nothing is ever overwritten.
+
+<Figure n="005" title="INSIDE AN SSD (CARTOON)" caption="The translation layer maps each address to wherever its data currently lives. Overwrites go to fresh pages and leave stale ones behind. To reclaim a block, garbage collection copies its still-live pages elsewhere and erases the whole block. Those copies are writes you never asked for: write amplification.">
+<svg viewBox="0 0 640 300" role="img" aria-label="A flash translation layer map next to three flash blocks of pages, with garbage collection copying live pages before an erase">
+  <defs>
+    <marker id="dk5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="10" y="30" width="166" height="150" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="50" class="strong">FTL MAP (IN DRAM)</text>
+  <text x="22" y="74">addr 3  → B0 · p2</text>
+  <text x="22" y="94">addr 7  → B1 · p2</text>
+  <text x="22" y="114">addr 12 → B0 · p5</text>
+  <text x="22" y="134">addr 40 → B1 · p0</text>
+  <text x="22" y="154" class="blue-t">addr 7 was B0 · p1</text>
+  <text x="22" y="170" class="blue-t">(now stale)</text>
+  <text x="252" y="22" text-anchor="middle" class="strong">B0 · FULL</text>
+  <text x="386" y="22" text-anchor="middle" class="strong">B1 · FILLING</text>
+  <text x="520" y="22" text-anchor="middle" class="strong">B2 · ERASED</text>
+  <g stroke-width="1">
+    <rect x="194" y="30" width="116" height="66" class="ink" />
+    <rect x="198" y="34" width="25" height="27" class="fill-paper dash" /><text x="210" y="52" text-anchor="middle">×</text>
+    <rect x="227" y="34" width="25" height="27" class="fill-paper dash" /><text x="239" y="52" text-anchor="middle">×</text>
+    <rect x="256" y="34" width="25" height="27" class="fill-wash" />
+    <rect x="285" y="34" width="21" height="27" class="fill-paper dash" /><text x="295" y="52" text-anchor="middle">×</text>
+    <rect x="198" y="65" width="25" height="27" class="fill-paper dash" /><text x="210" y="83" text-anchor="middle">×</text>
+    <rect x="227" y="65" width="25" height="27" class="fill-wash" />
+    <rect x="256" y="65" width="25" height="27" class="fill-paper dash" /><text x="268" y="83" text-anchor="middle">×</text>
+    <rect x="285" y="65" width="21" height="27" class="fill-wash" />
+    <rect x="328" y="30" width="116" height="66" class="ink" />
+    <rect x="332" y="34" width="25" height="27" class="fill-wash" />
+    <rect x="361" y="34" width="25" height="27" class="fill-wash" />
+    <rect x="390" y="34" width="25" height="27" class="fill-wash" />
+    <rect x="419" y="34" width="21" height="27" class="ink dash" />
+    <rect x="332" y="65" width="25" height="27" class="ink dash" />
+    <rect x="361" y="65" width="25" height="27" class="ink dash" />
+    <rect x="390" y="65" width="25" height="27" class="ink dash" />
+    <rect x="419" y="65" width="21" height="27" class="ink dash" />
+    <rect x="462" y="30" width="116" height="66" class="ink" />
+    <rect x="466" y="34" width="25" height="27" class="ink dash" />
+    <rect x="495" y="34" width="25" height="27" class="ink dash" />
+    <rect x="524" y="34" width="25" height="27" class="ink dash" />
+    <rect x="553" y="34" width="21" height="27" class="ink dash" />
+    <rect x="466" y="65" width="25" height="27" class="ink dash" />
+    <rect x="495" y="65" width="25" height="27" class="ink dash" />
+    <rect x="524" y="65" width="25" height="27" class="ink dash" />
+    <rect x="553" y="65" width="21" height="27" class="ink dash" />
+  </g>
+  <path d="M176 94 C 300 120, 360 120, 374 64" class="blue" stroke-width="1" marker-end="url(#dk5-arr)" />
+  <path d="M252 98 C 252 150, 500 150, 500 100" class="blue dash" stroke-width="1.2" marker-end="url(#dk5-arr)" />
+  <text x="376" y="164" text-anchor="middle" class="blue-t">GC: COPY 3 LIVE PAGES OUT, THEN ERASE B0</text>
+  <rect x="194" y="196" width="16" height="14" class="fill-wash" stroke-width="1" />
+  <text x="216" y="207">LIVE DATA</text>
+  <rect x="300" y="196" width="16" height="14" class="fill-paper dash" stroke-width="1" />
+  <text x="322" y="207">STALE (×)</text>
+  <rect x="404" y="196" width="16" height="14" class="ink dash" stroke-width="1" />
+  <text x="426" y="207">EMPTY, WRITABLE</text>
+  <text x="10" y="240" class="strong">READ A PAGE    ~tens of µs</text>
+  <text x="10" y="258" class="strong">PROGRAM A PAGE ~hundreds of µs to ~ms</text>
+  <text x="10" y="276" class="strong">ERASE A BLOCK  ~ms, wears the block</text>
+  <text x="330" y="240">approximate; varies a lot by</text>
+  <text x="330" y="258">flash type and drive. The drive</text>
+  <text x="330" y="276">hides most of it with parallelism.</text>
+</svg>
+</Figure>
+
+Eventually the drive runs low on empty pages. Then <Term w="garbage collection">In an SSD, the background job that picks a block full of mostly-stale pages, copies its few live pages somewhere else, and erases the block so it can be written again.</Term> kicks in: find a block that is mostly stale, copy its few live pages elsewhere, erase it. Those copies are writes you never asked for. The ratio of bytes written to flash over bytes you sent is the <Term w="write amplification">How many bytes the SSD writes internally for each byte the computer asked it to write. 1.0 is perfect; random small overwrites on a full drive can push it well above that.</Term>. It eats both speed and the drive's lifespan.
+
+What this means for how you write:
+
+- **Big sequential writes are the drive's favourite.** They fill whole blocks with data that tends to become stale together (you overwrite or delete the whole file later), so garbage collection finds blocks that are entirely stale and erases them without copying anything. A checkpoint is the ideal write.
+- **Small random overwrites are the worst.** Each one strands a stale page in some different block. Live and stale data end up mixed everywhere, and every erase drags copies with it.
+- **A full drive is slower.** With less free space, garbage collection has fewer good choices. Leaving free space keeps writes fast.
+- **Deleting tells the drive nothing, unless the OS says so.** The <Term w="TRIM">A command the OS sends to an SSD saying "these addresses no longer hold anything useful", so the drive can treat those pages as stale without copying them during garbage collection.</Term> command passes that information down. Modern OSes do it automatically or on a schedule.
+
+### Sequential vs random, one more time
+
+From the latency lesson: one random 4 KB read is ~50-100 µs, but the drive does several GB/s if you give it big requests or many at once. Reads and writes both behave this way, and the page cache adds another layer: when the kernel sees you reading a file front to back, it starts <Term w="readahead">The kernel noticing you're reading a file sequentially and fetching the next chunks before you ask, so they're already in the page cache when you get there.</Term>, fetching the next chunk before you ask. Sequential reads of a cold file get close to the drive's peak bandwidth. On my Mac, reading a cold 269 MB model file with big `read()` calls ran at about **6.6 GB/s**; reading it again warm, from the page cache, ran at about **17 GB/s**, which is memory copy speed.
+
+That's the bridge to loading models.
+
+### Reading a file two ways: read() and mmap
+
+There are two ways to get a file's bytes into your program.
+
+**`read()`** asks the kernel to copy bytes from the page cache into a buffer you own. If the pages aren't cached, the kernel reads them from the drive first. Either way you end up with **two copies** in RAM: one in the page cache (the kernel's, clean, droppable) and one in your buffer (yours, private).
+
+**`mmap()`** asks the kernel to make a range of your <Term w="virtual address space">The private range of addresses a process sees. Each page of it can be backed by RAM, by a file, or by nothing yet. See the virtual memory lesson.</Term> *be* the file. No data moves at that moment. The kernel just records that those addresses are backed by this file. The first time you touch one of those addresses, the CPU finds no mapping, a <Term w="page fault">The CPU trapping into the kernel because a page you touched isn't mapped to RAM yet. The kernel fixes it (here, by finding or reading the file page) and your code continues as if nothing happened.</Term> happens, and the kernel points that address at the page-cache page holding that part of the file (reading it from the drive first if needed). **One copy**: the page cache *is* your data. Nothing is copied into your heap.
+
+That changes three things:
+
+- **"Loading" becomes instant.** mmap of a 16 GB file returns in microseconds, because it did nothing yet. The cost moves to first touch, spread out over the forward pass.
+- **Several processes share one copy.** Two inference workers that mmap the same weights file both point at the same page-cache pages. With `read()`, each gets its own private copy.
+- **Memory pressure is gentler.** Mapped file pages are clean copies of the disk. Under pressure the kernel can simply drop them and re-read later. A private copy made by `read()` has to be kept (or swapped out, which means writing it somewhere first).
+
+The cost is that mmap turns one big, efficient sequential read into many small page faults, each a trip into the kernel. When everything is cached, those faults are cheap. When nothing is cached, they can be slower than a big `read()`, because the drive is getting a trickle of small requests instead of a few huge ones. You'll measure exactly this.
+
+### torch.load vs safetensors
+
+Now the ML part, which is these two ideas wearing different clothes.
+
+**A `.pt` file is a zip archive** (open one with `unzip -l` and see). Inside is `data.pkl`, a <Term w="pickle">Python's format for turning objects into bytes and back. Unpickling runs instructions stored in the file, and those instructions can call any Python function.</Term> describing the structure (a dict of names to tensors, with dtype, shape and which storage holds the bytes), plus one entry per tensor storage, `data/0`, `data/1`, ..., holding raw bytes. `torch.load` unpickles the structure and, for each storage, allocates memory and **copies** the bytes in. You get the page cache copy plus your own copy.
+
+And pickle has a second problem: **unpickling can run arbitrary code.** A pickle can say "to rebuild this object, call `os.system` with this string", and a normal unpickler will do it. Loading a `.pt` file from a stranger was, for years, the same as running their script. Since PyTorch 2.6, `torch.load` defaults to `weights_only=True`, which restricts the unpickler to an allowlist of tensor-ish types and refuses anything else. You'll watch it refuse a malicious file in the Build. Passing `weights_only=False` turns the old danger back on.
+
+**A `.safetensors` file is deliberately boring.** Eight bytes saying how long the header is, then a JSON header listing each tensor's name, dtype, shape and byte offsets, then all the raw bytes, packed. No code, nothing to execute; the worst a malicious file can do is lie about shapes, which the loader checks. And because each tensor is just a byte range at a known offset, the loader can mmap the file and hand you tensors that point straight into the mapping. That's the "zero-copy" in the safetensors pitch, and it's why `transformers` loads `.safetensors` by default.
+
+<Figure n="006" title="TWO WAYS TO LOAD WEIGHTS" caption="torch.load reads the file through the page cache and copies every tensor into fresh memory you own: two copies in RAM. safetensors maps the file, so tensors point straight at page-cache pages: one copy, read lazily on first touch, shared by every process that maps the same file.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Two lanes: torch.load copies from page cache into the heap; safetensors mmap points tensors at the page cache directly">
+  <defs>
+    <marker id="dk6-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="10" y="20" class="strong">TORCH.LOAD (.pt, pickle)</text>
+  <rect x="10" y="34" width="120" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="58" text-anchor="middle" class="strong">SSD</text>
+  <text x="70" y="76" text-anchor="middle">.pt (zip)</text>
+  <rect x="200" y="34" width="170" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="285" y="58" text-anchor="middle" class="strong">PAGE CACHE</text>
+  <text x="285" y="76" text-anchor="middle">copy 1 (kernel)</text>
+  <rect x="440" y="34" width="190" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="535" y="58" text-anchor="middle" class="strong">YOUR HEAP</text>
+  <text x="535" y="76" text-anchor="middle">copy 2 (tensors)</text>
+  <line x1="130" y1="62" x2="198" y2="62" class="blue" stroke-width="1.2" marker-end="url(#dk6-arr)" />
+  <line x1="370" y1="62" x2="438" y2="62" class="blue" stroke-width="1.5" marker-end="url(#dk6-arr)" />
+  <text x="404" y="54" text-anchor="middle" class="blue-t">memcpy</text>
+  <text x="200" y="112">+ unpickle data.pkl first: runs instructions from the file</text>
+  <line x1="10" y1="134" x2="630" y2="134" class="ink dash" stroke-width="1" />
+  <text x="10" y="160" class="strong">SAFETENSORS (mmap)</text>
+  <rect x="10" y="174" width="120" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="198" text-anchor="middle" class="strong">SSD</text>
+  <text x="70" y="216" text-anchor="middle">.safetensors</text>
+  <rect x="200" y="174" width="170" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="285" y="198" text-anchor="middle" class="strong">PAGE CACHE</text>
+  <text x="285" y="216" text-anchor="middle">the only copy</text>
+  <rect x="440" y="174" width="190" height="56" class="fill-paper dash" stroke-width="1" />
+  <text x="535" y="198" text-anchor="middle" class="strong">YOUR TENSORS</text>
+  <text x="535" y="216" text-anchor="middle">addresses only</text>
+  <line x1="130" y1="202" x2="198" y2="202" class="blue dash" stroke-width="1.2" marker-end="url(#dk6-arr)" />
+  <text x="164" y="248" text-anchor="middle">on first touch</text>
+  <line x1="440" y1="202" x2="372" y2="202" class="blue" stroke-width="1.2" marker-end="url(#dk6-arr)" />
+  <text x="406" y="194" text-anchor="middle" class="blue-t">maps</text>
+  <text x="200" y="270">header is JSON: names, dtypes, shapes, offsets. no code.</text>
+</svg>
+</Figure>
+
+Two caveats so you don't over-learn this.
+
+First, `torch.load(path, mmap=True)` exists (since PyTorch 2.1) and gives `.pt` files the same lazy, mapped loading. The real advantages of safetensors are the safety and the simple, documented layout, which lets any language read it and lets you read one tensor without parsing anything else.
+
+Second, the tensors eventually have to go where the compute is. `.to("cuda")` copies them into GPU memory regardless of how they were loaded. What mmap saves is the *extra CPU-side copy* and the time to make it; on a discrete GPU that's a page-cache → GPU copy instead of page cache → heap → GPU. The Spark's GPU shares one pool of memory with the CPU, so there it's worth measuring rather than assuming.
+
+### Cold and warm
+
+The last piece is why the same load is fast on Friday afternoon and slow on Monday morning. The first load of a file reads it from the SSD into the page cache: a **cold** load. Every load after that, in any process, finds the pages already cached: a **warm** load, at memory speed. The pages stay until the kernel needs the RAM for something else, or the machine reboots. Linux and macOS will happily use most of your "free" RAM as page cache; that's why `free -h` on the Spark shows a big "buff/cache" number.
+
+So any loading benchmark has to say which it measured. A 40 ms load of an 8B model is an mmap that hasn't touched anything yet. The honest cold cost for 16 GB is a few seconds, paid either at load or during the first forward pass.
+
+<Predict id="cold-warm-load">
+A 2.1 GB bf16 state dict, on an M4 Pro Mac. Four ways to get every byte into tensors and sum them: `torch.load` cold, `torch.load` warm, safetensors `load_file` (mmap) cold, safetensors warm. Rank them fastest to slowest, and guess a time for each. The SSD reads big sequential chunks at ~6.6 GB/s; memory copies run at ~10-17 GB/s.
+<Fragment slot="answer">
+
+What I measured (load + touch every tensor), best of a couple of runs:
+
+- safetensors warm: **~100 ms** (12 ms to "load", ~90 ms to touch and sum). No copy, the data is already mapped.
+- `torch.load` warm: **~300 ms** (~230 ms load + ~70 ms sum). The extra ~200 ms is the memcpy from page cache into fresh tensors, ~10 GB/s.
+- `torch.load` cold: **~0.5-0.7 s**. One big sequential read per storage, close to the SSD's speed.
+- safetensors cold: **~1.8-2.7 s**. The surprise. "Loading" took 50-70 ms, then touching every tensor page-faulted the file in, a small piece at a time, at under 1 GB/s.
+
+If you ranked mmap first in both rows, you'd be in good company. mmap wins big when warm, when several processes share the file, or when you only need some of the tensors. Cold, reading everything, on macOS, a few huge reads beat a few hundred thousand page faults. Linux's readahead handles mmap faults differently and may close the gap: that's one of your Spark measurements.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Everything goes in `~/workbench/disk/`. You need a venv with `torch`, `safetensors` and `huggingface_hub`. Run each experiment on the Mac first, then on the Spark, because the two OSes disagree on exactly the things this lesson is about.
+
+<Task id="t0" title="Set up: venv, a small model, a cold-cache helper" agent="ok">
+
+```bash
+mkdir -p ~/workbench/disk && cd ~/workbench/disk
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch safetensors huggingface_hub
+python -c "from huggingface_hub import snapshot_download; print(snapshot_download('HuggingFaceTB/SmolLM2-135M-Instruct', allow_patterns=['*.safetensors','*.json']))"
+```
+
+That's a 269 MB bf16 model, small enough to iterate quickly. Also make a bigger synthetic one so the timings are large enough to see:
+
+```python
+# prep.py: make .pt and .safetensors copies of the same weights
+import glob, torch
+from safetensors.torch import load_file, save_file
+src = glob.glob("/Users/*/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/*/model.safetensors")
+src = src or glob.glob("/home/*/.cache/huggingface/hub/models--HuggingFaceTB--SmolLM2-135M-Instruct/snapshots/*/model.safetensors")
+sd = load_file(src[0])
+torch.save(sd, "small_src.pt"); save_file(sd, "small_src.safetensors")
+big = {f"w{i}": torch.randn(4096, 4096).to(torch.bfloat16) for i in range(64)}  # 64 x 32 MB = 2.1 GB
+torch.save(big, "big_src.pt"); save_file(big, "big_src.safetensors")
+```
+
+Now the hard part of any disk benchmark: getting a **cold** file on demand.
+
+- **Linux (Spark):** drop the whole page cache with `sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`. Or, without root, evict one file: open it, `os.fsync(fd)`, then `os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)`. The kernel drops that file's clean pages.
+- **macOS:** `sudo purge` empties the cache. Without sudo, make a fresh copy of the file with caching turned off, so its pages never enter the cache. This is what I used:
+
+```python
+# coldcopy.py SRC DST: copy a file without putting it in the page cache (macOS)
+import os, sys, fcntl
+src, dst = sys.argv[1], sys.argv[2]
+fi = os.open(src, os.O_RDONLY); fcntl.fcntl(fi, fcntl.F_NOCACHE, 1)
+fo = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644); fcntl.fcntl(fo, fcntl.F_NOCACHE, 1)
+while (b := os.read(fi, 8 << 20)):
+    os.write(fo, b)
+fcntl.fcntl(fo, fcntl.F_FULLFSYNC)
+os.close(fi); os.close(fo)
+```
+
+Check that it works: time a full `read()` of the copy twice. The first should run near SSD speed, the second much faster. (Mine: 6.6 GB/s, then 17 GB/s.)
+
+</Task>
+
+<Task id="t1" title="See the syscalls, and the buffer" agent="explain">
+
+First, feel the buffer. Write 200,000 one-byte `f.write(b"x")` calls to a file opened normally, then to one opened with `buffering=0`. Time both. Predict the ratio first, using the syscall cost from The Idea. (Mine: 40 ns vs 1.8 µs per call, about 45x.)
+
+Then look at the syscalls themselves. This works best on the Spark:
+
+```bash
+strace -f -e trace=openat,write,fsync,fdatasync,rename,renameat,renameat2,close \
+  python3 -c "f = open('out.txt', 'w'); f.write('hello\n'); f.write('world\n'); f.close()"
+```
+
+Among Python's own startup noise, near the end, you should see something like this (details vary by Python version):
+
+```
+openat(AT_FDCWD, "out.txt", O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC, 0666) = 3
+write(3, "hello\nworld\n", 12)          = 12
+close(3)                                = 0
+```
+
+Two `f.write` calls, **one** `write` syscall: that's the buffer. `O_TRUNC` is the flag that destroyed the checkpoint in The Problem. And no `fsync` anywhere. Now run it again with `os.fsync(f.fileno())` before `close`, with `f.flush()` before that, and then with `os.replace('out.txt', 'final.txt')` at the end, and find each in the trace. Finally, trace `python3 -c "import torch; torch.save(torch.zeros(1000), 'z.pt')"` and count its writes.
+
+On the Mac the equivalent is `sudo dtruss`, but System Integrity Protection blocks it for most binaries. I didn't get it working without disabling SIP; use the Spark.
+
+</Task>
+
+<Task id="t2" title="Time writes with and without fsync" agent="hands">
+
+Write `fsync_bench.py`: write 1,000 blocks of 4 KB to a file with `os.write`, in four modes, and print the per-write time.
+
+```python
+# fsync_bench.py
+import os, sys, time, fcntl
+
+N, BLOCK = 1000, 4096
+
+def bench(mode: str) -> float:
+    """Open a fresh file with os.open, write N blocks of random bytes.
+    After each write: nothing ("none"), os.fsync ("fsync"),
+    os.fdatasync ("fdatasync", Linux only), or fcntl F_FULLFSYNC ("full", macOS only).
+    Return seconds per write. Delete the file afterwards."""
+    ...
+
+if __name__ == "__main__":
+    # run the modes this OS supports; print microseconds per write
+    ...
+```
+
+Hints: `hasattr(os, "fdatasync")` and `hasattr(fcntl, "F_FULLFSYNC")` tell you what this OS has. Use raw `os.open` / `os.write` so Python's buffer isn't involved. Fill in the Measure table, predictions first.
+
+Then a second experiment: write 512 MB in one go with `f.write(data)`, then time `f.flush()` and `os.fsync()` separately. Where does the time go: into `write()`, or into `fsync()`? Is that different on the two machines?
+
+</Task>
+
+<Task id="t3" title="Crash a save with kill -9" agent="hands">
+
+Two scripts. `saver.py` builds a ~1 GB state dict and saves it to `ckpt.pt`, either naively or atomically. `crash.py` makes a good checkpoint first, then starts a second save and kills it partway.
+
+```python
+# saver.py MODE   (MODE is "naive" or "atomic")
+import os, sys, torch
+
+state = {f"layer{i}": torch.randn(1024, 1024) for i in range(256)}  # 256 x 4 MB fp32 = 1 GB
+
+def naive_save(obj, path: str) -> None:
+    torch.save(obj, path)
+
+def atomic_save(obj, path: str) -> None:
+    """Write to path + '.tmp' in the same directory, flush, fsync it,
+    os.replace it over path, then open the directory and fsync that too."""
+    ...
+
+if __name__ == "__main__":
+    save = naive_save if sys.argv[1] == "naive" else atomic_save
+    print("ready", flush=True)       # crash.py waits for this line
+    save(state, "ckpt.pt")
+    print("saved", flush=True)
+```
+
+```python
+# crash.py MODE DELAY
+# 1. run saver.py MODE to completion: this is the "good" checkpoint. Print its size.
+# 2. start saver.py MODE again with subprocess.Popen(stdout=PIPE), wait for "ready",
+#    sleep DELAY seconds, then os.kill(pid, signal.SIGKILL)
+# 3. print the size of every file starting with "ckpt", then try torch.load("ckpt.pt")
+```
+
+Hints: `torch.save` accepts an open file object, so `atomic_save` can do `with open(tmp, "wb") as f: torch.save(obj, f); f.flush(); os.fsync(f.fileno())`. To fsync a directory, `os.open(dirpath, os.O_RDONLY)` gives you a descriptor you can pass to `os.fsync`. Try delays from 0.05 s to 1 s; find the window where the naive save breaks.
+
+You can't easily pull the power on purpose, so the power-cut column of Figure 003 stays a thought experiment. The kill test shows the truncation bug; the figure shows why the fsyncs matter beyond it.
+
+</Task>
+
+<Task id="t4" title="Load weights four ways, cold and warm" agent="hands">
+
+```python
+# load_one.py METHOD PATH: one measurement per fresh process
+import sys, time, resource
+import torch
+from safetensors import safe_open
+from safetensors.torch import load_file
+
+def load(method: str, path: str) -> dict:
+    """'torch.load'      -> torch.load(path)
+       'torch.load-mmap' -> torch.load(path, mmap=True)
+       'load_file'       -> safetensors load_file(path)
+       'one-tensor'      -> safe_open(path, framework='pt'), get_tensor() for just the first key"""
+    ...
+
+if __name__ == "__main__":
+    # time load(); then time touching every byte: sum(float(t.float().sum()) for t in sd.values())
+    # print both times, plus peak RSS from resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    # (bytes on macOS, kilobytes on Linux)
+    ...
+```
+
+Write a small driver (shell or Python) that, for each method and each file size, makes the file cold (`coldcopy.py` on the Mac, `posix_fadvise` or `drop_caches` on the Spark), runs `load_one.py` once (cold), then again (warm). Run each method in a **fresh process**, otherwise the second method inherits the first one's cache and imports.
+
+Predict before you run: which method has the smallest "load" time? The smallest "load + touch" time cold? Warm?
+
+</Task>
+
+<Task id="t5" title="Look inside both formats, and pickle's trapdoor" agent="explain">
+
+Open the files by hand.
+
+- `unzip -l small_src.pt`: find `data.pkl` and the `data/N` storages. Then `python -m pickletools` on the extracted `data.pkl` to see the instructions the unpickler runs (`GLOBAL`, `REDUCE` and friends).
+- Read the safetensors header yourself with only the standard library: the first 8 bytes are a little-endian unsigned 64-bit integer (`struct.unpack("<Q", ...)`), the next that many bytes are JSON. Print the first tensor's entry. (SmolLM2's first one: `model.embed_tokens.weight`, BF16, shape `[49152, 576]`, bytes 0 to 56,623,104.) Check: 49,152 × 576 × 2 bytes = 56,623,104.
+
+Then the trapdoor. Make a class whose `__reduce__` returns `(os.system, ("echo pwned",))`, put an instance in a dict next to a tensor, and `torch.save` it. Now `torch.load` it with the default settings, then with `weights_only=False`. The first should raise an `UnpicklingError`; the second prints "pwned", meaning the file ran a shell command inside your process. Only ever do this with your own file.
+
+</Task>
+
+<Task id="t6" title="Repeat on the Spark" agent="review">
+
+Copy the folder over (`rsync -a` over Tailscale, skip the big files and regenerate them there). Rerun `fsync_bench.py`, `crash.py` and the loading matrix, using `drop_caches` or `posix_fadvise` for cold runs. Also note `df -T .` (which filesystem), `getconf PAGESIZE` (ARM64 Linux kernels may use 4 KB or 64 KB pages; macOS on Apple silicon uses 16 KB), and `cat /proc/sys/vm/dirty_expire_centisecs`. Have an agent review your loading driver for unfair comparisons: a method that ran warm when it was supposed to be cold, imports counted in one timing and not another, or RSS units mixed up between macOS and Linux.
+
+</Task>
+
+<DoneWhen>
+
+- You traced a Python write on the Spark and can point to the `openat`, the single `write`, and (when you add it) the `fsync`.
+- `fsync_bench.py` has numbers for every mode on both machines, and you can explain why macOS has two fsyncs.
+- You broke a naive save with `kill -9`, and your `atomic_save` survived the same kill at every delay you tried.
+- The loading table below is filled in, cold and warm, and you can explain the row where mmap is slower.
+
+</DoneWhen>
+
+## Measure
+
+Predictions first, then fill in.
+
+| Experiment | Prediction | Mac | Spark |
+| --- | --- | --- | --- |
+| 1-byte write, buffered (ns/call) | | | |
+| 1-byte write, unbuffered (µs/call) | | | |
+| 4 KB `write` only (µs) | | | |
+| 4 KB `write` + `fsync` (µs) | | | |
+| 4 KB `write` + `fdatasync` (Linux) | | — | |
+| 4 KB `write` + `F_FULLFSYNC` (macOS) | | | — |
+| Naive save killed at 0.15 s: file size, loads? | | | |
+| Atomic save killed at 0.15 s: `ckpt.pt` loads? | | | |
+| 2.1 GB `torch.load`, cold / warm | | | |
+| 2.1 GB `load_file` load, cold / warm | | | |
+| 2.1 GB `load_file` load + touch, cold / warm | | | |
+| One tensor via `safe_open`, cold | | | |
+
+For reference, mine, on an M4 Pro MacBook Pro (macOS, APFS, internal SSD, 48 GB RAM), Python 3.14, PyTorch 2.14. Your numbers will differ; the shape should not.
+
+| Experiment | Mine (Mac) |
+| --- | --- |
+| 1-byte write, buffered / unbuffered | 40 ns / 1.8 µs |
+| 4 KB `write` only | ~4 µs |
+| 4 KB `write` + `fsync` | ~35-40 µs |
+| 4 KB `write` + `F_FULLFSYNC` | ~3.9 ms |
+| Naive save, kill -9 at 0.15 s | 264 MB of 1.07 GB left; `torch.load` fails ("central directory") |
+| Atomic save, kill -9 at 0.15 s | `ckpt.pt` intact (1.07 GB, 256 tensors); 487 MB `.tmp` left over |
+| 2.1 GB `torch.load` (load + touch), cold / warm | ~0.5-0.7 s / ~0.3 s |
+| 2.1 GB `torch.load(mmap=True)` (load + touch), cold / warm | ~1.3-2.0 s / ~0.1 s |
+| 2.1 GB `load_file` (load + touch), cold / warm | ~1.8-2.7 s / ~0.1 s |
+| 2.1 GB `load_file`, "load" only, cold / warm | ~50-70 ms / ~12 ms |
+| One tensor via `safe_open`, cold / warm | ~1 ms + ~20-50 ms to touch / ~5 ms |
+| Peak RSS: full load any method / one tensor | ~2.4 GB / ~320 MB |
+
+What the numbers should tell you:
+
+**Buffered vs unbuffered: ~45x.** That's the syscall boundary. The buffer exists so you pay it once per 128 KB, not once per call.
+
+**`write` only, ~4 µs for 4 KB.** That's a syscall plus a 4 KB memory copy into the page cache. It never waited for the SSD. Compare with the ~50-100 µs it would take the SSD to even read a page.
+
+**Mac `fsync` ~10x, `F_FULLFSYNC` ~1,000x.** Plain fsync got the data to the drive; F_FULLFSYNC waited for flash. On the Spark, tens of µs means a very fast drive or one acknowledging from a protected cache; milliseconds means it's doing what F_FULLFSYNC does on the Mac.
+
+**The big write.** On my Mac, one 512 MB `write` took ~0.1-0.25 s and the fsync after it only a few ms (F_FULLFSYNC: 50-80 ms): the data was already streaming out during the write. Linux may split it differently.
+
+**The crash.** The naive file was 264 MB of 1.07 GB: every byte the process had handed to `write()` before it died was there, and nothing after. That's the page-cache-survives-kill fact made visible. The zip index was missing, so the load failed. The atomic version left a partial `.tmp` and a perfectly good `ckpt.pt`. On startup, delete stray `.tmp` files and move on.
+
+**Loading, warm.** mmap-based loads cost ~100 ms for 2.1 GB, about the time to sum the numbers once. `torch.load` adds a ~200 ms memcpy; at 16 GB that's ~1.5 s and 16 GB of private RAM per process.
+
+**Loading, cold: mmap loses here.** Reading every byte through page faults ran at under 1 GB/s; `torch.load`'s big reads ran at 3-5 GB/s. mmap is not "faster disk", it's "no copy, and lazy". When you'll read everything from a cold disk right away, one big read can win. Libraries that care tell the kernel what's coming (`madvise` with `MADV_WILLNEED` or `MADV_SEQUENTIAL`) or just read the file. Check whether Linux's readahead closes the gap on the Spark.
+
+**Peak RSS is the same for every full load.** <Term w="RSS">Resident set size: how much of a process's memory is currently in physical RAM. It counts mapped file pages you've touched, not just memory you allocated.</Term> counts mapped file pages once you touch them. The difference is what kind: mapped pages are clean and shared with the page cache, so the kernel can drop them and a second process mapping the same file uses the same pages. `torch.load`'s are private copies. Two `torch.load` workers cost 2 × 2.1 GB plus the page cache; two mmap workers cost one page cache's worth. And with one tensor out of 2.1 GB, only that tensor's pages ever come in (the ~320 MB is mostly PyTorch itself).
+
+## Break It
+
+**1. fsync before flush.** In `atomic_save`, swap the order: `os.fsync(f.fileno())` then `f.flush()`. It still "works" in every test you can run, which is what makes it dangerous. fsync ran while the last chunk of the checkpoint was still in Python's buffer, so that chunk was not durable when you renamed. Use Figure 002: write two chunks, fsync, power cut. This is the mistake that the layers model catches and testing doesn't.
+
+**2. The temp file in /tmp.** Put the temp file in `/tmp` (or any other mount) and rename it into your checkpoint directory. On Linux, if `/tmp` is a different filesystem (on many distros it's a RAM-backed `tmpfs`), `os.replace` fails with `OSError: [Errno 18] Invalid cross-device link`. `shutil.move` "fixes" it by quietly copying the data and deleting the original, which is not atomic at all: you're back to writing in place. Rename is only atomic within one filesystem. Keep the temp file next to the target.
+
+**3. Ignore an fsync error.** If `fsync` fails (a dying drive, a full disk on some filesystems, a network filesystem that lost its server), what's in the page cache is now in an unknown state. In 2018 the PostgreSQL developers discovered ("fsyncgate") that on Linux, after a failed fsync, the kernel could mark the dirty pages clean anyway, so retrying fsync would *succeed* without the data ever being written. The only safe response to an fsync error is to treat the data as lost and redo the write from a copy you trust. Make your `atomic_save` raise, not retry, and never `os.replace` after a failed fsync.
+
+**4. Benchmark the page cache by accident.** Run the cold loading test twice without making the file cold in between. The "cold" mmap number collapses from seconds to ~100 ms and you conclude mmap is magic. Then run it after making a fresh copy with plain `shutil.copy` instead of `coldcopy.py`: still warm, because writing the copy put it in the page cache. Every claim of "loads in 40 ms" deserves the question: cold or warm?
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Walk me through what happens when Python calls f.write(data) on a file. When is the data safe?</summary>
+
+`f.write` copies the bytes into a buffer in my process; no syscall yet. When the buffer fills, or I call `flush` or `close`, Python makes a `write()` syscall: the kernel copies the bytes into its page cache, marks the pages dirty, and returns success immediately. Later, background writeback sends dirty pages to the SSD, usually within about 30 seconds on Linux. The SSD may hold them in its own DRAM cache before programming them into flash. The data is only safe against power loss once it's in flash, and the only way to know that is to call `fsync` (after flushing Python's buffer) and have it return without error. On macOS plain fsync stops at the drive, so you need `F_FULLFSYNC` for the same guarantee. Against a mere process crash, data is safe as soon as `write()` returns, because the page cache belongs to the kernel.
+
+</details>
+
+<details>
+<summary>2. How do you save a checkpoint so that a crash at any moment can't corrupt it?</summary>
+
+Never write over the real file. Write the new checkpoint to a temp file in the same directory, flush, `fsync` it, then `os.replace` it over the real name, then fsync the directory. The rename is atomic, so any reader sees all old or all new. The first fsync makes sure the data is on disk before the name points at it (otherwise a power cut can give you the new name with missing data). The directory fsync makes the rename itself durable. Rename only works atomically within one filesystem, so the temp file can't live in `/tmp`. On startup, delete leftover temp files. Many training setups also keep the last two or three checkpoints, which protects against bugs that write a garbage checkpoint cleanly.
+
+</details>
+
+<details>
+<summary>3. Why is an SSD slower at small random writes than big sequential ones, and why does a nearly-full drive get slower?</summary>
+
+Flash can't be overwritten in place: you can only write empty pages, and you can only empty a whole block of hundreds of pages at once. The drive's translation layer handles overwrites by writing the new data to a fresh page and remapping the address, leaving the old page stale. Later, garbage collection copies the still-live pages out of a block and erases it. Small random overwrites scatter stale pages across many blocks, so every erase drags lots of live data with it: extra internal writes, called write amplification, which costs speed and wear. Big sequential writes fill whole blocks with data that goes stale together, so blocks can be erased with nothing to copy. A full drive has fewer empty pages and fewer mostly-stale blocks to choose from, so garbage collection has to copy more for every block it frees.
+
+</details>
+
+<details>
+<summary>4. torch.load vs safetensors: what's actually different? Does mmap make loading faster?</summary>
+
+A `.pt` file is a zip with a pickle describing the structure; `torch.load` unpickles it and copies each tensor's bytes from the page cache into fresh memory, so the weights exist twice in RAM. Pickle can also execute code, which is why `weights_only=True` became the default. Safetensors is an 8-byte length, a JSON header with dtypes, shapes and offsets, and raw bytes: nothing to execute, and tensors can point straight into a memory map of the file, so there's no second copy and multiple processes share one page-cache copy. Whether it's faster depends. Warm, mmap is far faster because nothing is copied. Loading only some tensors, mmap wins because it reads only what you touch. But cold, reading everything immediately, page-faulting a file in can be slower than one big sequential read: on my Mac, 2.1 GB took ~2 s via mmap vs ~0.6 s via `torch.load`.
+
+</details>
+
+<details>
+<summary>5. You run 8 inference workers on one machine, each loading the same 16 GB model. How much RAM, and how do you make startup fast? What changes as you go to 50 workers on more machines?</summary>
+
+With `torch.load` into CPU memory, each worker makes a private 16 GB copy: 128 GB plus the page cache, which doesn't fit on most machines. With mmap'd safetensors, all 8 share one 16 GB page-cache copy; the first worker pays the cold read (a few seconds at a few GB/s), the rest start warm. If the weights go to GPUs, each GPU still needs its own copy, and that host-to-device copy becomes the startup cost. Across many machines, each pays its own cold read, and if 50 workers pull 16 GB each from shared network storage at once, that's 800 GB through one pipe: the storage becomes the bottleneck. Fixes: local SSD caches per node, staggered starts, or load once and broadcast over the fast interconnect.
+
+</details>
+
+## Go Deeper
+
+- **Remzi and Andrea Arpaci-Dusseau, _Operating Systems: Three Easy Pieces_** (free at [pages.cs.wisc.edu/~remzi/OSTEP](https://pages.cs.wisc.edu/~remzi/OSTEP/)). Read "Interlude: Files and Directories" (fds, fsync, rename, inodes), "Crash Consistency: FSCK and Journaling", and "Flash-based SSDs". This lesson is a compressed tour of those three chapters, with the ML bits added.
+- **Thanumalayan Sankaranarayana Pillai et al., "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications"**, OSDI 2014. The paper that tested real applications (SQLite, Git, LevelDB, PostgreSQL and more) against crashes and found how often they get file updates wrong. Shows exactly which orderings each filesystem does and doesn't guarantee.
+- **Dan Luu, ["Files are hard"](https://danluu.com/file-consistency/)**. A short, sharp blog-post tour of that research and why correct file I/O is so much harder than the APIs make it look.
+- **Jonathan Corbet, "PostgreSQL's fsync() surprise"**, LWN.net, 2018. The fsyncgate story from Break It, told clearly, including what Linux changed afterwards.
+- **Mendel Rosenblum and John Ousterhout, "The Design and Implementation of a Log-Structured File System"**, ACM TOCS, 1992. The idea of never overwriting in place and cleaning up stale segments later, which is exactly what an SSD's FTL does internally twenty years later.
+- **Man pages: `fsync(2)`, `rename(2)`, `mmap(2)`** ([man7.org](https://man7.org/linux/man-pages/)) and macOS's `man 2 fsync`, which explains `F_FULLFSYNC` in Apple's own words.
+- **[safetensors documentation](https://huggingface.co/docs/safetensors)** (Hugging Face), especially the format description and the security notes; and PyTorch's **`torch.load` docs and [Serialization semantics](https://pytorch.org/docs/stable/notes/serialization.html) note** for `weights_only` and `mmap=True`. Check these against your installed versions; the defaults changed in 2.6.
+
+## Connections
+
+This lesson stands on [How slow is slow?](/lessons/latency-numbers/): the SSD numbers there are why the page cache exists, and the `F_NOCACHE` / `O_DIRECT` trick there is the same "get past the page cache" problem you solved here for loading. mmap and page faults are the subject of [Virtual memory and the OOM killer](/lessons/virtual-memory/); this lesson is the file-backed half of that story. File descriptors first appeared in [Processes, threads and the GIL](/lessons/processes-threads-gil/).
+
+Looking ahead, the journal and the write-temp-then-rename trick are the seeds of how databases make transactions durable: a write-ahead log, fsynced at commit, is exactly Figure 004 applied to rows instead of inodes. And the cold-versus-warm load is one of the first things to check when an inference server's startup or first request is mysteriously slow.

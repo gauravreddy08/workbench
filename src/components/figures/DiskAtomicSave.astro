@@ -1,0 +1,160 @@
+---
+// Three ways to save a checkpoint. Pick a recipe, pick the moment of the crash and the kind of crash,
+// and see what ckpt.pt looks like after the restart.
+---
+<div class="das" data-fig="disk-atomic-save">
+  <div class="ctl das-top">
+    <span>Recipe</span>
+    <button class="btn" type="button" data-mode="naive" aria-pressed="true">Write in place</button>
+    <button class="btn" type="button" data-mode="rename" aria-pressed="false">Temp + rename</button>
+    <button class="btn" type="button" data-mode="atomic" aria-pressed="false">Temp + fsync + rename + fsync dir</button>
+  </div>
+  <ol class="das-steps"></ol>
+  <div class="ctl">
+    <label>Crash after step <input type="range" min="0" max="5" value="2" data-step /> <output data-o>2</output></label>
+  </div>
+  <div class="ctl">
+    <span>Crash kind</span>
+    <button class="btn" type="button" data-kind="kill" aria-pressed="true">kill -9</button>
+    <button class="btn" type="button" data-kind="power" aria-pressed="false">power cut</button>
+  </div>
+  <div class="das-out">
+    <div class="label">After restart</div>
+    <div class="das-files">
+      <div><code>ckpt.pt</code> <span class="das-v" data-main></span></div>
+      <div><code>ckpt.pt.tmp</code> <span class="das-v" data-tmp></span></div>
+    </div>
+    <p class="das-why" data-why></p>
+  </div>
+</div>
+
+<style is:global>
+  .das-top { margin-top: 0; }
+  .das-steps { list-style: none; margin: 14px 0 0; padding: 0; counter-reset: st -1; font-family: var(--mono); font-size: 12px; }
+  .das-steps li { counter-increment: st; display: grid; grid-template-columns: 26px 1fr; gap: 6px; padding: 4px 8px; border-left: 2px solid transparent; color: var(--ink-3); }
+  .das-steps li::before { content: counter(st); color: var(--ink-3); }
+  .das-steps li.done { color: var(--ink); }
+  .das-steps li.at { color: var(--blue); border-left-color: var(--blue); background: var(--blue-wash); }
+  .das-steps li.after { color: var(--ink-3); text-decoration: line-through; text-decoration-color: var(--rule); }
+  .das-out { margin-top: 14px; border: 1px solid var(--ink); background: var(--paper); padding: 10px 12px; }
+  .das-files { display: grid; gap: 6px; margin-top: 6px; font-family: var(--mono); font-size: 12px; }
+  .das-files code { font-size: 12px; }
+  .das-v { font-weight: 600; }
+  .das-v.ok { color: var(--ok); }
+  .das-v.bad { color: var(--warn); }
+  .das-v.meh { color: var(--ink-3); font-weight: 400; }
+  .das-why { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  type Out = { main: [string, string]; tmp: [string, string]; why: string };
+  const OK = 'ok', BAD = 'bad', MEH = 'meh';
+  const NONE: [string, string] = ['(none)', MEH];
+  const OLD: [string, string] = ['OLD checkpoint, intact', OK];
+  const NEW: [string, string] = ['NEW checkpoint, intact', OK];
+
+  const RECIPES: Record<string, { steps: string[]; out: (s: number, kind: string) => Out }> = {
+    naive: {
+      steps: [
+        'ckpt.pt holds step 1000 (good)',
+        "open('ckpt.pt', 'wb')  → truncated to 0 bytes",
+        'write first half of step 2000',
+        'write second half (tail still in Python buffer)',
+        'close()  → buffer flushed, every write() returned',
+        '~30 s later: kernel writeback finishes',
+      ],
+      out: (s, kind) => {
+        if (s === 0) return { main: OLD, tmp: NONE, why: 'Nothing happened yet.' };
+        if (kind === 'kill') {
+          if (s === 1) return { main: ['EMPTY, 0 bytes', BAD], tmp: NONE, why: 'Opening with "wb" truncated the file. The old checkpoint was destroyed before a single new byte existed.' };
+          if (s === 2) return { main: ['TORN: half new, no zip index', BAD], tmp: NONE, why: 'Half a file. torch.load fails: the zip index lives at the very end, and the end was never written. Old checkpoint gone too.' };
+          if (s === 3) return { main: ['TORN: tail missing', BAD], tmp: NONE, why: 'Every byte is written as far as torch.save knows, but the last chunk, including the zip index, was still in Python\'s buffer. close() would have flushed it. Old checkpoint gone too.' };
+          return { main: NEW, tmp: NONE, why: 'Every write() returned before the kill, so the bytes were in the page cache, which belongs to the kernel. A dead process cannot lose them.' };
+        }
+        if (s < 5) return { main: ['UNKNOWN: old, empty, or torn', BAD], tmp: NONE, why: 'Power cut before writeback finished. Whatever pieces happened to reach flash are what you get, in no promised order. Could be anything.' };
+        return { main: NEW, tmp: NONE, why: 'Writeback finished before the power went. Lucky timing, not a guarantee: you never called fsync.' };
+      },
+    },
+    rename: {
+      steps: [
+        'ckpt.pt holds step 1000 (good)',
+        "open('ckpt.pt.tmp', 'wb')",
+        'write first half to tmp',
+        'write second half to tmp',
+        'close()',
+        "os.replace('ckpt.pt.tmp', 'ckpt.pt')",
+        '~30 s later: kernel writeback finishes',
+      ],
+      out: (s, kind) => {
+        if (s === 0) return { main: OLD, tmp: NONE, why: 'Nothing happened yet.' };
+        if (s <= 4) return { main: OLD, tmp: s === 1 ? ['empty', MEH] : ['partial or garbage, ignore it', MEH], why: 'The real name was never touched. The crash only hurt a scratch file you can delete on startup.' };
+        if (kind === 'kill') return { main: NEW, tmp: NONE, why: 'The rename swapped the name in one step. Any reader sees all old or all new, never a mix.' };
+        if (s === 5) return { main: ['MAYBE BROKEN: new name, missing data', BAD], tmp: NONE, why: 'The rename is a small metadata change; the data is large and still in the page cache. Some filesystems can make the rename durable first. After a power cut you may get the new name pointing at an empty or partial file.' };
+        return { main: NEW, tmp: NONE, why: 'Everything reached flash before the power went. Again, timing, not a promise.' };
+      },
+    },
+    atomic: {
+      steps: [
+        'ckpt.pt holds step 1000 (good)',
+        "open('ckpt.pt.tmp', 'wb')",
+        'write first half to tmp',
+        'write second half to tmp',
+        'f.flush(); os.fsync(f.fileno())',
+        'close()',
+        "os.replace('ckpt.pt.tmp', 'ckpt.pt')",
+        'fsync the directory',
+      ],
+      out: (s, kind) => {
+        if (s === 0) return { main: OLD, tmp: NONE, why: 'Nothing happened yet.' };
+        if (s <= 3) return { main: OLD, tmp: ['partial or garbage, ignore it', MEH], why: 'The real name was never touched.' };
+        if (s <= 5) return { main: OLD, tmp: ['complete and durable, but unnamed', MEH], why: 'The new data is safely on flash. The swap has not happened, so the old checkpoint is still the official one.' };
+        if (kind === 'kill') return { main: NEW, tmp: NONE, why: 'Data was durable before the rename, and the rename is atomic. Readers see old or new, whole.' };
+        if (s === 6) return { main: ['OLD or NEW, both whole', OK], tmp: ['maybe still there', MEH], why: 'The rename might not have reached flash yet, so you might wake up on the old checkpoint. But the data was fsynced first, so whichever name wins points at a complete file.' };
+        return { main: NEW, tmp: NONE, why: 'The directory entry itself is now durable. This is the only recipe that promises the new checkpoint survives a power cut.' };
+      },
+    },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="disk-atomic-save"]').forEach((root) => {
+    const list = root.querySelector<HTMLOListElement>('.das-steps')!;
+    const range = root.querySelector<HTMLInputElement>('[data-step]')!;
+    const outEl = root.querySelector<HTMLOutputElement>('[data-o]')!;
+    const mainEl = root.querySelector<HTMLElement>('[data-main]')!;
+    const tmpEl = root.querySelector<HTMLElement>('[data-tmp]')!;
+    const whyEl = root.querySelector<HTMLElement>('[data-why]')!;
+    const modeBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const kindBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-kind]')];
+    const s = { mode: 'naive', kind: 'kill', step: 2 };
+
+    const setV = (el: HTMLElement, [t, c]: [string, string]) => { el.textContent = t; el.className = 'das-v ' + c; };
+
+    function draw() {
+      const r = RECIPES[s.mode];
+      range.max = String(r.steps.length - 1);
+      if (s.step > r.steps.length - 1) s.step = r.steps.length - 1;
+      range.value = String(s.step);
+      outEl.textContent = String(s.step);
+      list.replaceChildren(...r.steps.map((t, i) => {
+        const li = document.createElement('li');
+        li.textContent = t;
+        li.className = i < s.step ? 'done' : i === s.step ? 'at' : 'after';
+        return li;
+      }));
+      const o = r.out(s.step, s.kind);
+      setV(mainEl, o.main); setV(tmpEl, o.tmp); whyEl.textContent = o.why;
+    }
+
+    range.addEventListener('input', () => { s.step = +range.value; draw(); });
+    modeBtns.forEach((b) => b.addEventListener('click', () => {
+      s.mode = b.dataset.mode!;
+      modeBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    kindBtns.forEach((b) => b.addEventListener('click', () => {
+      s.kind = b.dataset.kind!;
+      kindBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    draw();
+  });
+</script>

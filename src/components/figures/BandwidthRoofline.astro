@@ -1,0 +1,251 @@
+---
+// Decode-speed calculator + roofline. Pick a model, precision, hardware, batch and context;
+// see bytes moved per step, predicted tokens/sec, and where the step sits on the roofline.
+// Usage: <BandwidthRoofline />
+---
+<div class="br" data-fig="bandwidth-roofline">
+  <div class="br-row">
+    <span class="label">Model</span>
+    <div class="br-btns" data-group="model">
+      <button class="btn" type="button" data-v="1b">Llama 3.2 1B</button>
+      <button class="btn" type="button" data-v="8b" aria-pressed="true">Llama 3.1 8B</button>
+      <button class="btn" type="button" data-v="moe">Qwen3 30B-A3B (MoE)</button>
+      <button class="btn" type="button" data-v="70b">Llama 3.1 70B</button>
+    </div>
+  </div>
+  <div class="br-row">
+    <span class="label">Weights</span>
+    <div class="br-btns" data-group="prec">
+      <button class="btn" type="button" data-v="2" aria-pressed="true">BF16 · 2 B</button>
+      <button class="btn" type="button" data-v="1">FP8 · 1 B</button>
+      <button class="btn" type="button" data-v="0.5">4-bit · 0.5 B</button>
+    </div>
+  </div>
+  <div class="br-row">
+    <span class="label">Hardware</span>
+    <div class="br-btns" data-group="hw">
+      <button class="btn" type="button" data-v="spark" aria-pressed="true">DGX Spark</button>
+      <button class="btn" type="button" data-v="mac">Mac M4 Max</button>
+      <button class="btn" type="button" data-v="4090">RTX 4090</button>
+      <button class="btn" type="button" data-v="h100">H100 SXM</button>
+    </div>
+  </div>
+  <div class="ctl">
+    <label>batch <input type="range" min="0" max="10" step="1" value="0" data-in="batch" /> <output data-out="batch">1</output></label>
+    <label>context <input type="range" min="0" max="10" step="1" value="3" data-in="ctx" /> <output data-out="ctx">1K</output></label>
+  </div>
+
+  <svg viewBox="0 0 560 290" class="br-plot" role="img" aria-label="Roofline plot: achievable compute versus arithmetic intensity, with a dot for the current settings">
+    <g data-layer="grid"></g>
+    <g data-layer="roof"></g>
+    <g data-layer="trail"></g>
+    <g data-layer="dot"></g>
+    <text x="300" y="284" text-anchor="middle">ARITHMETIC INTENSITY · FLOPs PER BYTE MOVED (LOG)</text>
+    <text x="12" y="150" text-anchor="middle" transform="rotate(-90 12 150)">TFLOP/S DONE (LOG)</text>
+  </svg>
+
+  <div class="br-bar" aria-hidden="true">
+    <span class="label">Bytes read per step</span>
+    <div class="br-track"><span class="br-w" data-bar="w"></span><span class="br-k" data-bar="k"></span></div>
+    <div class="br-legend"><span><i class="sw w"></i>weights <b class="readout" data-out="wgb">-</b></span><span><i class="sw k"></i>KV cache <b class="readout" data-out="kgb">-</b></span></div>
+  </div>
+
+  <dl class="br-out">
+    <div><dt class="label">Per stream</dt><dd><span class="readout big" data-out="per">-</span> tok/s</dd></div>
+    <div><dt class="label">All streams</dt><dd><span class="readout big" data-out="agg">-</span> tok/s</dd></div>
+    <div><dt class="label">Step time</dt><dd><span class="readout" data-out="step">-</span></dd></div>
+    <div><dt class="label">Intensity / ridge</dt><dd><span class="readout" data-out="ai">-</span></dd></div>
+    <div><dt class="label">Bound by</dt><dd><span class="readout" data-out="bound">-</span></dd></div>
+    <div><dt class="label">Memory needed</dt><dd><span class="readout" data-out="fit">-</span></dd></div>
+  </dl>
+  <p class="br-note" data-out="note"></p>
+</div>
+
+<style>
+  .br-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+  .br-row > .label { width: 74px; flex: none; font-size: 10.5px; }
+  .br-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .br-btns .btn { padding: 5px 9px; font-size: 10.5px; }
+  .br-plot { width: 100%; margin-top: 14px; }
+  .br-bar { margin-top: 8px; }
+  .br-bar > .label { font-size: 10.5px; }
+  .br-track { display: flex; height: 14px; border: 1px solid var(--ink); margin: 6px 0; background: var(--paper); }
+  .br-w { background: var(--blue); height: 100%; }
+  .br-k { background: var(--blue-fill); height: 100%; border-left: 1px solid var(--blue); }
+  .br-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+  .br-legend .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border: 1px solid var(--blue); vertical-align: -1px; }
+  .br-legend .sw.w { background: var(--blue); }
+  .br-legend .sw.k { background: var(--blue-fill); }
+  .br-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; margin: 16px 0 0; }
+  .br-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .br-out dt { font-size: 10px; }
+  .br-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+  .br-out .big { font-size: 20px; }
+  .br-note { margin: 14px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  type Model = {
+    name: string;
+    total: number; // all parameters (must fit in memory)
+    shared: number; // params every token reads (dense: all of them)
+    experts: number; // MoE expert params in total (0 for dense)
+    expertFrac: number; // fraction of experts one token activates per layer
+    layers: number;
+    qdim: number; // query heads x head_dim, for attention FLOPs
+    kvPerTok: number; // bytes of KV cache per token, bf16
+  };
+  // Shapes from the public model configs. KV per token = 2 (K and V) x layers x kv_heads x head_dim x 2 bytes.
+  const MODELS: Record<string, Model> = {
+    '1b': { name: 'Llama 3.2 1B', total: 1.24e9, shared: 1.24e9, experts: 0, expertFrac: 0, layers: 16, qdim: 2048, kvPerTok: 2 * 16 * 8 * 64 * 2 },
+    '8b': { name: 'Llama 3.1 8B', total: 8.03e9, shared: 8.03e9, experts: 0, expertFrac: 0, layers: 32, qdim: 4096, kvPerTok: 2 * 32 * 8 * 128 * 2 },
+    // Qwen3-30B-A3B: 128 experts, 8 active per token. ~1.5B non-expert params + ~29B in experts; ~3.3B active.
+    moe: { name: 'Qwen3 30B-A3B', total: 30.5e9, shared: 1.53e9, experts: 29.0e9, expertFrac: 8 / 128, layers: 48, qdim: 4096, kvPerTok: 2 * 48 * 4 * 128 * 2 },
+    '70b': { name: 'Llama 3.1 70B', total: 70.6e9, shared: 70.6e9, experts: 0, expertFrac: 0, layers: 80, qdim: 8192, kvPerTok: 2 * 80 * 8 * 128 * 2 },
+  };
+  // Approximate spec-sheet numbers. peak = dense BF16 tensor TFLOPS. Spark's is an upper bound derived
+  // from NVIDIA's "1 PFLOP FP4 with sparsity" (/2 sparsity, /2 FP8, /2 BF16); measure yours.
+  const HW: Record<string, { name: string; bw: number; peak: number; cap: number }> = {
+    spark: { name: 'DGX Spark', bw: 273e9, peak: 125e12, cap: 128e9 },
+    mac: { name: 'M4 Max', bw: 546e9, peak: 17e12, cap: 128e9 },
+    '4090': { name: 'RTX 4090', bw: 1008e9, peak: 165e12, cap: 24e9 },
+    h100: { name: 'H100 SXM', bw: 3350e9, peak: 989e12, cap: 80e9 },
+  };
+  const BATCH = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024];
+  const CTX = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const ctxLabel = (c: number) => (c >= 1024 ? `${c / 1024}K` : `${c}`);
+  const gb = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(b >= 1e10 ? 0 : 1)} GB` : `${(b / 1e6).toFixed(0)} MB`);
+  const fmt = (x: number) => (x >= 100 ? Math.round(x).toLocaleString('en-US') : x >= 10 ? x.toFixed(0) : x.toFixed(1));
+  const ms = (s: number) => (s >= 0.01 ? `${(s * 1e3).toFixed(1)} ms` : `${(s * 1e3).toFixed(2)} ms`);
+
+  function step(m: Model, bpw: number, hw: { bw: number; peak: number }, B: number, ctx: number) {
+    // Weights read once per step, shared by every sequence in the batch. For MoE, the batch touches
+    // more distinct experts as it grows: expected fraction touched = 1 - (1 - k/E)^B.
+    const touched = m.experts ? 1 - Math.pow(1 - m.expertFrac, B) : 0;
+    const wBytes = (m.shared + m.experts * touched) * bpw;
+    const kBytes = B * ctx * m.kvPerTok; // each sequence reads its own KV cache: not shared
+    const active = m.shared + m.experts * m.expertFrac;
+    const flops = B * (2 * active + 4 * m.layers * m.qdim * ctx);
+    const tMem = (wBytes + kBytes) / hw.bw;
+    const tCmp = flops / hw.peak;
+    const t = Math.max(tMem, tCmp);
+    return { wBytes, kBytes, flops, tMem, tCmp, t, ai: flops / (wBytes + kBytes), perf: flops / t };
+  }
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  // plot frame
+  const X0 = 52, X1 = 548, Y0 = 258, Y1 = 14;
+  const AI_MIN = 0.25, AI_MAX = 4096, P_MIN = 0.1e12, P_MAX = 2000e12;
+  const px = (ai: number) => X0 + ((Math.log10(ai) - Math.log10(AI_MIN)) / (Math.log10(AI_MAX) - Math.log10(AI_MIN))) * (X1 - X0);
+  const py = (p: number) => Y0 - ((Math.log10(p) - Math.log10(P_MIN)) / (Math.log10(P_MAX) - Math.log10(P_MIN))) * (Y0 - Y1);
+  const clampP = (p: number) => Math.min(P_MAX, Math.max(P_MIN, p));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="bandwidth-roofline"]').forEach((root) => {
+    const state = { model: '8b', prec: 2, hw: 'spark', b: 0, c: 3 };
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const layer = (k: string) => q<SVGGElement>(`[data-layer="${k}"]`);
+
+    // static grid
+    const g = layer('grid');
+    g.appendChild(el('rect', { x: X0, y: Y1, width: X1 - X0, height: Y0 - Y1, class: 'ink', 'stroke-width': 1 }));
+    [1, 4, 16, 64, 256, 1024].forEach((v) => {
+      g.appendChild(el('line', { x1: px(v), x2: px(v), y1: Y1, y2: Y0, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      g.appendChild(el('text', { x: px(v), y: Y0 + 14, 'text-anchor': 'middle' }, String(v)));
+    });
+    [1e12, 10e12, 100e12, 1000e12].forEach((v) => {
+      g.appendChild(el('line', { x1: X0, x2: X1, y1: py(v), y2: py(v), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      g.appendChild(el('text', { x: X0 - 6, y: py(v) + 4, 'text-anchor': 'end' }, String(v / 1e12)));
+    });
+
+    const render = () => {
+      const m = MODELS[state.model];
+      const hw = HW[state.hw];
+      const B = BATCH[state.b];
+      const ctx = CTX[state.c];
+      const r = step(m, state.prec, hw, B, ctx);
+      const ridge = hw.peak / hw.bw;
+
+      // roof
+      const roof = layer('roof');
+      roof.replaceChildren();
+      const xr = Math.min(ridge, AI_MAX);
+      const pts = [
+        [px(AI_MIN), py(clampP(hw.bw * AI_MIN))],
+        [px(xr), py(clampP(hw.bw * xr))],
+        [px(AI_MAX), py(clampP(hw.peak))],
+      ];
+      roof.appendChild(el('polygon', { points: `${pts.map((p) => p.join(',')).join(' ')} ${X1},${Y0} ${X0},${Y0}`, style: 'fill:var(--blue-wash);stroke:none' }));
+      roof.appendChild(el('polyline', { points: pts.map((p) => p.join(',')).join(' '), class: 'blue', 'stroke-width': 2 }));
+      roof.appendChild(el('line', { x1: px(xr), x2: px(xr), y1: py(hw.peak), y2: Y0, class: 'blue dash', 'stroke-width': 1 }));
+      roof.appendChild(el('text', { x: Math.min(px(xr) + 4, X1 - 4), y: Y0 - 8, 'text-anchor': px(xr) > X1 - 110 ? 'end' : 'start', class: 'blue-t' }, `RIDGE ≈ ${Math.round(ridge)}`));
+      roof.appendChild(el('text', { x: X1 - 6, y: py(hw.peak) - 6, 'text-anchor': 'end', class: 'blue-t' }, `COMPUTE ROOF ${hw.peak / 1e12} TFLOP/S`));
+      const sx = px(2), sy = py(hw.bw * 2) - 14;
+      roof.appendChild(el('text', { x: sx, y: sy, class: 'blue-t', transform: `rotate(-26 ${sx} ${sy})` }, `${hw.bw / 1e9} GB/S SLOPE`));
+
+      // trail of every batch size at these settings
+      const trail = layer('trail');
+      trail.replaceChildren();
+      const tp = BATCH.map((bb) => step(m, state.prec, hw, bb, ctx)).map((s) => [px(Math.min(Math.max(s.ai, AI_MIN), AI_MAX)), py(clampP(s.perf))]);
+      trail.appendChild(el('polyline', { points: tp.map((p) => p.join(',')).join(' '), class: 'ink dash', 'stroke-width': 1, style: 'stroke:var(--ink-3)' }));
+      tp.forEach((p) => trail.appendChild(el('circle', { cx: p[0], cy: p[1], r: 2.5, style: 'fill:var(--paper);stroke:var(--ink-3)' })));
+
+      const dot = layer('dot');
+      dot.replaceChildren();
+      const dx = px(Math.min(Math.max(r.ai, AI_MIN), AI_MAX));
+      const dy = py(clampP(r.perf));
+      dot.appendChild(el('circle', { cx: dx, cy: dy, r: 6, class: 'fill-blue' }));
+      dot.appendChild(el('text', { x: dx + (dx > X1 - 90 ? -10 : 10), y: dy + 16, 'text-anchor': dx > X1 - 90 ? 'end' : 'start', class: 'strong' }, `BATCH ${B}`));
+
+      // bar
+      const tot = r.wBytes + r.kBytes;
+      q<HTMLElement>('[data-bar="w"]').style.width = `${(100 * r.wBytes) / tot}%`;
+      q<HTMLElement>('[data-bar="k"]').style.width = `${(100 * r.kBytes) / tot}%`;
+      out('wgb').textContent = gb(r.wBytes);
+      out('kgb').textContent = gb(r.kBytes);
+
+      const memBound = r.tMem >= r.tCmp;
+      out('per').textContent = fmt(1 / r.t);
+      out('agg').textContent = fmt(B / r.t);
+      out('step').textContent = `${ms(r.t)} (mem ${ms(r.tMem)} · math ${ms(r.tCmp)})`;
+      out('ai').textContent = `${r.ai.toFixed(r.ai < 10 ? 1 : 0)} / ${Math.round(ridge)}`;
+      out('bound').textContent = memBound ? 'MEMORY' : 'COMPUTE';
+      const need = m.total * state.prec + r.kBytes;
+      const fits = need <= hw.cap;
+      out('fit').textContent = `${gb(need)} of ${hw.cap / 1e9} GB${fits ? '' : ' · DOES NOT FIT'}`;
+      out('fit').style.color = fits ? '' : 'var(--warn)';
+      out('batch').textContent = String(B);
+      out('ctx').textContent = ctxLabel(ctx);
+
+      let note: string;
+      if (!fits) note = `This configuration needs ${gb(need)} but the ${hw.name} has ${hw.cap / 1e9} GB. The math says one thing; the machine says no.`;
+      else if (!memBound) note = `Past the ridge: the tensor cores are now the bottleneck. More batch adds latency per stream without adding much throughput.`;
+      else if (r.kBytes > r.wBytes) note = `The KV cache is now most of the bytes. Each sequence reads its own, so batching stops helping: aggregate speed flattens. This is why long contexts and big batches fight over the same bandwidth.`;
+      else if (B === 1) note = `One stream: ${gb(r.wBytes)} of weights per token through a ${hw.bw / 1e9} GB/s pipe. The math units are busy ${((100 * r.tCmp) / r.t).toFixed(1)}% of the time. Drag batch up.`;
+      else note = `${B} streams share each weight read. Step time grew ${(r.t / step(m, state.prec, hw, 1, ctx).t).toFixed(2)}x, but you get ${B} tokens per step. Math units busy ${((100 * r.tCmp) / r.t).toFixed(0)}%.`;
+      out('note').textContent = note;
+    };
+
+    root.querySelectorAll<HTMLElement>('[data-group]').forEach((grp) => {
+      const key = grp.dataset.group as 'model' | 'prec' | 'hw';
+      grp.querySelectorAll<HTMLButtonElement>('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          grp.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+          const v = btn.dataset.v!;
+          if (key === 'prec') state.prec = Number(v);
+          else state[key] = v;
+          render();
+        });
+      });
+    });
+    q<HTMLInputElement>('[data-in="batch"]').addEventListener('input', (e) => { state.b = Number((e.target as HTMLInputElement).value); render(); });
+    q<HTMLInputElement>('[data-in="ctx"]').addEventListener('input', (e) => { state.c = Number((e.target as HTMLInputElement).value); render(); });
+    render();
+  });
+</script>

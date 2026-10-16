@@ -1,0 +1,206 @@
+---
+// Interactive: why an average hides a 5% slowdown, how a Prometheus-style bucket histogram
+// estimates p99, and why you can't average p99s across servers (but can add buckets).
+---
+<div class="oh" data-fig="obs-histogram">
+  <div class="oh-read" data-o="read"></div>
+  <svg class="oh-svg" viewBox="0 0 480 190" role="img" aria-label="Latency histogram with mean, p50 and p99 marked"></svg>
+  <div class="ctl">
+    <label>Slow requests <input type="range" min="0" max="20" step="1" value="5" data-k="f" /><output></output></label>
+    <label>Extra delay <input type="range" min="100" max="1500" step="50" value="400" data-k="d" /><output></output></label>
+  </div>
+  <div class="ctl">
+    <span class="oh-group">
+      <button class="btn" type="button" data-m="one" aria-pressed="true">One server</button>
+      <button class="btn" type="button" data-m="fleet" aria-pressed="false">Fleet of 4, one sick</button>
+    </span>
+  </div>
+  <p class="oh-note" data-o="note"></p>
+</div>
+
+<style is:global>
+  .oh-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px 16px; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 10px; }
+  .oh-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .oh-read .label { font-size: 10px; line-height: 1.35; }
+  .oh-read .readout { font-size: 17px; }
+  .oh-read .readout.muted { color: var(--ink-2); }
+  .oh svg { width: 100%; }
+  .oh-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .oh-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.55; color: var(--ink-2); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  // Prometheus-style bucket upper bounds, in ms (a sensible set for a ~300 ms service)
+  const LE = [50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800, 1000, 1250, 1500, 2000, 2500, 3000];
+  const N = 4000; // samples per server
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  // seeded PRNG so the picture is stable
+  function rng(seed: number) {
+    return () => ((seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296);
+  }
+  // base latencies: lognormal, median ~260 ms
+  function baseSamples(seed: number) {
+    const r = rng(seed);
+    const xs: number[] = [];
+    for (let i = 0; i < N; i++) {
+      const u = Math.max(1e-9, r()), v = r();
+      const z = Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+      xs.push(260 * Math.exp(0.3 * z));
+    }
+    return xs;
+  }
+  const BASES = [baseSamples(11), baseSamples(23), baseSamples(37), baseSamples(51)];
+
+  function withFault(xs: number[], f: number, d: number) {
+    const k = Math.round(f * xs.length);
+    // every (1/f)-th request, spread evenly, gets the extra delay
+    return xs.map((x, i) => (k > 0 && (i * k) % xs.length < k ? x + d : x));
+  }
+  const quant = (sorted: number[], q: number) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+  const mean = (xs: number[]) => xs.reduce((a, b) => a + b, 0) / xs.length;
+
+  function buckets(xs: number[]) {
+    const c = new Array(LE.length + 1).fill(0); // last = +Inf
+    for (const x of xs) {
+      let i = LE.findIndex((b) => x <= b);
+      if (i < 0) i = LE.length;
+      c[i]++;
+    }
+    return c;
+  }
+  // what PromQL's histogram_quantile does: find the bucket, interpolate linearly inside it
+  function histQuantile(counts: number[], q: number) {
+    const total = counts.reduce((a, b) => a + b, 0);
+    const rank = q * total;
+    let cum = 0;
+    for (let i = 0; i < counts.length; i++) {
+      if (cum + counts[i] >= rank) {
+        if (i === LE.length) return LE[LE.length - 1]; // in +Inf: returns the last finite bound
+        const lo = i === 0 ? 0 : LE[i - 1], hi = LE[i];
+        return lo + ((hi - lo) * (rank - cum)) / Math.max(1, counts[i]);
+      }
+      cum += counts[i];
+    }
+    return LE[LE.length - 1];
+  }
+
+  const ms = (x: number) => (x >= 1000 ? `${(x / 1000).toFixed(2)} s` : `${Math.round(x)} ms`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="obs-histogram"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.oh-svg')!;
+    const sf = root.querySelector<HTMLInputElement>('[data-k="f"]')!;
+    const sd = root.querySelector<HTMLInputElement>('[data-k="d"]')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-m]')];
+    const read = root.querySelector<HTMLElement>('[data-o="read"]')!;
+    const note = root.querySelector<HTMLElement>('[data-o="note"]')!;
+    let mode: 'one' | 'fleet' = 'one';
+
+    function card(label: string, value: string, muted = false) {
+      const d = document.createElement('div');
+      const l = document.createElement('span'); l.className = 'label'; l.textContent = label;
+      const v = document.createElement('span'); v.className = 'readout' + (muted ? ' muted' : ''); v.textContent = value;
+      d.append(l, v);
+      return d;
+    }
+
+    function render() {
+      const f = +sf.value / 100, d = +sd.value;
+      sf.nextElementSibling!.textContent = `${sf.value}%`;
+      sd.nextElementSibling!.textContent = `+${d} ms`;
+
+      let all: number[];
+      read.replaceChildren();
+      if (mode === 'one') {
+        all = withFault(BASES[0], f, d);
+        const s = [...all].sort((a, b) => a - b);
+        const healthy = mean(BASES[0]);
+        read.append(
+          card('Mean', ms(mean(all))),
+          card('p50', ms(quant(s, 0.5))),
+          card('p99 (exact)', ms(quant(s, 0.99))),
+          card('p99 from buckets', ms(histQuantile(buckets(all), 0.99)), true),
+        );
+        note.textContent =
+          `Mean moved ${ms(mean(all) - healthy)} (that is ${sf.value}% × ${d} ms). ` +
+          `p99 moved ${ms(quant(s, 0.99) - quant([...BASES[0]].sort((a, b) => a - b), 0.99))}. ` +
+          'The bucket estimate is only as sharp as the bucket it lands in: it interpolates linearly inside it, as PromQL histogram_quantile() does.';
+      } else {
+        const servers = BASES.map((b, i) => (i === 3 ? withFault(b, f, d) : b));
+        const p99s = servers.map((x) => quant([...x].sort((a, b) => a - b), 0.99));
+        all = servers.flat();
+        const merged = servers.map(buckets).reduce((a, b) => a.map((v, i) => v + b[i]));
+        const avgP99 = mean(p99s);
+        const trueP99 = quant([...all].sort((a, b) => a - b), 0.99);
+        read.append(
+          card('p99 A / B / C', p99s.slice(0, 3).map((x) => Math.round(x)).join(' / ') + ' ms', true),
+          card('p99 D (sick)', ms(p99s[3])),
+          card('Average of p99s', ms(avgP99)),
+          card('p99 of summed buckets', ms(histQuantile(merged, 0.99))),
+          card('True fleet p99', ms(trueP99)),
+        );
+        note.textContent =
+          `Server D has the fault; A, B and C are healthy. ${(f * 25).toFixed(2)}% of all fleet requests are slow. ` +
+          'Averaging four p99s is not a p99 of anything. Adding the bucket counts first and then estimating is the right way, and is what sum by (le) does in PromQL.';
+      }
+
+      // draw histogram of `all` in 50 ms bins, 0..2500 ms
+      svg.replaceChildren();
+      const x0 = 24, x1 = 452, yTop = 26, yBot = 150, maxMs = 2500, bin = 50;
+      const X = (v: number) => x0 + (Math.min(v, maxMs) / maxMs) * (x1 - x0);
+      const nb = maxMs / bin;
+      const hist = new Array(nb).fill(0);
+      for (const v of all) hist[Math.min(nb - 1, Math.floor(v / bin))]++;
+      const peak = Math.max(...hist);
+      // log-ish height so the small slow hump is visible
+      const H = (c: number) => (c === 0 ? 0 : (Math.log1p(c) / Math.log1p(peak)) * (yBot - yTop));
+      hist.forEach((c, i) => {
+        if (!c) return;
+        const h = H(c);
+        svg.appendChild(el('rect', { x: X(i * bin) + 0.5, y: yBot - h, width: (x1 - x0) / nb - 1, height: h, class: 'fill-wash', 'stroke-width': 0.8 }));
+      });
+      // bucket boundaries as ticks under the axis
+      for (const b of LE) {
+        if (b > maxMs) continue;
+        svg.appendChild(el('line', { x1: X(b), y1: yBot, x2: X(b), y2: yBot + 5, style: 'stroke:var(--ink-3);stroke-width:1' }));
+      }
+      svg.appendChild(el('line', { x1: x0, y1: yBot, x2: x1, y2: yBot, style: 'stroke:var(--ink);stroke-width:1' }));
+      for (const v of [0, 500, 1000, 1500, 2000, 2500]) {
+        svg.appendChild(el('text', { x: X(v), y: yBot + 18, 'text-anchor': 'middle' }, v === 0 ? '0' : `${v}`));
+      }
+      svg.appendChild(el('text', { x: x1, y: yBot + 34, 'text-anchor': 'end' }, 'MS · TICKS = BUCKET EDGES · LOG HEIGHT'));
+
+      const s = [...all].sort((a, b) => a - b);
+      const marks: [string, number, string][] = [
+        ['MEAN', mean(all), 'stroke:var(--ink);stroke-width:1.2;stroke-dasharray:4 3'],
+        ['P50', quant(s, 0.5), 'stroke:var(--ink-2);stroke-width:1'],
+        ['P99', quant(s, 0.99), 'stroke:var(--blue);stroke-width:1.5'],
+      ];
+      marks.forEach(([name, v, style], i) => {
+        svg.appendChild(el('line', { x1: X(v), y1: yTop - 6, x2: X(v), y2: yBot, style }));
+        const ty = 12 + (i === 2 ? 0 : i * 10);
+        const anchor = i === 0 ? 'start' : i === 1 ? 'end' : 'middle';
+        const dx = i === 0 ? 3 : i === 1 ? -3 : 0;
+        svg.appendChild(el('text', { x: X(v) + dx, y: ty, 'text-anchor': anchor, class: i === 2 ? 'blue-t' : '' }, name));
+      });
+    }
+
+    sf.addEventListener('input', render);
+    sd.addEventListener('input', render);
+    btns.forEach((b) =>
+      b.addEventListener('click', () => {
+        mode = b.dataset.m as 'one' | 'fleet';
+        btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

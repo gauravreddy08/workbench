@@ -1,0 +1,692 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import DesignGoodputTimeline from '../components/figures/DesignGoodputTimeline.astro';
+
+## Today
+
+- Say what a design doc is for (thinking, agreeing, remembering) and why writing one finds problems that writing code lets you skip.
+- Write one with the standard parts: context, goals and non-goals, requirements with numbers, the proposal, alternatives with honest tradeoffs, failure modes, rollout, open questions.
+- Do the fault-tolerance math for a large training job: how often it fails, how often to checkpoint (√(2 × checkpoint cost × MTBF), and why), and what goodput is.
+- Name the real techniques: async and sharded checkpoints, in-memory copies, fast detection, hot spares, elastic training, catching silent corruption.
+- Write a 2-3 page design doc for a 1,000-GPU run with numbers from a simulator you built, then a second one for your own job, and get it reviewed by a person.
+
+Prerequisites: [How do you train across many GPUs?](/lessons/distributed-training/) (data, tensor and pipeline parallelism; the all-reduce that needs every GPU) and [How does it scale?](/lessons/back-of-envelope/) (turning a vague question into arithmetic). Rough time: one evening for the reading and the simulator, a second evening for the doc, and a week of calendar time for the review.
+
+## The Problem
+
+Two scenes.
+
+The first is the job posting. A research engineer role at an AI lab lists, among the things you'd do: "writing a design doc for fault-tolerant strategies". Not "implementing", writing. The lab expects that before anyone touches the training code, someone will decide in writing what happens when a machine dies halfway through a two-month run on a thousand GPUs, and other people will read it and argue with it.
+
+The second scene is your desk. At a startup there is no roadmap and nobody hands you a spec. Someone says "the ranker needs to be faster" or "we need evals for the new model", and you go and build it your way. It works. But a voice says: *my way is probably not the best way, and I'd never know.* Nobody reviewed the approach, only the code, and by the time code exists, the approach is too expensive to change. A reviewer will tell you to rename a variable; they won't tell you that the whole cache layer was the wrong idea, because you've already built it.
+
+These are the same problem. In both, the expensive decisions happen before the code, and the only cheap place to find out you're wrong is on paper. A design doc is the tool for finding the better way *before* you've paid for yours. It also forces something code doesn't: you can write a training loop with checkpointing without ever asking how often the job fails. You cannot write the "Requirements" section of a doc without a number there.
+
+So this lesson does two things at once. It teaches the document: what goes in it and how to make people read it. And it teaches the content of the posting's doc, fault tolerance for a big training run, well enough that you could write it for real.
+
+<Origin year="1969" title="Request for Comments">
+
+The ARPANET was being built by a handful of graduate students at four universities, and nobody was in charge. They had to agree on how the machines would talk, and they were nervous about sounding like they were giving orders to the senior people they assumed would take over. Steve Crocker, a UCLA grad student, wrote up the first notes in April 1969 and called them "Request for Comments" to make clear they were proposals, open to argument, not decrees. RFC 1 described host software. Every internet protocol since, from TCP to HTTP, was settled the same way: someone writes down a proposal, others argue in writing, the document gets better, and then people build it.
+
+The startup worry is the RFC situation exactly: no authority, no roadmap, and a need to find the best design anyway. The answer in 1969 was to write it down and ask. Google, Amazon, Rust, Python and most serious engineering teams kept that habit and gave it different names: design docs, six-pagers, RFCs, PEPs.
+
+</Origin>
+
+## The Idea
+
+### What a design doc is for
+
+A <Term w="design doc">A short document, written before building something non-trivial, that states the problem, the constraints, the chosen approach, the alternatives and why they lost. Read and argued over by others before the work starts.</Term> does three jobs. They are different jobs, and a doc that does only one of them is weaker for it.
+
+**1. Thinking.** Writing is a slower, more honest version of thinking. In your head, "we'll checkpoint regularly" feels like a plan. On paper the next sentence has to be "every ___ minutes, because ___", and you discover you don't know the failure rate, the checkpoint size, or the storage bandwidth. Code lets you skip those questions: `if step % 1000 == 0: save()` runs fine and hides the fact that 1000 was a guess. The doc is where the guess gets noticed.
+
+**2. Agreement.** A design touches other people: the infra person whose storage you'll hammer, the researcher whose run you'll pause, the manager paying for the GPUs. A doc lets them object while objecting is cheap. Code review comes too late for "is this the right approach?"; the doc review is where that question belongs.
+
+**3. A record.** Six months later someone asks "why do we checkpoint every 8 minutes and keep 20 copies?" Without a doc, the answer is "ask Gaurav", and you've forgotten. With one, the reasoning, the numbers and the rejected alternatives are written down, and when the numbers change (new cluster, bigger model), someone can redo the decision instead of cargo-culting it.
+
+The common failure is a doc that only does job 3: written after the code is done, describing what was built. That's documentation, and it's fine, but it can't change anything. The value of a design doc comes from writing it while the decision is still open.
+
+When is a doc worth it? A useful test is the cost of being wrong. Jeff Bezos split decisions into <Term w="one-way doors">Decisions that are expensive or impossible to reverse: a storage format other teams depend on, a public API, the checkpoint layout of a run that's already 3 weeks in. Their opposite, two-way doors, can be undone cheaply.</Term> and two-way doors. Renaming a function is a two-way door; just do it. Choosing how a two-month training run survives failures is a one-way door: you find out it was wrong when the run is late, and you can't get the GPU-hours back. Rough rule: if it'll take more than a week to build, touches someone else's system, or will be painful to undo, write the doc first.
+
+### The shape of a design doc
+
+There's no official format, but good docs converge on the same parts, in roughly this order. Each part answers one question a reader has.
+
+<Figure n="001" title="ANATOMY OF A DESIGN DOC" caption="Each section answers one question a reader will ask. Almost everyone reads the top; the people who decide read the top half; reviewers read all of it. So the top has to carry the decision on its own.">
+<svg viewBox="0 0 640 440" role="img" aria-label="Stack of design doc sections, each with the question it answers, and brackets showing which readers read how far">
+  <g>
+    <rect x="20" y="10" width="230" height="44" class="fill-wash" stroke-width="1.2" />
+    <text x="32" y="30" class="strong">SUMMARY</text>
+    <text x="32" y="45">5 lines. the whole decision</text>
+    <text x="268" y="30" class="strong">What are you proposing, and what do you need from me?</text>
+  </g>
+  <g>
+    <rect x="20" y="60" width="230" height="38" class="fill-paper" stroke-width="1.2" />
+    <text x="32" y="84" class="strong">CONTEXT / PROBLEM</text>
+    <text x="268" y="84">Why now? What hurts, with a number?</text>
+  </g>
+  <g>
+    <rect x="20" y="104" width="230" height="38" class="fill-paper" stroke-width="1.2" />
+    <text x="32" y="128" class="strong">GOALS · NON-GOALS</text>
+    <text x="268" y="128">What counts as done? What are we NOT doing?</text>
+  </g>
+  <g>
+    <rect x="20" y="148" width="230" height="38" class="fill-paper" stroke-width="1.2" />
+    <text x="32" y="172" class="strong">REQUIREMENTS</text>
+    <text x="268" y="172">Which numbers must the design hit?</text>
+  </g>
+  <g>
+    <rect x="20" y="192" width="230" height="44" class="fill-wash" stroke-width="1.2" />
+    <text x="32" y="212" class="strong">PROPOSED DESIGN</text>
+    <text x="32" y="227">diagram + the key numbers</text>
+    <text x="268" y="218">How does it work, and why does it hit the numbers?</text>
+  </g>
+  <g>
+    <rect x="20" y="242" width="230" height="38" class="fill-wash" stroke-width="1.2" />
+    <text x="32" y="266" class="strong">ALTERNATIVES</text>
+    <text x="268" y="266">What else did you consider, and what does it cost?</text>
+  </g>
+  <g>
+    <rect x="20" y="286" width="230" height="38" class="fill-paper" stroke-width="1.2" />
+    <text x="32" y="310" class="strong">FAILURE MODES</text>
+    <text x="268" y="310">How does this break, and what happens then?</text>
+  </g>
+  <g>
+    <rect x="20" y="330" width="230" height="38" class="fill-paper" stroke-width="1.2" />
+    <text x="32" y="354" class="strong">ROLLOUT · TESTING</text>
+    <text x="268" y="354">How do we know it works before we bet on it?</text>
+  </g>
+  <g>
+    <rect x="20" y="374" width="230" height="38" class="fill-paper dash" stroke-width="1.2" />
+    <text x="32" y="398" class="strong">OPEN QUESTIONS</text>
+    <text x="268" y="398">What don't you know yet, and who might?</text>
+  </g>
+  <line x1="8" y1="10" x2="8" y2="54" class="blue" stroke-width="2" />
+  <line x1="12" y1="10" x2="12" y2="280" class="blue" stroke-width="1.2" />
+  <line x1="16" y1="10" x2="16" y2="412" class="ink" stroke-width="1" />
+  <text x="20" y="432" class="blue-t">BARS AT LEFT: EVERYONE · DECIDERS · REVIEWERS</text>
+</svg>
+</Figure>
+
+A few of these deserve a word, because they're the ones people get wrong.
+
+**Non-goals** are the most underrated section. They say what you are deliberately *not* solving, so a reviewer doesn't spend their comments asking for it. "Non-goal: surviving the loss of the whole storage cluster" saves you a page of argument and tells everyone the risk was considered and accepted, not forgotten.
+
+**Requirements** have numbers or they aren't requirements. "Fast recovery" is a wish. "Recover from a single-node failure in under 5 minutes, at least 95% goodput over the run" is a requirement: you can check whether a design meets it, and two designs can be compared against it. This is where the [back-of-envelope lesson](/lessons/back-of-envelope/) pays off.
+
+**Alternatives considered** is where a doc earns trust. If the only alternative listed is a strawman ("we could also not do this"), reviewers assume you didn't look. List the two or three serious options, with what each one is good at, honestly, and why you still chose yours. Often the best review comment is "alternative B is better than you think", and you only get that comment if B is on the page.
+
+**Failure modes** asks how the design itself breaks. For a fault-tolerance doc this gets recursive: what happens when the checkpointing system fails?
+
+**Open questions** is permission to not know everything. "I don't know whether our storage can absorb 1.1 TB every 10 minutes; storage team, can it?" is a better doc than one that pretends. It turns reviewers into collaborators.
+
+Now let's write the content of the posting's doc, section by section, starting where every fault-tolerance doc has to start: how often things break.
+
+### Requirements start with a failure rate
+
+A single GPU server is reliable. You could run one for months without a problem. But a training job on a thousand GPUs is not a thousand independent jobs. With data parallelism, every step ends in an all-reduce that needs *every* GPU (that was [the distributed training lesson](/lessons/distributed-training/)), so one dead GPU stops all of them. The job is a chain, and a chain fails when any link does.
+
+The number that describes this is <Term w="MTBF">Mean time between failures. The average time from one failure to the next. If a server's MTBF is 260 days, it fails on average once every 260 days, though any particular failure can come much sooner or later.</Term>. Here's the key fact about it. If failures on different machines are independent and each machine fails on average once every N days, then a job that needs all of K machines fails, on average, once every N / K days. Failures add up across machines: K machines produce K times as many failures per day as one does.
+
+<Predict id="mtbf-scale">
+
+A single 8-GPU server, in a well-run cluster, fails (or causes a job interruption) about once every 260 days. Your run uses 128 such servers: 1,024 GPUs. How often does the *job* get interrupted? And at 2,048 servers (16,384 GPUs)?
+
+<Fragment slot="answer">
+
+Divide by the number of servers. 260 / 128 ≈ 2 days for 1,024 GPUs. 260 / 2,048 ≈ 0.13 days, about **3 hours**, for 16,384 GPUs. One server feels immortal; a few thousand of them fail several times a day. That 260-day figure isn't invented: it's what Meta's Llama 3 numbers work out to, below.
+
+</Fragment>
+
+</Predict>
+
+Where does 260 days come from? Meta's Llama 3 paper is unusually candid. During a 54-day stretch of pre-training on 16,384 H100s (2,048 servers of 8), they report 466 job interruptions: 47 planned (maintenance, config changes) and 419 unexpected. About 78% of the unexpected ones were attributed to confirmed or suspected hardware problems, with GPUs and their memory the biggest category. 419 over 54 days is about 7.8 a day, one every three hours or so. Divide across 2,048 servers and you get roughly one interruption per server every 260 days.
+
+Two honest caveats belong in any doc that uses this number. First, "interruption" isn't the same as "server died": it includes software bugs, network problems and storage issues. That's fine; it's the number that matters for the job. Second, this is Meta's mature cluster at the end of a lot of engineering. A new cluster in its first weeks (when bad hardware is still being weeded out), or a smaller team's software stack, can easily be several times worse. Meta's own later study of its research clusters (Kokolis et al., 2024) is a good read on how much the rate varies.
+
+<Figure n="002" title="FAILURES ADD UP" caption="Job MTBF when every server is needed, using about 260 days per server (derived from the Llama 3 report, approximate). Time is on a log scale. Sixteen times the servers means one sixteenth the time between failures.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Bars on a log scale showing job MTBF falling from 260 days for one server to 3 hours for 2,048 servers">
+  <line x1="170" y1="20" x2="170" y2="190" class="ink" stroke-width="1" />
+  <text x="160" y="44" text-anchor="end" class="strong">1 SERVER</text>
+  <text x="160" y="58" text-anchor="end">8 GPUs</text>
+  <rect x="170" y="34" width="424" height="22" class="fill-wash" stroke-width="1" />
+  <text x="588" y="49" text-anchor="end" class="strong">~260 DAYS</text>
+  <text x="160" y="84" text-anchor="end" class="strong">16 SERVERS</text>
+  <text x="160" y="98" text-anchor="end">128 GPUs</text>
+  <rect x="170" y="74" width="288" height="22" class="fill-wash" stroke-width="1" />
+  <text x="452" y="89" text-anchor="end" class="strong">~16 DAYS</text>
+  <text x="160" y="124" text-anchor="end" class="strong">128 SERVERS</text>
+  <text x="160" y="138" text-anchor="end">1,024 GPUs</text>
+  <rect x="170" y="114" width="188" height="22" class="fill-wash" stroke-width="1" />
+  <text x="352" y="129" text-anchor="end" class="strong">~2 DAYS</text>
+  <text x="160" y="164" text-anchor="end" class="strong">2,048 SERVERS</text>
+  <text x="160" y="178" text-anchor="end">16,384 GPUs</text>
+  <rect x="170" y="154" width="53" height="22" class="fill-blue" stroke-width="1" />
+  <text x="231" y="169" class="blue-t">~3 HOURS · LLAMA 3 SCALE</text>
+  <line x1="170" y1="200" x2="610" y2="200" class="ink" stroke-width="1" />
+  <text x="170" y="216">1 H</text>
+  <text x="324" y="216" text-anchor="middle">1 DAY</text>
+  <text x="436" y="216" text-anchor="middle">10 DAYS</text>
+  <text x="604" y="216" text-anchor="end">1 YEAR</text>
+</svg>
+</Figure>
+
+For our doc, a 1,024-GPU run (128 servers), the Llama 3 rate gives about 50 hours between interruptions. We'll plan for something worse, **12 hours**, and say so in the doc: "planning MTBF 12 h, about 4x worse than Llama 3's reported rate, to cover cluster burn-in and our less mature stack; the design should still meet its goals at 6 h and get better at 50 h." A range with a reason is better than a single number with false precision. Reviewers can argue with the reason.
+
+One more modelling choice, which the doc should state out loud: we'll treat failures as random and <Term w="memoryless">A failure process where the chance of failing in the next minute doesn't depend on how long it's been since the last failure. Modelled with the exponential distribution. Real hardware isn't quite like this (failures cluster), but it's the standard starting assumption.</Term>. That's the assumption behind every formula below. Real failures cluster (a bad batch of nodes, a flaky switch that takes out a rack), and the doc should name that as a known weakness of the model.
+
+### Where the time goes: goodput
+
+When the job fails, what do you actually lose? Here's one failure, slowed down.
+
+<Figure n="003" title="ANATOMY OF ONE FAILURE" caption="The job trains, saves a checkpoint, trains some more, and dies. Everything since the last checkpoint is thrown away. Then it pays the restart: notice the failure, replace the machine, load the checkpoint, warm up. Only the plain blue stretches count.">
+<svg viewBox="0 0 640 200" role="img" aria-label="Timeline of one failure: work, checkpoint, lost work, failure, then detect, replace, reload and warm-up phases of a restart">
+  <defs>
+    <pattern id="design-hatch-003" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <line x1="0" y1="0" x2="0" y2="6" style="stroke:var(--warn)" stroke-width="2" />
+    </pattern>
+  </defs>
+  <rect x="20" y="60" width="150" height="40" class="fill-wash" stroke-width="1" />
+  <text x="95" y="84" text-anchor="middle" class="strong">TRAIN</text>
+  <rect x="170" y="60" width="10" height="40" class="fill-blue" />
+  <text x="175" y="50" text-anchor="middle" class="blue-t">CKPT</text>
+  <rect x="180" y="60" width="130" height="40" fill="url(#design-hatch-003)" />
+  <rect x="180" y="60" width="130" height="40" class="ink" stroke-width="1" />
+  <text x="245" y="122" text-anchor="middle" class="strong">LOST WORK</text>
+  <text x="245" y="137" text-anchor="middle">avg τ/2</text>
+  <line x1="310" y1="34" x2="310" y2="100" style="stroke:var(--warn)" stroke-width="2" />
+  <text x="310" y="26" text-anchor="middle" class="strong">FAIL</text>
+  <rect x="310" y="60" width="50" height="40" style="fill:var(--ink-3);opacity:0.35" />
+  <rect x="360" y="60" width="60" height="40" style="fill:var(--ink-3);opacity:0.55" />
+  <rect x="420" y="60" width="50" height="40" style="fill:var(--ink-3);opacity:0.35" />
+  <rect x="470" y="60" width="40" height="40" style="fill:var(--ink-3);opacity:0.55" />
+  <rect x="310" y="60" width="200" height="40" class="ink" stroke-width="1" />
+  <text x="335" y="122" text-anchor="middle">DETECT</text>
+  <text x="390" y="122" text-anchor="middle">REPLACE</text>
+  <text x="445" y="122" text-anchor="middle">RELOAD</text>
+  <text x="490" y="122" text-anchor="middle">WARM</text>
+  <line x1="310" y1="150" x2="510" y2="150" class="ink" stroke-width="1" />
+  <line x1="310" y1="145" x2="310" y2="155" class="ink" stroke-width="1" />
+  <line x1="510" y1="145" x2="510" y2="155" class="ink" stroke-width="1" />
+  <text x="410" y="170" text-anchor="middle" class="strong">RESTART TIME R</text>
+  <rect x="510" y="60" width="110" height="40" class="fill-wash" stroke-width="1" />
+  <text x="565" y="84" text-anchor="middle" class="strong">TRAIN</text>
+  <line x1="20" y1="150" x2="170" y2="150" class="blue" stroke-width="1" />
+  <line x1="20" y1="145" x2="20" y2="155" class="blue" stroke-width="1" />
+  <line x1="170" y1="145" x2="170" y2="155" class="blue" stroke-width="1" />
+  <text x="95" y="170" text-anchor="middle" class="blue-t">INTERVAL τ</text>
+</svg>
+</Figure>
+
+Every minute of wall-clock time is one of four things:
+
+- **Kept work.** Training steps that made it into a checkpoint and survived.
+- **Checkpointing.** Time the GPUs spent saving instead of training (if the save blocks training).
+- **Lost work.** Steps that were computed and then thrown away because the job died before the next checkpoint. If failures land at random, a failure arrives on average halfway through an interval, so each one loses about τ/2, where τ (the Greek letter tau) is the checkpoint interval.
+- **Restarting.** From the moment of failure to the moment training resumes. Call it R.
+
+The metric that matters is <Term w="goodput">The fraction of wall-clock time spent on work you kept. Throughput counts every step the GPUs ran; goodput counts only the ones that survived into the final model. A job at 100% throughput can have 80% goodput.</Term>: kept work divided by wall-clock time. It's the right headline number for the doc because it converts directly to money and calendar time. At 1,024 H100s for 30 days (about 737,000 GPU-hours), every 1% of goodput is about 7,400 GPU-hours. At a rough $2-3 per GPU-hour, that's around $20,000 per percentage point per month, or about seven hours of calendar delay. Numbers like that make reviewers pay attention.
+
+### How often to checkpoint
+
+Here's the tension. Checkpoint often and you waste time saving. Checkpoint rarely and each failure throws away a lot of work. Somewhere in between is a best interval.
+
+Think of it as insurance. Each checkpoint is a premium you pay (C minutes of not training). The thing you're insuring against is losing work when a failure hits. Pay premiums constantly and you're safe but broke; never pay and one bad day costs you everything. The right premium depends on how expensive the premium is (C) and how often disaster strikes (MTBF, call it M).
+
+Now the arithmetic, in plain steps. Over a long stretch of time, per minute of running:
+
+- **Checkpoint cost per minute:** you pay C once every τ minutes, so C / τ. Bigger τ, less waste here.
+- **Lost work per minute:** failures arrive once every M minutes, and each one loses τ/2 on average, so (τ/2) / M = τ / (2M). Bigger τ, more waste here.
+
+Total waste ≈ C/τ + τ/(2M) (plus restarts, R/M, which τ doesn't affect). One term falls as τ grows; the other rises. The minimum is where they're equal, where the extra premium of checkpointing slightly more often exactly equals the extra loss it saves. Setting C/τ = τ/(2M) and solving:
+
+**τ\* = √(2 × C × M)**
+
+That's the <Term w="Young/Daly formula">The optimal checkpoint interval √(2 × checkpoint cost × MTBF). Young derived it in 1974; Daly refined it in 2006 (roughly √(2CM) − C, plus small corrections), which matters only when checkpoints are expensive compared to the MTBF.</Term>. At the optimum the two wastes are equal, and the total is about √(2C/M) + R/M.
+
+<Origin year="1974" title="Checkpointing mainframe jobs">
+
+Checkpointing is older than deep learning by decades. In the 1970s, long scientific jobs on mainframes faced the same problem: run for hours, crash, start over. John Young at IBM wrote a two-page note in *Communications of the ACM* (1974) with the first-order answer, √(2 × checkpoint time × MTBF). In 2006 John Daly, working on supercomputers at Los Alamos where failures every few hours were routine, published a higher-order version that stays accurate when checkpoints are expensive. GPU clusters inherited the formula, and the problem, from supercomputing.
+
+</Origin>
+
+<Predict id="young-daly">
+
+Your run: MTBF 12 hours (720 minutes). A blocking checkpoint of the full 1.1 TB training state to shared storage takes about 1 minute. What's the best interval? And if you checkpoint every 3 hours instead (it felt safe), roughly how much goodput do you lose? Assume a 30-minute restart either way.
+
+<Fragment slot="answer">
+
+τ\* = √(2 × 1 × 720) = √1440 ≈ **38 minutes**. Waste at the optimum: about √(2/720) ≈ 5.3% from checkpoints plus lost work, plus R/M = 30/720 ≈ 4.2% from restarts, so goodput around 91%. Every 3 hours: checkpoint waste 1/180 ≈ 0.6%, but lost work is 180/(2 × 720) = 12.5%, plus 4.2% restarts: goodput around 84%. The exact calculation (in the figure below) gives 91.0% and 83.9%. Seven points of a 1,024-GPU month: roughly 50,000 GPU-hours, from one constant chosen by feel.
+
+</Fragment>
+
+</Predict>
+
+Play with it. The top strip is 72 hours of one simulated run with random failures; the bar below it is where a simulated year of running goes; the curve is the expected goodput for every possible interval, with the √(2CM) line dashed and your choice as the dot. It starts at the "felt safe" setting from the prediction.
+
+<Figure n="004" title="GOODPUT TIMELINE" caption="Slide the interval toward the dashed line and watch the hatched (lost) area shrink while the blue ticks thicken. Then try cutting the checkpoint cost (async saves) or the restart time: those lift the whole curve, which choosing τ never can." wide>
+
+<DesignGoodputTimeline />
+
+</Figure>
+
+Four things to notice as you play:
+
+1. **The curve is flat on top.** Halving or doubling τ from the optimum costs about one point of goodput (at C = 1 min, M = 12 h, R = 15 min: 92.9% at the optimum, 91.8% at half, 91.6% at double). So don't agonize over the exact interval. Be in the right range. Way off is what hurts.
+2. **τ\* moves with the square root.** Make checkpoints 100x cheaper and the best interval gets only 10x shorter. Make failures 4x more frequent and you checkpoint 2x as often.
+3. **Restart time is untouched by τ.** At the optimum, if restarts are a big slice of the bar, no interval can fix it. That's a signal for the doc: the next engineering dollar goes to restarts, not checkpoints.
+4. **Cheaper checkpoints help twice.** They reduce the premium, and they let you checkpoint more often, which shrinks lost work. That's why so much real engineering goes into making C nearly zero.
+
+### Making checkpoints cheap
+
+A <Term w="checkpoint">A saved copy of everything needed to resume training exactly: weights, optimizer state, step count, data loader position, random number generator states. For a 70B model with Adam in mixed precision, about 16 bytes per parameter, so about 1.1 TB.</Term> for a 70B model is about 1.1 TB. Where it goes, and how, decides C.
+
+**Shard it.** If one process gathered all 1.1 TB and wrote it, C would be enormous. Instead every GPU writes only its own slice of the state, in parallel. This is a <Term w="sharded checkpoint">A checkpoint written as many pieces, one per GPU (or per group of GPUs), plus a small index saying which piece holds what. PyTorch's torch.distributed.checkpoint does this. A good one can be reloaded onto a different number of GPUs.</Term>. With 1,024 GPUs, each writes about 1.1 GB, and the bottleneck becomes the storage system's total bandwidth. If shared storage absorbs, say, 20 GB/s in aggregate (a plausible number for a modest cluster, but measure yours; it's the most important unknown in the doc), 1.1 TB takes about 55 seconds. That's where "C ≈ 1 minute" came from.
+
+**Make it async.** Here's the trick that changes everything. Training doesn't need to wait while bytes crawl to storage. It only needs to wait while the state is *copied somewhere safe from the next step's updates*. Copying each GPU's 1.1 GB to its host's CPU memory over PCIe takes well under a second (spec-sheet PCIe Gen5 x16 is ~64 GB/s each way; real copies get a good fraction of that). Then a background thread writes from CPU memory to storage while the GPUs keep training. An <Term w="async checkpoint">A checkpoint in two phases: a short blocking snapshot (GPU memory to CPU memory, seconds) and a long background write (CPU memory to storage, a minute or more) that overlaps with training. Only the snapshot counts as checkpoint cost.</Term> brings the blocking cost C from about a minute to a few seconds.
+
+Plug it in: C = 3 seconds (0.05 min), M = 720 minutes gives τ\* = √(2 × 0.05 × 720) ≈ 8.5 minutes. Checkpoint waste plus lost work drops from about 5% to about 1.2%.
+
+Async has two catches, and both belong in the "Failure modes" section. First, the background write must finish before the next snapshot starts, or saves pile up: 55 seconds of writing inside an 8.5-minute interval is fine; at a 1-minute interval it isn't. Second, a failure during the background write means that checkpoint never landed, so you fall back to the previous one and lose up to two intervals. Your simulator will model this. And note what async costs in storage traffic: 1.1 TB every 8.5 minutes is a steady ~2 GB/s, all day. Whoever runs the storage needs to agree to that, which is exactly the kind of thing a design doc is for.
+
+**Keep a copy in memory, on a different machine.** Storage is the slow part of restarts too: after a failure, all 1,024 GPUs read 1.1 TB back at the same moment. An <Term w="in-memory checkpoint">A checkpoint kept in CPU memory rather than (or before) going to storage, usually with each node also holding a copy of a peer node's shard, so one node's death doesn't lose its piece. Recovery reads from RAM over the network in seconds instead of from storage in minutes.</Term> fixes this. Each node keeps its latest snapshot in its own RAM and also sends a copy to one or two other nodes. A single node dies: its replacement pulls the shard from the peer's RAM over a 400 Gb/s link in well under a minute. Everyone else reloads from their own RAM. Storage is only needed if several nodes holding the same shard die together. Google's Gemini 1.0 report credits redundant in-memory copies of model state for raising goodput on its largest run from 85% to 97% (their numbers; read the infrastructure section).
+
+<Figure n="005" title="WHERE A CHECKPOINT LIVES" caption="Each tier is slower to reach but survives a bigger disaster. A good design writes to the fast tiers often and the slow tier less often, and restores from the fastest tier that survived. Bandwidths are rough spec-sheet orders of magnitude; measure your own.">
+<svg viewBox="0 0 640 280" role="img" aria-label="Four checkpoint tiers from GPU memory to shared storage, with copy speed and which failures each survives">
+  <text x="20" y="20" class="strong">TIER</text>
+  <text x="330" y="20" class="strong">REACH IT</text>
+  <text x="460" y="20" class="strong">SURVIVES</text>
+  <rect x="20" y="32" width="290" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="52" class="strong">GPU MEMORY (LIVE STATE)</text>
+  <text x="32" y="67">being changed every step</text>
+  <text x="330" y="58">-</text>
+  <text x="460" y="58">nothing</text>
+  <rect x="20" y="88" width="290" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="32" y="108" class="strong">HOST RAM, SAME NODE</text>
+  <text x="32" y="123">async snapshot · PCIe</text>
+  <text x="330" y="108">~tens of GB/s</text>
+  <text x="330" y="123">≪1 s per GPU</text>
+  <text x="460" y="108">process crash,</text>
+  <text x="460" y="123">bad step, NCCL hang</text>
+  <rect x="20" y="144" width="290" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="32" y="164" class="strong">PEER NODE'S RAM</text>
+  <text x="32" y="179">replicated shard · network</text>
+  <text x="330" y="164">~50 GB/s per node</text>
+  <text x="330" y="179">seconds</text>
+  <text x="460" y="164">one node dying</text>
+  <text x="460" y="179">(not its peer too)</text>
+  <rect x="20" y="200" width="290" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="220" class="strong">SHARED STORAGE / OBJECT STORE</text>
+  <text x="32" y="235">sharded, all nodes at once</text>
+  <text x="330" y="220">~10-100s GB/s total</text>
+  <text x="330" y="235">~1 min for 1.1 TB</text>
+  <text x="460" y="220">many nodes, the</text>
+  <text x="460" y="235">whole job, next week</text>
+  <line x1="610" y1="40" x2="610" y2="240" class="blue" stroke-width="1.2" marker-end="url(#design-arrow-005)" />
+  <defs>
+    <marker id="design-arrow-005" markerWidth="8" markerHeight="8" refX="4" refY="7" orient="auto">
+      <path d="M0 0 L4 7 L8 0" class="blue" stroke-width="1.2" />
+    </marker>
+  </defs>
+  <text x="604" y="268" text-anchor="end" class="blue-t">SLOWER, SAFER</text>
+</svg>
+</Figure>
+
+### Making restarts fast
+
+From the prediction, a 30-minute restart costs 30/720 ≈ 4% of the run by itself, more than everything else combined once checkpoints are async. So take R apart. It's four things in a row, and each one has a fix.
+
+**Detect.** How long until anyone notices? Surprisingly, this can be the biggest piece. When one GPU dies mid all-reduce, the others don't get an error; they wait. <Term w="NCCL">NVIDIA's library for collectives (all-reduce, all-gather...) between GPUs. PyTorch uses it under the hood for multi-GPU training.</Term> collectives have a timeout, and PyTorch's default for NCCL process groups is measured in minutes (10 minutes in recent versions; check yours). So a dead node can mean ten minutes of 1,023 GPUs staring at nothing. The fix is a <Term w="heartbeat">A small "I'm alive" message each worker sends every few seconds to a monitor. Missing a few in a row means the worker is presumed dead, much faster than waiting for a collective to time out.</Term> from every worker plus a much shorter collective timeout, so detection takes tens of seconds. ByteDance's MegaScale paper describes this kind of monitoring in detail.
+
+**Replace.** The dead machine needs a substitute. Asking the scheduler for a new node can take minutes, or hours if the cluster is full. A <Term w="hot spare">A healthy, already-booted node kept idle and ready to join the job the moment another one fails. You pay for it while it waits; in return, replacement takes seconds instead of a trip through the scheduler queue.</Term> removes that wait. For a 128-node job, keeping 2-4 spares costs 1.5-3% of the hardware. Whether that's worth it is a perfect "Alternatives" table row: compare its cost to the goodput it buys, using your simulator.
+
+**Reload.** Read the checkpoint back. From storage, about a minute for 1.1 TB at 20 GB/s if every node reads its shard in parallel (often slower, because everyone hits storage at once). From in-memory copies, seconds.
+
+**Warm up.** Re-create the process group (NCCL setup across 1,024 GPUs isn't instant), rebuild any compiled kernels, fast-forward the data loader to the right position, and get back to full speed. Minutes, unless you cache compiled artifacts and make the data loader seekable.
+
+The other approach to "replace" is to not replace at all. <Term w="elastic training">Training that keeps going when the number of machines changes: if a node dies, the survivors regroup at a smaller size and continue (or grow back when a replacement arrives), instead of the whole job stopping until the cluster is the original size again.</Term> regroups the survivors and continues with one fewer data-parallel replica. In PyTorch, `torchrun` provides the plumbing: workers meet at a <Term w="rendezvous">The meeting point where workers find each other at startup and agree on who is rank 0, 1, 2... If a worker dies, torchrun restarts the group, the survivors meet again, and training resumes from the latest checkpoint.</Term>, and it can restart the group with a range of node counts. Elastic training sounds strictly better, but it has a catch your doc must address: with fewer replicas, either the global batch shrinks (changing the training dynamics mid-run) or each replica does more <Term w="gradient accumulation">Running several small batches and adding up their gradients before taking one optimizer step, so a smaller number of GPUs can produce the same effective batch size, more slowly.</Term> to keep it constant. Also, tensor- and pipeline-parallel groups can't lose one member and keep going; the whole group of 8 or 16 GPUs has to go. Elastic is natural for the data-parallel dimension and awkward for the others.
+
+### Failures that don't crash
+
+So far a failure has been loud: a process dies and everyone knows. The scarier failures are quiet.
+
+**Silent data corruption.** Once in a while a chip computes a wrong answer without raising any error. A bit flips in a multiply, a core has a manufacturing defect that only shows at certain temperatures. This is <Term w="silent data corruption">SDC: hardware producing wrong results with no error reported. Rare per chip, but at thousands of chips running for months, it becomes a regular event. Meta and Google both published studies of it in their CPU fleets in 2021.</Term>, and at the scale of thousands of chips it stops being a curiosity. A corrupted gradient on one GPU gets averaged into everyone's update in the next all-reduce. Now the model is wrong everywhere, and every checkpoint from here on carries the damage. Google's Gemini report discusses this as a recurring event at its scale and describes replaying training steps deterministically to find the faulty machine.
+
+**Loss spikes and NaNs.** The visible symptom of corruption (or of plain numerical instability) is often a sudden spike in the training loss or a `NaN`. Your doc needs a policy: monitor loss and gradient norm every step, alert on a spike beyond some threshold, and on a bad one, roll back to a checkpoint before the spike and skip or reorder the offending batches. PaLM's paper describes exactly this: restart from a checkpoint about 100 steps before the spike and skip a few hundred batches. Meta's OPT-175B logbook shows dozens of such restarts.
+
+**Stragglers.** One GPU running 20% slow (thermal throttling, a bad cable renegotiated to a lower speed) doesn't fail; it just makes all 1,024 GPUs wait for it at every all-reduce. A <Term w="straggler">A worker that's much slower than the others. In synchronous training, the whole job runs at the speed of the slowest worker, so one straggler slows everyone.</Term> shows up only if you log per-rank step times and look for outliers. The policy: detect, then treat it like a failure (swap in a spare).
+
+These change one more design decision: **retention**. If you only keep the latest checkpoint, then a corruption that went unnoticed for two hours has already overwritten every good copy. Keep a ladder: the last few in-memory snapshots, the last several on storage, and one per few hours kept for days. Storage is cheap compared to rerunning a week of training.
+
+### Writing it so people read it
+
+All the content above is useless if nobody reads past the first paragraph. Most won't. People who decide are busy, and they decide from the top of the page. So:
+
+**The summary decides.** Five lines at the top, written last, that stand on their own. What you propose, the one number that says why, what it costs, and what you need from the reader. For our doc:
+
+> Proposal: async sharded checkpoints every ~10 min, with in-memory peer copies, heartbeat detection and 2 hot spares, for the 1,024-GPU, 30-day run. Simulated goodput at a pessimistic 12 h MTBF: ~98%, versus ~84% for the default setup (blocking saves every 3 h, 30 min restarts), which is about 100,000 GPU-hours saved. Cost: 2 idle spare nodes (1.6% of hardware) and ~2 GB/s sustained storage writes. Need from infra: confirm storage can sustain that. Decision needed by: Friday.
+
+A reader who stops there can say yes or no. That's the test.
+
+**Numbers over adjectives.** "Checkpointing will be fast" means nothing. "Training pauses ~3 s per checkpoint" can be checked, compared and argued with. Every adjective in a draft is a place where you skipped the arithmetic. When you find "fast", "large", "rarely", "significant", replace it with a number and its unit, or with "unknown, see open question 2".
+
+**Diagrams.** One picture of the system (boxes for the GPU nodes, the in-memory tier, storage, the monitor; arrows for what flows when) does more than a page of prose. Draw the failure path too: what happens, in order, when node 37 dies. If you can't draw it, the design isn't finished.
+
+**Short.** Two to three pages for a design like this, plus an appendix for derivations and simulator output. Amazon's "six-pager" culture caps documents for a reason: length is easy, and choosing what matters is the work.
+
+**Alternatives as a table.** For our doc, something like this, with every number from the simulator (built below), not from feel:
+
+| Option | Goodput @ 12 h MTBF | What it costs | Why (not) |
+|---|---|---|---|
+| Blocking save every 3 h, manual restart | ~84% | nothing new | the default; loses ~119k GPU-h/month |
+| Blocking save at √(2CM) ≈ 38 min | ~91% | one config change | big win for free; restarts now dominate |
+| + async snapshot (C ≈ 3 s), τ ≈ 8.5 min | ~95% | async save code, ~2 GB/s storage | needs storage team sign-off |
+| + heartbeat detection (R ≈ 10 min) | ~97.5% | monitor process | cheap, large win |
+| + in-memory peers + hot spares (R ≈ 3 min) | ~98.4% | 2 spare nodes, RAM | the proposal |
+| Elastic data parallelism instead of spares | similar | batch-size changes mid-run | rejected: changes training dynamics; revisit at 10x scale |
+
+Look at what the table does. It shows the reader that the first and cheapest step (just pick a better interval) gets half the gain, so even if they reject everything else, they get that. It makes the expensive steps justify themselves in GPU-hours. And it shows the elastic option was considered with a reason, so no one has to ask.
+
+### Reviews, and taking feedback
+
+Send the doc to two or three people, chosen for what they know, not for rank: someone who runs the storage, someone who's babysat a big run, and someone who'll be skeptical. Tell them what you want: "I'm most unsure about the planning MTBF and whether storage can take 2 GB/s; please attack those." A vague "thoughts?" gets vague thoughts.
+
+When comments come back, sort them before replying:
+
+- **"This fact is wrong."** Fix it, and recompute anything that depended on it. This is the best kind.
+- **"You're missing a requirement."** ("Researchers need to be able to restart from any checkpoint in the last week.") Add it, and check the design still meets it.
+- **"I'd do it differently."** Treat it as a new alternative. Put it in the table, with numbers. Either it wins, which is the whole point of review, or the table shows why it loses, and the commenter can see that.
+- **"I prefer..."** Taste. Accept it if it's cheap, decline politely if it isn't.
+
+Two habits make reviews work. First, change the doc, not just the comment thread; the doc is the record. Second, separate the comment from your ego. You wrote the doc to find the better way. A comment that kills your proposal and replaces it with a better one is the doc succeeding, at the cheapest possible moment. At a startup with no roadmap, this is the answer to "my way might not be the best way": put your way on paper next to the alternatives and invite people to beat it.
+
+End with a recorded decision: "Decided 2026-10-20: going with option 5, revisit if MTBF in the first week is worse than 6 h." Then the doc becomes the record.
+
+### Lighter versions: RFCs and ADRs
+
+Not every decision needs three pages.
+
+An <Term w="RFC">Request for Comments. In companies and open-source projects, a proposal document circulated for comment before a decision, usually with a defined process: draft, discussion period, accept or reject. Rust's RFCs and Python's PEPs are well-known public examples.</Term>, in the modern team sense, is a design doc with a process around it: where you post it, how long comments stay open, who decides. Use one when many people care about the decision and you need a fair way to settle it.
+
+An <Term w="ADR">Architecture Decision Record. A very short document (often under a page) capturing one decision: the context, the decision, its status, and the consequences. Kept in the repo next to the code, numbered, never deleted, only superseded.</Term> is the smallest version: one decision, half a page, committed to the repo next to the code. Michael Nygard's 2011 template has five parts: title, status, context, decision, consequences. "ADR 7: Checkpoint every 10 minutes, async, keep last 20. Context: MTBF ~12 h, C ≈ 3 s... Consequences: ~2 GB/s writes; if storage changes, revisit." It doesn't argue alternatives at length; it just makes sure the *why* outlives the person.
+
+The progression: an ADR for a decision that's reversible but whose reasoning should be remembered; a design doc for a one-way door that needs real thinking; an RFC when the decision affects many people and needs a formal process. At a small startup, a design doc reviewed by two people and a folder of ADRs covers almost everything.
+
+## Build It
+
+You'll build the tool first, then use its numbers in two real documents. Put everything in `~/workbench/design-docs/`. The simulator is plain Python, no packages; matplotlib is optional for plots.
+
+<Task id="t0" title="Set up the folder and a theory checker" agent="ok">
+
+This is the exact expected goodput for random (memoryless) failures, allowing failures to strike during checkpoints and during restarts. You'll check your simulator against it, so it's given in full. It comes from the same line of work as Daly's paper: the expected wall time to finish one interval of work τ, with checkpoint cost C, restart R and MTBF M, is e^(R/M) · M · (e^((τ+C)/M) − 1).
+
+```python
+# theory.py   (all times in minutes)
+import math
+
+def expected_goodput(tau, C, R, M):
+    """Expected goodput with exponential failures (MTBF M), failures possible
+    during checkpoints and restarts."""
+    wall_per_interval = math.exp(R / M) * M * math.expm1((tau + C) / M)
+    return tau / wall_per_interval
+
+def young(C, M):
+    return math.sqrt(2 * C * M)
+
+def daly(C, M):
+    # First terms of Daly (2006); good when C is small compared to M.
+    return math.sqrt(2 * C * M) - C if C < 2 * M else M
+
+if __name__ == "__main__":
+    for C, R, M in [(1, 15, 720), (1, 15, 180), (1, 15, 3000), (0.05, 15, 720)]:
+        t = young(C, M)
+        print(f"C={C:<5} R={R} M={M:<5} young={t:6.1f}  daly={daly(C, M):6.1f}  "
+              f"goodput@young={expected_goodput(t, C, R, M):.4f}")
+```
+
+Run it. The first line should say young ≈ 37.9, daly ≈ 36.9, goodput ≈ 0.9287.
+
+</Task>
+
+<Task id="t1" title="Write the failure simulator" agent="hands">
+
+Write a discrete-event simulator of one long training job. This is the core of the lesson's numbers; write it yourself. The shape:
+
+```python
+# ftsim.py   (all times in minutes)
+import random
+
+def simulate(interval, ckpt_cost, restart, mtbf, work, seed=0):
+    """Run until `work` minutes of training are safely inside a finished checkpoint.
+    Return a dict: wall (total minutes), goodput (work / wall), failures,
+    and the fraction of wall time spent in each of: kept, ckpt, lost, restart."""
+    rng = random.Random(seed)
+    t = 0.0           # wall clock
+    saved = 0.0       # work safely checkpointed
+    next_fail = rng.expovariate(1 / mtbf)
+    # ... your loop ...
+```
+
+Hints, not code:
+
+- One loop iteration = one interval. Compute when this interval's work ends and when its checkpoint ends. If the next failure is after the checkpoint ends, bank the work and move on.
+- If the failure lands before the checkpoint finishes, everything since the last *finished* checkpoint is lost, including a half-done save. Add that time to "lost".
+- Then restart. A failure can also strike *during* the restart (another node dies while you reload). Then the restart starts over. A small inner loop handles it.
+- Because failures are memoryless, after each failure you can just draw a fresh `rng.expovariate(1 / mtbf)` from the current time. (That's the property that makes this easy. Break It will take it away.)
+- The four time buckets must add up to `wall`. Assert it.
+
+Sanity checks: with `mtbf=1e12` (no failures) goodput is `interval / (interval + ckpt_cost)`. With `ckpt_cost=0` and `restart=0`, goodput is the fraction of work not lost.
+
+</Task>
+
+<Task id="t2" title="Find the best interval empirically" agent="hands">
+
+Write `sweep.py`: for a given (C, R, M), try ~100 intervals spaced evenly on a log scale from 0.5 minutes to 1,000 minutes, simulate each with a work total of at least 100,000 minutes and 4+ seeds, and average. Print the best interval and its goodput next to `young()`, `daly()` and `expected_goodput()` from `theory.py`.
+
+Run it for the rows in the Measure table. Then plot goodput vs interval (log x-axis) for C = 1, R = 15, M = 720, with the simulated points and the theory curve on the same axes. You should recognise the curve from figure 004.
+
+One thing will look like a bug and isn't: your empirical best interval will jump around between runs by 10-20%. Look at the curve and explain why (answer in Measure).
+
+</Task>
+
+<Task id="t3" title="Add async saves and a realistic restart" agent="hands">
+
+The basic simulator can't tell you whether async checkpoints or hot spares are worth it. Extend it:
+
+```python
+def simulate2(interval, snapshot_cost, persist_time, detect, replace, reload, warmup,
+              mtbf, work, p_peer_ok=1.0, reload_from_peer=0.2, seed=0):
+    """snapshot_cost: blocking GPU->CPU copy. persist_time: background write to storage,
+    overlapping training. A failure before persist finishes means that checkpoint
+    didn't land: fall back to the previous one. Restart = detect + replace + reload
+    + warmup. With probability p_peer_ok the failed node's shard is in a peer's RAM,
+    so reload takes reload_from_peer minutes instead of `reload`."""
+```
+
+Then compute this ladder at M = 720 minutes, each row adding one thing, with the interval set to the empirical best for that row:
+
+1. Blocking save C = 1 min every 180 min, R = 30 (detect 10, replace 12, reload 3, warm-up 5).
+2. Same, at the best interval.
+3. Async: snapshot 3 s, persist 1 min.
+4. Plus heartbeat detection: detect 0.5 min.
+5. Plus hot spares and in-memory peers: replace 0.5, reload from peer 0.2.
+
+Then rerun the ladder at M = 360 and M = 3,000. These are the numbers for your design doc's alternatives table. The restart pieces above are planning guesses; label them as such in the doc and list "measure real restart time on day 1" under rollout.
+
+</Task>
+
+<Task id="t4" title="Write the fault-tolerance design doc" agent="review">
+
+Write a 2-3 page design doc for: **fault tolerance for a 30-day pre-training run of a 70B model on 1,024 H100s (128 nodes)**. Use your simulator's numbers everywhere a number is needed. Use this template:
+
+```markdown
+# Fault tolerance for the 70B / 1,024-GPU run
+Author · Reviewers · Status (draft / in review / decided) · Last updated
+
+## Summary
+(5 lines, written last. Proposal, headline number, cost, what you need, by when.)
+
+## Context
+Why this matters now. The run, its size, its cost per hour, what a lost day means.
+
+## Goals
+- G1: ≥ __% goodput over the run at planning MTBF __ h
+- G2: single-node failure → training resumes in ≤ __ min, no human
+- G3: ...
+## Non-goals
+- (what you are deliberately not solving, e.g. whole-storage-cluster loss)
+
+## Requirements and assumptions
+Table: MTBF (planning value + range + source), checkpoint size, storage bandwidth,
+PCIe/network bandwidth, restart components. Mark each: measured / spec sheet / guess.
+
+## Proposed design
+Diagram. Checkpoint tiers and intervals (with the √(2CM) reasoning).
+Detection. Replacement. Reload path. Retention policy. SDC and loss-spike policy.
+The failure path, step by step, when node 37 dies.
+
+## Alternatives considered
+Table: option · goodput at 6 / 12 / 50 h MTBF · cost · why (not).
+
+## Failure modes of this design
+What if the checkpoint write fails? Storage is slow? Two peers die together?
+A corrupted checkpoint? The monitor itself dies?
+
+## Rollout and testing
+How you prove it before day 1: fault injection (kill a node on purpose in a
+small run), restore drills, measuring real C and R. What you watch in week 1.
+
+## Open questions
+Numbered, each with who might know.
+
+## Appendix
+Derivation of τ*, simulator description and full output.
+```
+
+Rules for yourself: no adjective where a number could go; every number labelled measured, spec sheet, or assumed; at least one diagram; the summary must let someone decide without reading further.
+
+When the draft is done, give it to an agent with this prompt: "You are a skeptical senior infrastructure engineer reviewing this design doc. Find the assumption that, if wrong, most changes the decision. List missing failure modes. Do not rewrite the doc." Then you revise it.
+
+</Task>
+
+<Task id="t5" title="Write a second doc for your real job and get a person to review it" agent="hands">
+
+Pick a real decision at work that's still open. Good candidates: how the cross-encoder ranker is served (batching, timeout and fallback when the model is slow, what happens when a GPU node dies), or how the eval pipeline runs (what triggers it, how results are stored and compared, what makes a regression block a release). It should be a decision where you suspect your current way might not be the best.
+
+Write a short version: 1-2 pages, same skeleton, with at least one requirements table with real numbers (QPS, p99 latency, cost, eval runtime) from [the back-of-envelope lesson](/lessons/back-of-envelope/) or from production. Put at least two real alternatives in the table.
+
+Then send it to one colleague, with a specific ask ("which alternative would you pick, and what am I missing about X?"). No agent for this one; the point is a human who knows your system. Afterwards, write three lines at the bottom: what they said, what changed, what you decided.
+
+</Task>
+
+<DoneWhen>
+
+- `ftsim.py` matches `expected_goodput()` within about half a percentage point for every row of the Measure table.
+- You have a plot of goodput vs interval with simulated points on the theory curve, and you can say why the empirical optimum jumps around.
+- The ladder from t3 exists at three MTBF values, and your design doc's alternatives table uses it.
+- The fault-tolerance doc is 2-3 pages, has a stand-alone summary, a diagram, a non-goals list, and every number is labelled; you've revised it after the agent review.
+- The second doc has been read by a colleague, and the bottom says what changed.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in from `sweep.py` (R = 15 minutes for all rows). The expected numbers are from the closed-form formula and from my own run of a simulator like yours; your simulated optimum will wobble.
+
+| MTBF M | Ckpt cost C | Young √(2CM) | Daly | Your best τ (sim) | Goodput at your τ | Expected at Young |
+|---|---|---|---|---|---|---|
+| 720 min (12 h) | 1 min | 37.9 min | 36.9 min | | | 92.9% |
+| 180 min (3 h) | 1 min | 19.0 min | 18.0 min | | | 82.6% |
+| 3,000 min (50 h) | 1 min | 77.5 min | 76.5 min | | | 97.0% |
+| 720 min | 3 s (async) | 8.5 min | 8.4 min | | | 96.8% |
+| 720 min | 3 min | 65.7 min | 62.7 min | | | 88.7% |
+
+What you should see:
+
+- **Your best τ lands near √(2CM)**, within the wobble. When I ran it with 4 seeds and 200,000 minutes of work, the best simulated interval for the first row came out at 37 minutes and for the async row at 7.3 minutes (Young says 8.5). Daly's correction is visibly better only in the last row, where C is large.
+- **The wobble is the lesson.** Near the optimum the curve is so flat that random noise between seeds is bigger than the difference between neighbouring intervals, so the "winner" is mostly luck. The goodput at your τ and at Young's τ will agree to a few tenths of a percent. The practical reading: compute √(2CM), round it to something convenient, and spend your effort on C and R.
+- **Cheaper checkpoints gain less than you'd hope.** At the optimum, the checkpoint-plus-lost waste is about √(2C/M). Going from 1 min to 3 s (20x cheaper) cuts it by √20 ≈ 4.5x, from 5.3% to 1.2%.
+
+Then the ladder from t3, at M = 12 h. These are the closed-form numbers for the simple model (yours will differ slightly because of persist windows and the peer-copy probability):
+
+| Row | Setup | τ | Expected goodput | GPU-hours lost per 30 days (of ~737k) |
+|---|---|---|---|---|
+| 1 | blocking 1 min, every 3 h, R = 30 | 180 min | 83.9% | ~119,000 |
+| 2 | blocking, best τ, R = 30 | 38 min | 91.0% | ~67,000 |
+| 3 | async 3 s, R = 30 | 8.5 min | 94.8% | ~38,000 |
+| 4 | + fast detection, R ≈ 10 | 8.5 min | 97.5% | ~19,000 |
+| 5 | + spares + in-memory, R ≈ 3 | 8.5 min | 98.4% | ~12,000 |
+
+Read the ladder as a doc reader would. Rows 1 to 2 is a config change worth 52,000 GPU-hours. After that, restarts are the biggest remaining cost, which is why detection (row 4) beats a cleverer checkpoint. Llama 3 reported more than 90% effective training time at 16,384 GPUs with mostly automated recovery; Gemini reported 97%. Your ladder should make it obvious why those numbers needed engineering, not luck.
+
+## Break It
+
+**Forget to divide the MTBF.** Use one server's MTBF (260 days, about 374,000 minutes) instead of the job's. Young then says τ ≈ √(2 × 1 × 374,000) ≈ 870 minutes, about 14.5 hours. Run that interval against the job's real 12-hour MTBF (R = 30 min) in your simulator. Expected goodput: about 49%. Half the cluster's month, gone, from one wrong number in the requirements section. This is the most common error in real fault-tolerance planning, and it's why the doc has to show the arithmetic: a reviewer can catch "you used the per-node number" in five seconds.
+
+**Make failures cluster.** Change the simulator so that after any failure, there's a 30% chance of another one within the next 20 minutes (the replacement node was also bad, or the same flaky switch). The average MTBF barely moves, but the formula assumes failures don't remember each other. Check yourself: does the best interval move much? (Hint: think about where the extra failures land: mostly inside restarts.) What does it do to goodput? The point for the doc: name the memoryless assumption in "Requirements and assumptions", and say what you'd do about bursts (for example, a burn-in test before a replacement node joins).
+
+**Overwrite your only good checkpoint.** Add silent corruption to the simulator: at random times (say every 7 days on average), the model becomes silently bad, and you only notice after a detection delay D (try 30 minutes, then 6 hours). On noticing, you must roll back to a checkpoint from *before* the corruption. Simulate two retention policies: keep only the latest, versus keep the last 20 plus one every 6 hours. With "latest only" and D = 6 hours, there's no clean checkpoint to go back to. This is why retention and loss monitoring are in the design, not an afterthought.
+
+**Send the doc without its summary.** Delete your summary and send the doc to a friend (or an agent playing a busy manager) with "should we do this?". Count how many questions they ask before they can answer, and whether any of them is answered in the doc already, just too far down. Then restore the summary and try again. The difference is what the summary is for.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What's a design doc for, and why write one before the code instead of after?</summary>
+
+Three jobs: it forces you to think (on paper "we'll checkpoint regularly" has to become a number with a reason, and you find what you don't know); it gets people to agree, or object, while changing the plan is cheap; and it records why a decision was made, so it can be redone when the numbers change. Written after the code it can only do the third job. The expensive decisions happen before code exists, and a code review can't easily say "the whole approach is wrong", so the doc is the cheapest place to discover a better approach. That's especially true at a startup without a roadmap: the doc is how you put your way next to the alternatives and let others try to beat it.
+
+</details>
+
+<details>
+<summary>2. Derive the optimal checkpoint interval, in words.</summary>
+
+Two wastes pull in opposite directions. Checkpointing costs C every τ minutes, so C/τ of the time. A failure arrives on average every M minutes and loses about half an interval, τ/2, so τ/(2M) of the time. The sum is smallest where the two are equal: C/τ = τ/(2M), so τ = √(2CM). That's Young's 1974 result; Daly's refinement subtracts about C, which matters only when checkpoints are expensive relative to the MTBF. Example: 1-minute checkpoints and a 12-hour job MTBF give about 38 minutes. The curve is flat near the optimum, so being within 2x costs about a point of goodput, and making C smaller or restarts faster matters more than getting τ exact.
+
+</details>
+
+<details>
+<summary>3. How does this scale? Your run goes from 1,024 GPUs to 10,240. What happens to the failure rate, the checkpoint interval and goodput, and what do you change?</summary>
+
+With independent failures, 10x the servers means 10x the failures: the job MTBF drops from about 12 hours (our planning number) to about 72 minutes. The best interval scales with √M, so it shrinks only by √10 ≈ 3.2x. Checkpoint-and-lost waste, √(2C/M), grows by 3.2x, but restart waste, R/M, grows by the full 10x, so restarts become the dominant cost. With blocking 1-minute saves and 30-minute restarts, goodput falls to roughly 55%. With 3-second async saves and 3-minute restarts it stays around 92%. So at larger scale the design shifts toward making R tiny: in-memory peer copies, hot spares, heartbeat detection, possibly elastic data parallelism. Checkpoint traffic also grows, because the interval is shorter and storage is shared.
+
+</details>
+
+<details>
+<summary>4. What is goodput, and why is it a better headline than throughput or "number of failures"?</summary>
+
+Goodput is the fraction of wall-clock time spent on work that survived into the final model. Throughput counts steps the GPUs ran, including ones later thrown away; failure count says nothing about what each failure cost. Goodput captures all of it in one number: checkpoint overhead, lost work, restart time, stragglers. And it converts directly to money and calendar time: at 1,024 GPUs for a month, each point is about 7,400 GPU-hours. A design that halves failures but doubles restart time can lower goodput, and only goodput shows that.
+
+</details>
+
+<details>
+<summary>5. A colleague says "just checkpoint every 100 steps, it's fine". How would you respond in a design review?</summary>
+
+Ask what 100 steps is in minutes, and what the checkpoint costs, and then do the arithmetic in front of them. If a step is 4 s, 100 steps is about 7 minutes; with a blocking 1-minute save that's ~13% of the run spent saving, far past √(2CM). With async 3-second saves, 7 minutes is close to the optimum and fine. The number is neither right nor wrong by itself; it's only right relative to C and M. Then put both options in the alternatives table with goodput numbers from the simulator, so the decision rests on numbers rather than on who argues longer. And if they were right, say so and change the doc.
+
+</details>
+
+## Go Deeper
+
+- **Malte Ubl, "Design Docs at Google"** (2020, on his blog industrialempathy.com). A short, practical description of what Google design docs contain, when they're worth writing, and how the review works. The best single read on the document itself.
+- **Michael Nygard, "Documenting Architecture Decisions"** (Cognitect blog, 2011). The original ADR post: five sections, half a page, in the repo. Two minutes to read, and you'll use the template for years.
+- **Stephen D. Crocker, "How the Internet Got Its Rules"** (The New York Times, April 2009). The author of RFC 1 on why the notes were called "Request for Comments", and why writing proposals for argument worked when nobody was in charge.
+- **J. W. Young, "A First Order Approximation to the Optimum Checkpoint Interval"** (Communications of the ACM, 1974) and **J. T. Daly, "A Higher Order Estimate of the Optimum Checkpoint Interval for Restart Dumps"** (Future Generation Computer Systems, 2006). Young is two pages. Daly is where the exact expression you used in `theory.py` comes from.
+- **Llama Team, Meta, "The Llama 3 Herd of Models"** (2024), [arXiv:2407.21783](https://arxiv.org/abs/2407.21783). Read the infrastructure section: the interruption table for the 54-day snapshot, what failed, and how recovery was automated. Real numbers from a real run.
+- **Gemini Team, Google, "Gemini: A Family of Highly Capable Multimodal Models"** (2023), [arXiv:2312.11805](https://arxiv.org/abs/2312.11805). The training infrastructure section is short and dense: in-memory redundant state, the goodput numbers, and how they dealt with silent data corruption.
+- **Ziheng Jiang et al., "MegaScale: Scaling Large Language Model Training to More Than 10,000 GPUs"** (NSDI 2024). ByteDance's account of fault detection, diagnostics, stragglers and fast recovery. The closest thing to a public fault-tolerance design doc for LLM training.
+- **Harish Dattatraya Dixit et al., "Silent Data Corruptions at Scale"** (Meta, 2021) and **Peter H. Hochschild et al., "Cores that don't count"** (Google, HotOS 2021). Two short papers that made silent corruption a mainstream concern; read either to believe it's real.
+
+## Connections
+
+This lesson stands on two earlier ones. [How do you train across many GPUs?](/lessons/distributed-training/) explains why one dead GPU stops everyone (the all-reduce needs all of them) and where the 1.1 TB training state comes from. [How does it scale?](/lessons/back-of-envelope/) is the habit that fills the Requirements section: turn "fast" and "big" into numbers with units.
+
+A checkpoint is only as good as the write that produced it: [files and disks](/lessons/files-and-disks/) covers why a crash halfway through a save can leave a corrupt file, and the write-to-temp-then-rename trick that prevents it. Your real checkpoints should use it.
+
+And the second doc you wrote is practice for every lesson after this one. Whenever you're about to build something that takes more than a week, the first artifact is the doc: [Train a small LM, end to end](/lessons/tiny-lm/) is a good place to write one before you start, including how it checkpoints.

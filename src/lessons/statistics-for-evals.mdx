@@ -1,0 +1,895 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import StatsPairedCI from '../components/figures/StatsPairedCI.astro';
+import StatsPower from '../components/figures/StatsPower.astro';
+
+## Today
+
+- Put an error bar on any eval score, by formula and by bootstrap, and say in plain words what the bar means.
+- Explain why comparing two models on the *same* questions is several times more sensitive than comparing their two error bars, and compute the paired interval for the difference.
+- Run McNemar's test and a permutation test on per-question results, and know when each one fits.
+- Spot the three ways evals fool you even with error bars: clustered questions, sampling noise from temperature, and picking the best of many tries.
+- Work out, before you run anything, how many questions you need to see a 1 or 2 point improvement, and write a result statement the way a careful paper would.
+
+Prerequisites: none beyond high-school probability. It helps to have done [Smaller numbers, same model?](/lessons/quantization/), because its `eval_small.py` gives you a real pair of models to test at the end. Rough time: one evening for the idea and the first four tasks, one more to apply it to real results.
+
+## The Problem
+
+You retrain the cross-encoder with a new hard-negative sampler. The eval script prints the share of 500 held-out queries where the right document lands at rank 1:
+
+```text
+v6   top-1 accuracy: 71.2%
+v7   top-1 accuracy: 72.0%
+```
+
+Plus 0.8 points. You post it in Slack. Someone replies "nice, is that significant?" and you realise you don't know what that question means, let alone the answer.
+
+So you try something. You run the *old* model, v6, again, with the same weights and the same 500 queries, but sampling its query rewrites at temperature 0.7 instead of 0. It scores 70.6%. Then 71.8%. The same model moved 1.2 points between two runs. Your "improvement" is smaller than the wobble of a model compared against itself.
+
+That is the whole lesson in one scene. An eval score is not a fact about the model. It is a *measurement*, taken with a noisy instrument (a finite set of questions, maybe random sampling), and every measurement has an error bar. Most of the "wins" posted in ML channels are inside the error bar. Most of the real wins are smaller than people think, and need either many more questions or a smarter comparison to see.
+
+The good news: the smarter comparison is cheap. You already have the data for it. It just isn't the two numbers you printed.
+
+<Origin year="1908" title="A brewer with ten patients">
+
+William Sealy Gosset worked for the Guinness brewery in Dublin, where decisions about barley and hops had to be made from a handful of small, expensive experiments. The statistics of the day assumed large samples, so he worked out what happens when you only have a few. Guinness didn't let staff publish under their own names, so his 1908 paper, "The Probable Error of a Mean", appeared under the pen name "Student". That is the origin of Student's t-test.
+
+The paper's worked example is worth knowing: two sleeping drugs, each given to the same ten patients, with the extra hours of sleep recorded for each. Gosset didn't compare the two drugs' averages as if they came from different groups. He took the *difference for each patient* and asked whether those ten differences were reliably above zero. Same patients, two treatments, look at the per-patient difference: that is a paired comparison, and it is exactly what you will do with two models on the same questions. Evan Miller's 2024 paper for Anthropic, "Adding Error Bars to Evals", is in large part a reminder to the ML world of things Gosset and his successors worked out a century ago.
+
+</Origin>
+
+## The Idea
+
+### A score is a sample
+
+Think about what an eval set is. Somebody wrote 500 questions. They could have written 500 different ones of the same kind, and the model would have scored a bit differently on those. The thing you actually care about is how the model does on *the kind of question* the set stands for: all the queries your customers will ever send, or all grade-school math problems. That big imaginary pool is called the <Term w="population">The whole set of things you want a conclusion about, of which your data is a sample. Here: every question of this kind that could have been in the eval.</Term>, and the model's accuracy on all of it is the <Term w="true accuracy">The accuracy the model would get on the entire population of questions. You never see it; you estimate it.</Term>. Your 500 questions are a sample from that pool, and 71.2% is an <Term w="estimate">A number computed from a sample to stand in for an unknown true value. It would come out a bit different on a different sample.</Term> of the true accuracy.
+
+<Figure n="001" title="A SCORE IS A SAMPLE" caption="Left: the pool of questions you could have asked; the blue ones happen to be in your eval. Right: if you drew a fresh 500 again and again, the scores would scatter around the true accuracy like this. The width of that bell is the error bar.">
+<svg viewBox="0 0 640 250" role="img" aria-label="A pool of possible questions, a sample of 500 drawn from it, and the bell-shaped spread of scores across many such samples">
+  <rect x="12" y="30" width="200" height="160" class="fill-paper" stroke-width="1.2" />
+  <text x="112" y="22" text-anchor="middle" class="strong">ALL POSSIBLE QUESTIONS</text>
+  <circle cx="28" cy="47" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="27" cy="67" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="33" cy="92" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="28" cy="110" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="27" cy="127" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="33" cy="153" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="32" cy="168" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="51" cy="52" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="53" cy="67" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="51" cy="90" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="50" cy="107" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="53" cy="130" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="53" cy="151" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="53" cy="170" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="71" cy="49" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="68" cy="73" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="66" cy="91" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="70" cy="110" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="74" cy="128" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="68" cy="151" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="69" cy="172" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="90" cy="53" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="86" cy="68" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="91" cy="88" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="87" cy="110" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="92" cy="133" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="92" cy="154" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="88" cy="174" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="109" cy="54" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="113" cy="68" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="110" cy="87" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="114" cy="109" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="106" cy="127" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="109" cy="148" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="114" cy="169" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="126" cy="46" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="131" cy="67" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="130" cy="88" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="127" cy="110" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="129" cy="134" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="128" cy="149" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="129" cy="168" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="153" cy="50" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="148" cy="68" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="148" cy="93" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="146" cy="113" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="154" cy="129" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="151" cy="152" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="150" cy="167" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="173" cy="53" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="169" cy="71" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="171" cy="93" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="171" cy="111" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="173" cy="134" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="174" cy="154" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="166" cy="173" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="194" cy="51" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="187" cy="71" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="192" cy="93" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="186" cy="113" r="3.5" class="fill-blue" stroke-width="1" />
+  <circle cx="193" cy="127" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="192" cy="153" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="193" cy="168" r="3.5" class="fill-paper" stroke-width="1" />
+  <text x="112" y="208" text-anchor="middle" class="blue-t">BLUE = IN YOUR EVAL</text>
+  <line x1="214" y1="110" x2="262" y2="110" class="ink" stroke-width="1.2" />
+  <polygon points="262,106 270,110 262,114" class="fill-blue" />
+  <rect x="272" y="80" width="104" height="60" class="fill-wash" stroke-width="1.2" />
+  <text x="324" y="102" text-anchor="middle" class="strong">YOUR 500</text>
+  <text x="324" y="120" text-anchor="middle">score 70.0%</text>
+  <line x1="378" y1="110" x2="396" y2="110" class="ink dash" stroke-width="1" />
+  <text x="515" y="22" text-anchor="middle" class="strong">SCORES OVER MANY FRESH 500s</text>
+  <polyline points="400.0,170.0 405.8,169.9 411.5,169.8 417.3,169.6 423.0,169.3 428.8,168.7 434.5,167.7 440.2,166.2 446.0,163.9 451.7,160.5 457.5,155.8 463.3,149.7 469.0,141.9 474.8,132.6 480.5,122.1 486.2,111.0 492.0,99.9 497.7,90.0 503.5,82.0 509.2,76.8 515.0,75.0 520.8,76.8 526.5,82.0 532.2,90.0 538.0,99.9 543.8,111.0 549.5,122.1 555.2,132.6 561.0,141.9 566.7,149.7 572.5,155.8 578.3,160.5 584.0,163.9 589.8,166.2 595.5,167.7 601.2,168.7 607.0,169.3 612.8,169.6 618.5,169.8 624.2,169.9 630.0,170.0" class="blue" stroke-width="1.5" />
+  <line x1="400" y1="170" x2="630" y2="170" class="ink" stroke-width="1" />
+  <line x1="400" y1="170" x2="400" y2="175" class="ink" stroke-width="1" />
+  <line x1="457.5" y1="170" x2="457.5" y2="175" class="ink" stroke-width="1" />
+  <line x1="515" y1="170" x2="515" y2="175" class="ink" stroke-width="1" />
+  <line x1="572.5" y1="170" x2="572.5" y2="175" class="ink" stroke-width="1" />
+  <line x1="630" y1="170" x2="630" y2="175" class="ink" stroke-width="1" />
+  <text x="400" y="188" text-anchor="middle">62%</text>
+  <text x="457.5" y="188" text-anchor="middle">66%</text>
+  <text x="515" y="188" text-anchor="middle">70%</text>
+  <text x="572.5" y="188" text-anchor="middle">74%</text>
+  <text x="630" y="188" text-anchor="end">78%</text>
+  <line x1="515" y1="60" x2="515" y2="170" class="ink dash" stroke-width="1" />
+  <text x="519" y="58">TRUE</text>
+  <line x1="486.2" y1="200" x2="543.8" y2="200" class="ink" stroke-width="1.2" />
+  <line x1="486.2" y1="195" x2="486.2" y2="205" class="ink" stroke-width="1.2" />
+  <line x1="543.8" y1="195" x2="543.8" y2="205" class="ink" stroke-width="1.2" />
+  <text x="515" y="215" text-anchor="middle">±1 SE ≈ ±2 PTS (68%)</text>
+  <line x1="457.5" y1="224" x2="572.5" y2="224" class="blue" stroke-width="1.2" />
+  <line x1="457.5" y1="219" x2="457.5" y2="229" class="blue" stroke-width="1.2" />
+  <line x1="572.5" y1="219" x2="572.5" y2="229" class="blue" stroke-width="1.2" />
+  <text x="515" y="242" text-anchor="middle" class="blue-t">±1.96 SE ≈ ±4 PTS (95%)</text>
+</svg>
+</Figure>
+
+How far off is the estimate likely to be? Picture each question as a coin that comes up "right" with probability p, the true accuracy. Your score is the average of n such coins. The typical size of the error in that average has a name, the <Term w="standard error">How much an estimate typically misses the true value by, if you repeated the whole experiment with fresh data. The standard deviation of the estimate itself, not of the individual data points.</Term>, and for an accuracy it is:
+
+```text
+SE = √( p (1 − p) / n )
+```
+
+Two parts to read. The `p (1 − p)` is how noisy one coin is: largest at 50%, small near 0% or 100% (a model that gets everything right has nothing left to wobble). The `/ n` under the square root is the averaging: more coins, less wobble, but only with the square root of n.
+
+<Predict id="se-500">
+
+A model scores 70% on 500 questions. Give a range that you'd bet, at 19-to-1 odds, contains its true accuracy. How many points wide on each side?
+
+<Fragment slot="answer">
+
+About ±4 points: roughly 66% to 74%.
+
+SE = √(0.7 × 0.3 / 500) = √0.00042 ≈ 0.0205, so the standard error is about **2 points**. For a 95% range you go out about two standard errors (1.96, to be exact), which is **±4.0 points**. If your gut said "±1" you are in good company; most people underestimate this by a factor of 3 or 4. And if someone says "±2" for a 500-question benchmark, they've quoted one standard error and called it a 95% interval, which is a common slip.
+
+</Fragment>
+
+</Predict>
+
+That "go out 1.96 standard errors" step builds a <Term w="confidence interval">A range computed from the data by a recipe that, if you repeated the whole experiment many times, would contain the true value in 95% of repeats (for a 95% interval). Often shortened to CI.</Term>. The plain-words meaning is about the *recipe*, not this one interval: if you ran the whole experiment over and over with fresh questions, and built an interval this way each time, 95% of those intervals would contain the true accuracy. In practice you can read it as "the range of true accuracies that are consistent with what I saw". Where does 1.96 come from? Averages of many coins are shaped like the bell in Figure 001 (that's the <Term w="central limit theorem">The result that the average of many independent random things has a bell-shaped (normal) distribution, whatever the shape of the individual things, as long as there are enough of them.</Term>), and 95% of a bell lies within 1.96 standard deviations of the middle.
+
+The square root is brutal. To halve the error bar you need four times the questions.
+
+| Questions (at 70%) | Standard error | 95% CI half-width |
+| --- | --- | --- |
+| 100 | 4.6 pts | ±9.0 pts |
+| 200 | 3.2 pts | ±6.4 pts |
+| 500 | 2.0 pts | ±4.0 pts |
+| 1,000 | 1.4 pts | ±2.8 pts |
+| 5,000 | 0.65 pts | ±1.3 pts |
+| 14,042 (MMLU's test set) | 0.39 pts | ±0.76 pts |
+
+So a 0.8-point change on 500 questions is a fifth of the error bar. On its own, it says almost nothing. Even on all of MMLU, ±0.8 is the noise floor. That's sobering when leaderboards rank models 0.3 points apart.
+
+### Two models, one set of questions
+
+Here is where most people go wrong in the other direction: they compute both error bars, see that they overlap, and declare the difference meaningless. Sometimes that's right. Often it throws away a real result.
+
+If A and B were tested on *different* random sets of 500 questions, the difference between their scores would carry both sets of noise. The standard error of a difference of two independent things is `√(SE_A² + SE_B²)`, about 2.9 points here, so ±5.7 for a 95% interval on the gap. Hopeless for a 1-point effect.
+
+But you didn't test them on different questions. You tested them on the *same* 500. And on most of those, the two models do the same thing: an easy question is easy for both, an ambiguous label trips both. A question that both get right says nothing about which model is better. Neither does one both get wrong. Only the questions where they **disagree** carry information about the gap.
+
+<Figure n="002" title="ONLY DISAGREEMENTS CARRY THE SIGNAL" caption="Top: the first 20 questions of a 500-question eval, filled = correct. A and B agree on 18 of them. Bottom: all 500 sorted into a 2×2 table. The 479 questions on the diagonal are identical for both models and cancel out of the difference. The whole comparison rests on the 21 off-diagonal ones: B wins 17, A wins 4.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Twenty questions with each model's right or wrong answers, and a two-by-two table of agreement counts">
+  <text x="10" y="44" class="strong">A</text>
+  <text x="10" y="74" class="strong">B</text>
+  <g stroke-width="1">
+    <rect x="34" y="30" width="18" height="18" class="fill-blue" /><rect x="60" y="30" width="18" height="18" class="fill-blue" /><rect x="86" y="30" width="18" height="18" class="fill-blue" /><rect x="112" y="30" width="18" height="18" class="fill-paper" /><rect x="138" y="30" width="18" height="18" class="fill-blue" /><rect x="164" y="30" width="18" height="18" class="fill-blue" /><rect x="190" y="30" width="18" height="18" class="fill-paper" /><rect x="216" y="30" width="18" height="18" class="fill-blue" /><rect x="242" y="30" width="18" height="18" class="fill-blue" /><rect x="268" y="30" width="18" height="18" class="fill-paper" /><rect x="294" y="30" width="18" height="18" class="fill-paper" /><rect x="320" y="30" width="18" height="18" class="fill-blue" /><rect x="346" y="30" width="18" height="18" class="fill-blue" /><rect x="372" y="30" width="18" height="18" class="fill-blue" /><rect x="398" y="30" width="18" height="18" class="fill-blue" /><rect x="424" y="30" width="18" height="18" class="fill-blue" /><rect x="450" y="30" width="18" height="18" class="fill-paper" /><rect x="476" y="30" width="18" height="18" class="fill-paper" /><rect x="502" y="30" width="18" height="18" class="fill-paper" /><rect x="528" y="30" width="18" height="18" class="fill-blue" />
+    <rect x="34" y="60" width="18" height="18" class="fill-blue" /><rect x="60" y="60" width="18" height="18" class="fill-blue" /><rect x="86" y="60" width="18" height="18" class="fill-blue" /><rect x="112" y="60" width="18" height="18" class="fill-paper" /><rect x="138" y="60" width="18" height="18" class="fill-blue" /><rect x="164" y="60" width="18" height="18" class="fill-blue" /><rect x="190" y="60" width="18" height="18" class="fill-paper" /><rect x="216" y="60" width="18" height="18" class="fill-blue" /><rect x="242" y="60" width="18" height="18" class="fill-blue" /><rect x="268" y="60" width="18" height="18" class="fill-blue" /><rect x="294" y="60" width="18" height="18" class="fill-paper" /><rect x="320" y="60" width="18" height="18" class="fill-paper" /><rect x="346" y="60" width="18" height="18" class="fill-blue" /><rect x="372" y="60" width="18" height="18" class="fill-blue" /><rect x="398" y="60" width="18" height="18" class="fill-blue" /><rect x="424" y="60" width="18" height="18" class="fill-blue" /><rect x="450" y="60" width="18" height="18" class="fill-paper" /><rect x="476" y="60" width="18" height="18" class="fill-paper" /><rect x="502" y="60" width="18" height="18" class="fill-paper" /><rect x="528" y="60" width="18" height="18" class="fill-blue" />
+  </g>
+  <rect x="264" y="26" width="26" height="56" class="blue" stroke-width="1.5" />
+  <rect x="316" y="26" width="26" height="56" class="blue" stroke-width="1.5" />
+  <text x="277" y="100" text-anchor="middle" class="blue-t">B+</text>
+  <text x="329" y="100" text-anchor="middle" class="blue-t">A+</text>
+  <text x="560" y="58">… 480 MORE</text>
+  <rect x="120" y="140" width="120" height="40" class="fill-paper" stroke-width="1.2" />
+  <rect x="240" y="140" width="120" height="40" class="fill-wash" stroke-width="1.2" />
+  <rect x="120" y="180" width="120" height="40" class="fill-wash" stroke-width="1.2" />
+  <rect x="240" y="180" width="120" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="132" text-anchor="middle">B RIGHT</text>
+  <text x="300" y="132" text-anchor="middle">B WRONG</text>
+  <text x="112" y="164" text-anchor="end">A RIGHT</text>
+  <text x="112" y="204" text-anchor="end">A WRONG</text>
+  <text x="180" y="165" text-anchor="middle" class="strong">362</text>
+  <text x="300" y="165" text-anchor="middle" class="strong">4</text>
+  <text x="180" y="205" text-anchor="middle" class="strong">17</text>
+  <text x="300" y="205" text-anchor="middle" class="strong">117</text>
+  <text x="240" y="240" text-anchor="middle">DIAGONAL: 362 + 117 = 479 AGREE, CANCEL</text>
+  <text x="390" y="156" class="blue-t">SHADED = DISAGREE</text>
+  <text x="390" y="174" class="blue-t">A ONLY: 4 · B ONLY: 17</text>
+  <text x="390" y="200">B − A = (17 − 4) / 500</text>
+  <text x="390" y="218" class="strong">= +2.6 PTS</text>
+</svg>
+</Figure>
+
+So do what Gosset did. For each question i, write down the difference `d_i = B_i − A_i`. It is +1 if only B got it right, −1 if only A did, and 0 otherwise. The gap between the models is just the average of the d's, and its standard error is computed the same way as any average:
+
+```text
+d_i  = B_i − A_i                 (each one is −1, 0 or +1)
+gap  = mean(d)
+SE   = std(d) / √n
+95% CI = gap ± 1.96 × SE
+```
+
+This is a <Term w="paired comparison">Measuring two things on the same units (questions, patients, queries) and analysing the per-unit differences, so whatever is shared between the two measurements cancels out.</Term>. Why is it so much tighter? Because the variance of a difference is
+
+```text
+Var(B − A) = Var(A) + Var(B) − 2 × Cov(A, B)
+```
+
+and that last term, the <Term w="covariance">How much two quantities move together. Positive when one tends to be high whenever the other is. Divided by both standard deviations it becomes the correlation, between −1 and +1.</Term>, is big and positive when the models tend to get the same questions right. Unpaired analysis pretends it is zero. Paired analysis subtracts it.
+
+Here's a concrete case: the fake data you'll generate in the Build, where B really is 2.5 points better and the two models agree a lot (their per-question <Term w="correlation">A number from −1 to +1 for how strongly two things move together. Here: how much two models tend to get the same questions right and wrong. 0 means unrelated, 1 means identical.</Term> is about 0.89, which is typical for two checkpoints of one model or two quantizations of it).
+
+| | Score | 95% CI |
+| --- | --- | --- |
+| Model A | 73.2% | 69.3 to 77.1 |
+| Model B | 75.8% | 72.0 to 79.6 |
+| B − A, unpaired | +2.6 pts | −2.8 to +8.0 |
+| B − A, **paired** | +2.6 pts | **+0.8 to +4.4** |
+
+The two separate intervals overlap by more than 5 points. The paired interval for the difference is a third as wide and sits entirely above zero. Same data. One analysis says "can't tell", the other says "B is better, by somewhere between about 1 and 4 points".
+
+The rule to burn in: **overlapping error bars do not mean "no difference"**. If the two models were scored on the same questions, the separate error bars are the wrong tool for comparing them. Compute the interval of the difference, paired.
+
+Play with it. The defaults show the case above: overlapping bars, a paired interval clear of zero. Then drag the correlation to 0 and watch the paired interval grow until it matches the unpaired one. Then set the true gap to 0 and run the fake experiments.
+
+<Figure n="003" title="PAIRED VS UNPAIRED" caption="Each drag re-scores the same simulated questions. Top: each model's own 95% interval. Bottom: two intervals for the gap, unpaired (as if the questions were unrelated) and paired. The dashed blue line is the true gap. Run 1000 fake experiments to see how often each method finds a real gap, and how often a gap of 0.8 points shows up by luck alone." wide>
+
+<StatsPairedCI />
+
+</Figure>
+
+Three things to try, and what they teach:
+
+1. **Correlation 0.7, gap 3 points, 1,000 questions** (the default): the bars overlap, the paired interval excludes zero. Run the fake experiments: the paired test finds the gap in roughly three runs out of four, while "the bars don't overlap" finds it about once in a hundred. Comparing bars throws almost all of your power away.
+2. **Gap 0, 500 questions:** run the experiments. The paired interval excludes zero about 5% of the time. That's the 5% you signed up for with "95%". But look at the third readout: B appears to beat A by 0.8 points or more in roughly a third of the experiments. That's your Slack message, produced by two identical models.
+3. **Correlation 0:** paired and unpaired become the same width. Pairing helps exactly as much as the models agree, which is why it's so powerful for comparing close variants of one model, the comparison you make most often.
+
+### The bootstrap: error bars without a formula
+
+The formula `√(p(1−p)/n)` works for accuracy. What about NDCG@10 averaged over queries? The median latency? F1? The ratio of two things? Each has its own formula, some are ugly, and some don't have a clean one.
+
+In 1979 the statistician Bradley Efron published a way around all of it, called the <Term w="bootstrap">Estimating how much a statistic would vary across repeated experiments by resampling your one dataset many times with replacement and recomputing the statistic each time.</Term>. The idea fits in a sentence: you can't draw fresh question sets from the population, so draw them from your sample instead, which is your best picture of the population.
+
+Concretely: from your 500 questions, draw 500 *with replacement*. Some questions will be picked twice or three times, about a third won't be picked at all (the chance a given one is missed is `(1 − 1/500)^500 ≈ 1/e ≈ 37%`). Score the model on this fake set. Do it 10,000 times. You now have 10,000 scores that vary the way scores on fresh question sets would vary. The middle 95% of them, from the 2.5th to the 97.5th <Term w="percentile">The value below which a given percent of the data falls. The 2.5th percentile has 2.5% of values below it.</Term>, is your confidence interval.
+
+<Figure n="004" title="THE BOOTSTRAP" caption="Resample the questions with replacement, rescore, repeat thousands of times. Repeated questions (marked) and missing ones are the point: each resample is a plausible alternative eval set. The spread of the rescored values is the error bar. For a gap between two models, resample question indices and score both models on the same indices.">
+<svg viewBox="0 0 640 250" role="img" aria-label="An eval of eight questions resampled three times with replacement, giving different scores whose spread forms the confidence interval">
+  <text x="10" y="34" class="strong">YOUR EVAL</text>
+  <text x="10" y="94">RESAMPLE 1</text>
+  <text x="10" y="134">RESAMPLE 2</text>
+  <text x="10" y="174">RESAMPLE 3</text>
+  <text x="10" y="214">… × 10,000</text>
+  <g stroke-width="1.2">
+    <rect x="110" y="18" width="34" height="26" class="fill-wash" /><text x="127" y="35" text-anchor="middle">1 ✓</text>
+    <rect x="148" y="18" width="34" height="26" class="fill-wash" /><text x="165" y="35" text-anchor="middle">2 ✓</text>
+    <rect x="186" y="18" width="34" height="26" class="fill-paper" /><text x="203" y="35" text-anchor="middle">3 ✗</text>
+    <rect x="224" y="18" width="34" height="26" class="fill-wash" /><text x="241" y="35" text-anchor="middle">4 ✓</text>
+    <rect x="262" y="18" width="34" height="26" class="fill-wash" /><text x="279" y="35" text-anchor="middle">5 ✓</text>
+    <rect x="300" y="18" width="34" height="26" class="fill-paper" /><text x="317" y="35" text-anchor="middle">6 ✗</text>
+    <rect x="338" y="18" width="34" height="26" class="fill-wash" /><text x="355" y="35" text-anchor="middle">7 ✓</text>
+    <rect x="376" y="18" width="34" height="26" class="fill-wash" /><text x="393" y="35" text-anchor="middle">8 ✓</text>
+  </g>
+  <text x="430" y="35" class="strong">6/8 = 75%</text>
+  <line x1="260" y1="48" x2="260" y2="70" class="ink dash" stroke-width="1" />
+  <text x="268" y="64">DRAW 8, WITH REPLACEMENT</text>
+  <g stroke-width="1">
+    <rect x="110" y="78" width="34" height="24" class="fill-wash" /><text x="127" y="94" text-anchor="middle">2</text>
+    <rect x="148" y="78" width="34" height="24" class="fill-wash" /><text x="165" y="94" text-anchor="middle" class="blue-t">2</text>
+    <rect x="186" y="78" width="34" height="24" class="fill-wash" /><text x="203" y="94" text-anchor="middle">5</text>
+    <rect x="224" y="78" width="34" height="24" class="fill-paper" /><text x="241" y="94" text-anchor="middle">3</text>
+    <rect x="262" y="78" width="34" height="24" class="fill-wash" /><text x="279" y="94" text-anchor="middle">8</text>
+    <rect x="300" y="78" width="34" height="24" class="fill-wash" /><text x="317" y="94" text-anchor="middle">1</text>
+    <rect x="338" y="78" width="34" height="24" class="fill-paper" /><text x="355" y="94" text-anchor="middle">6</text>
+    <rect x="376" y="78" width="34" height="24" class="fill-paper" /><text x="393" y="94" text-anchor="middle" class="blue-t">6</text>
+    <rect x="110" y="118" width="34" height="24" class="fill-wash" /><text x="127" y="134" text-anchor="middle">7</text>
+    <rect x="148" y="118" width="34" height="24" class="fill-wash" /><text x="165" y="134" text-anchor="middle">1</text>
+    <rect x="186" y="118" width="34" height="24" class="fill-wash" /><text x="203" y="134" text-anchor="middle">4</text>
+    <rect x="224" y="118" width="34" height="24" class="fill-wash" /><text x="241" y="134" text-anchor="middle" class="blue-t">4</text>
+    <rect x="262" y="118" width="34" height="24" class="fill-wash" /><text x="279" y="134" text-anchor="middle">8</text>
+    <rect x="300" y="118" width="34" height="24" class="fill-wash" /><text x="317" y="134" text-anchor="middle">5</text>
+    <rect x="338" y="118" width="34" height="24" class="fill-wash" /><text x="355" y="134" text-anchor="middle">2</text>
+    <rect x="376" y="118" width="34" height="24" class="fill-wash" /><text x="393" y="134" text-anchor="middle" class="blue-t">7</text>
+    <rect x="110" y="158" width="34" height="24" class="fill-wash" /><text x="127" y="174" text-anchor="middle">4</text>
+    <rect x="148" y="158" width="34" height="24" class="fill-paper" /><text x="165" y="174" text-anchor="middle">3</text>
+    <rect x="186" y="158" width="34" height="24" class="fill-wash" /><text x="203" y="174" text-anchor="middle">1</text>
+    <rect x="224" y="158" width="34" height="24" class="fill-wash" /><text x="241" y="174" text-anchor="middle">7</text>
+    <rect x="262" y="158" width="34" height="24" class="fill-wash" /><text x="279" y="174" text-anchor="middle">8</text>
+    <rect x="300" y="158" width="34" height="24" class="fill-paper" /><text x="317" y="174" text-anchor="middle">6</text>
+    <rect x="338" y="158" width="34" height="24" class="fill-wash" /><text x="355" y="174" text-anchor="middle">5</text>
+    <rect x="376" y="158" width="34" height="24" class="fill-wash" /><text x="393" y="174" text-anchor="middle">2</text>
+  </g>
+  <text x="430" y="94">5/8 = 62.5%</text>
+  <text x="430" y="134">8/8 = 100%</text>
+  <text x="430" y="174">6/8 = 75%</text>
+  <line x1="470" y1="196" x2="630" y2="196" class="ink" stroke-width="1" />
+  <rect x="482" y="195" width="14" height="1" class="fill-blue" />
+  <rect x="500" y="192" width="14" height="4" class="fill-blue" />
+  <rect x="518" y="187" width="14" height="9" class="fill-blue" />
+  <rect x="536" y="179" width="14" height="17" class="fill-blue" />
+  <rect x="554" y="163" width="14" height="33" class="fill-blue" />
+  <rect x="572" y="149" width="14" height="47" class="fill-blue" />
+  <rect x="590" y="155" width="14" height="41" class="fill-blue" />
+  <rect x="608" y="181" width="14" height="15" class="fill-blue" />
+  <text x="550" y="212" text-anchor="middle">BOOTSTRAP SCORES</text>
+  <line x1="527" y1="222" x2="615" y2="222" class="blue" stroke-width="1.5" />
+  <line x1="527" y1="216" x2="527" y2="228" class="blue" stroke-width="1.5" />
+  <line x1="615" y1="216" x2="615" y2="228" class="blue" stroke-width="1.5" />
+  <text x="571" y="244" text-anchor="middle" class="blue-t">MIDDLE 95% = CI</text>
+  <text x="110" y="214">BLUE NUMBER = PICKED AGAIN</text>
+</svg>
+</Figure>
+
+For a plain accuracy on 500 questions the bootstrap and the formula agree to within a tenth of a point (you'll check this). The bootstrap earns its keep elsewhere:
+
+- **Any metric.** NDCG, MRR, a judge's win rate, mean tokens per answer. The code is the same: resample, recompute, take percentiles.
+- **The gap between two models.** This is the <Term w="paired bootstrap">A bootstrap for the difference between two systems: resample question indices once per round and score both systems on those same indices, so the pairing is preserved.</Term>: in each round, draw one set of question indices and score *both* models on them. Never resample A and B separately; that silently turns your paired comparison back into an unpaired one.
+- **Honest failure.** When it goes wrong, it tends to go wrong visibly: with tiny n or a score at 100%, the resamples barely vary and the interval collapses, which is a hint to use a better method (for small-sample accuracies, the Wilson interval is the standard fix).
+
+What the bootstrap does **not** fix: it assumes the units you resample are independent draws. If they aren't, it is exactly as wrong as the formula. That's the clustering problem, coming up.
+
+### Tests: is the gap bigger than luck?
+
+A confidence interval says how big the gap plausibly is. A test answers a narrower yes/no question: if the two models were truly equally good, how surprising would a gap this big be?
+
+That "truly equally good" world is the <Term w="null hypothesis">The boring explanation you try to rule out: here, that both models have the same true accuracy and the observed gap is luck.</Term>. The <Term w="p-value">If the null hypothesis were true, the probability of seeing a result at least as extreme as yours. Small means "this would be a weird coincidence". It is not the probability that the null is true.</Term> is how often luck alone would produce a gap at least as big as yours. A p-value below 0.05 is the convention for "probably not luck", and it lines up with a 95% interval that excludes zero.
+
+Three tests, from most general to most specific, all paired.
+
+**The permutation (sign-flip) test.** If A and B were interchangeable, then on each question it shouldn't matter which one we called A. So swap them at random: flip the sign of each `d_i` with a coin toss, and recompute the mean gap. Do it 10,000 times. The share of shuffled gaps at least as big (in absolute value) as the real one is the p-value. That is a <Term w="permutation test">A test that builds the "nothing is going on" distribution by randomly shuffling or swapping labels in your own data, then checks how extreme the real result is against it.</Term>, and like the bootstrap it works for any per-question metric, including per-query NDCG.
+
+**The sign test.** Throw away the sizes and keep only who won each question. Under the null, each non-tied question is a fair coin: B wins it half the time. So the number of B-wins out of the m disagreements follows a coin-flip (binomial) distribution, and you ask how surprising your count is. Simple, robust, and it works when the per-question scores are on weird scales.
+
+**McNemar's test.** When the outcome is right/wrong, the sign test has a name. Quinn McNemar published it in 1947 for exactly this situation, "correlated proportions": the same people answering two questions, or the same questions answered by two models. Call the off-diagonal counts from Figure 002 `b` (A right, B wrong) and `c` (B right, A wrong). <Term w="McNemar's test">A paired test for right/wrong outcomes. Uses only the discordant counts: under the null, each disagreement is equally likely to favour either model.</Term> says: under the null, each of the `b + c` <Term w="discordant pairs">Questions where the two models disagree: one right, one wrong. The only ones that carry information about which is better.</Term> is a fair coin.
+
+```text
+b = 4, c = 17, m = b + c = 21
+exact p = 2 × P(Binomial(21, 0.5) ≤ 4) ≈ 0.007
+chi-square version: (|b − c| − 1)² / (b + c) = 144/21 ≈ 6.9  →  p ≈ 0.009
+```
+
+Notice what isn't in that calculation: the 479 questions where the models agreed. They don't add evidence either way. That cuts both ways. Add 10,000 easy questions both models ace and McNemar doesn't change, but every unpaired error bar gets narrower and the gap looks more "stable" than it is.
+
+Tests and intervals are two views of one thing. When they disagree near the boundary (an interval that barely excludes zero, a p of 0.06), that's information too: the evidence is borderline, and the honest report says so. In write-ups, lead with the interval for the gap. It says how big, not just whether.
+
+### Two kinds of noise: which questions, and which sample
+
+So far each question had a fixed answer: the model gets it right or it doesn't. That's true at temperature 0 (nearly: GPU batching can still flip a token now and then). At temperature 0.7, though, the same model on the same question might be right 6 times out of 10. Now there are two sources of noise stacked on top of each other:
+
+1. **Question noise:** which questions happened to be in the set. Some are easy, some are hard.
+2. **Sampling noise:** for a fixed question, which answer the model happened to sample this time.
+
+Write `p_i` for the model's chance of getting question i right. Miller's paper splits the variance of the mean score into these two parts. If you sample K answers per question and average them:
+
+```text
+Var(score) = [ Var over questions of p_i   +   average of p_i (1 − p_i) / K ] / n
+               ^ question noise                ^ sampling noise, shrinks with K
+```
+
+Re-asking each question K times shrinks only the second part. A worked example: 500 questions, average accuracy 70%, with question difficulty spread so that `Var(p_i) = 0.05` (then the average `p_i (1 − p_i)` comes out to 0.16). With one sample each, the standard error is √(0.21/500) ≈ 2.0 points, the same as before. With K = 5 samples it's √(0.082/500) ≈ 1.3 points, as if you had about 2.5 times as many questions, for 5 times the inference cost. With infinitely many samples it bottoms out at √(0.05/500) = 1.0 point: the question noise you can only fix with more questions.
+
+So: if questions are expensive to write and inference is cheap (often true for a ranker or a small model on the Spark), sample several answers per question. And when you bootstrap, resample *questions* and carry each question's K answers along with it. Resampling individual answers treats 5 answers to one question as 5 independent questions, and the interval comes out far too narrow.
+
+**pass@k.** Code benchmarks ask a different question: if the model gets k tries, does at least one pass the tests? The obvious estimate, generate exactly k samples and check, is very noisy. Chen et al.'s 2021 Codex paper ("Evaluating Large Language Models Trained on Code") introduced the standard fix. Generate n samples with n ≥ k (they used n = 200), count the c that pass, and compute
+
+```text
+pass@k = 1 − C(n − c, k) / C(n, k)
+```
+
+where C is "n choose k". In words: the chance that a random set of k of your n samples contains no passing one is `C(n−c, k) / C(n, k)`, so pass@k is one minus that. It is an <Term w="unbiased estimator">An estimate that is right on average: if you repeated the experiment many times, the average of the estimates would equal the true value.</Term>. The tempting shortcut `1 − (1 − c/n)^k` is not: it plugs the estimated pass rate into a curved formula, and on average comes out low. With n = 10 samples and c = 3 passing, the unbiased pass@5 is 0.917; the shortcut says 0.832. Average pass@k across problems, then bootstrap over problems (not samples) for the interval.
+
+### Clustered questions
+
+Here's a trap that the formula and a naive bootstrap both fall into. Many evals are built in clumps: 10 questions about each of 50 documents, 8 queries from each of 60 customer sessions, several reading-comprehension questions per passage. Questions in the same clump rise and fall together. If the model doesn't understand a document, it misses most of that document's questions.
+
+Then you don't really have 500 independent questions. You have something between 50 and 500. Your eval is <Term w="clustered">Data that comes in groups whose members are more alike than random members would be (questions from one document, queries from one user). The groups, not the individual items, are the independent units.</Term>, and the naive standard error is too small.
+
+How much too small depends on two things: the cluster size m and how alike questions in a cluster are, the <Term w="intraclass correlation">How similar items within the same cluster are, from 0 (no more alike than random) to 1 (identical). Often written ρ (rho) or ICC.</Term> ρ. The variance gets multiplied by the <Term w="design effect">How much clustering inflates the variance compared with independent items: roughly 1 + (m − 1) × ρ for clusters of size m.</Term>:
+
+```text
+design effect ≈ 1 + (m − 1) × ρ
+effective number of questions ≈ n / design effect
+```
+
+I simulated 50 documents × 10 questions, overall accuracy 70%, with document difficulty varying enough to give ρ ≈ 0.2. Design effect: 1 + 9 × 0.2 = 2.8. Over 5,000 simulated evals:
+
+| | Standard error |
+| --- | --- |
+| Actual spread of the score across evals | 3.4 pts |
+| Naive formula `√(p(1−p)/n)` | 2.0 pts |
+| Clustered standard error | 3.4 pts |
+
+The naive "95%" interval contained the true accuracy only **76%** of the time. The clustered one, 94%. Your 500 questions were worth about 180.
+
+The fix, which Miller's paper recommends whenever questions come in groups, is the <Term w="clustered standard error">A standard error that treats each cluster as one independent unit: it adds up the residuals within each cluster first, then combines clusters.</Term>. Sum the residuals (score minus overall mean) inside each cluster, square those sums, add them up:
+
+```text
+SE_clustered = √( Σ over clusters c of ( Σ over i in c of (x_i − x̄) )² ) / n
+```
+
+If every cluster has one question, this is the ordinary formula. The bootstrap version is just as simple: **resample clusters, not questions**. Draw 50 documents with replacement and take all their questions along.
+
+For your ranker this matters directly. NDCG is computed per query, so the query is already the unit, not the document. But if your 500 eval queries came from 60 customers, and customers differ (one customer's catalog is weird), then the customer is the cluster. And never let queries from one customer appear in both train and eval if you want to know how the model does on a new customer. That's a different lesson ([Ranking metrics and eval sets](/lessons/ranking-metrics/)), but it's the same idea: know what your independent unit is.
+
+### Many tries and the winner's curse
+
+You write 20 prompt variants for the ranker's query rewriter and evaluate each on the 500-question set. The best one scores 2 points above the baseline. Ship it?
+
+Suppose, as is often the case, that none of the 20 is truly better. Each one's score still wobbles. Pick the highest of 20 wobbly numbers and you've picked the one whose luck ran hottest. That's the <Term w="winner's curse">When you select the best of many noisy measurements, the winner's measured score overstates its true score, because selection favours lucky noise.</Term>. In a simulation of exactly this (20 prompts with zero true effect, each disagreeing with the baseline on about 10% of questions, 500 questions), the best one beat the baseline by **2.5 points on average**, and by at least 1 point in **97%** of runs.
+
+<Figure n="005" title="THE WINNER'S CURSE" caption="Twenty prompt variants, none truly better than the baseline (the zero line). Left: their measured gain on the dev set; the winner (blue) is +2.0. Right: the same twenty on a fresh held-out set. The winner falls back to +0.8, a different prompt now looks best, and the whole cloud is just noise centred on zero.">
+<svg viewBox="0 0 640 260" role="img" aria-label="Dot plots of twenty prompt variants' gains on a dev set and a held-out set, with the dev winner regressing toward zero">
+  <line x1="120" y1="140" x2="580" y2="140" class="ink dash" stroke-width="1" />
+  <line x1="100" y1="40" x2="100" y2="240" class="ink" stroke-width="1" />
+  <line x1="95" y1="50" x2="100" y2="50" class="ink" stroke-width="1" /><text x="90" y="54" text-anchor="end">+3</text>
+  <line x1="95" y1="80" x2="100" y2="80" class="ink" stroke-width="1" /><text x="90" y="84" text-anchor="end">+2</text>
+  <line x1="95" y1="110" x2="100" y2="110" class="ink" stroke-width="1" /><text x="90" y="114" text-anchor="end">+1</text>
+  <line x1="95" y1="140" x2="100" y2="140" class="ink" stroke-width="1" /><text x="90" y="144" text-anchor="end">0</text>
+  <line x1="95" y1="170" x2="100" y2="170" class="ink" stroke-width="1" /><text x="90" y="174" text-anchor="end">−1</text>
+  <line x1="95" y1="200" x2="100" y2="200" class="ink" stroke-width="1" /><text x="90" y="204" text-anchor="end">−2</text>
+  <line x1="95" y1="230" x2="100" y2="230" class="ink" stroke-width="1" /><text x="90" y="234" text-anchor="end">−3</text>
+  <text x="12" y="12">GAIN VS BASELINE, PTS</text>
+  <text x="220" y="30" text-anchor="middle" class="strong">DEV SET (CHOSE HERE)</text>
+  <text x="470" y="30" text-anchor="middle" class="strong">HELD-OUT SET</text>
+  <line x1="220" y1="80" x2="470" y2="116" class="blue" stroke-width="1.2" />
+  <circle cx="220" cy="128" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="110" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="164" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="188" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="209" cy="164" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="104" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="122" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="170" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="206" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="209" cy="170" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="116" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="140" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="134" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="86" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="152" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="231" cy="164" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="176" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="158" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="98" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="220" cy="80" r="4.5" class="fill-blue" stroke-width="1" />
+  <circle cx="470" cy="158" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="122" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="110" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="140" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="68" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="164" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="459" cy="116" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="146" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="459" cy="122" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="459" cy="158" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="92" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="86" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="481" cy="122" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="176" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="44" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="448" cy="122" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="182" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="459" cy="164" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="50" r="3.5" class="fill-paper" stroke-width="1" />
+  <circle cx="470" cy="116" r="4.5" class="fill-blue" stroke-width="1" />
+  <text x="236" y="76" class="blue-t">WINNER +2.0</text>
+  <text x="486" y="112" class="blue-t">SAME PROMPT +0.8</text>
+  <text x="340" y="254" text-anchor="middle">20 PROMPTS · 500 QUESTIONS EACH SET · TRUE GAIN OF EVERY PROMPT = 0</text>
+</svg>
+</Figure>
+
+The p-values get fooled the same way. Each test at the 5% level has a 1 in 20 chance of a false alarm. Run 20 of them and the chance of at least one is `1 − 0.95^20 ≈ 64%`. This is the <Term w="multiple comparisons">Running many tests or picking among many candidates on the same data. The more you try, the more likely at least one looks good by chance.</Term> problem, and it doesn't need 20 deliberate experiments. Trying a few prompts, a few checkpoints, a few decoding settings and two metrics, and then reporting the best combination, is the same thing.
+
+Two fixes, which you can use together:
+
+- **Make each test stricter.** The Bonferroni correction divides the threshold by the number of tries: 20 comparisons means p below 0.0025 each. Crude, a bit too strict, impossible to get wrong.
+- **Split the data.** Choose on a dev set as much as you like, then confirm the single winner, once, on a <Term w="held-out set">Data set aside and not looked at during any choices (tuning, picking prompts, picking checkpoints), used once at the end to measure the chosen option honestly.</Term> you haven't looked at. The held-out number is the one you report. This is why every serious benchmark has a hidden test split, and why "I tuned on the test set" quietly invalidates a result.
+
+### How many questions do you need?
+
+Now turn the whole thing around. Before running an experiment, ask: if the improvement is real and of the size I care about, how likely am I to detect it? That probability is the <Term w="power">The chance that your experiment detects an effect that really exists. 80% is the usual target: a real effect of the planned size is detected 4 times out of 5.</Term> of the experiment, and the effect size you plan for is the <Term w="minimum detectable effect">The smallest true improvement your experiment is designed to detect with the chosen power. Smaller effects may be real but will usually be missed.</Term>.
+
+For a paired comparison at 95% confidence and 80% power, the number of questions is
+
+```text
+n ≈ (1.96 + 0.84)² × Var(d) / gap²         where Var(d) = (disagreement rate) − gap²
+```
+
+The 1.96 is the 95% threshold; the 0.84 is what it takes to clear that threshold 80% of the time when the true gap is real. And the only property of the models that matters is how often they disagree. For an unpaired comparison you'd replace `Var(d)` with `p_A(1 − p_A) + p_B(1 − p_B)`, about 0.42 near 70%.
+
+<Predict id="power-2pts">
+
+Two checkpoints of the same model, around 70% accuracy, disagreeing on 10% of questions. You want an 80% chance of detecting a true 2-point improvement. How many questions? And how many if you compared them unpaired?
+
+<Fragment slot="answer">
+
+Paired: `7.85 × (0.10 − 0.0004) / 0.0004` ≈ **1,950 questions**. Unpaired: `7.85 × (0.21 + 0.2016) / 0.0004` ≈ **8,100 per model**. Pairing cuts it by about 4×.
+
+And the uncomfortable flip side: with your 500 questions, a real 2-point gain gets detected only about **a quarter** of the time (I simulated it: 25%). You'd miss it three times out of four and conclude "no effect". At n = 500 with 10% disagreement, the smallest gap you can reliably see is about 4 points.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="006" title="POWER CALCULATOR" caption="Questions needed to detect a gap with 80% power at 95% confidence, on a log scale. Lower the gap and both bars grow with one over the gap squared. Raise the disagreement rate and only the paired bar grows. The dashed lines are a 500-question set and MMLU's 14,042.">
+
+<StatsPower />
+
+</Figure>
+
+The `1 / gap²` is the headline. Halving the effect you want to see quadruples the questions. A 1-point improvement between close checkpoints (10% disagreement) needs about 7,800 questions paired, and around 33,000 per model unpaired. That's why careful labs care about eval set size and pairing, and why "we got +0.5 on a 1,000-question benchmark" is not a result.
+
+### Seeds: the run is also a sample
+
+One more source of noise sits above all of this. Train the same cross-encoder twice with different <Term w="random seed">The starting number for a program's random number generator. It fixes the initial weights, the data order, dropout masks; change it and you get a different, equally valid training run.</Term>s and you get two different models, which can differ on the eval by more than your eval's own error bar. Dodge et al. (2020) fine-tuned BERT on small GLUE tasks with many seeds and found that the seed alone, through weight initialisation and data order, could move results as much as many published "improvements".
+
+That changes what a fair comparison of two *training recipes* is. The eval interval tells you about this checkpoint on this question set. It says nothing about how much the recipe varies run to run, because you only ran it once. If you want to claim "the new hard-negative sampler is better", the unit is the training run: train each recipe with several seeds (3 is a bare minimum, 5 is better), evaluate each run on the same questions, and compare the recipes using the spread across seeds. If you only claim "this checkpoint is better than that checkpoint", the single-run paired analysis is fine, but say that's what it is.
+
+### What a careful result looks like
+
+Put it all together and here is the result statement for the fake data, written the way a paper would:
+
+> On our 500-question evaluation set, model B scored 75.8% (95% CI 72.0 to 79.6) and model A 73.2% (69.3 to 77.1). Because both models answered the same questions, we compare them on per-question differences: B outperforms A by 2.6 points (paired bootstrap 95% CI +0.8 to +4.4, 10,000 resamples). The models disagreed on 21 questions, with B correct on 17 and A on 4 (exact McNemar p = 0.007). Each model was run once at temperature 0, and we did not vary training seeds, so these intervals reflect question sampling only.
+
+Every part is load-bearing. Each score has its own interval. The comparison is paired and says so. The number of disagreements tells a reader how much evidence there really is. And the last sentence names the noise that was *not* measured. You'll write one of these for a real pair of models at the end of the Build.
+
+## Build It
+
+Everything goes in one folder, say `~/workbench/evalstats/`, with NumPy as the only dependency. Each script reads a CSV with one row per question and a 0/1 (or a score) column per model, so the same code works on fake data now and real results later.
+
+<Task id="t0" title="Set up the folder and fake data" agent="ok">
+
+```bash
+mkdir -p ~/workbench/evalstats && cd ~/workbench/evalstats
+python3 -m venv .venv && source .venv/bin/activate
+pip install numpy
+```
+
+A generator for two correlated models where B is truly about 2.5 points better. Every question has a hidden difficulty; both models share most of their luck on each question, which is what makes them agree.
+
+```python
+# make_fake.py: two "models" answering the same 500 questions.
+# B is truly better by about 2.5 points, and the two agree on most questions.
+import csv, random
+
+random.seed(3)
+N = 500
+rows = []
+for i in range(N):
+    difficulty = random.random()           # 0 = easy, 1 = hard
+    p_a = 0.97 - 0.55 * difficulty         # A's chance on this question
+    p_b = min(1.0, p_a + 0.025)            # B is a little better everywhere
+    u = random.random()                    # shared luck: makes A and B agree
+    a = int(u < p_a)
+    b = int(u < p_b) if random.random() < 0.9 else int(random.random() < p_b)
+    rows.append((f"q{i:04d}", a, b))
+
+with open("results.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["qid", "model_a", "model_b"])
+    w.writerows(rows)
+print("wrote results.csv:", N, "questions")
+```
+
+And a loader that every script shares. It joins on question ID, which matters more than it looks (see Break It).
+
+```python
+# load.py
+import csv
+import numpy as np
+
+def load_pair(path: str, col_a: str = "model_a", col_b: str = "model_b"):
+    """Return (qids, a, b) as aligned arrays, one entry per question."""
+    with open(path) as f:
+        rows = list(csv.DictReader(f))
+    rows.sort(key=lambda r: r["qid"])
+    qids = [r["qid"] for r in rows]
+    assert len(set(qids)) == len(qids), "duplicate question IDs"
+    a = np.array([float(r[col_a]) for r in rows])
+    b = np.array([float(r[col_b]) for r in rows])
+    return qids, a, b
+```
+
+Run `python make_fake.py`. With seed 3 you should get A = 73.2% and B = 75.8%.
+
+</Task>
+
+<Task id="t1" title="Error bars for one model: formula and bootstrap" agent="hands">
+
+```python
+# ci.py
+import numpy as np
+from load import load_pair
+
+def clt_ci(x: np.ndarray, z: float = 1.96) -> tuple[float, float, float]:
+    """Mean, lower, upper. SE = sample std (ddof=1) / sqrt(n)."""
+    ...
+
+def bootstrap_ci(x: np.ndarray, stat=np.mean, B: int = 10_000,
+                 alpha: float = 0.05, seed: int = 0) -> tuple[float, float]:
+    """Percentile bootstrap: resample x with replacement B times, apply stat,
+    return the alpha/2 and 1 - alpha/2 percentiles."""
+    ...
+
+if __name__ == "__main__":
+    _, a, b = load_pair("results.csv")
+    # print both CIs for A and for B, as percentages with one decimal
+```
+
+Hints:
+
+- `rng = np.random.default_rng(seed)`, then `idx = rng.integers(0, n, size=(B, n))` gives you all B resamples at once as an index matrix. `x[idx].mean(axis=1)` scores them all in one line. 10,000 × 500 is 5 million numbers, fine for memory.
+- For a 0/1 array the sample std with `ddof=1` is almost exactly `√(p(1−p))`, so `clt_ci` *is* the accuracy formula.
+- Then stress it: build `x = np.array([1]*19 + [0])` (n = 20, 95% right) and compare the two intervals. Look at the upper end of the formula's interval. What's wrong with it?
+
+</Task>
+
+<Task id="t2" title="The paired interval for the gap" agent="hands">
+
+```python
+# paired.py
+import numpy as np
+from load import load_pair
+from ci import clt_ci
+
+def unpaired_diff_ci(a, b, z=1.96) -> tuple[float, float, float]:
+    """Gap b-a with SE = sqrt(SE_a^2 + SE_b^2): what you'd do if the
+    questions were unrelated."""
+    ...
+
+def paired_diff_ci(a, b, z=1.96) -> tuple[float, float, float]:
+    """Gap and CI from the per-question differences d = b - a."""
+    ...
+
+def paired_bootstrap_ci(a, b, metric=np.mean, B=10_000, seed=0) -> tuple[float, float]:
+    """Each round: ONE set of resampled indices, metric(b[idx]) - metric(a[idx])."""
+    ...
+
+if __name__ == "__main__":
+    _, a, b = load_pair("results.csv")
+    # print all three, plus np.corrcoef(a, b)[0, 1] and the disagreement rate
+```
+
+Predict before running: if the correlation is about 0.9, how many times narrower should the paired interval be than the unpaired one? (Hint: compare `Var(A) + Var(B) − 2 Cov` with `Var(A) + Var(B)`.)
+
+</Task>
+
+<Task id="t3" title="McNemar and a permutation test" agent="hands">
+
+```python
+# tests.py
+import math
+import numpy as np
+from load import load_pair
+
+def mcnemar_exact(a, b) -> tuple[int, int, float]:
+    """Return (n_a_only, n_b_only, two-sided exact p).
+    Under the null, n_b_only ~ Binomial(n_a_only + n_b_only, 0.5)."""
+    ...
+
+def sign_flip_p(a, b, R=20_000, seed=0) -> float:
+    """Paired permutation test on d = b - a: flip each d_i's sign at random,
+    count how often |mean| >= |observed mean|. Works for any per-question score."""
+    ...
+```
+
+Hints:
+
+- Two-sided exact p: `min(1, 2 * sum(math.comb(m, i) for i in range(k + 1)) / 2**m)` with `k = min(b, c)`. Use Python ints for this, not NumPy ints: `2**m` overflows a NumPy int64 quietly once m passes 63.
+- For `sign_flip_p`, `rng.choice([-1, 1], size=(R, n))` times `d`, then `.mean(axis=1)`. Add a tiny tolerance when comparing to the observed value, because floating point.
+- On the fake data, the two p-values should be close to each other. Why does `sign_flip_p` never need to know the data was 0/1?
+
+</Task>
+
+<Task id="t4" title="How often is +0.8 points just noise?" agent="hands">
+
+This is the one that should change how you read Slack. Simulate an **A/A test**: two models with *identical* true accuracy (70%) on 500 questions, and count how often one appears at least 0.8 points ahead.
+
+```python
+# noise.py
+import numpy as np
+
+def fake_pair(n: int, p: float, gap: float, disagree: float, rng):
+    """Paired 0/1 outcomes. P(A only right) = (disagree - gap)/2,
+    P(B only right) = (disagree + gap)/2, both right = p - P(A only right)."""
+    ...
+
+def how_often(n=500, p=0.7, gap=0.0, disagree=0.10, threshold=0.008, T=20_000, seed=0):
+    """Fraction of T experiments where mean(b) - mean(a) >= threshold.
+    Also return the fraction where your paired CI from t2 excludes zero."""
+    ...
+```
+
+Run it for disagreement rates 5%, 10%, 20%, and for the fully unpaired case (draw A and B independently). Then run it with `gap=0.02` and read the "CI excludes zero" fraction: that's the power of a 500-question eval for a 2-point gain.
+
+</Task>
+
+<Task id="t5" title="A power calculator" agent="hands">
+
+```python
+# power.py
+def n_paired(gap: float, disagree: float, alpha=0.05, power=0.8) -> int: ...
+def n_unpaired(gap: float, p: float, alpha=0.05, power=0.8) -> int: ...
+def mde_paired(n: int, disagree: float, alpha=0.05, power=0.8) -> float:
+    """Smallest gap detectable at this n. Solve the n formula for gap."""
+    ...
+```
+
+Use `statistics.NormalDist().inv_cdf(1 - alpha/2)` and `inv_cdf(power)` from the standard library for the 1.96 and 0.84. Print a table for gaps of 0.5, 1, 2, 3, 5 points at 5%, 10% and 20% disagreement. Then **check one row by simulation**: plug its n into `how_often` from t4 with that gap and confirm you get about 80% detection. If the formula and simulation disagree by more than a few points, one of them has a bug.
+
+</Task>
+
+<Task id="t6" title="Clustered SEs and pass@k" agent="hands">
+
+Two small functions for the two structures that break the basic formula.
+
+```python
+# structure.py
+import numpy as np
+
+def clustered_se(x: np.ndarray, cluster_ids: np.ndarray) -> float:
+    """sqrt(sum over clusters of (sum of (x - mean) in cluster)^2) / n"""
+    ...
+
+def cluster_bootstrap_ci(x, cluster_ids, B=10_000, seed=0) -> tuple[float, float]:
+    """Resample whole clusters with replacement; score all questions in the drawn clusters."""
+    ...
+
+def pass_at_k(n: int, c: int, k: int) -> float:
+    """Unbiased estimator from Chen et al. 2021: 1 - C(n-c, k) / C(n, k)."""
+    ...
+```
+
+Test `clustered_se` on simulated data: 50 clusters of 10, where each cluster's accuracy is drawn from `rng.beta(2.8, 1.2)` (mean 0.7). Compare it with the naive SE and with the actual spread of the mean over 2,000 simulated datasets. For `pass_at_k`, check `pass_at_k(10, 3, 1) == 0.3`, `pass_at_k(10, 3, 5) ≈ 0.917`, and that it returns 1.0 when `n − c < k`. The Codex paper gives a product form that avoids huge binomial coefficients; try to derive it before you look.
+
+</Task>
+
+<Task id="t7" title="Apply it to a real pair, and write the result" agent="review">
+
+Pick one (or both):
+
+- **Two quantizations.** From [Smaller numbers, same model?](/lessons/quantization/), `eval_small.py` saved per-question GSM8K results for bf16 and each quantized format, 200 problems at temperature 0. Build a CSV with `qid, bf16, q4_k_m` and run `ci.py`, `paired.py` and `tests.py` on it.
+- **Your ranker.** Two checkpoints of the cross-encoder, per-query NDCG@10 on the same eval queries. NDCG isn't 0/1, so McNemar doesn't apply. Use the paired bootstrap and `sign_flip_p`, which don't care. If you know which customer or session each query came from, add a cluster-bootstrap version and compare the widths.
+
+Before running, use `power.py` to write down the smallest gap your set can detect. Then write the one-paragraph result statement, in the style of the example at the end of The Idea: each score with its CI, the paired gap with its CI and method, the number of disagreements (or wins and losses per query), the test p-value, and one sentence on the noise you did *not* measure. Have an agent review the paragraph for overclaiming and for anything a skeptical reviewer would ask.
+
+</Task>
+
+<DoneWhen>
+
+- `ci.py`, `paired.py`, `tests.py` reproduce the fake-data numbers in Measure to within a tenth of a point (bootstrap results move a little with the seed).
+- `noise.py` gives you the A/A false-positive table and the power at n = 500, and `power.py` agrees with it by simulation.
+- `clustered_se` tracks the true spread on clustered fake data while the naive SE doesn't.
+- You have a written result paragraph for a real pair of models, and you can defend every number in it out loud.
+
+</DoneWhen>
+
+## Measure
+
+Fill in your predictions before each run, then your numbers. The "mine" column is from my runs on the fake data and simulations above (NumPy, fixed seeds); yours should be very close for anything deterministic and within a few tenths for anything bootstrapped or simulated.
+
+| Quantity | Prediction | Yours | Mine |
+| --- | --- | --- | --- |
+| SE of 70% on 500 questions | | | 2.05 pts (95% CI ±4.0) |
+| A: score and 95% CI (formula) | | | 73.2%, 69.3 to 77.1 |
+| A: bootstrap CI | | | 69.2 to 77.0 |
+| B − A, unpaired 95% CI | | | +2.6, −2.8 to +8.0 |
+| B − A, paired CLT CI | | | +2.6, +0.8 to +4.4 |
+| B − A, paired bootstrap CI | | | +0.8 to +4.4 |
+| Correlation of A and B | | | 0.89 |
+| McNemar exact p (4 vs 17) | | | 0.0072 |
+| Sign-flip permutation p | | | ≈ 0.007 |
+| A/A: P(B ahead ≥ 0.8 pts), disagree 10% | | | 31% |
+| A/A: same, disagree 20% | | | 36% |
+| A/A: same, unpaired | | | 41% |
+| Power at n = 500, true +2 pts, disagree 10% | | | 25% |
+| n for 80% power, +2 pts, disagree 10% | | | ≈ 1,950 (simulated 78% at 2,000) |
+| Clustered (50 × 10, ρ ≈ 0.2): naive SE vs clustered SE | | | 2.0 vs 3.4 pts |
+| Best of 20 null prompts: mean inflation | | | +2.5 pts |
+| Real pair: smallest detectable gap | | | |
+| Real pair: paired gap and CI | | | |
+
+What the numbers should tell you:
+
+**The single-model intervals are wide, and the bootstrap agrees with the formula.** At n = 500 the two methods match to a tenth of a point. At n = 20 with 19 right, they don't: the formula's upper end goes above 100%, which is the formula telling you its bell-curve assumption has broken. The bootstrap interval is cramped against 100% in the other direction. Neither is good at that size, which is what the Wilson interval is for.
+
+**The paired interval is about 3 times narrower than the unpaired one.** With correlation 0.89, `Var(A) + Var(B) − 2 Cov` is about 11% of `Var(A) + Var(B)`, and the square root of 0.11 is about 0.33. Pairing didn't create evidence; it stopped the 479 agreeing questions from adding noise to the comparison.
+
+**The A/A table is the Slack lesson.** Two identical models, 500 questions, and one of them "wins" by 0.8 points or more a third of the time (and by 0.8 in *either* direction about two-thirds of the time). A 0.8-point gain at n = 500 is not weak evidence. It is close to no evidence.
+
+**Power at 500 is 25% for a real 2-point gain.** Your eval set is usually too small for the effects you care about. Better to know before running than to conclude "no effect" from an experiment that could barely have found one.
+
+**Real pair, quantization.** With 200 GSM8K problems, even a paired comparison can only reliably see gaps of several points (put your disagreement rate into the power calculator). Expect Q8 and FP8 to be indistinguishable from bf16 and the 4-bit formats to be "within a few points, can't tell" unless something is broken, while the disagreement count shows how many individual answers flipped. That's the right conclusion to write, and the paragraph should say what n would be needed to see a 1-point loss.
+
+## Break It
+
+**1. Misalign the rows.** In `load.py`, delete the `rows.sort(...)` line, then shuffle the rows of one model's results before joining (in real life: one results file in question order and the other in completion order, as an async eval loop writes them). Rerun `paired.py`. On my run, the "paired" interval went from +0.8 to +4.4 to **−3.1 to +8.3**, the disagreement rate jumped from 4% to 42%, and McNemar's p went from 0.007 to 0.41. Nothing crashes. The paired analysis silently became a bad unpaired one. Always join on question ID, and assert the IDs match.
+
+**2. Peek and stop early.** Two equal models (A/A). Check McNemar's p after every 50 questions, up to 1,000, and stop as soon as p is below 0.05. In my simulation that "found" a significant difference **16%** of the time, against **4%** when testing once at the end (the exact test is slightly conservative). Every peek is another chance for luck. If you must watch results come in, decide n in advance with `power.py`, or use methods built for sequential testing.
+
+**3. Resample the wrong unit.** Sample 5 answers per question at temperature 0.7 (or fake it: 100 questions, each with its own p_i, 5 Bernoulli draws). Bootstrap over the 500 *answers* as if they were independent, then over the 100 *questions*, carrying each question's 5 answers. The first interval is much too narrow. Same with clusters: bootstrap the 500 clustered questions from t6 instead of the 50 documents and the interval shrinks back to the naive, wrong, width. The rule: resample whatever was independently drawn.
+
+**4. Tune on the test set.** Generate 20 "prompts" with zero true effect (`fake_pair` with `gap=0` against one shared baseline vector), pick the best on 500 questions, and record its gain. Then score that same prompt on a fresh 500. Repeat 1,000 times. The selected gain averages around +2.5 points; the confirmed gain averages around zero. Now add a Bonferroni-corrected paired test to the selection and see how rarely any prompt survives.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. A model scores 72.0% on 500 questions. What does a 95% confidence interval on that mean, and roughly how wide is it?</summary>
+
+The 500 questions are a sample from all the questions of that kind, so 72.0% is an estimate of the model's true accuracy on the whole population. The standard error is √(0.72 × 0.28 / 500) ≈ 2 points, and the 95% interval is about ±1.96 standard errors, so roughly 68% to 76%. In words: if we repeated the whole thing with fresh question sets, intervals built this way would contain the true accuracy 95% of the time. Practically, any true accuracy between about 68 and 76 is consistent with what we saw. To halve the width you need four times as many questions.
+
+</details>
+
+<details>
+<summary>2. Two models' 95% intervals overlap. Your colleague says the difference isn't significant. When are they wrong, and what should you compute instead?</summary>
+
+They're wrong whenever the two models were scored on the same questions, which is almost always. Overlapping separate intervals ignore that both models tend to succeed and fail on the same questions; that shared part cancels in the difference. Compute the per-question difference d = B − A and the interval of its mean (or a paired bootstrap that resamples question indices once and scores both models on them), or run McNemar's test on the disagreements. With highly correlated models the paired interval can be three times narrower than the unpaired one, so it can exclude zero while the separate intervals overlap a lot. Even for independent samples, overlapping 95% intervals don't imply p above 0.05; the unpaired test on the difference is also less strict than "no overlap".
+
+</details>
+
+<details>
+<summary>3. How does the bootstrap work, and when does it give the wrong answer?</summary>
+
+You can't draw new question sets from the population, so you draw them from your sample: pick n questions with replacement, recompute the metric, repeat thousands of times, and take the middle 95% of the results. It works for any metric, and for a gap between models you resample indices once per round and score both models on them. It goes wrong when the things you resample aren't independent: questions clustered by document, several sampled answers per question, queries from the same user. Then you must resample the independent unit (documents, questions, users). It's also poor at very small n or at scores near 0% or 100%, where the resamples barely vary.
+
+</details>
+
+<details>
+<summary>4. You need to detect a 1-point improvement between two checkpoints. How many questions, and how does that scale?</summary>
+
+Paired, at 95% confidence and 80% power, n ≈ 7.85 × (disagreement rate − gap²) / gap². If the checkpoints disagree on 10% of questions, that's about 7,800 questions; unpaired it would be about 33,000 per model. It scales as one over the gap squared: halving the gap you care about quadruples the questions, and doubling the disagreement rate doubles them. If you can't get that many questions, you can reduce the noise instead: sample several answers per question at temperature (only shrinks the sampling part), use a continuous score like the probability of the correct answer instead of 0/1, or make the two systems more comparable so they disagree less. And if training recipes are what you compare, you also need several seeds per recipe, because run-to-run variance adds on top.
+
+</details>
+
+<details>
+<summary>5. You tried 20 prompt variants and the best is +2 points on your eval (p = 0.03). What do you report?</summary>
+
+Nothing yet. With 20 tries, the chance that at least one passes p below 0.05 by luck is about 64%, and the best of 20 null variants is inflated by around 2.5 points on a 500-question set: the winner's curse. Either correct for the number of tries (Bonferroni: require p below 0.0025) or, better, confirm the chosen prompt once on a held-out set nobody has used for any decision, and report the held-out paired gap with its interval. If it holds up there, it's real; the dev-set number is never the one you report.
+
+</details>
+
+## Go Deeper
+
+- **Evan Miller, "Adding Error Bars to Evals: A Statistical Approach to Language Model Evaluations"** (Anthropic, November 2024; arXiv 2411.00640), with a shorter companion post on Anthropic's research blog, "A statistical approach to model evaluations". The key reference for this lesson: the question-sampling view, clustered standard errors, variance from resampling answers, paired differences and power, all aimed at LLM evals, with formulas you can copy.
+- **Student (W. S. Gosset), "The Probable Error of a Mean"**, Biometrika, 1908. The original small-sample paper. The sleeping-drug example is a paired comparison, and it's short enough to read in one sitting.
+- **Bradley Efron and Robert Tibshirani, _An Introduction to the Bootstrap_** (Chapman & Hall, 1993). The standard book by the bootstrap's inventor. Read the early chapters for the idea and the chapter on confidence intervals for why the simple percentile method sometimes needs fixing.
+- **Mark Chen et al., ["Evaluating Large Language Models Trained on Code"](https://arxiv.org/abs/2107.03374)** (OpenAI, 2021). The Codex/HumanEval paper. Section 2.1 defines the unbiased pass@k estimator and gives the numerically stable code.
+- **Rotem Dror, Gili Baumer, Segev Shlomov and Roi Reichart, "The Hitchhiker's Guide to Testing Statistical Significance in Natural Language Processing"** (ACL 2018). A practical guide to which test fits which metric, and a survey of how rarely NLP papers did any of it.
+- **Dallas Card et al., "With Little Power Comes Great Responsibility"** (EMNLP 2020). Shows that many NLP comparisons are badly underpowered, with power calculations for common benchmarks. The paper version of "Measure" above.
+- **Jesse Dodge et al., "Fine-Tuning Pretrained Language Models: Weight Initializations, Data Orders, and Early Stopping"** (2020). How much the random seed alone moves fine-tuning results. Read it before you compare two training recipes with one run each.
+- **Quinn McNemar, "Note on the sampling error of the difference between correlated proportions or percentages"**, Psychometrika, 1947. The source of McNemar's test, if you want to see how little it needs.
+
+## Connections
+
+This lesson is the "how sure?" half of [Ranking metrics and eval sets](/lessons/ranking-metrics/): that lesson decides what to measure for your cross-encoder and builds the eval set; this one decides whether a change in it is real. The query, not the document, is the unit there too.
+
+It gives [Smaller numbers, same model?](/lessons/quantization/) the tools it asked for: put a paired interval and a disagreement count next to every quantized format, and "within noise" becomes a statement with a number in it.
+
+Next, [LLMs as judges](/lessons/llm-judges/) adds another noisy instrument: the judge itself. Its agreement with your labels is an estimate with an error bar, its position bias is a paired comparison (same pair, swapped order), and everything here applies. And [Why is the eval separate?](/lessons/why-evals-are-separate/) is the held-out-set idea from the winner's curse, taken seriously as a system design rule.

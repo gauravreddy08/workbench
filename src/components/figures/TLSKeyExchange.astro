@@ -1,0 +1,238 @@
+---
+// Diffie-Hellman, step by step, with paint and with numbers side by side.
+// Alice and Bob each keep a secret; Eve sees everything on the wire.
+// Toy mode (p = 23) lets you drag the secrets; "bigger" mode (p = 2^31 - 1) uses random secrets
+// and lets Eve brute-force for real in your browser, to feel how fast the work grows.
+---
+<div class="dhx" data-fig="tls-dh">
+  <div class="ctl dhx-top">
+    <button class="btn" type="button" data-size="toy" aria-pressed="true">Toy: p = 23</button>
+    <button class="btn" type="button" data-size="big" aria-pressed="false">Bigger: p = 2^31 - 1</button>
+  </div>
+
+  <div class="dhx-grid">
+    <div class="dhx-col">
+      <div class="label dhx-who">Alice <span>(private)</span></div>
+      <div class="dhx-cell" data-row="0"><span class="dhx-sw" data-paint="pub"></span><span class="dhx-txt" data-a="pub"></span></div>
+      <div class="dhx-cell" data-row="1"><span class="dhx-sw" data-paint="sa"></span><span class="dhx-txt" data-a="sec"></span></div>
+      <div class="dhx-cell" data-row="2"><span class="dhx-sw" data-paint="ma"></span><span class="dhx-txt" data-a="mix"></span></div>
+      <div class="dhx-cell" data-row="3"><span class="dhx-sw" data-paint="mb"></span><span class="dhx-txt" data-a="got"></span></div>
+      <div class="dhx-cell dhx-final" data-row="4"><span class="dhx-sw" data-paint="final-a"></span><span class="dhx-txt" data-a="key"></span></div>
+    </div>
+
+    <div class="dhx-col dhx-eve">
+      <div class="label dhx-who">Eve <span>(sees the wire)</span></div>
+      <div class="dhx-cell" data-row="0"><span class="dhx-sw" data-paint="pub"></span><span class="dhx-txt" data-e="pub"></span></div>
+      <div class="dhx-cell" data-row="1"><span class="dhx-sw dhx-unknown"></span><span class="dhx-txt">secrets never sent</span></div>
+      <div class="dhx-cell" data-row="2"><span class="dhx-sw" data-paint="ma"></span><span class="dhx-txt" data-e="ma"></span></div>
+      <div class="dhx-cell" data-row="3"><span class="dhx-sw" data-paint="mb"></span><span class="dhx-txt" data-e="mb"></span></div>
+      <div class="dhx-cell dhx-final" data-row="4"><span class="dhx-sw" data-paint="eve"></span><span class="dhx-txt" data-e="key"></span></div>
+    </div>
+
+    <div class="dhx-col">
+      <div class="label dhx-who">Bob <span>(private)</span></div>
+      <div class="dhx-cell" data-row="0"><span class="dhx-sw" data-paint="pub"></span><span class="dhx-txt" data-b="pub"></span></div>
+      <div class="dhx-cell" data-row="1"><span class="dhx-sw" data-paint="sb"></span><span class="dhx-txt" data-b="sec"></span></div>
+      <div class="dhx-cell" data-row="2"><span class="dhx-sw" data-paint="mb"></span><span class="dhx-txt" data-b="mix"></span></div>
+      <div class="dhx-cell" data-row="3"><span class="dhx-sw" data-paint="ma"></span><span class="dhx-txt" data-b="got"></span></div>
+      <div class="dhx-cell dhx-final" data-row="4"><span class="dhx-sw" data-paint="final-b"></span><span class="dhx-txt" data-b="key"></span></div>
+    </div>
+  </div>
+
+  <div class="ctl" data-toy-ctl>
+    <label>Alice's secret a <input type="range" min="1" max="21" value="6" data-in="a" /><output data-out="a">6</output></label>
+    <label>Bob's secret b <input type="range" min="1" max="21" value="15" data-in="b" /><output data-out="b">15</output></label>
+  </div>
+  <div class="ctl" data-big-ctl hidden>
+    <button class="btn" type="button" data-reroll>New random secrets</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-back>Back</button>
+    <button class="btn" type="button" data-next>Next step</button>
+    <button class="btn" type="button" data-brute>Eve: brute-force a</button>
+    <span class="label">step <span class="readout" data-stepno>1</span> / 5</span>
+  </div>
+  <p class="dhx-msg" data-msg></p>
+  <p class="dhx-msg" data-eve-msg></p>
+</div>
+
+<style>
+  .dhx-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .dhx-col { border: 1px solid var(--rule); background: var(--paper); padding: 8px; min-width: 0; }
+  .dhx-eve { border-style: dashed; border-color: var(--ink-3); background: var(--paper-2); }
+  .dhx-who { display: block; margin-bottom: 6px; color: var(--ink); }
+  .dhx-who span { color: var(--ink-3); text-transform: none; letter-spacing: 0; }
+  .dhx-cell { display: flex; gap: 8px; align-items: center; min-height: 44px; padding: 4px 2px; border-top: 1px solid var(--rule); transition: opacity 0.2s; }
+  .dhx-cell.off { opacity: 0.12; }
+  .dhx-cell.now { background: var(--blue-wash); }
+  .dhx-final { border-top: 1px solid var(--ink); }
+  .dhx-sw { flex: none; width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--ink-3); }
+  .dhx-unknown { background: repeating-linear-gradient(45deg, var(--paper-2), var(--paper-2) 3px, var(--rule) 3px, var(--rule) 6px); }
+  .dhx-txt { font-family: var(--mono); font-size: 11.5px; line-height: 1.35; color: var(--ink-2); overflow-wrap: anywhere; min-width: 0; }
+  .dhx-txt :global(b) { color: var(--blue); font-weight: 600; }
+  .dhx-msg { font-family: var(--mono); font-size: 12px; line-height: 1.6; color: var(--ink-2); margin: 12px 0 0; }
+  .dhx .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .dhx-top { margin: 0 0 12px; }
+  .dhx .ctl[hidden] { display: none; }
+  @media (max-width: 560px) {
+    .dhx-grid { grid-template-columns: 1fr 1fr; }
+    .dhx-eve { grid-column: 1 / 3; grid-row: 2; }
+  }
+</style>
+
+<script>
+  // Paint colours come from theme variables, mixed in oklab so the analogy works in both themes.
+  const PUB = 'var(--ok)';
+  const SA = 'var(--warn)';
+  const SB = 'var(--blue)';
+  const MA = `color-mix(in oklab, ${PUB}, ${SA})`;
+  const MB = `color-mix(in oklab, ${PUB}, ${SB})`;
+  // Final: one third each. Alice adds her secret to Bob's mix; Bob adds his to Alice's.
+  const FA = `color-mix(in oklab, ${MB} 66.67%, ${SA})`;
+  const FB = `color-mix(in oklab, ${MA} 66.67%, ${SB})`;
+  // Eve can only mix the two public mixes: half common paint, a quarter of each secret. Wrong shade.
+  const FE = `color-mix(in oklab, ${MA}, ${MB})`;
+
+  function modpow(base: bigint, exp: bigint, mod: bigint): bigint {
+    let r = 1n; base %= mod;
+    while (exp > 0n) { if (exp & 1n) r = (r * base) % mod; base = (base * base) % mod; exp >>= 1n; }
+    return r;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="tls-dh"]').forEach((root) => {
+    const $ = <T extends HTMLElement>(s: string) => root.querySelector<T>(s)!;
+    const $$ = (s: string) => [...root.querySelectorAll<HTMLElement>(s)];
+    let mode: 'toy' | 'big' = 'toy';
+    let step = 0;
+    let p = 23n, g = 5n, a = 6n, b = 15n;
+    let bruteTimer: number | undefined;
+    let bruteRun = 0;
+
+    const paint: Record<string, string> = { pub: PUB, sa: SA, sb: SB, ma: MA, mb: MB, 'final-a': FA, 'final-b': FB, eve: FE };
+    $$('[data-paint]').forEach((el) => { el.style.background = paint[el.dataset.paint!]; });
+
+    function rand31(): bigint {
+      const u = new Uint32Array(1); crypto.getRandomValues(u);
+      return BigInt(2 + (u[0] % 2147483643)); // 2 .. p-2
+    }
+
+    const MSG = [
+      'Step 1. In the open, they agree on public numbers: a prime p and a generator g. Paint: a common colour anyone can buy.',
+      'Step 2. Each picks a secret number and keeps it. Paint: a secret colour that never leaves the house.',
+      'Step 3. Each mixes: Alice computes A = g^a mod p, Bob computes B = g^b mod p. Mixing is easy; un-mixing is the hard direction.',
+      'Step 4. They swap A and B over the wire. Eve now has p, g, A and B: everything that was ever sent.',
+      'Step 5. Each adds their own secret to what they received: Alice B^a mod p, Bob A^b mod p. Same number, because both equal g^(ab) mod p. Eve has no way to combine A and B into it.',
+    ];
+
+    function render() {
+      const A = modpow(g, a, p), B = modpow(g, b, p);
+      const KA = modpow(B, a, p), KB = modpow(A, b, p);
+      const set = (sel: string, html: string) => { $(sel).innerHTML = html; };
+      set('[data-a="pub"]', `p = ${p}<br>g = ${g}`);
+      set('[data-b="pub"]', `p = ${p}<br>g = ${g}`);
+      set('[data-e="pub"]', `p = ${p}<br>g = ${g}`);
+      set('[data-a="sec"]', `a = <b>${a}</b>`);
+      set('[data-b="sec"]', `b = <b>${b}</b>`);
+      set('[data-a="mix"]', `A = g^a mod p<br>= ${A}`);
+      set('[data-b="mix"]', `B = g^b mod p<br>= ${B}`);
+      set('[data-a="got"]', `got B = ${B}`);
+      set('[data-b="got"]', `got A = ${A}`);
+      set('[data-e="ma"]', `A = ${A}`);
+      set('[data-e="mb"]', `B = ${B}`);
+      set('[data-a="key"]', `B^a mod p<br>= <b>${KA}</b>`);
+      set('[data-b="key"]', `A^b mod p<br>= <b>${KB}</b>`);
+      const naive = (A * B) % p;
+      set('[data-e="key"]', `A·B mod p = ${naive}<br>(not the key)`);
+
+      $$('.dhx-cell').forEach((c) => {
+        const r = +c.dataset.row!;
+        c.classList.toggle('off', r > step);
+        c.classList.toggle('now', r === step);
+      });
+      // Eve's row 3 (B) shows from step 3, row 2 (A) also only once sent.
+      $$('.dhx-eve .dhx-cell').forEach((c) => {
+        const r = +c.dataset.row!;
+        const visibleFrom = r === 0 ? 0 : r === 1 ? 1 : r === 4 ? 4 : 3;
+        c.classList.toggle('off', step < visibleFrom);
+      });
+      $('[data-msg]').textContent = MSG[step];
+      $('[data-stepno]').textContent = String(step + 1);
+      $<HTMLButtonElement>('[data-back]').disabled = step === 0;
+      $<HTMLButtonElement>('[data-next]').disabled = step === 4;
+      $<HTMLButtonElement>('[data-brute]').disabled = step < 3;
+    }
+
+    function stopBrute() { bruteRun++; if (bruteTimer) cancelAnimationFrame(bruteTimer); bruteTimer = undefined; }
+
+    function brute() {
+      stopBrute();
+      const run = bruteRun;
+      const eveMsg = $('[data-eve-msg]');
+      const A = Number(modpow(g, a, p));
+      const P = Number(p), G = Number(g);
+      // Walk x = 1, 2, 3... keeping cur = g^x mod p. Every number fits in a double (p < 2^31, g < 8).
+      let x = 1, cur = G;
+      const t0 = performance.now();
+      const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+      const chunk = mode === 'toy' ? (reduce ? 1e9 : 1) : 4_000_000;
+      const tick = () => {
+        if (run !== bruteRun) return;
+        for (let i = 0; i < chunk; i++) {
+          if (cur === A) {
+            const ms = performance.now() - t0;
+            eveMsg.innerHTML = `Eve found a = <span class="readout">${x}</span> after ${x.toLocaleString()} tries (${ms < 1000 ? ms.toFixed(0) + ' ms' : (ms / 1000).toFixed(1) + ' s'}). Now she computes B^a mod p and reads everything. ` +
+              (mode === 'toy' ? 'With p = 23 there are only 22 candidates.' : `That was a 31-bit prime. Each extra bit doubles her work. Real TLS uses X25519 (a ~255-bit curve, about 2^128 work by the best known attack) or 2048-bit primes (about 2^112). At a billion billion tries a second, 2^128 takes about 10^13 years.`);
+            return;
+          }
+          x++; cur = (cur * G) % P;
+          if (x >= P) { eveMsg.textContent = 'Searched everything without a match (should not happen).'; return; }
+        }
+        eveMsg.innerHTML = `Eve trying x = <span class="readout">${x.toLocaleString()}</span> ... is g^x mod p = A?`;
+        bruteTimer = requestAnimationFrame(tick);
+      };
+      if (mode === 'toy' && !reduce) {
+        // Slow it down so you can watch each guess.
+        const slow = () => {
+          if (run !== bruteRun) return;
+          if (cur === A) { tick(); return; }
+          eveMsg.innerHTML = `Eve tries x = <span class="readout">${x}</span>: g^x mod p = ${cur}${cur === A ? '' : ', not A'}`;
+          x++; cur = (cur * G) % P;
+          window.setTimeout(slow, 220);
+        };
+        slow();
+      } else tick();
+    }
+
+    function setMode(m: 'toy' | 'big') {
+      stopBrute();
+      mode = m;
+      $$('[data-size]').forEach((btn) => btn.setAttribute('aria-pressed', String(btn.dataset.size === m)));
+      $('[data-toy-ctl]').hidden = m !== 'toy';
+      $('[data-big-ctl]').hidden = m !== 'big';
+      if (m === 'toy') {
+        p = 23n; g = 5n;
+        a = BigInt($<HTMLInputElement>('[data-in="a"]').value);
+        b = BigInt($<HTMLInputElement>('[data-in="b"]').value);
+      } else {
+        p = 2147483647n; g = 7n; a = rand31(); b = rand31();
+      }
+      $('[data-eve-msg]').textContent = '';
+      render();
+    }
+
+    root.querySelectorAll<HTMLInputElement>('[data-in]').forEach((inp) => inp.addEventListener('input', () => {
+      stopBrute();
+      const v = BigInt(inp.value);
+      if (inp.dataset.in === 'a') a = v; else b = v;
+      root.querySelector<HTMLOutputElement>(`[data-out="${inp.dataset.in}"]`)!.textContent = inp.value;
+      $('[data-eve-msg]').textContent = '';
+      render();
+    }));
+    $$('[data-size]').forEach((btn) => btn.addEventListener('click', () => setMode(btn.dataset.size as 'toy' | 'big')));
+    $('[data-reroll]').addEventListener('click', () => { stopBrute(); a = rand31(); b = rand31(); $('[data-eve-msg]').textContent = ''; render(); });
+    $('[data-next]').addEventListener('click', () => { if (step < 4) step++; render(); });
+    $('[data-back]').addEventListener('click', () => { if (step > 0) step--; render(); });
+    $('[data-brute]').addEventListener('click', brute);
+    render();
+  });
+</script>

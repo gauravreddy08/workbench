@@ -1,0 +1,224 @@
+---
+// Interactive: a sliding-window sender (go-back-N, cumulative acks, one retransmission timer)
+// between a client and a server, drawn as a sequence diagram with time flowing down.
+// Link model: each packet takes 12 ms to put on the wire, 48 ms to cross; acks are tiny (no
+// serialization delay). So RTT ≈ 108 ms and the pipe holds 9 packets. Loss applies to data and acks.
+// The diagram shows the first 1.2 s of one run; the readouts come from an offline run with
+// the same settings (10 minutes of simulated time), so they are stable instead of being at the mercy of one roll of the dice.
+---
+<div class="tcps" data-fig="tcp-seq">
+  <svg viewBox="0 0 480 652" role="img" aria-label="Sequence diagram of packets and acks between a client and a server"></svg>
+  <div class="tcps-read">
+    <div><span class="label">Goodput</span><span class="readout" data-o="gp">–</span></div>
+    <div><span class="label">Of link speed</span><span class="readout" data-o="pct">–</span></div>
+    <div><span class="label">No-loss ceiling</span><span class="readout" data-o="ceil">–</span></div>
+    <div><span class="label">Sends that were retries</span><span class="readout" data-o="retx">–</span></div>
+    <div><span class="label">Timeouts / min</span><span class="readout" data-o="to">–</span></div>
+  </div>
+  <div class="ctl">
+    <label>Loss <input type="range" min="0" max="30" step="1" value="0" data-k="loss" /><output></output></label>
+    <label>Window <input type="range" min="1" max="16" step="1" value="1" data-k="win" /><output></output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-k="replay">Replay</button>
+    <button class="btn" type="button" data-k="dice">New dice</button>
+  </div>
+  <p class="tcps-note">Solid black = data, blue = a retransmitted copy, dashed = ack (carrying "next number I want"), × = dropped. RTO = the retransmission timer firing. Link: 12 ms to send one 1,200-byte packet (100 KB/s), 48 ms to cross, RTT ≈ 108 ms. Readouts: a 10-minute run with these settings.</p>
+</div>
+
+<style>
+  .tcps svg { width: 100%; max-width: 480px; }
+  .tcps-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)); gap: 10px 16px; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 8px; }
+  .tcps-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .tcps-read .label { font-size: 10px; }
+  .tcps-read .readout { font-size: 17px; }
+  .tcps-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const S = 12; // ms to serialize one data packet
+  const D = 48; // ms one-way propagation
+  const RTT = 2 * D + S;
+  const RTO = 250; // ms
+  const SHOW = 1200; // ms drawn
+  const PX = 0.5; // px per ms
+  const TOP = 42;
+  const CX = 96, SX = 384;
+  const PKT_BYTES = 1200;
+
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  type Data = { t0: number; t1: number; seq: number; lost: boolean; retx: boolean };
+  type Ack = { t0: number; t1: number; ack: number; lost: boolean };
+  type Ev = { t: number; kind: 'data' | 'ack' | 'rto'; v: number };
+
+  function simulate(W: number, p: number, seed: number, tEnd: number, record: boolean) {
+    const r = rng(seed);
+    const q: Ev[] = [];
+    const push = (e: Ev) => {
+      let i = q.length;
+      while (i > 0 && q[i - 1].t > e.t) i--;
+      q.splice(i, 0, e);
+    };
+    const datas: Data[] = [], acks: Ack[] = [], rtos: number[] = [];
+    let base = 0, next = 0, highest = 0, linkFree = 0, expected = 0;
+    let timerGen = 0, timerOn = false;
+    let sent = 0, retx = 0, timeouts = 0;
+
+    const startTimer = (now: number) => { timerGen++; timerOn = true; push({ t: now + RTO, kind: 'rto', v: timerGen }); };
+    const transmit = (seq: number, now: number) => {
+      const t0 = Math.max(now, linkFree);
+      linkFree = t0 + S;
+      const isRetx = seq < highest;
+      if (!isRetx) highest = seq + 1;
+      const lost = r() < p;
+      sent++; if (isRetx) retx++;
+      if (record && t0 < SHOW) datas.push({ t0, t1: t0 + S + D, seq, lost, retx: isRetx });
+      if (!lost) push({ t: t0 + S + D, kind: 'data', v: seq });
+    };
+    const fill = (now: number) => {
+      while (next < base + W) { transmit(next, now); next++; }
+      if (!timerOn && base < next) startTimer(now);
+    };
+
+    fill(0);
+    while (q.length) {
+      const e = q.shift()!;
+      if (e.t > tEnd) break;
+      if (e.kind === 'data') {
+        if (e.v === expected) expected++;
+        const lost = r() < p;
+        if (record && e.t < SHOW) acks.push({ t0: e.t, t1: e.t + D, ack: expected, lost });
+        if (!lost) push({ t: e.t + D, kind: 'ack', v: expected });
+      } else if (e.kind === 'ack') {
+        if (e.v > base) {
+          base = e.v;
+          if (base >= next) { timerOn = false; timerGen++; }
+          else startTimer(e.t);
+          fill(e.t);
+        }
+      } else if (e.v === timerGen && timerOn) {
+        timeouts++;
+        if (record && e.t < SHOW) rtos.push(e.t);
+        next = base; // go back N
+        timerOn = false;
+        fill(e.t);
+      }
+    }
+    return { datas, acks, rtos, delivered: expected, sent, retx, timeouts };
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const y = (t: number) => TOP + t * PX;
+
+  let figCount = 0;
+  document.querySelectorAll<HTMLElement>('[data-fig="tcp-seq"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const lossIn = root.querySelector<HTMLInputElement>('[data-k="loss"]')!;
+    const winIn = root.querySelector<HTMLInputElement>('[data-k="win"]')!;
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const clipId = `tcps-clip-${figCount++}`;
+    let seed = 3;
+    let anim = 0;
+
+    function draw(animate: boolean) {
+      const W = +winIn.value, p = +lossIn.value / 100;
+      (lossIn.nextElementSibling as HTMLOutputElement).value = `${lossIn.value}%`;
+      (winIn.nextElementSibling as HTMLOutputElement).value = `${W} pkt${W > 1 ? 's' : ''}`;
+      const run = simulate(W, p, seed, SHOW + 400, true);
+
+      svg.replaceChildren();
+      const defs = el('defs', {});
+      const clip = el('clipPath', { id: clipId });
+      const clipRect = el('rect', { x: 0, y: 0, width: 480, height: 652 });
+      clip.appendChild(clipRect); defs.appendChild(clip); svg.appendChild(defs);
+
+      // axes
+      svg.appendChild(el('text', { x: CX, y: 18, 'text-anchor': 'middle', class: 'strong' }, 'CLIENT'));
+      svg.appendChild(el('text', { x: SX, y: 18, 'text-anchor': 'middle', class: 'strong' }, 'SERVER'));
+      svg.appendChild(el('text', { x: CX, y: 32, 'text-anchor': 'middle' }, 'SENDER'));
+      svg.appendChild(el('text', { x: SX, y: 32, 'text-anchor': 'middle' }, 'RECEIVER'));
+      svg.appendChild(el('line', { x1: CX, y1: TOP, x2: CX, y2: y(SHOW), class: 'ink', 'stroke-width': 1.5 }));
+      svg.appendChild(el('line', { x1: SX, y1: TOP, x2: SX, y2: y(SHOW), class: 'ink', 'stroke-width': 1.5 }));
+      for (let t = 0; t <= SHOW; t += 200) {
+        svg.appendChild(el('line', { x1: CX - 5, y1: y(t), x2: CX, y2: y(t), class: 'ink', 'stroke-width': 1 }));
+        svg.appendChild(el('text', { x: CX - 9, y: y(t) + 4, 'text-anchor': 'end' }, `${t} ms`));
+      }
+      svg.appendChild(el('text', { x: 240, y: y(SHOW) + 18, 'text-anchor': 'middle' }, 'TIME FLOWS DOWN'));
+
+      const g = el('g', { 'clip-path': `url(#${clipId})` });
+      svg.appendChild(g);
+
+      for (const a of run.acks) {
+        const x2 = a.lost ? SX - (SX - CX) * 0.55 : CX;
+        const t2 = a.lost ? a.t0 + D * 0.55 : a.t1;
+        g.appendChild(el('line', { x1: SX, y1: y(a.t0), x2, y2: y(Math.min(t2, SHOW)), style: 'stroke:var(--ink-3)', 'stroke-width': 1, 'stroke-dasharray': '3 3' }));
+        if (a.lost && t2 < SHOW) g.appendChild(el('text', { x: x2, y: y(t2) + 4, 'text-anchor': 'middle', style: 'fill:var(--warn)', 'font-size': 13 }, '×'));
+      }
+      let lastLbl = -99;
+      for (const d of run.datas) {
+        const t1 = d.lost ? d.t0 + S + D * 0.55 : d.t1;
+        const x2 = d.lost ? CX + (SX - CX) * 0.55 : SX;
+        const ln = el('line', { x1: CX, y1: y(d.t0), x2, y2: y(Math.min(t1, SHOW)), 'stroke-width': d.retx ? 1.6 : 1.2 });
+        ln.setAttribute('class', d.retx ? 'blue' : 'ink');
+        g.appendChild(ln);
+        if (d.lost && t1 < SHOW) g.appendChild(el('text', { x: x2, y: y(t1) + 4, 'text-anchor': 'middle', style: 'fill:var(--warn)', 'font-size': 13 }, '×'));
+        if (y(d.t0) - lastLbl >= 12) {
+          g.appendChild(el('text', { x: CX + 5, y: y(d.t0) - 2, class: d.retx ? 'blue-t' : '', 'font-size': 9.5 }, `#${d.seq}`));
+          lastLbl = y(d.t0);
+        }
+      }
+      for (const t of run.rtos) {
+        g.appendChild(el('line', { x1: CX - 30, y1: y(t), x2: CX, y2: y(t), style: 'stroke:var(--warn)', 'stroke-width': 1.5 }));
+        g.appendChild(el('text', { x: CX - 33, y: y(t) + 4, 'text-anchor': 'end', style: 'fill:var(--warn)' }, 'RTO'));
+      }
+
+      // offline numbers
+      const T = 600000;
+      const big = simulate(W, p, seed + 101, T, false);
+      const kbps = (big.delivered * PKT_BYTES) / (T / 1000) / 1000;
+      const link = PKT_BYTES / S; // KB/s (bytes per ms)
+      const ceil = Math.min(1, (W * S) / RTT) * link;
+      out('gp').textContent = `${kbps.toFixed(1)} KB/s`;
+      out('pct').textContent = `${Math.round((100 * kbps) / link)}%`;
+      out('ceil').textContent = `${ceil.toFixed(0)} KB/s`;
+      out('retx').textContent = big.sent ? `${Math.round((100 * big.retx) / big.sent)}%` : '0%';
+      out('to').textContent = `${Math.round(big.timeouts / (T / 60000))}`;
+
+      cancelAnimationFrame(anim);
+      if (animate && !reduce) {
+        const start = performance.now();
+        const dur = 3200;
+        const step = (now: number) => {
+          const f = Math.min(1, (now - start) / dur);
+          clipRect.setAttribute('height', String(TOP + f * SHOW * PX + 2));
+          if (f < 1) anim = requestAnimationFrame(step);
+        };
+        clipRect.setAttribute('height', String(TOP));
+        anim = requestAnimationFrame(step);
+      }
+    }
+
+    lossIn.addEventListener('input', () => draw(false));
+    winIn.addEventListener('input', () => draw(false));
+    root.querySelector('[data-k="replay"]')!.addEventListener('click', () => draw(true));
+    root.querySelector('[data-k="dice"]')!.addEventListener('click', () => { seed = Math.floor(Math.random() * 1e9); draw(true); });
+    draw(false);
+  });
+</script>

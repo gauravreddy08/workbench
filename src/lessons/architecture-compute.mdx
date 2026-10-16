@@ -1,0 +1,721 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import ArchFlopBreakdown from '../components/figures/ArchFlopBreakdown.astro';
+import ArchIsoFlop from '../components/figures/ArchIsoFlop.astro';
+
+## Today
+
+- Count the FLOPs of a transformer forward pass from first principles, including the parts the famous `2N` rule leaves out, and check your count against PyTorch's own counter.
+- Explain where `6ND` comes from, and what MFU measures.
+- Say what "a fair comparison" means (equal parameters, equal FLOPs, equal wall-clock) and build an example where the answer flips depending on which one you pick.
+- Run a small isoFLOP sweep on the Spark comparing MHA, GQA and MQA, with tuned learning rates and more than one seed.
+- Separate "cheaper to train" from "cheaper to serve", measure both, and write a one-page answer to "which is more compute efficient, and for what?"
+
+Prerequisites: you have written a GPT from scratch (you have), and [the KV cache lesson](/lessons/kv-cache/) for why decoding reads the cache every step. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) helps for the inference half. Rough time: an evening to read and write the code, one night of Spark time for the sweep, an evening to measure and write up.
+
+## The Problem
+
+Three messages land in a team channel on the same afternoon.
+
+> "Swapped MHA for MQA in the 125M config. Val loss is 0.04 worse. MQA is out."
+
+> "GQA matches MHA and has 11% fewer parameters, so it's more efficient."
+
+> "Ran decode on both: GQA is 3x faster. Ship it."
+
+Each of these is a real measurement. None of them answers the question. The first one used the learning rate tuned for MHA on both models, ran one seed, and stopped both after the same number of steps. The second one is counting parameters, but nobody is paying for parameters; they are paying for GPU hours. The third one measured decoding at batch size 32 with long prompts, which is exactly where GQA shines; at batch size 1 with short prompts the gap is closer to 1.2x.
+
+"Compare the compute efficiency of two transformer variants" sounds like one experiment. It is really three decisions you have to make before you run anything: **what is held equal**, **what is measured**, and **which use (training or serving) you care about**. Get those wrong and you can make either variant win. This lesson is about making them on purpose.
+
+<Origin year="2020-2022" title="The same mistake, at the scale of the whole field">
+
+In January 2020, Jared Kaplan and colleagues at OpenAI published "Scaling Laws for Neural Language Models". They trained hundreds of models and found that loss falls as a smooth power law in parameters, data and compute. That gave everyone a common currency: instead of "my model beats yours", you could say "my model reaches your loss with 30% less compute". One of their conclusions was that, as your compute budget grows, you should spend most of it on a bigger model and comparatively little on more data. GPT-3 and Gopher were sized that way.
+
+In March 2022, Jordan Hoffmann and colleagues at DeepMind ("Training Compute-Optimal Large Language Models", the Chinchilla paper) redid the experiment and got a different answer: grow parameters and tokens about equally, roughly 20 tokens per parameter. A big part of the difference was a confounder. Kaplan's runs used a learning-rate schedule whose length was not matched to each run's length, so the shorter runs were handicapped and the comparison leaned toward big models trained briefly. Chinchilla, a 70B model trained on 1.4 trillion tokens, beat the 280B Gopher with the same compute.
+
+The lesson for us is not the 20. It is that a careful, famous comparison flipped because of how the runs were set up, not because of the models. Your two-variant comparison has the same failure modes in miniature.
+
+</Origin>
+
+## The Idea
+
+### The currency: a FLOP
+
+A <Term w="FLOP">One floating-point operation: a single add or a single multiply. "FLOPs" (lowercase s) is a count of them. "FLOP/s" is a rate: how many per second.</Term> is one add or one multiply on floating-point numbers. Counting them is the standard way to say how much arithmetic a model costs, because it doesn't depend on which GPU you used or how good your kernels are. Time depends on both. FLOPs depend on neither.
+
+Almost all the arithmetic in a transformer is matrix multiplication, and matrix multiplication has one rule worth tattooing somewhere: **multiplying an (m × k) matrix by a (k × n) matrix costs 2·m·k·n FLOPs.** There are m·n numbers in the output. Each one is a dot product of length k, which is k multiplies and (about) k adds. That's where the 2 comes from.
+
+Now look at it from one token's point of view.
+
+<Figure n="001" title="ONE MATMUL, COUNTED PER TOKEN" caption="One token's vector (length d) goes through a weight matrix with d × 4d entries. Every entry of the matrix gets used exactly once: one multiply, one add. So the cost per token is 2 FLOPs per weight, whatever the shape.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A row vector times a weight matrix, with each weight used once per token">
+  <rect x="20" y="96" width="120" height="20" class="fill-wash" stroke-width="1.2" />
+  <text x="80" y="88" text-anchor="middle" class="strong">x · 1 × d</text>
+  <text x="80" y="135" text-anchor="middle">ONE TOKEN</text>
+  <text x="165" y="111" text-anchor="middle" class="strong">×</text>
+  <rect x="190" y="40" width="200" height="120" class="fill-paper" stroke-width="1.2" />
+  <text x="290" y="30" text-anchor="middle" class="strong">W · d × 4d</text>
+  <line x1="230" y1="40" x2="230" y2="160" class="blue" stroke-width="2" />
+  <text x="290" y="180" text-anchor="middle">PARAMS = 4d²</text>
+  <text x="415" y="111" text-anchor="middle" class="strong">=</text>
+  <rect x="440" y="96" width="180" height="20" class="fill-paper" stroke-width="1.2" />
+  <rect x="476" y="96" width="9" height="20" class="fill-blue" />
+  <text x="530" y="88" text-anchor="middle" class="strong">y · 1 × 4d</text>
+  <line x1="480" y1="116" x2="480" y2="150" class="blue" stroke-width="1" />
+  <text x="480" y="164" text-anchor="middle" class="blue-t">ONE OUTPUT = DOT PRODUCT</text>
+  <text x="480" y="180" text-anchor="middle" class="blue-t">d MULTIPLIES + d ADDS</text>
+  <text x="20" y="214" class="strong">COST PER TOKEN = 4d OUTPUTS × 2d = 2 × (4d²) = 2 FLOPs PER PARAMETER</text>
+</svg>
+</Figure>
+
+That last line is the whole trick. Every weight matrix in the model gets touched exactly once per token in the forward pass, and each touch is a multiply and an add. So if the model has N parameters sitting in weight matrices, the forward pass costs about **2N FLOPs per token**. This is the famous rule, and it is a good first approximation. It is also wrong in two specific places, and at small scale both matter.
+
+### Where N comes from
+
+Take one standard block of a GPT with model width d (`d_model`) and an MLP that expands to 4d.
+
+- Attention projections: the Q, K, V and output matrices are each d × d. That's 4d² parameters.
+- MLP: up-projection d × 4d and down-projection 4d × d. That's 8d².
+
+So each layer holds about 12d² parameters, and with L layers, N ≈ 12·L·d² (ignoring the tiny LayerNorm and bias vectors). For GPT-2 small, L = 12 and d = 768: 12 × 12 × 768² ≈ 85M. That matches the usual "85M non-embedding parameters" for the 124M model; the other ~39M are the token and position embeddings.
+
+People usually define N as the <Term w="non-embedding parameters">The parameters in the transformer blocks, not counting the token embedding table (vocab × d) or position embeddings. Kaplan et al. found loss scales more cleanly with this count.</Term>, because an embedding lookup is not a matmul. Fetching row 4,182 of a table costs no arithmetic at all.
+
+### The two things 2N leaves out
+
+**1. The attention itself.** The projections are matmuls with weights. But inside attention there are two more matmuls that use no weights at all: the scores Q·Kᵀ, and the mixing of values, softmax(scores)·V. Their cost depends on how many tokens are in the context, not on N.
+
+Count it for one token at position t, in one layer. Its query (length d once you line up all the heads side by side) gets dotted with t keys: 2·t·d FLOPs. Then the t attention weights mix t value vectors of length d: another 2·t·d. So **4·t·d per layer per token.**
+
+Averaged over a sequence of length T, t depends on how you count:
+
+- If the kernel computes the full T × T square and then masks the future out (the simple implementation, and how PyTorch's FLOP counter counts it), every token pays as if t = T: **4·L·T·d per token.**
+- If you only count the half of the square a causal model actually needs (each position sees, on average, T/2 earlier ones), it is **2·L·T·d per token.** This is the term in Kaplan et al.'s formula, written 2·n_layer·n_ctx·d_attn. Fused attention kernels like FlashAttention do skip most of the masked-out blocks, so this is closer to the work actually done.
+
+Neither is "the" right answer. Pick one, say which, and use the same one for both variants.
+
+How big is it next to 2N? Divide: 4·L·T·d over 2·12·L·d² is **T / (6d)** (full counting) or T / (12d) (causal counting). With d = 768 and T = 1024, full counting gives 22% extra. With a tiny model, d = 256 and T = 2048, it is 133%: the attention costs more than all the weights combined.
+
+**2. The output head.** The last step turns each token's d-vector into scores over the whole vocabulary: a d × V matmul, 2·d·V FLOPs per token. With weight tying, those weights *are* the embedding table, so they're excluded from N, yet this matmul is very real. For GPT-2 small: 2 × 768 × 50,304 ≈ 77M FLOPs per token, against 2N ≈ 170M. At large scale it's a rounding error. At the sizes you can train on one Spark, it's a quarter of your compute.
+
+<Predict id="gpt2-split">
+GPT-2 small (12 layers, d = 768, vocab padded to 50,304, tied embeddings), sequence length 1024, counting the full attention square. What fraction of the forward FLOPs is the MLP? The attention scores and mixing? The output head? And what fraction does 2N capture?
+<Fragment slot="answer">
+
+Per sequence of 1024 tokens: projections 58.0 GFLOP (20%), MLP 116.0 (40%), attention scores and mixing 38.7 (13%), output head 79.1 (27%). Total 291.7 GFLOP. The 2N rule says 173.9, so it covers only about 60%.
+
+I checked this on a Mac: the analytic count matched `torch.utils.flop_counter` to the last digit, once PyTorch was forced to use its plain math attention (more on that in Build It). If you compare two variants with 2N and they differ in context length or vocab, you're comparing with a ruler that's 40% short in a way that's different for each.
+
+</Fragment>
+</Predict>
+
+Now play with it. Start at GPT-2 small. Push sequence length up until attention overtakes the MLP. Then drop d_model to 256 and watch the output head eat the bar. Then toggle MQA: notice which segment changes, and which doesn't.
+
+<Figure n="002" title="WHERE THE FORWARD FLOPS GO" caption="Forward FLOPs per token for a GPT with head size 64 and a 50,304-token vocabulary. Attention cost grows with sequence length; the output head is a fixed cost that dominates tiny models. MQA and GQA only shrink the K and V projections; the attention scores still cost the same, because every query head still looks at every past token." wide>
+
+<ArchFlopBreakdown />
+
+</Figure>
+
+That last point is the first surprise about GQA and MQA: **they barely change training FLOPs.** In GPT-2 small, going from 12 KV heads to 1 trims the K and V projections from 2d² to about d²/6 per layer, which is a 9% cut in forward FLOPs. The expensive things, the MLP, the scores, the head, don't move. Whatever these designs are good for, it isn't mainly training arithmetic.
+
+### Training: why 6N
+
+Training does a forward pass and then a backward pass. The backward pass costs about twice the forward, and the reason is mechanical.
+
+For a layer that computes Y = X·W, the backward pass gets handed dY (how the loss changes with the output) and has to produce two things:
+
+- dX = dY·Wᵀ, to pass the gradient further back to earlier layers. Same shape of matmul as the forward: 2 FLOPs per weight per token.
+- dW = Xᵀ·dY, the gradient for the weights themselves, which the optimizer needs. Another matmul of the same size: 2 more.
+
+<Figure n="003" title="FORWARD 2N, BACKWARD 4N" caption="Per token and per weight: the forward pass is one multiply-add, the backward pass is two (one to send the gradient backward, one to compute the weight's own gradient). 2 + 2 + 2 = 6 FLOPs per parameter per token.">
+<svg viewBox="0 0 640 200" role="img" aria-label="Forward pass costs 2N, backward pass costs 4N split into gradient for inputs and gradient for weights">
+  <rect x="20" y="30" width="170" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="105" y="52" text-anchor="middle" class="strong">FORWARD</text>
+  <text x="105" y="70" text-anchor="middle">Y = X · W</text>
+  <text x="105" y="104" text-anchor="middle" class="blue-t">2N PER TOKEN</text>
+  <line x1="190" y1="58" x2="240" y2="58" class="ink" stroke-width="1.2" />
+  <text x="215" y="50" text-anchor="middle">LOSS</text>
+  <rect x="240" y="16" width="180" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="330" y="34" text-anchor="middle" class="strong">dX = dY · Wᵀ</text>
+  <text x="330" y="49" text-anchor="middle">gradient flows back</text>
+  <rect x="240" y="64" width="180" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="330" y="82" text-anchor="middle" class="strong">dW = Xᵀ · dY</text>
+  <text x="330" y="97" text-anchor="middle">gradient for weights</text>
+  <text x="330" y="122" text-anchor="middle" class="blue-t">2N + 2N = 4N PER TOKEN</text>
+  <line x1="420" y1="58" x2="470" y2="58" class="ink" stroke-width="1.2" />
+  <rect x="470" y="30" width="150" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="545" y="52" text-anchor="middle" class="strong">TOTAL</text>
+  <text x="545" y="70" text-anchor="middle">6N PER TOKEN</text>
+  <line x1="20" y1="148" x2="620" y2="148" class="ink dash" stroke-width="1" />
+  <text x="20" y="170" class="strong">TRAINING COMPUTE  C ≈ 6 · N · D</text>
+  <text x="20" y="188">D = TRAINING TOKENS. ADD 3× THE ATTENTION AND HEAD TERMS AT SMALL SCALE.</text>
+</svg>
+</Figure>
+
+So training costs about 6N FLOPs per token, and over a run of D tokens, **C ≈ 6·N·D.** This is the number scaling-law papers put on their x-axis. The attention and head terms triple the same way, so at small scale the honest version is C ≈ 3 × (forward FLOPs per token) × D, with your full forward count. I checked the 3x on a Mac too: `FlopCounterMode` around forward plus backward of the GPT-2 config reported exactly 3.0 times the forward.
+
+Two refinements you'll see:
+
+- If you use <Term w="activation checkpointing">Throwing away some activations during the forward pass to save memory, then recomputing them during the backward pass. Costs roughly one extra forward pass.</Term>, the hardware does about 8N per token, not 6N. The extra 2N is real work but not useful work, so it is not counted as "model FLOPs".
+- The optimizer step (Adam's few operations per parameter, once per step, not per token) is tiny next to 6N × tokens per batch, and is usually ignored.
+
+### MFU: how much of the GPU you're actually using
+
+Once you can count FLOPs, you can ask how close to the hardware's limit you are. <Term w="MFU">Model FLOPs Utilization. The model FLOPs your training actually completes per second (6N plus attention, times tokens per second), divided by the hardware's peak FLOP/s. Defined in Google's PaLM paper, 2022.</Term> is:
+
+```text
+MFU = (model FLOPs per token × tokens per second) / peak FLOP/s of the hardware
+```
+
+The PaLM paper introduced it because the older measure counted recomputation as useful work, which flattered runs that recomputed a lot. Well-tuned large runs report MFU in the 40-60% range; PaLM 540B reported 46%. A small model on one GPU is usually much lower, because its matmuls are too skinny to fill the chip, and Python and kernel-launch overhead eat a bigger share of each step.
+
+For the Spark you'll want a realistic denominator. The headline "1 petaFLOP" on its spec sheet is FP4 with sparsity, which your bf16 training never touches. Dense bf16 is several times lower. Rather than trust a number, you'll measure it: time a large bf16 matmul and call that your "achievable peak" (Task 0). Then MFU against that tells you how good your code is, not how optimistic the brochure was.
+
+MFU is not part of the comparison itself; it's a sanity check on it. If one variant runs at 15% MFU and the other at 35%, you'll see a big wall-clock difference that has nothing to do with the architecture and everything to do with kernels.
+
+### What "fair" means
+
+Now the heart of it. You have two variants, A and B. You want to know which is "more efficient". There are three things you could hold equal:
+
+| Hold equal | Question it answers | Typical trap |
+| --- | --- | --- |
+| Parameters (and tokens) | Which design gets more out of each weight? | If B does more work per weight, it's getting extra compute for free. |
+| Training FLOPs | For a fixed compute bill, which gets the lower loss? | Each variant needs its own best size for that budget, not the same size. |
+| Wall-clock time (on given hardware) | Which is better on *my* GPUs today? | Rewards good kernels, not good designs; may not transfer to other hardware. |
+
+And the most common thing people actually hold equal is a fourth one, **training steps**, which is equal-parameters-and-tokens when the batch is the same, with the same trap.
+
+The default currency for "compute efficiency" is **equal FLOPs**, and the reason is that compute is what you pay for and what you can redistribute. With a fixed budget you can always choose a bigger model trained for fewer tokens, or a smaller one for more. A fair FLOP comparison lets each variant make that choice for itself.
+
+Here's how the answer flips. Suppose B does 1.5x the FLOPs per parameter per token (it reuses its weights more, the way a weight-shared looped block or a longer context window does) and gets 1.3x as much out of each parameter. At equal parameters and equal tokens, B wins, obviously: it's using 50% more compute. At equal FLOPs, B has to train on two-thirds as many tokens, or be a smaller model, and that can cost more than its per-parameter advantage gains.
+
+<Predict id="flip">
+In the scenario above (B: 1.3x quality per parameter, 1.5x FLOPs per parameter), at a fixed compute budget, does B still win? What about the opposite design (0.9x quality per parameter, but only 0.8x FLOPs per parameter)?
+<Fragment slot="answer">
+
+Under a Chinchilla-shaped loss law: no, B loses at equal FLOPs, even though it wins at equal parameters. And the cheap-but-weak design does the reverse: it loses at equal parameters and wins at equal FLOPs. The intuition: at the compute-optimal point, loss is roughly a power of compute, so a design that's 1.5x more expensive per token has to be more than 1.5x "better" per parameter (in effective-size terms) to break even, and the exponent on parameters is small. Check both in the figure below.
+
+</Fragment>
+</Predict>
+
+### isoFLOP curves: the method
+
+The Chinchilla paper gives a clean recipe for comparing at equal compute without guessing the right model size. It's called an <Term w="isoFLOP curve">Fix a compute budget C. Train several model sizes, each for exactly C FLOPs (smaller models see more tokens). Plot final loss against model size. The curve is U-shaped; its bottom is the best size for that budget.</Term> ("iso" is Greek for "equal"):
+
+1. Fix a compute budget C.
+2. Pick 4 or 5 model sizes N around your guess of the best size. For each, set the number of training tokens to D = C / (FLOPs per token), so every run costs exactly C.
+3. Train each to the end of its schedule. Record final validation loss.
+4. Plot loss against log N. You get a U: too small a model is limited by its capacity, too big a model didn't see enough data. The bottom of the U is the <Term w="compute-optimal">The model size (and matching token count) that reaches the lowest loss for a given compute budget.</Term> point for that C.
+5. Repeat at two or three budgets, each about 3x the last.
+
+Do that for both variants and you get two sets of U's. The comparison is between the bottoms: **at each budget, which variant's best run is lower?** Connect the bottoms across budgets and you have each variant's <Term w="compute frontier">The best loss a design reaches at each compute budget, using its best size. Plotted against log compute it's close to a straight line (a power law).</Term>. If B's frontier sits below A's, B is more compute efficient, and you can say by how much in a currency anyone understands: "B reaches A's loss with 0.7x the compute", a <Term w="compute multiplier">How much compute variant A would need to match variant B's loss at budget C, divided by C. Above 1 means B is better. Lets you compare improvements of different kinds on one scale.</Term> of about 1.4x.
+
+The multiple budgets aren't decoration. A variant can win at small scale and lose at large (or the reverse) if its frontier has a different slope. Two points can't tell you a slope reliably; three can at least warn you.
+
+<Figure n="004" title="ISOFLOP EXPLORER (TOY DATA)" caption="Each U is one compute budget; solid is variant A, dashed blue is B. Dots are each variant's best size at the selected budget (the equal-FLOPs comparison). The square is B at A's size and A's token count, which costs B extra FLOPs (the equal-params comparison). Quality is how much B gets out of each parameter, cost is B's FLOPs per parameter per token, both relative to A. The loss law is Chinchilla's fitted formula, used for shape only, not as a prediction for your runs." wide>
+
+<ArchIsoFlop />
+
+</Figure>
+
+Things to try:
+
+- **Costly + strong.** The square sits below A's dot (B wins at equal params), but B's own dot sits above A's (B loses at equal FLOPs). The compute multiplier is below 1: B is a worse use of money.
+- **Cheap + weak.** The reverse. This is roughly the MQA story: a little worse per parameter, a little cheaper per token.
+- **Identical**, then nudge B's FLOPs to 1.1x. A 10% cost increase with no quality change shows up as a compute multiplier near 0.9, and a loss gap at the dots of only about 0.01 to 0.03, depending on the budget. That's the size of effect you're hunting for, and it's about the size of seed noise. Hold that thought.
+- Move the budget slider. The compute multiplier doesn't budge: in this toy it is exactly (quality per param) ÷ (FLOPs per param), because a B that's m times better per parameter and k times costlier per token behaves just like A with m/k times the compute. So the verdict never flips with scale. Real variants don't have constant multipliers, and theirs can.
+
+### The variants: MHA, GQA, MQA
+
+Here are the designs you'll actually compare. All three keep the same number of query heads. They differ in how many key and value heads those queries share.
+
+<Figure n="005" title="MHA · GQA · MQA" caption="Eight query heads in each case. Multi-head attention gives each its own key/value head. Grouped-query attention shares one KV head per group (here, groups of four). Multi-query attention shares one KV head across all of them. The KV cache, and the K/V projection weights, shrink by the same factor.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Query heads connected to key/value heads for MHA, GQA and MQA">
+  <text x="105" y="18" text-anchor="middle" class="strong">MHA · 8 KV</text>
+  <text x="320" y="18" text-anchor="middle" class="strong">GQA · 2 KV</text>
+  <text x="535" y="18" text-anchor="middle" class="strong">MQA · 1 KV</text>
+  <g>
+    <rect x="13" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="37" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="61" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="85" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="109" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="133" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="157" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="181" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="13" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="37" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="61" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="85" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="109" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="133" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="157" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="181" y="110" width="18" height="18" class="fill-wash" stroke-width="1" />
+    <line x1="22" y1="52" x2="22" y2="110" class="blue" stroke-width="1" />
+    <line x1="46" y1="52" x2="46" y2="110" class="blue" stroke-width="1" />
+    <line x1="70" y1="52" x2="70" y2="110" class="blue" stroke-width="1" />
+    <line x1="94" y1="52" x2="94" y2="110" class="blue" stroke-width="1" />
+    <line x1="118" y1="52" x2="118" y2="110" class="blue" stroke-width="1" />
+    <line x1="142" y1="52" x2="142" y2="110" class="blue" stroke-width="1" />
+    <line x1="166" y1="52" x2="166" y2="110" class="blue" stroke-width="1" />
+    <line x1="190" y1="52" x2="190" y2="110" class="blue" stroke-width="1" />
+  </g>
+  <g>
+    <rect x="228" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="252" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="276" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="300" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="324" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="348" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="372" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="396" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="252" y="110" width="42" height="18" class="fill-wash" stroke-width="1" />
+    <rect x="348" y="110" width="42" height="18" class="fill-wash" stroke-width="1" />
+    <line x1="237" y1="52" x2="273" y2="110" class="blue" stroke-width="1" />
+    <line x1="261" y1="52" x2="273" y2="110" class="blue" stroke-width="1" />
+    <line x1="285" y1="52" x2="273" y2="110" class="blue" stroke-width="1" />
+    <line x1="309" y1="52" x2="273" y2="110" class="blue" stroke-width="1" />
+    <line x1="333" y1="52" x2="369" y2="110" class="blue" stroke-width="1" />
+    <line x1="357" y1="52" x2="369" y2="110" class="blue" stroke-width="1" />
+    <line x1="381" y1="52" x2="369" y2="110" class="blue" stroke-width="1" />
+    <line x1="405" y1="52" x2="369" y2="110" class="blue" stroke-width="1" />
+  </g>
+  <g>
+    <rect x="443" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="467" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="491" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="515" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="539" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="563" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="587" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="611" y="34" width="18" height="18" class="fill-paper" stroke-width="1" />
+    <rect x="514" y="110" width="42" height="18" class="fill-wash" stroke-width="1" />
+    <line x1="452" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="476" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="500" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="524" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="548" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="572" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="596" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+    <line x1="620" y1="52" x2="535" y2="110" class="blue" stroke-width="1" />
+  </g>
+  <text x="10" y="76">Q</text>
+  <text x="10" y="148">K,V</text>
+  <text x="105" y="172" text-anchor="middle">KV CACHE 1x</text>
+  <text x="320" y="172" text-anchor="middle">KV CACHE 1/4</text>
+  <text x="535" y="172" text-anchor="middle">KV CACHE 1/8</text>
+  <text x="105" y="190" text-anchor="middle">K,V PROJ 2d²</text>
+  <text x="320" y="190" text-anchor="middle">K,V PROJ d²/2</text>
+  <text x="535" y="190" text-anchor="middle">K,V PROJ d²/4</text>
+  <text x="320" y="218" text-anchor="middle" class="blue-t">SCORES Q·Kᵀ AND MIXING: SAME COST IN ALL THREE</text>
+</svg>
+</Figure>
+
+<Term w="MHA">Multi-head attention, the original design: every query head has its own key head and value head.</Term> is the original. <Term w="MQA">Multi-query attention (Shazeer, 2019): all query heads share a single key head and a single value head.</Term> came from Noam Shazeer in 2019, who noticed that cached decoding is limited by reading keys and values from memory (the point of [the KV cache lesson](/lessons/kv-cache/)), so sharing one K and V across all heads makes each decode step read far less. The price was a little quality. <Term w="GQA">Grouped-query attention (Ainslie et al., 2023): query heads are split into groups; each group shares one key head and one value head. MHA and MQA are its two extremes.</Term>, from Joshua Ainslie and colleagues in 2023, is the middle: groups of query heads share a KV head. They reported quality close to MHA and decode speed close to MQA, and showed an existing MHA model can be converted by averaging its KV heads within each group and then training a little more ("uptraining", about 5% of the original pretraining compute). Llama 2 70B and every Llama 3 model use GQA.
+
+In code the change is tiny. The K and V projections output `n_kv_head × head_dim` instead of `n_head × head_dim`, and before attention each KV head is broadcast to the query heads in its group. Recent PyTorch does the broadcast for you: `F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)` accepts k and v with fewer heads than q (I used this on PyTorch 2.14; check your version's docs).
+
+Now put these through the fairness machinery.
+
+**Training.** At the same width and depth, GQA and MQA have fewer parameters and slightly fewer FLOPs per token (Figure 002). So "same config" is neither equal parameters nor equal FLOPs. Papers that compare at equal parameters usually widen the MLP to give back what attention lost. An isoFLOP sweep side-steps the question: each variant gets the same compute and its best size. The expected outcome, from the papers and from how little attention projections matter, is that GQA lands on top of MHA within noise, and MQA is close but perhaps slightly worse. "Perhaps slightly" is exactly the kind of claim this lesson is teaching you to check rather than repeat.
+
+**Inference** is a different world. In [the bandwidth lesson](/lessons/bandwidth-bound/) you saw that each decode step has to read all the weights from memory, and in [the KV cache lesson](/lessons/kv-cache/) that it also reads every cached key and value for every sequence in the batch. Arithmetic is not the bottleneck; bytes are. So the right model for decode time is:
+
+```text
+time per decode step ≈ (weight bytes + batch × context × KV bytes per token) / memory bandwidth
+KV bytes per token   = 2 (K and V) × layers × n_kv_head × head_dim × bytes per number
+```
+
+The weights term doesn't care about batch size. The KV term grows with batch and with context. So:
+
+- **Batch 1, short context:** weights dominate. Shrinking the KV cache barely matters. GQA and MQA are a little faster mostly because their K and V *weights* are smaller.
+- **Batch 32, long context:** the cache dominates. Cutting it 4x or 16x cuts the step time a lot, and lets you fit far more sequences in memory at once.
+
+<Predict id="decode">
+A 24-layer, d = 1024, head size 64 model (~355M params with MHA, bf16) on the Spark at a context of 1024 tokens. Using the formula above and the spec-sheet ~273 GB/s, estimate the ceiling decode throughput (tokens/s summed over the batch) for MHA (16 KV heads), GQA (4) and MQA (1), at batch 1 and at batch 32.
+<Fragment slot="answer">
+
+KV per token: 2 × 24 × 16 × 64 × 2 bytes = 96 KiB for MHA, 24 KiB for GQA-4, 6 KiB for MQA. Weights: 0.71 GB, 0.63 GB, 0.61 GB (GQA and MQA have smaller K and V matrices).
+
+- Batch 1: cache is 0.09 / 0.02 / 0.006 GiB, so each step reads about 0.81 / 0.66 / 0.62 GB. Ceilings ≈ 340 / 410 / 440 tok/s. MQA is about 1.3x MHA, and most of that is the smaller weights.
+- Batch 32: cache is 3.0 / 0.75 / 0.19 GiB. Each step reads ≈ 3.9 / 1.4 / 0.8 GB. Ceilings ≈ 2,200 / 6,100 / 10,700 tok/s. Now GQA is 2.7x MHA and MQA almost 5x.
+
+These are bandwidth floors from spec-sheet numbers. Your measured numbers will be lower, and at this model size, batch 1 may be limited by kernel-launch overhead rather than bandwidth, which squashes the differences further. That's part of what you're measuring.
+
+</Fragment>
+</Predict>
+
+So "which is more efficient?" has at least two honest answers, and a good results doc gives both: **per training FLOP, they're roughly tied (measure it); per served token at realistic batch sizes, GQA and MQA win by a lot, and the win grows with batch and context.** That separation, training efficiency vs inference efficiency, is why every modern open model uses GQA: you pay almost nothing at training time for a big win at serving time, and serving runs for much longer than training.
+
+### Other variants worth the same treatment
+
+The method is general. Three others you'll meet, each with its own fairness wrinkle:
+
+- **SwiGLU vs GELU MLP** (Shazeer, 2020, "GLU Variants Improve Transformer"). A <Term w="SwiGLU">An MLP with three weight matrices instead of two: the input goes through two up-projections, one is passed through SiLU and multiplied elementwise with the other, then a down-projection. Used in Llama, PaLM and most recent models.</Term> MLP has three matrices instead of two. To compare fairly, people shrink its hidden size from 4d to 8d/3, which makes parameters and FLOPs equal (3 × d × 8d/3 = 8d²; I checked the counts match exactly for d = 768). At the same hidden size, SwiGLU gets 50% more MLP compute and of course looks better.
+- **RoPE vs learned positions.** You've implemented <Term w="RoPE">Rotary position embedding: positions are encoded by rotating each query and key vector by an angle that depends on its position, so the dot product only depends on how far apart two tokens are.</Term>. It has no parameters and negligible FLOPs, while learned position embeddings add a T × d table (no FLOPs, just a lookup). So for this pair, equal-params and equal-FLOPs nearly coincide, and the comparison is about loss and about behaviour at lengths longer than training.
+- **Pre-norm vs post-norm.** Putting LayerNorm before each sublayer (as GPT-2 does) instead of after (as the original Transformer did) changes no FLOPs at all, but post-norm needs a learning-rate warmup and a lower peak LR to train stably (Xiong et al., 2020). Here the whole comparison lives or dies on LR tuning.
+
+### Noise: is the gap real?
+
+Train the same config twice with different <Term w="seed">The number that initialises the random number generator: it decides the initial weights and the order of the data. Same seed, same run (nearly); different seed, slightly different final model.</Term>s and the final validation loss won't match. At the sizes you'll train, the spread is often around 0.005 to 0.02 in loss (nats per token). That's a rough range; you'll measure yours. The differences you're looking for between MHA and GQA are the same size or smaller.
+
+So one run per variant tells you almost nothing. You need either several seeds per point, so you can compare a difference in means to the spread, or a margin so large that noise can't explain it. [Is that improvement real?](/lessons/statistics-for-evals/) covers the statistics properly. The working rule here: run at least 2-3 seeds at each frontier point, report mean ± standard deviation, and don't call a difference smaller than about twice the seed spread.
+
+One mercy: the isoFLOP U is fitted through 4-5 points, and fitting a curve averages away some noise. The bottom of a fitted parabola is more trustworthy than any single run.
+
+### Confounders: the comparison you didn't mean to run
+
+A <Term w="confounder">Something other than the thing you're testing that differs between the two runs and affects the result. It makes you credit (or blame) the variant for what the setup did.</Term> is anything other than the architecture that differs between your runs. The usual suspects, in roughly the order they bite:
+
+1. **Learning rate tuned for one variant.** You tuned MHA, then reused its LR for MQA. Different designs often have different best LRs. Tune each one, at least coarsely, at your smallest budget, and check the best isn't at the edge of your grid.
+2. **Schedule length not matched to run length.** The Kaplan/Chinchilla lesson. Every run's cosine decay must end when that run ends.
+3. **Different tokens.** Different data order is fine (that's seed noise); different data, tokenizer or validation set is not.
+4. **Different parameter counting.** Counting embeddings for one and not the other, or forgetting that tied weights are counted once.
+5. **Different FLOP counting.** Using 2N for one variant whose real cost is dominated by attention.
+6. **Equal steps when you meant equal FLOPs.** A variant that's 10% cheaper per token should get 10% more tokens.
+7. **Speed from software, not design.** In wall-clock comparisons: one variant hits a fast fused kernel and the other falls back to a slow path. Check MFU for both.
+
+Narang et al. (2021) re-tested dozens of published transformer modifications in one shared codebase. Most of them didn't help. The ones that did were mostly small and computationally cheap, the GLU variants among them. Treat that as a base rate: when a variant looks like a big win, look for the confounder first.
+
+## Build It
+
+Everything runs on the Spark except the FLOP counter check, which runs anywhere. Layout:
+
+```text
+archcmp/
+  model.py        # configurable GPT: MHA/GQA/MQA, gelu/swiglu
+  flops.py        # analytic counter + check against torch
+  train.py        # one run: config, budget C, lr, seed -> final val loss (JSON)
+  sweep.py        # LR sweep, then isoFLOP sweep
+  plot.py         # isoFLOP U's and frontiers
+  decode_bench.py # KV cache size, decode tok/s at batch 1 and 32
+  results/        # one JSON per run
+  RESULTS.md      # the write-up
+```
+
+<Task id="t0" title="Set up, get data, measure your achievable peak" agent="ok">
+
+Use a recent PyTorch with CUDA on the Spark (NVIDIA's PyTorch container is the easy route on DGX OS; check its docs for the current tag). Data: reuse the pretokenized shards from [Train a small LM](/lessons/tiny-lm/) if you have them. Otherwise any clean English corpus works (a FineWeb-Edu sample is a good choice), tokenized once into a flat `uint16` array of token IDs for train and a separate one for validation. You'll need on the order of a billion training tokens.
+
+**Use a small vocabulary.** At the sizes you'll train (a few million to a few tens of millions of non-embedding parameters), a 50K-token embedding table would be bigger than the model and the output head would dominate your FLOPs. An 8K-16K BPE vocab, like the one you build in [Tokenizers](/lessons/tokenizers/), keeps the comparison about attention. Whatever you choose, it is the same for every run.
+
+Then measure your achievable bf16 peak:
+
+```python
+# peak.py: time a big bf16 matmul and report TFLOP/s
+import torch, time
+n = 8192
+a = torch.randn(n, n, device="cuda", dtype=torch.bfloat16)
+b = torch.randn(n, n, device="cuda", dtype=torch.bfloat16)
+for _ in range(3):
+    a @ b
+torch.cuda.synchronize()
+iters = 20
+t = time.perf_counter()
+for _ in range(iters):
+    a @ b
+torch.cuda.synchronize()
+dt = (time.perf_counter() - t) / iters
+print(f"{2 * n**3 / dt / 1e12:.1f} TFLOP/s achievable bf16")
+```
+
+Write the number down. It's your MFU denominator.
+
+</Task>
+
+<Task id="t1" title="A GPT where attention is MHA, GQA or MQA" agent="hands">
+
+Start from your from-scratch GPT. Add `n_kv_head` to the config. MHA is `n_kv_head == n_head`, MQA is `n_kv_head == 1`, GQA is anything in between that divides `n_head`. Use RoPE or learned positions, your call, but the same for every variant.
+
+```python
+# model.py (shape only)
+@dataclass
+class Cfg:
+    vocab: int = 16384
+    ctx: int = 512
+    n_layer: int = 6
+    d: int = 384
+    n_head: int = 12        # head_dim = d // n_head
+    n_kv_head: int = 12     # 12 = MHA, 3 = GQA (groups of 4), 1 = MQA
+    mlp: str = "gelu"       # or "swiglu" with hidden 8d/3
+    tie_weights: bool = True
+
+class Attention(nn.Module):
+    def __init__(self, c: Cfg): ...
+        # q: d -> n_head * hd ; kv: d -> 2 * n_kv_head * hd ; o: d -> d
+    def forward(self, x, kv_cache=None): ...
+        # returns y, and the updated cache when kv_cache is given.
+        # The cache stores the small, un-broadcast (B, n_kv_head, T, hd) K and V.
+
+class GPT(nn.Module):
+    def __init__(self, c: Cfg): ...
+    def forward(self, idx, targets=None, kv_cache=None): ...
+    def num_params(self, non_embedding: bool = True) -> int: ...
+```
+
+Hints:
+
+- `F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)` handles the broadcast. If your version lacks `enable_gqa`, `k.repeat_interleave(n_head // n_kv_head, dim=1)` does the same thing at the cost of a copy.
+- When decoding with a cache, `is_causal=True` is wrong for a single new query against T cached keys (it would mask almost everything). Pass `is_causal=False` for the one-token step.
+- Test: with `n_kv_head == n_head`, outputs must match your original model bit for bit (or to bf16 rounding) given the same weights.
+
+</Task>
+
+<Task id="t2" title="An analytic FLOP counter, checked against PyTorch" agent="hands">
+
+Write the counter from the formulas in The Idea, broken into parts so you can see them.
+
+```python
+# flops.py
+def forward_flops_per_token(c: Cfg, T: int, causal_half: bool = False) -> dict[str, int]:
+    """Return {'proj': ..., 'attn': ..., 'mlp': ..., 'head': ...}, forward FLOPs per token
+    at sequence length T. 'attn' is 4*L*T*d (full square) or 2*L*T*d (causal_half)."""
+    ...
+
+def train_flops_per_token(c: Cfg, T: int) -> int:
+    """3x the forward total."""
+    ...
+
+def check(c: Cfg, T: int = 512) -> None:
+    """Run one forward (and one forward+backward) under FlopCounterMode, print torch's total
+    next to yours and the ratio. It should be 1.000."""
+    ...
+```
+
+PyTorch's counter lives in `torch.utils.flop_counter`:
+
+```python
+from torch.utils.flop_counter import FlopCounterMode
+with FlopCounterMode(display=False) as fc:
+    model(x)
+print(fc.get_total_flops())
+```
+
+**A trap I hit on the Mac:** on CPU, the default fused attention kernel wasn't counted at all (PyTorch 2.14.1). The total came out exactly one "attention term" short, and a bare `scaled_dot_product_attention` call reported 0 FLOPs. Forcing the plain math path fixed it:
+
+```python
+from torch.nn.attention import sdpa_kernel, SDPBackend
+with sdpa_kernel(SDPBackend.MATH), FlopCounterMode(display=False) as fc:
+    model(x)
+```
+
+With that, my GPT-2-small-shaped model matched the analytic count exactly for MHA, GQA and MQA, and forward plus backward came out at exactly 3.0x forward. The math path counts the full T × T square even with `is_causal=True`, which is why the analytic default above is full counting. On the Spark's GPU, check whether the flash and memory-efficient kernels are counted, and whether they count the full square. Write down what you find; it decides which number you trust.
+
+</Task>
+
+<Task id="t3" title="Tune LRs, then run the isoFLOP sweep" agent="review">
+
+Pick shapes. Head size 32, so every width splits evenly into groups of 4 for GQA:
+
+| Shape | Layers | d | Heads (MHA) | GQA KV heads | Non-emb params (MHA) |
+| --- | --- | --- | --- | --- | --- |
+| S1 | 4 | 256 | 8 | 2 | 3.1M |
+| S2 | 6 | 256 | 8 | 2 | 4.7M |
+| S3 | 6 | 384 | 12 | 3 | 10.6M |
+| S4 | 8 | 384 | 12 | 3 | 14.2M |
+| S5 | 8 | 512 | 16 | 4 | 25.2M |
+
+Budgets: C = 3e15, 1e16, 3e16 FLOPs (training, counted with your counter, not 6N). The Chinchilla rule of thumb (about 20 tokens per parameter, so N ≈ sqrt(C / 120)) puts the bottoms near 5M, 9M and 16M parameters; pick the 4 shapes that bracket each. Sequence length 512 and a fixed batch in tokens (say 64K tokens per step) for every run.
+
+`train.py` takes (variant, shape, C, lr, seed), computes `steps = C / (train_flops_per_token × tokens_per_step)`, uses warmup then cosine decay **ending at that run's last step**, and writes the final validation loss (on a fixed held-out set of a few million tokens) to `results/*.json`, along with measured tokens/s and MFU.
+
+1. **Time it first.** Run one short job per shape, measure tokens/s, and work out how long the whole sweep takes: `hours = total FLOPs / (achieved FLOP/s × 3600)`. Three variants × three budgets × four shapes is about 5e17 FLOPs; at an assumed 20 TFLOP/s achieved, that's 7 hours. If your number is much worse, scale every budget down by the same factor rather than dropping the largest one.
+2. **LR sweep**, per variant, on the middle shape at the smallest budget: 4 LRs a factor of 2 apart (for example 1.5e-3 to 1.2e-2 for models this small, but let your sweep decide). If the best is at an edge, extend the grid. Use each variant's own best LR for the rest.
+3. **isoFLOP sweep**, seed 0, every variant × budget × its 4 shapes.
+4. **Extra seeds**: rerun the two shapes nearest each U's bottom with seeds 1 and 2.
+
+Have an agent review `train.py` before the long run: specifically that the schedule length follows the budget, that the FLOPs per token include attention and the head, and that validation uses the same tokens for every run.
+
+</Task>
+
+<Task id="t4" title="Plot the U's and the frontier" agent="hands">
+
+```python
+# plot.py (shape only)
+def load(results_dir) -> list[dict]: ...
+def fit_bottom(Ns, losses) -> tuple[float, float]:
+    """Fit loss = a*(log N)^2 + b*log N + c through one budget's points;
+    return (N at the minimum, loss at the minimum)."""
+    ...
+def compute_multiplier(frontier_a, frontier_b) -> list[float]:
+    """Fit log(loss - E) ~ log C for A's frontier (or just interpolate in log C),
+    and for each of B's points find the C_A where A reaches B's loss. Return C_A / C."""
+    ...
+```
+
+Two plots: (1) loss vs log N, one U per budget, one colour per variant, mean of seeds as the marker and the seed spread as an error bar. (2) Frontier loss vs log C for each variant.
+
+</Task>
+
+<Task id="t5" title="Measure inference: KV size and decode speed" agent="hands">
+
+Decode speed doesn't depend on what the weights are, only on their shapes. So, besides your trained models, benchmark a bigger shape with random weights where the effect is easy to see: 24 layers, d = 1024, head size 64, and n_kv_head 16 / 4 / 1.
+
+```python
+# decode_bench.py (shape only)
+def kv_bytes(cache) -> int:
+    """Sum of .nbytes over every cached K and V tensor. Compare with the formula."""
+    ...
+
+@torch.no_grad()
+def bench(model, batch: int, prompt: int = 512, gen: int = 512) -> dict:
+    """Prefill `prompt` random tokens for `batch` sequences, then decode `gen` tokens one at a
+    time with the cache. Return {'kv_GiB': ..., 'decode_tok_s': batch*gen/seconds, 'peak_mem_GiB': ...}."""
+    ...
+```
+
+Rules for honest timing (from [the bandwidth lesson](/lessons/bandwidth-bound/)): warm up first, call `torch.cuda.synchronize()` before reading the clock, use bf16, and preallocate the cache to its final length so you aren't timing `torch.cat`. Run batch 1 and batch 32. At batch 1 this model is small enough that Python and kernel-launch overhead may dominate; try `torch.compile` or CUDA graphs (check the current docs for the right mode) and report both.
+
+</Task>
+
+<Task id="t6" title="Write RESULTS.md: which is more efficient, for what?" agent="review">
+
+One page. A reader who only reads the first paragraph should get the answer. Shape:
+
+```markdown
+## Answer
+<one paragraph: training efficiency verdict with compute multiplier ± noise;
+ inference verdict with tok/s ratios at batch 1 and 32; the recommendation.>
+
+## Setup
+data, tokenizer, shapes, budgets, seeds, LR per variant, FLOP counting convention.
+
+## Training: isoFLOP results
+plot + table. Seed spread. What is and isn't distinguishable.
+
+## Inference
+KV bytes per token, decode tok/s at batch 1 and 32, vs the bandwidth floor.
+
+## Caveats
+what scale this was, what might change at 100x, what you didn't control.
+```
+
+Then have an agent play a skeptical reviewer: "find the confounder". Fix what it finds, or list it under Caveats.
+
+</Task>
+
+<DoneWhen>
+
+- Your analytic FLOP count matches `FlopCounterMode` to within 1% for all three variants, and you know which attention kernels your counter does and doesn't see.
+- You have isoFLOP U's for MHA, GQA and MQA at three budgets, each variant at its own tuned LR, with at least three seeds at the points near each bottom.
+- You have KV bytes and decode tok/s for each variant at batch 1 and 32, next to the bandwidth-floor prediction.
+- RESULTS.md answers "which is more compute efficient, for what?" in its first paragraph, with numbers and error bars.
+
+</DoneWhen>
+
+## Measure
+
+**FLOP counter check** (any machine):
+
+| Variant | Analytic fwd / seq | torch fwd / seq | Ratio | fwd+bwd / fwd |
+| --- | --- | --- | --- | --- |
+| MHA | | | | |
+| GQA | | | | |
+| MQA | | | | |
+
+For reference, my Mac run on a GPT-2-small shape (12 layers, d = 768, T = 1024, vocab 50,304, math attention): MHA 291.7 GFLOP, GQA with 4 KV heads 272.4, MQA 265.2, all ratios 1.0000, and fwd+bwd exactly 3.0x. Without forcing the math path, torch reported 253.1, 233.7 and 226.5: exactly 38.7 GFLOP short each time, which is the attention term.
+
+**LR sweep:**
+
+| Variant | LR grid | Best LR | Loss at best | Edge of grid? |
+| --- | --- | --- | --- | --- |
+| MHA | | | | |
+| GQA | | | | |
+| MQA | | | | |
+
+**isoFLOP bottoms** (fitted, mean ± sd over seeds at the nearest points):
+
+| Budget C | MHA best N | MHA loss | GQA best N | GQA loss | MQA best N | MQA loss | Seed sd |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 3e15 | | | | | | | |
+| 1e16 | | | | | | | |
+| 3e16 | | | | | | | |
+
+**Throughput and MFU** (training, per shape): tokens/s and MFU against your measured peak. Also write down the same shape's MFU for each variant: if they differ by more than a few points, your wall-clock comparison is a kernel comparison.
+
+**Inference** (24 layers, d = 1024, head 64, context 1024 at the end):
+
+| Variant | KV per token | KV at batch 32 | Floor tok/s b1 | Measured b1 | Floor tok/s b32 | Measured b32 |
+| --- | --- | --- | --- | --- | --- | --- |
+| MHA (16) | 96 KiB | 3.0 GiB | ~340 | | ~2,200 | |
+| GQA (4) | 24 KiB | 0.75 GiB | ~410 | | ~6,100 | |
+| MQA (1) | 6 KiB | 0.19 GiB | ~440 | | ~10,700 | |
+
+The floors are from the formula with the spec-sheet 273 GB/s and are approximate; measured numbers should be lower.
+
+What the numbers should look like, and why:
+
+- **GQA vs MHA in training: indistinguishable**, most likely. The difference is a small cut in a fifth of the FLOPs. If your GQA bottom is within a seed sd or two of MHA's, the honest statement is "no detectable difference at these budgets", not "GQA is 0.3% better".
+- **MQA vs MHA in training: close, possibly slightly worse.** If you see a gap, check it survives seeds and per-variant LR before believing it.
+- **The best N shifts.** For the same C, GQA's and MQA's best runs should sit at a slightly larger shape (they're cheaper per token at a given shape). This is the equal-FLOP comparison doing its job.
+- **Decode, batch 1:** a modest win for GQA/MQA, partly from smaller weights. If you're launch-bound, maybe nothing at all.
+- **Decode, batch 32:** a large win, roughly tracking the bandwidth floors' ratios. If it doesn't, check that your cache really is stored un-broadcast (a `repeat_interleave` into the cache gives back all the memory you saved).
+
+## Break It
+
+**1. Tune the LR for MHA only.** Rerun MQA's U at the middle budget with MHA's best LR instead of its own. If the gap between the variants changes by more than the seed spread, you've just measured how much of a "result" a confounder can manufacture. This is the most common way variant comparisons go wrong.
+
+**2. Compare at equal steps, with the wrong SwiGLU.** Add a SwiGLU variant with hidden size 4d (not 8d/3). Train it and GELU for the same number of steps on the same shape. SwiGLU "wins" comfortably. Now put both through one isoFLOP budget, counting its real FLOPs (50% more in the MLP). Most of the win shrinks. Then fix the hidden size to 8d/3 and compare again. Whatever is left is the actual design effect.
+
+**3. Trust one seed.** Run five seeds of one config and look at the spread. Then go back to your seed-0-only isoFLOP points and ask how many of the orderings between variants would survive. Usually, at these budgets, very few of the small ones do.
+
+**4. Count FLOPs with 2N at long context.** Rerun the smallest shape at sequence length 2048 and set its steps with `6N` instead of your full counter. With d = 256, the attention term alone is more than all the weight FLOPs, so the run silently costs about twice its budget, and a variant whose attention is cheaper looks bad. Then remember Task 2: if your FLOP counter can't see the fused attention kernel, it makes exactly this mistake for you.
+
+## Explain It Back
+
+<details>
+<summary>1. Derive the forward FLOPs per token of a GPT. Where does the 2 in 2N come from, and what does 2N miss?</summary>
+
+A matmul of (m × k) by (k × n) costs 2mkn: m·n outputs, each a dot product of k multiplies and k adds. For one token, each weight in each matrix is used once: one multiply and one add, so 2 FLOPs per parameter, 2N per token, with N ≈ 12·L·d² (4d² attention projections, 8d² MLP per layer). It misses two things. The attention scores and value mixing have no weights but cost 4·t·d per layer for a token at position t: 4·L·T·d per token if you count the full square, 2·L·T·d if you count only the causal half. Relative to 2N that's T/(6d) or T/(12d), so it matters at long context or small width. And the output head costs 2·d·V per token even though tied weights aren't counted in N; at small scale that's a quarter of the compute.
+
+</details>
+
+<details>
+<summary>2. Why is training about 6ND? What's MFU and why would two variants have different MFU?</summary>
+
+The backward pass of each matmul Y = XW does two matmuls of the same size: dX = dY·Wᵀ to keep the gradient flowing, and dW = Xᵀ·dY for the weight update. That's 4N per token on top of the forward's 2N, so 6N per token and 6ND for D tokens (plus 3x the attention and head terms). MFU is model FLOPs actually completed per second divided by the hardware's peak: how much of the chip you used for useful arithmetic. Recomputation doesn't count. Two variants can have different MFU because one's matmuls are skinnier (MQA's K and V projections are tiny) or because one hits a fast fused kernel and the other doesn't. That's why wall-clock comparisons can reflect software rather than design.
+
+</details>
+
+<details>
+<summary>3. Equal params, equal FLOPs, equal wall-clock: what does each answer, and give an example where they disagree.</summary>
+
+Equal params asks which design gets more per weight; equal FLOPs asks which gets the lowest loss for a fixed compute bill, with each variant at its own best size; equal wall-clock asks which is best on this hardware and software today. They disagree whenever the variants do different amounts of work per parameter. A design that reuses its weights (say 1.5x FLOPs per parameter) and gets 1.3x more out of each parameter wins at equal params, but under a Chinchilla-shaped loss law loses at equal FLOPs, because it's paying 50% more per token. A deeper, narrower model at the same params and FLOPs can lose at equal wall-clock because its layers run one after another and each matmul is too small to fill the GPU. The default for "compute efficiency" is equal FLOPs, done as an isoFLOP sweep so each variant can pick its own size.
+
+</details>
+
+<details>
+<summary>4. Is GQA more compute efficient than MHA? How does the answer scale with batch size and context?</summary>
+
+For training, roughly no difference: it removes part of the K and V projection cost, a small slice of the total FLOPs, and loss at equal compute is about the same (measure it with seeds). For inference it's a big yes, and it grows with load. Decode time is roughly (weight bytes + batch × context × KV bytes per token) / bandwidth. GQA with groups of 4 cuts the KV term 4x. At batch 1 and short context the weights dominate, so the win is small (maybe 1.2x, mostly from slightly smaller weights). At batch 32 and 1K context on a 355M model the cache is about 4x the weights for MHA, so GQA is close to 3x faster, and it also fits 4x as many sequences in memory. At 128K context or hundreds of users, the cache is everything, and the ratio approaches the full 4x (or 16x for MQA). That's why every recent open model uses GQA: almost free in training, a big saving for the much longer life of serving.
+
+</details>
+
+<details>
+<summary>5. A teammate shows a new variant beating baseline by 0.02 loss. What do you ask before believing it?</summary>
+
+How many seeds, and what's the seed spread (at small scale it's often around 0.01, so one seed of 0.02 is weak evidence). Equal what: steps, params or FLOPs, and counted how (did the FLOP count include attention and the head)? Was the learning rate tuned for both, or just for the baseline? Did the schedule end when each run ended? Same data, tokenizer and validation set? One budget, or does it hold at 3x and 10x the compute (frontiers can have different slopes)? And what does it cost at inference, since training loss isn't the only bill. Narang et al. found most published modifications didn't survive a re-test in a shared codebase, so the default is skepticism.
+
+</details>
+
+## Go Deeper
+
+- **"Scaling Laws for Neural Language Models"**, Jared Kaplan et al. (OpenAI), 2020. Table 1 is the FLOP accounting this lesson derives, and the paper is where "compare at equal compute" became standard practice.
+- **"Training Compute-Optimal Large Language Models"**, Jordan Hoffmann et al. (DeepMind), 2022. The Chinchilla paper. Read the isoFLOP method (their "Approach 2") and Appendix F's FLOP counting, which counts both attention matmuls in full.
+- **"Fast Transformer Decoding: One Write-Head is All You Need"**, Noam Shazeer, 2019. Introduces MQA. Short, and its argument about memory traffic during decoding is the inference half of this lesson.
+- **"GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints"**, Joshua Ainslie et al., 2023. The quality/speed tradeoff between MHA and MQA, measured, plus how to convert an existing model.
+- **"GLU Variants Improve Transformer"**, Noam Shazeer, 2020. Two pages of results, and a model of how to keep params and FLOPs equal when the variant changes the shape (the 8d/3 trick).
+- **"PaLM: Scaling Language Modeling with Pathways"**, Aakanksha Chowdhery et al. (Google), 2022. Defines MFU, with the exact FLOPs-per-token formula including attention, in an appendix.
+- **"Do Transformer Modifications Transfer Across Implementations and Applications?"**, Sharan Narang et al. (Google), 2021. Dozens of modifications re-tested in one codebase; most didn't help. The best argument for careful baselines.
+- **"Transformer Math 101"**, Quentin Anthony, Stella Biderman and Hailey Schoelkopf, EleutherAI blog, 2023. The practical cheat sheet: 6ND, memory, and how to sanity-check a training run's throughput.
+
+## Connections
+
+This builds directly on [Why does the KV cache exist?](/lessons/kv-cache/) (what the cache stores and why decoding reads it all) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (decode is bytes, not FLOPs). The training side leans on [Train a small LM](/lessons/tiny-lm/) and [Tokenizers](/lessons/tokenizers/) for the data and model, and the noise question is the whole subject of [Is that improvement real?](/lessons/statistics-for-evals/).
+
+It sets up [Training on many GPUs](/lessons/distributed-training/), where the same FLOP accounting tells you how long a run should take and MFU tells you how badly communication is hurting, and [Why training needs so much memory](/lessons/training-memory/), the other half of what a variant costs.

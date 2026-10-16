@@ -1,0 +1,11 @@
+---
+// Numbered figure in the blueprint frame.
+// Usage: <Figure n="001" title="LATENCY LADDER" caption="..." wide> <svg>..</svg> </Figure>
+interface Props { n: string; title: string; caption?: string; wide?: boolean }
+const { n, title, caption, wide = false } = Astro.props;
+---
+<figure class:list={['fig', { wide }]}>
+  <div class="fig-head"><span class="label">FIG_{n}</span><span class="label">[ {title} ]</span></div>
+  <div class="fig-body"><slot /></div>
+  {caption && <figcaption class="fig-note">{caption}</figcaption>}
+</figure>

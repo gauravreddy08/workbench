@@ -1,0 +1,126 @@
+---
+// Time to move N bytes over several "pipes": time = latency + size / bandwidth.
+// The split bar shows how much of that time is waiting (latency) vs flowing (bandwidth).
+// Numbers are rough, best-case, and labelled as such in the lesson.
+type Link = { name: string; lat: number; bw: number; sub: string };
+const links: Link[] = [
+  { name: 'Spark RAM', lat: 100e-9, bw: 273e9, sub: '100 ns · 273 GB/s (spec)' },
+  { name: 'NVMe SSD', lat: 80e-6, bw: 7e9, sub: '80 µs · 7 GB/s' },
+  { name: 'Datacenter network', lat: 200e-6, bw: 12.5e9, sub: '200 µs · 100 Gb/s' },
+  { name: 'Home LAN', lat: 0.5e-3, bw: 125e6, sub: '0.5 ms · 1 Gb/s' },
+  { name: 'Internet to Europe', lat: 0.15, bw: 62.5e6, sub: '150 ms · 500 Mb/s' },
+];
+const presets = [
+  { label: '64 B line', v: Math.log10(64) },
+  { label: '4 KB page', v: Math.log10(4096) },
+  { label: '1 MB', v: 6 },
+  { label: '16 GB model', v: Math.log10(16e9) },
+];
+const start = Math.log10(4096);
+---
+<div class="lt" data-fig="latency-transfer">
+  <div class="ctl lt-ctl">
+    <label>Move
+      <input type="range" min="0" max="11" step="0.05" value={start} aria-label="Transfer size (log scale)" />
+      <output class="lt-size">4.1 KB</output>
+    </label>
+  </div>
+  <div class="ctl lt-presets">
+    {presets.map((p) => <button class="btn" type="button" data-v={p.v}>{p.label}</button>)}
+  </div>
+
+  <div class="lt-rows">
+    {links.map((l) => (
+      <div class="lt-row" data-lat={l.lat} data-bw={l.bw}>
+        <div class="lt-head">
+          <span class="lt-name">{l.name}</span>
+          <span class="lt-total readout">–</span>
+        </div>
+        <div class="lt-bar" aria-hidden="true">
+          <span class="lt-wait"></span><span class="lt-flow"></span>
+        </div>
+        <div class="lt-sub">
+          <span>{l.sub}</span>
+          <span class="lt-share"></span>
+        </div>
+      </div>
+    ))}
+  </div>
+
+  <div class="lt-legend">
+    <span><i class="sw wait"></i>Waiting for the first byte (latency)</span>
+    <span><i class="sw flow"></i>Bytes flowing (size ÷ bandwidth)</span>
+  </div>
+</div>
+
+<style>
+  .lt { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .lt-ctl { margin-top: 0; }
+  .lt-ctl label { flex-wrap: wrap; }
+  .lt-presets { margin-top: 10px; gap: 8px; }
+  .lt-presets .btn { padding: 5px 9px; font-size: 10.5px; }
+  .lt-rows { margin-top: 18px; display: grid; gap: 14px; }
+  .lt-head, .lt-sub { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+  .lt-name { color: var(--ink); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+  .lt-sub { font-size: 10.5px; color: var(--ink-3); margin-top: 3px; }
+  .lt-bar { display: flex; height: 14px; margin-top: 4px; border: 1px solid var(--blue); background: var(--paper); }
+  .lt-wait {
+    background: repeating-linear-gradient(135deg, var(--blue-fill) 0 4px, var(--paper) 4px 7px);
+    transition: width 0.2s;
+  }
+  .lt-flow { background: var(--blue); transition: width 0.2s; }
+  .lt-legend { display: flex; gap: 8px 18px; flex-wrap: wrap; margin-top: 14px; font-size: 11px; color: var(--ink-3); }
+  .lt-legend span { display: flex; align-items: center; gap: 6px; }
+  .sw { display: inline-block; width: 14px; height: 9px; border: 1px solid var(--blue); }
+  .sw.wait { background: repeating-linear-gradient(135deg, var(--blue-fill) 0 3px, var(--paper) 3px 5px); }
+  .sw.flow { background: var(--blue); }
+  @media (prefers-reduced-motion: reduce) { .lt-wait, .lt-flow { transition: none; } }
+</style>
+
+<script>
+  const fmtBytes = (b: number) => {
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; }
+    return `${b < 10 && i > 0 ? b.toFixed(1).replace(/\.0$/, '') : Math.round(b)} ${u[i]}`;
+  };
+  const fmtTime = (s: number) => {
+    const r = (x: number) => (x < 10 ? x.toPrecision(2).replace(/\.0$/, '') : String(Math.round(x)));
+    if (s < 1e-6) return `${r(s * 1e9)} ns`;
+    if (s < 1e-3) return `${r(s * 1e6)} µs`;
+    if (s < 1) return `${r(s * 1e3)} ms`;
+    if (s < 120) return `${r(s)} s`;
+    if (s < 7200) return `${r(s / 60)} min`;
+    return `${r(s / 3600)} hours`;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="latency-transfer"]').forEach((root) => {
+    const slider = root.querySelector<HTMLInputElement>('input[type="range"]')!;
+    const out = root.querySelector<HTMLElement>('.lt-size')!;
+    const rows = [...root.querySelectorAll<HTMLElement>('.lt-row')];
+    const presets = [...root.querySelectorAll<HTMLButtonElement>('[data-v]')];
+
+    const update = () => {
+      const v = Number(slider.value);
+      const bytes = Math.pow(10, v);
+      out.textContent = fmtBytes(bytes);
+      presets.forEach((p) => p.setAttribute('aria-pressed', String(Math.abs(Number(p.dataset.v) - v) < 0.03)));
+      rows.forEach((row) => {
+        const lat = Number(row.dataset.lat);
+        const bw = Number(row.dataset.bw);
+        const flow = bytes / bw;
+        const total = lat + flow;
+        const waitPct = (lat / total) * 100;
+        row.querySelector<HTMLElement>('.lt-total')!.textContent = fmtTime(total);
+        row.querySelector<HTMLElement>('.lt-wait')!.style.width = `${waitPct}%`;
+        row.querySelector<HTMLElement>('.lt-flow')!.style.width = `${100 - waitPct}%`;
+        row.querySelector<HTMLElement>('.lt-share')!.textContent =
+          `${Math.round(waitPct)}% waiting · evens out at ${fmtBytes(lat * bw)}`;
+      });
+    };
+
+    slider.addEventListener('input', update);
+    presets.forEach((p) => p.addEventListener('click', () => { slider.value = p.dataset.v!; update(); }));
+    update();
+  });
+</script>

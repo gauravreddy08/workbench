@@ -1,0 +1,141 @@
+---
+// Pipeline parallelism timeline. p stages (one per GPU), m micro-batches.
+// Forward takes 1 time unit, backward 2 (backward does about twice the FLOPs).
+// GPipe: all forwards, then all backwards. 1F1B: a few warm-up forwards, then alternate.
+// Each stage runs its ops in a fixed order, starting each as soon as its input is ready.
+---
+<div class="dpipe" data-fig="dist-pipe">
+  <svg viewBox="0 0 640 220" role="img" aria-label="Gantt chart of pipeline stages running forward and backward passes of micro-batches, with idle bubbles"></svg>
+  <div class="ctl">
+    <label>Stages (p) <input type="range" min="2" max="8" value="4" data-k="p" /> <output data-o="p">4</output></label>
+    <label>Micro-batches (m) <input type="range" min="1" max="16" value="4" data-k="m" /> <output data-o="m">4</output></label>
+  </div>
+  <div class="ctl">
+    <span>Schedule</span>
+    <button class="btn" type="button" data-s="gpipe" aria-pressed="true">GPipe</button>
+    <button class="btn" type="button" data-s="1f1b" aria-pressed="false">1F1B</button>
+  </div>
+  <p class="dpipe-read">
+    Idle (bubble) <span class="readout" data-r="bub">-</span> ·
+    formula (p−1)/(m+p−1) <span class="readout" data-r="formula">-</span> ·
+    most micro-batches stored on stage 0 <span class="readout" data-r="mem">-</span>
+  </p>
+</div>
+
+<style>
+  .dpipe-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  type Op = { k: 'F' | 'B'; i: number };
+  const NS = 'http://www.w3.org/2000/svg';
+  const TF = 1, TB = 2;
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function orders(p: number, m: number, kind: string): Op[][] {
+    return Array.from({ length: p }, (_, s) => {
+      const o: Op[] = [];
+      if (kind === 'gpipe') {
+        for (let i = 0; i < m; i++) o.push({ k: 'F', i });
+        for (let i = 0; i < m; i++) o.push({ k: 'B', i });
+      } else {
+        const w = Math.min(p - s - 1, m);
+        for (let i = 0; i < w; i++) o.push({ k: 'F', i });
+        let f = w;
+        for (let b = 0; b < m; b++) {
+          if (f < m) o.push({ k: 'F', i: f++ });
+          o.push({ k: 'B', i: b });
+        }
+      }
+      return o;
+    });
+  }
+
+  function simulate(p: number, m: number, kind: string) {
+    const ord = orders(p, m, kind);
+    const done = new Map<string, number>();
+    const free = new Array(p).fill(0), idx = new Array(p).fill(0);
+    const ops: { s: number; k: string; i: number; t: number; d: number }[] = [];
+    let guard = 0;
+    while (idx.some((x, s) => x < ord[s].length) && guard++ < 10000) {
+      for (let s = 0; s < p; s++) {
+        if (idx[s] >= ord[s].length) continue;
+        const { k, i } = ord[s][idx[s]];
+        let dep: string | null = null;
+        if (k === 'F' && s > 0) dep = `F${s - 1}.${i}`;
+        else if (k === 'B') dep = s < p - 1 ? `B${s + 1}.${i}` : `F${s}.${i}`;
+        if (dep && !done.has(dep)) continue;
+        const t = Math.max(free[s], dep ? done.get(dep)! : 0), d = k === 'F' ? TF : TB;
+        done.set(`${k}${s}.${i}`, t + d); free[s] = t + d; idx[s]++;
+        ops.push({ s, k, i, t, d });
+      }
+    }
+    const T = Math.max(...free);
+    // peak number of micro-batches whose activations stage 0 holds (forward done, backward not yet)
+    let live = 0, peak = 0;
+    ops.filter((o) => o.s === 0).sort((a, b) => a.t - b.t).forEach((o) => { live += o.k === 'F' ? 1 : -1; peak = Math.max(peak, live); });
+    return { ops, T, bubble: 1 - (p * m * (TF + TB)) / (p * T), peak };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="dist-pipe"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const st = { p: 4, m: 4, kind: 'gpipe' };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const kindBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-s]')];
+
+    function draw() {
+      const { ops, T, bubble, peak } = simulate(st.p, st.m, st.kind);
+      const X0 = 62, X1 = 632, LANE = 22, GAP = 6, TOP = 26;
+      const H = TOP + st.p * (LANE + GAP) + 34;
+      const sc = (X1 - X0) / T;
+      svg.setAttribute('viewBox', `0 0 640 ${H}`);
+      svg.replaceChildren();
+      svg.append(el('text', { x: X0, y: 14, class: 'strong' }, 'TIME →'));
+      svg.append(el('text', { x: X1, y: 14, 'text-anchor': 'end' }, `ONE STEP = ${T} UNITS`));
+      for (let s = 0; s < st.p; s++) {
+        const y = TOP + s * (LANE + GAP);
+        svg.append(el('text', { x: 0, y: y + 15, class: 'strong' }, `GPU ${s}`));
+        svg.append(el('rect', { x: X0, y, width: X1 - X0, height: LANE, class: 'fill-paper dash', 'stroke-width': 0.8 }));
+      }
+      for (const o of ops) {
+        const y = TOP + o.s * (LANE + GAP), x = X0 + o.t * sc, w = o.d * sc;
+        svg.append(el('rect', { x: x + 0.4, y: y + 0.4, width: Math.max(w - 0.8, 0.5), height: LANE - 0.8, class: o.k === 'F' ? 'fill-wash' : 'fill-blue', 'stroke-width': 0.8 }));
+        if (w > 15) {
+          const t = el('text', { x: x + w / 2, y: y + 15, 'text-anchor': 'middle' }, `${o.k}${o.i}`);
+          if (o.k === 'B') t.setAttribute('style', 'fill:var(--paper)');
+          svg.append(t);
+        }
+      }
+      const ly = H - 8;
+      svg.append(el('rect', { x: 0, y: ly - 10, width: 16, height: 12, class: 'fill-wash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: 22, y: ly }, 'FORWARD'));
+      svg.append(el('rect', { x: 100, y: ly - 10, width: 16, height: 12, class: 'fill-blue' }));
+      svg.append(el('text', { x: 122, y: ly }, 'BACKWARD (2x)'));
+      svg.append(el('rect', { x: 240, y: ly - 10, width: 16, height: 12, class: 'fill-paper dash', 'stroke-width': 0.8 }));
+      svg.append(el('text', { x: 262, y: ly }, 'IDLE = BUBBLE'));
+
+      r('bub').textContent = Math.round(bubble * 1000) / 10 + '%';
+      r('formula').textContent = Math.round(((st.p - 1) / (st.m + st.p - 1)) * 1000) / 10 + '%';
+      r('mem').textContent = String(peak);
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        (st as any)[inp.dataset.k!] = +inp.value;
+        root.querySelector<HTMLElement>(`[data-o="${inp.dataset.k}"]`)!.textContent = inp.value;
+        draw();
+      });
+    });
+    kindBtns.forEach((b) => b.addEventListener('click', () => {
+      st.kind = b.dataset.s!;
+      kindBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    draw();
+  });
+</script>

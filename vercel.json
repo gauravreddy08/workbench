@@ -1,0 +1,13 @@
+{
+  "buildCommand": "npm run build",
+  "outputDirectory": ".vercel-out",
+  "trailingSlash": false,
+  "redirects": [
+    {
+      "source": "/",
+      "destination": "/learn-cs",
+      "permanent": false
+    }
+  ],
+  "cleanUrls": true
+}

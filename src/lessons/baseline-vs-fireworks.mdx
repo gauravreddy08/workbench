@@ -1,0 +1,588 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import BaselineAnatomy from '../components/figures/BaselineAnatomy.astro';
+import BaselineTokens from '../components/figures/BaselineTokens.astro';
+import BaselineTimeline from '../components/figures/BaselineTimeline.astro';
+import BaselineQueue from '../components/figures/BaselineQueue.astro';
+import BaselineHarness from '../components/figures/BaselineHarness.astro';
+import BaselineGap from '../components/figures/BaselineGap.astro';
+
+## Today
+
+- Say precisely what "fast" means for an LLM API: six numbers, each with a p50 and a p99, and which one a user actually feels.
+- Account for every millisecond of one streaming request, from your code to the GPU and back, and say where your Spark beats Fireworks and where it can't.
+- Build a deliberately naive model server on the Spark that speaks the same API as Fireworks, with real token streaming.
+- Turn your load generator from [Waiting vs working](/lessons/waiting-vs-working/) into a benchmark harness, run it against both servers, and start the `SCOREBOARD.md` that every later lesson in this track adds a row to.
+
+Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (your async load generator) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (your prediction). Time: an evening for the server, an evening for the harness, and one overnight run.
+
+## The Problem
+
+In the last lesson you did one division, 273 GB/s over 16 GB, and predicted your Spark would decode an 8B model at about 17 tokens per second, tops. Hold that number.
+
+Now open Fireworks' playground, pick an 8B Llama, and ask it for a short story. The text arrives faster than you can read it. Do the same on your Spark and it comes out at roughly the speed you read aloud. So Fireworks is faster. Obviously.
+
+Except: run both from the Spark itself, with a short prompt, and watch the very first word. On localhost your server can show the first word *before* Fireworks does, because your request never left the box. Then it falls behind on every word after that. And if three friends hit your Spark at the same moment, the third one stares at a blank screen for most of a minute while Fireworks serves thousands of strangers without blinking.
+
+So "which one is faster?" has no answer yet. Faster at what? For how many people? Measured how? This lesson pins all of that down, and turns it into a scoreboard you will spend the rest of this track trying to move.
+
+<Origin year="2023" title="The weights got out, and serving became a business">
+
+In February 2023 Meta released LLaMA to researchers, and the weights were on the open internet within about a week. That July, Llama 2 shipped with a license that allowed commercial use. Mistral, Qwen, DeepSeek and later Llama versions followed. Suddenly anyone could download a model close to the best closed ones.
+
+Downloading a model is easy. Serving it well is not. GPUs are expensive, and as you learned in the last lesson, a GPU answering one person spends most of its time waiting on memory while its compute sits idle. A crop of companies, Fireworks (started by people from Meta's PyTorch team), Together AI, Baseten and others, built a business in that gap: run fleets of data-center GPUs, serve open models to many customers at once, and sell the output by the token.
+
+The margin comes from the tricks. Serve many users per weight read (batching), skip work you have already done (caching), move fewer bytes (quantization), guess several tokens at once (speculative decoding), and write faster GPU code. Each of those is a later lesson in this track. Today you build the server *without* any of them, so you can see exactly what they buy.
+
+</Origin>
+
+## The Idea
+
+### Six numbers that mean "fast"
+
+Think of a restaurant. How long until the first plate lands? How steady is the pace after that? How long is the whole meal? And how many diners can the kitchen feed per hour? A diner cares about the first three. The owner cares about the fourth. An LLM API has the same four, plus two more that come from looking at many requests instead of one.
+
+1. <Term w="TTFT">Time to first token: from the moment your code sends the request to the moment the first piece of generated text arrives. This is what makes a chat app feel responsive.</Term>. The wait before anything happens.
+2. <Term w="ITL">Inter-token latency: the gap between one generated token and the next, once text is flowing. Also called time per output token (TPOT). Averaged over a request it is the inverse of tokens per second.</Term>, also called TPOT. The pace once text is flowing.
+3. **Output tokens per second, per stream.** Just one over ITL. This is the number you predicted in the last lesson (17 tok/s was a ceiling on it).
+4. **End-to-end latency.** First token to last token, plus the wait before. For N output tokens it is roughly TTFT + (N − 1) × ITL.
+5. <Term w="Aggregate throughput">Total output tokens per second across every request the server is handling at once. One user at 15 tok/s and sixteen users at 15 tok/s each are the same per-stream speed but a 16× different throughput.</Term>. The owner's number. It is what an inference company sells.
+6. **The tail.** Every one of the above, reported as a <Term w="percentile">The value below which that fraction of your measurements fall. p50 (the median) is the typical request; p99 is the value only 1 in 100 requests is worse than.</Term>: p50 for the typical request, p99 for the unlucky one. You already know why p99 matters: at scale, someone is always the unlucky one.
+
+Where do those milliseconds actually go? Follow one request.
+
+<Figure n="001" title="ANATOMY OF A REQUEST" caption="One streaming request, end to end. Everything up to the first token lands in TTFT; prefill is compute work, each decode step is mostly memory reads. Which segments are big depends entirely on where the server sits and how busy it is." wide>
+
+<BaselineAnatomy />
+
+</Figure>
+
+Left to right:
+
+- **Network.** Your request travels to the server and the first token travels back: one <Term w="RTT">Round-trip time: how long a tiny message takes to get to another machine and back. Localhost is well under a millisecond, your home network about a millisecond, a cloud region across the country tens of milliseconds.</Term> in total. From the [latency ladder](/lessons/latency-numbers/): localhost is well under a millisecond, a home LAN about one, a data center across the country tens of milliseconds.
+- **Handshake, first call only.** A brand-new HTTPS connection needs a TCP handshake (one round trip) and a <Term w="TLS">Transport Layer Security, the encryption under HTTPS. Before any data flows, client and server swap keys; with TLS 1.3 that costs one extra round trip on a new connection.</Term> handshake (one more with TLS 1.3) before your request can even be sent. Reuse the connection (HTTP keep-alive, which httpx does by default inside one client) and you pay this once. Your Spark on plain HTTP pays only the TCP part, and on localhost that is nothing.
+- **Queue.** The server may not start on you right away. On Fireworks, a scheduler slots you into a batch that is already running. On the server you are about to build, you wait until every request ahead of you is completely done. Hold that thought; it is the biggest number in this whole lesson.
+- **Prefill.** The model reads your entire prompt in one forward pass, all tokens at once. That is big matrix-times-matrix work, so it is limited by compute, not memory, and it gets longer as the prompt gets longer. Prefill also produces the first output token.
+- **Decode.** Then one token per forward pass, and each pass reads every weight from memory. That is the bandwidth-bound loop from [the last lesson](/lessons/bandwidth-bound/): each pass costs about one ITL, no matter how short the prompt was.
+
+So TTFT is network + handshake + queue + prefill. Everything after is decode, at one ITL per token.
+
+<Predict id="who-wins">
+
+Same 8B model. Your Spark, called from a script running on the Spark itself, versus Fireworks, called over the internet. One user, a 256-token prompt, a 256-token answer. Who shows the first token first? Who finishes the whole answer first? Guess a number for each.
+
+<Fragment slot="answer">
+
+First token: plausibly your Spark, or close to a tie. Localhost costs nothing, and nobody is queued ahead of you. Fireworks pays an internet round trip plus its gateway and scheduler, which can add up to a hundred milliseconds or more before its (much faster) prefill even starts. Your prefill of 256 tokens is slower, but it is short: about the cost of one pass over the weights plus some compute, so on the order of 100 ms.
+
+Whole answer: Fireworks, by a mile. 255 more tokens at your ~13 tok/s is about 20 seconds. At a couple of hundred tokens per second it is closer to one or two. The internet round trip is paid once; the per-token speed is paid 255 times. Short answers favor the box nearby, long answers favor the fast GPU.
+
+</Fragment>
+
+</Predict>
+
+### Tokens are not chunks
+
+The server streams text using <Term w="SSE">Server-sent events: a plain HTTP response that never "finishes" quickly. The server keeps writing lines that start with `data:` followed by a blank line, and the client reads them as they arrive.</Term>: one HTTP response that stays open, with the server writing `data: ...` lines as text becomes ready. It is tempting to treat each event as one token and time the gaps. Don't. An event can carry several tokens.
+
+Your own server will do it on purpose: Hugging Face's streamer holds text back until it has a whole word, so "Hello!" might arrive as one event even though it is two or three tokens. A busy API might do it by accident, flushing a few tokens at once after a hiccup. Either way, counting events gives you the wrong token count, and the gaps between events are not ITL.
+
+<Figure n="002" title="TOKENS VS EVENTS" caption="The server makes tokens at a steady rhythm; the client receives events that carry one or more of them. Count tokens from the usage field the server reports, time the window from first to last token, and divide.">
+
+<BaselineTokens />
+
+</Figure>
+
+So the harness does three things per request: stamp the time it sends, stamp the time of the first event that contains text (TTFT), and stamp the time of the last event with text. Then it takes the token count N from the server's own report (`usage.completion_tokens`, sent in the final event) and computes decode speed as (N − 1) divided by the first-to-last window. Minus one because the first token was produced by prefill, not by a decode step. The largest gap between events is still worth recording, as a stutter detector.
+
+### Where each one wins
+
+Now play with the whole thing. This figure is a model with made-up-but-reasonable rates (printed underneath), not a measurement. Its job is to show you the *shape* before your harness shows you the numbers.
+
+<Figure n="003" title="SPARK VS FIREWORKS, ONE REQUEST" caption="Top: the race to the first token. Bottom: the whole answer, on its own time scale. Try a 4,096-token prompt, then Tailscale from away, then 16 users. At concurrency above 1 the Spark bar shows a request in steady state, waiting behind everyone else." wide>
+
+<BaselineTimeline />
+
+</Figure>
+
+Things to try:
+
+- **Short prompt, localhost, one user.** The Spark wins first token, barely. Nearby beats fast when there is little work to do.
+- **Drag the prompt to 4,096 tokens.** Now prefill dominates TTFT, and prefill is compute. A data-center GPU has many times the Spark's compute, so Fireworks takes the lead even after paying for the internet.
+- **Switch to Tailscale from a café.** Your Spark's network advantage evaporates. Your home server is only "local" when you are home.
+- **Drag output to 1,024 tokens.** The bottom chart is almost all decode. This is where the 10× per-token gap lives, and no amount of network luck makes it up.
+- **Concurrency 16.** Look at the Spark's queue segment. That is the next section.
+
+Why is Fireworks' per-token speed so much higher, when decode is "just" reading weights? Because everything in the division from the last lesson is different for them. Their GPUs use <Term w="HBM">High-bandwidth memory: memory stacked right next to the GPU chip with a very wide connection. An H100's spec sheet lists about 3.35 TB/s, roughly 12 times the Spark's 273 GB/s.</Term>, about an order of magnitude more bandwidth than your Spark's LPDDR5x. They may serve the model in <Term w="FP8">An 8-bit floating point format. Storing weights in 8 bits instead of 16 halves the bytes read per token, so a bandwidth-bound decoder gets up to twice as fast. Some quality can be lost; that is the quantization lesson.</Term>, halving the bytes per token. They may use speculative decoding, which produces several tokens per weight read. And their code is fused, compiled GPU kernels, not a Python loop. They don't tell you all of it, which is fine. You will build each piece and see what it is worth.
+
+### Many users at once
+
+Here is the part that surprises people.
+
+<Predict id="sixteen-users">
+
+Sixteen people send a request to your naive Spark server at the same instant. Each wants a 256-token answer, and your server handles exactly one request at a time at about 13 tok/s. How long does the 16th person wait for their *first* token? What is the server's total throughput while all this happens?
+
+<Fragment slot="answer">
+
+Each request takes about 20 seconds of service (a fraction of a second of prefill, then 255 tokens at ~13 tok/s). The 16th person waits for 15 full requests before theirs starts: about 15 × 20 s = 5 minutes to the first token. Meanwhile the server's total throughput is still ~13 tok/s, exactly what it was with one user. Adding users added only waiting.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="004" title="SIXTEEN USERS, ONE GPU" caption="Naive: each request waits for every one before it, so first-token time grows in a staircase while total throughput stays flat. Batched (a preview of the batching lesson): everyone shares each pass over the weights, so throughput climbs and nobody waits in line. Same illustrative rates as Fig. 003.">
+
+<BaselineQueue />
+
+</Figure>
+
+Your load generator from [Waiting vs working](/lessons/waiting-vs-working/) runs a <Term w="closed loop">A load test where a fixed number of workers each send a request, wait for the full answer, then send the next. The number of requests in flight is held constant; the arrival rate adjusts itself.</Term>: c workers, each sending its next request as soon as the last one finishes. In steady state there are always c requests in the system, and the one at the back of the line waits behind c − 1 others. That is <Term w="Little's Law">For any stable system: average number of things inside = arrival rate × average time each spends inside. L = λ × W. It holds for queues at a coffee shop and for requests in a server.</Term> from lesson 4, made concrete. L = c requests are in the system. The server finishes λ = 1 / S requests per second, where S is one request's service time. So each request spends W = L / λ = c × S in the system. Double the users, double the wait. Throughput never moves.
+
+Fireworks behaves completely differently, because it does not serve one request at a time. It runs one pass over the weights for a whole batch of requests, so the expensive memory read is shared. Sixteen more users barely change their per-pass time, which is why their p99 hardly moves as you turn up concurrency. Your server will get the same trick in the [batching lesson](/lessons/batching/).
+
+### How many samples a p99 needs
+
+Suppose you send 20 requests and sort their TTFTs. Where is the p99? It is the value that 99% of requests beat, so it sits between the 19th and 20th sorted samples, 81% of the way toward the slowest. In other words: your "p99" is just your single worst request. One unlucky garbage collection, one network blip, and that is your headline number.
+
+To trust a percentile you want something like ten samples beyond it. For p90 that means about 100 requests. For p99, about 1,000. That has a real cost here: at 20 seconds a request, 1,000 requests on your naive server is five and a half hours. So be honest instead of heroic. Report n next to every percentile, report p90 when n is small, and print "n under 100" instead of a p99 that is really a max. A nice side effect of the flat throughput: on the naive server, 200 requests take about the same wall time whether c is 1 or 16.
+
+### One client for both servers
+
+Fireworks exposes an <Term w="OpenAI-compatible API">An HTTP API shaped exactly like OpenAI's: POST to /v1/chat/completions with a JSON body of model, messages and max_tokens. Most inference providers and engines (vLLM, SGLang) speak it, so one client works against all of them.</Term>. You POST a JSON body with `model`, `messages`, `max_tokens` and `stream: true` to `/v1/chat/completions`, and get back a stream like this:
+
+```text
+data: {"id":"...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Once"},"finish_reason":null}]}
+
+data: {"id":"...","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" upon a"},"finish_reason":null}]}
+
+data: {"id":"...","choices":[{"index":0,"delta":{},"finish_reason":"length"}],"usage":{"prompt_tokens":41,"completion_tokens":256,"total_tokens":297}}
+
+data: [DONE]
+```
+
+Three details matter for timing. The first event often carries only the role and empty content, so TTFT is the first event with *non-empty* content. Fireworks' docs say it returns `usage` in the final chunk of a stream; OpenAI's own API only does that if you ask with `stream_options`. And the stream ends with the literal line `data: [DONE]`, which is not JSON.
+
+If your Spark server speaks the same API, the benchmark client has no idea which server it is talking to. That is the whole design.
+
+<Figure n="005" title="THE HARNESS" caption="A fixed prompt set feeds c async workers. The same request body goes to either server. The parser timestamps events as they arrive, each request becomes one record, and each run becomes one results file and one scoreboard row.">
+
+<BaselineHarness />
+
+</Figure>
+
+### Rules for a fair fight
+
+A benchmark is only as good as the boring parts. Write these into the harness, not into your memory.
+
+- **Same model.** Pick one that Fireworks serves and you can run in bf16. Llama 3.1 8B Instruct is the natural choice: it is the model your 16 GB math in the last lesson described, and Fireworks' own docs use it as their example (as `accounts/fireworks/models/llama-v3p1-8b-instruct`). Check their current model catalog first: what is available on their pay-per-token tier changes. A Qwen3 8B class model is a fine alternative, but turn off its "thinking" output on both sides or you are comparing different amounts of text.
+- **Same prompts.** A fixed file of prompts, used in the same order every run.
+- **Same work.** Temperature 0. A fixed `max_tokens`. And force every request to generate exactly that many tokens, so a chatty answer and a curt one don't get compared: Fireworks' API reference lists an `ignore_eos` flag; in Hugging Face you get the same effect with `min_new_tokens`.
+- **Warm up.** Throw away the first few requests. They pay for connection setup, GPU warm-up and caches being cold.
+- **Same token counting.** Use the server's `usage` count, and spot-check it by re-tokenizing a few outputs with the model's own Hugging Face tokenizer.
+- **Write down the precision.** Yours is bf16. If Fireworks says how a model is served (some model pages mention FP8 or similar), record it; if not, record "undisclosed". It matters: half the bytes per token is up to twice the speed.
+- **Several concurrency levels.** 1, 4, 16 and 64. One number at c = 1 hides the most important behavior.
+- **Same client location.** Run the harness on the Spark for both targets. That compares servers. Then, once, run it from your laptop so you know what a user on your network actually feels.
+- **Errors are data.** Fireworks' pay-per-token tier has rate limits; at c = 64 you may get HTTP 429s. Record every failure in the results. Never drop them silently.
+- **Note the time.** A shared API is busier at some hours than others. Run Fireworks twice, at different times of day, and keep both.
+
+## Build It
+
+Your project folder for the whole track:
+
+```text
+inference/
+  server_naive.py     # today: the "before" picture
+  bench.py            # the harness, reused by every later lesson
+  scoreboard.py
+  prompts/short.jsonl
+  prompts/long.jsonl
+  results/            # one JSON per run, committed
+  SCOREBOARD.md       # one row per change, forever
+```
+
+<Task id="t1" title="Get PyTorch and the model onto the Spark" agent="ok">
+
+The Spark is an ARM64 CPU with a Blackwell GPU (GB10). A plain `pip install torch` may hand you a wheel that is not built for that combination, and you will lose an evening finding out. Follow NVIDIA's DGX Spark documentation and playbooks for the current way to get PyTorch; at the time of writing that means one of NVIDIA's NGC PyTorch containers. The shape, with the tag left for you to look up:
+
+```bash
+# Shape only: take the current image tag from NVIDIA's DGX Spark docs / the NGC catalog.
+docker run --gpus all -it --rm --ipc=host -p 8000:8000 \
+  -v "$HOME/inference:/work" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  nvcr.io/nvidia/pytorch:<tag>-py3
+
+# inside the container
+pip install transformers fastapi uvicorn httpx
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name())"
+```
+
+If `pip` starts downloading a new `torch`, stop it: you want the one the container shipped. Llama 3.1 is gated on Hugging Face, so accept the license on the model page and log in with the Hugging Face CLI (check its docs for the current login command). Download the weights once; the volume mount keeps them across container restarts.
+
+</Task>
+
+<Task id="t2" title="Write the naive streaming server" agent="hands">
+
+One file, `server_naive.py`. It must load the model once in bf16 on the GPU, accept OpenAI-shaped chat requests at `/v1/chat/completions`, and stream SSE events in the format above, ending with a `usage` event and `data: [DONE]`.
+
+The scaffolding is boilerplate; take it as is:
+
+```python
+# server_naive.py: deliberately naive. One request on the GPU at a time. No batching.
+import json, os, threading, time, uuid
+
+import torch
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+
+MODEL_ID = os.environ.get("MODEL_ID", "meta-llama/Llama-3.1-8B-Instruct")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=torch.bfloat16).to("cuda")  # older transformers: torch_dtype=
+model.eval()
+
+gpu_lock = threading.Lock()  # THE naive part. Every later lesson attacks this line.
+app = FastAPI()
+
+
+class ChatRequest(BaseModel):
+    model: str | None = None
+    messages: list[dict]
+    max_tokens: int = 256
+    temperature: float = 0.0
+    stream: bool = True
+    ignore_eos: bool = False
+
+
+def sse(obj: dict) -> str:
+    return f"data: {json.dumps(obj)}\n\n"
+
+
+def chunk(rid: str, created: int, delta: dict, finish=None, usage=None) -> dict:
+    return {"id": rid, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], "usage": usage}
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+```
+
+The endpoint is yours. Here is its shape:
+
+```python
+@app.post("/v1/chat/completions")
+def chat(req: ChatRequest):
+    rid, created = f"chatcmpl-{uuid.uuid4().hex[:12]}", int(time.time())
+
+    def events():                 # a plain (sync) generator, on purpose
+        with gpu_lock:
+            # 1. messages -> token ids with the model's chat template, on the GPU
+            # 2. a TextIteratorStreamer (skip the prompt, skip special tokens)
+            # 3. start model.generate(...) in a background thread, greedy, max_new_tokens,
+            #    and min_new_tokens when req.ignore_eos
+            # 4. yield the role event, then one event per piece of text the streamer gives you
+            # 5. join the thread, count completion tokens from generate's output ids,
+            #    yield the final event with finish_reason and usage, then "data: [DONE]\n\n"
+            ...
+
+    return StreamingResponse(events(), media_type="text/event-stream")
+```
+
+**Why a thread?** `model.generate` is one long blocking call: it does not return until the last token. The streamer is a queue that `generate` pushes text into as it goes. Something else has to pull text out of that queue and write it to the socket *while* `generate` is still running. Two jobs at once, so two threads: the generate thread does GPU work, and the response thread mostly sleeps on the queue. From [Processes, threads and the GIL](/lessons/processes-threads-gil/): threads are fine when one side is mostly waiting, which is exactly this case.
+
+**Why a sync generator?** Iterating the streamer blocks. If you did that inside an `async def`, you would freeze the event loop, and from [Waiting vs working](/lessons/waiting-vs-working/) you know what that means: no other request, not even `/health`, gets a word in. Starlette runs a plain generator passed to `StreamingResponse` in a worker thread, so blocking there is safe.
+
+**Why the lock?** Without it, two requests would run two `generate` calls on the GPU at once, fighting over memory bandwidth in ways that are hard to reason about. With it, requests queue. That queue is the "before" picture. It is supposed to look bad at c = 16.
+
+Hints: `tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=True, return_tensors="pt")` gives you the inputs as a dict you can move to the GPU and pass to `generate` with `**`. Wrap the generate call in `torch.inference_mode()`. The output ids of `generate` include the prompt, so completion tokens = output length − prompt length. Check the transformers docs for streaming if the API has moved.
+
+Run it with `uvicorn server_naive:app --host 0.0.0.0 --port 8000` and test with curl `-N` (no buffering). You should see one `data:` line per word, not one big blob at the end.
+
+</Task>
+
+<Task id="t3" title="Turn the load generator into a benchmark harness" agent="hands">
+
+Start from the asyncio + httpx load generator you wrote in lesson 4. You are adding streaming, per-token timing, percentiles, and a results file. Two helpers are pure plumbing; take them:
+
+```python
+import json, time
+import httpx
+
+
+async def sse_events(resp: httpx.Response):
+    """Yield each JSON payload from an OpenAI-style SSE stream. Stops at [DONE]."""
+    async for line in resp.aiter_lines():
+        if not line.startswith("data:"):
+            continue  # blank separators, ": keep-alive" comments, "event:" lines
+        data = line[len("data:"):].strip()
+        if data == "[DONE]":
+            return
+        yield json.loads(data)
+
+
+def pct(xs: list[float], q: float) -> float | None:
+    """Percentile with linear interpolation (same as numpy's default)."""
+    xs = sorted(xs)
+    if not xs:
+        return None
+    k = (len(xs) - 1) * q / 100
+    lo, hi = int(k), min(int(k) + 1, len(xs) - 1)
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+```
+
+The measuring is yours:
+
+```python
+async def one_request(client: httpx.AsyncClient, url: str, headers: dict, body: dict) -> dict:
+    """Stream one request. Return a record with: ok, ttft, e2e, n_out, decode_tps,
+    n_chunks, max_gap, error. Never raise: a failure is a record with ok=False."""
+    # t_send = time.perf_counter()
+    # async with client.stream("POST", url, headers=headers, json=body) as resp:
+    #     non-200 -> record the status and the start of the body, return
+    #     for each event: take usage if present; for each choice with non-empty delta content,
+    #     stamp t_first (once), t_last (every time), and the gap since the previous one
+    # ttft = t_first - t_send; e2e = end of stream - t_send
+    # decode_tps = (n_out - 1) / (t_last - t_first), with n_out from usage
+
+
+async def run_level(url, headers, model, prompts, conc, n_requests, n_warmup, max_tokens, ignore_eos):
+    """Warm up, then run n_requests through `conc` closed-loop workers sharing one AsyncClient.
+    Return (records, summary). Summary: n, n_ok, wall_s, throughput_tps (total output tokens
+    of successful requests / wall_s), and p50/p90/p99 of ttft, e2e and decode_tps."""
+```
+
+Then a `main()` with argparse that loops over concurrency levels and writes one JSON file per run into `results/`. The metadata is what makes a number mean something six months from now:
+
+```json
+{
+  "meta": {
+    "target": "spark-naive", "base_url": "http://localhost:8000/v1",
+    "model": "meta-llama/Llama-3.1-8B-Instruct", "precision": "bf16",
+    "change": "baseline", "git_sha": "3f2c9e1", "date": "2026-10-20T03:12:44Z",
+    "max_tokens": 256, "ignore_eos": true, "prompts": "prompts/short.jsonl",
+    "n": 200, "warmup": 3, "client": "spark"
+  },
+  "levels": [ { "summary": { "concurrency": 1, "ttft_p50": 0.0, "...": "..." }, "requests": ["..."] } ]
+}
+```
+
+Hints:
+
+- httpx's default timeout is 5 seconds. A request queued behind fifteen others on your server waits minutes before its first byte. Pass `httpx.Timeout(connect=10, read=None, write=10, pool=None)`, and make the connection pool at least as large as c.
+- Workers share one iterator of request indices (`for i in counter:` in each worker) so the total is exactly n.
+- The API key comes from an environment variable named on the command line, never from the code: `--key-env FIREWORKS_API_KEY`, then `headers["Authorization"] = f"Bearer {os.environ[name]}"`. Add `.env` to `.gitignore` before you create it.
+- Get the git sha with `subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True, stderr=subprocess.DEVNULL)`, and commit before a run so the sha points at the code that produced the numbers.
+- Test it against a fake: a 20-line FastAPI app that sleeps 50 ms, then streams fake tokens at 10 ms each, sometimes two or three per event, behind an `asyncio.Lock`. You know the right answers for that server (TTFT about 60 ms at c = 1, about (c − 1) × service time above that, flat throughput), so your harness has to reproduce them before you trust it on a real one.
+
+</Task>
+
+<Task id="t4" title="Prompt sets and the scoreboard" agent="ok">
+
+Two prompt files, one JSON object per line, each `{"messages": [...]}`. `short.jsonl`: 50 varied chat prompts of a sentence or two (questions, small writing tasks, code questions). `long.jsonl`: 20 prompts of about 2,000 tokens each (paste a long public-domain passage plus a question about it), for measuring prefill. An agent can write these; check the lengths with the tokenizer.
+
+The scoreboard script reads one results file, prints every concurrency level, and prints the row to paste:
+
+```python
+# scoreboard.py: print every level of a results file, and its SCOREBOARD.md row.
+import json, sys
+
+
+def ms(x):
+    return "-" if x is None else f"{x * 1000:.0f}"
+
+
+def num(x, d=1):
+    return "-" if x is None else f"{x:.{d}f}"
+
+
+def main(path):
+    run = json.load(open(path))
+    meta, levels = run["meta"], {l["summary"]["concurrency"]: l["summary"] for l in run["levels"]}
+
+    print(f"{meta['target']}  {meta['model']}  {meta['precision']}  sha={meta['git_sha']}")
+    print(f"{'c':>3} {'n_ok':>5} {'ttft p50':>9} {'p90':>7} {'p99':>7} {'tok/s p50':>10} {'e2e p50':>8} {'tput':>8}")
+    for c, s in sorted(levels.items()):
+        p99 = ms(s["ttft_p99"]) if s["n_ok"] >= 100 else "n<100"
+        print(f"{c:>3} {s['n_ok']:>5} {ms(s['ttft_p50']):>9} {ms(s['ttft_p90']):>7} {p99:>7} "
+              f"{num(s['decode_tps_p50']):>10} {num(s['e2e_p50'], 2):>8} {num(s['throughput_tps']):>8}")
+
+    one, sixteen = levels.get(1, {}), levels.get(16, {})
+    row = [meta["date"][:10], meta["target"], meta["change"],
+           f"{ms(one.get('ttft_p50'))} / {ms(one.get('ttft_p99'))}",
+           num(one.get("decode_tps_p50")), num(sixteen.get("throughput_tps")),
+           f"{meta['precision']}, n={meta['n']}, sha {meta['git_sha']}"]
+    print("\nSCOREBOARD row:\n| " + " | ".join(row) + " |")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1])
+```
+
+And `SCOREBOARD.md`, which you will append to at the end of every lesson in this track:
+
+```markdown
+# Scoreboard: Llama 3.1 8B Instruct, short prompts, 256 output tokens, ignore_eos
+
+| date | target | change | TTFT p50 / p99 ms (c=1) | tok/s p50 (c=1) | throughput tok/s (c=16) | notes |
+|------|--------|--------|-------------------------|-----------------|-------------------------|-------|
+|      | fireworks | reference |                      |                 |                         |       |
+|      | spark  | baseline: HF generate, 1 at a time |  |                 |                         | bf16  |
+```
+
+</Task>
+
+<Task id="t5" title="Run both, overnight" agent="explain">
+
+Commit, then:
+
+```bash
+export FIREWORKS_API_KEY=...   # in your shell or an untracked .env, never in a file you commit
+
+python bench.py --target spark-naive --base-url http://localhost:8000/v1 \
+  --model meta-llama/Llama-3.1-8B-Instruct --precision bf16 \
+  --prompts prompts/short.jsonl --concurrency 1,4,16 --n 200 --max-tokens 256 --ignore-eos
+
+python bench.py --target fireworks --base-url https://api.fireworks.ai/inference/v1 \
+  --key-env FIREWORKS_API_KEY --model accounts/fireworks/models/llama-v3p1-8b-instruct \
+  --precision undisclosed --prompts prompts/short.jsonl --concurrency 1,4,16,64 \
+  --n 1000 --max-tokens 256 --ignore-eos
+```
+
+The Spark run takes a few hours (200 requests × ~20 s, three times). For c = 64 on the Spark, use `--n 128`: every request will wait about 20 minutes, which makes the point without costing a day. Then run both once more with `prompts/long.jsonl`, `--max-tokens 64`, at c = 1, to measure prefill. Check Fireworks' pricing page before the big run; it is a few hundred thousand tokens of an 8B model, but you should know what you are spending.
+
+</Task>
+
+<DoneWhen>
+
+- `curl -N` against your server shows text arriving word by word, and the last events carry `usage` and `[DONE]`.
+- Your harness reproduces the known answers on a fake server, including the (c − 1) × service-time staircase.
+- `results/` holds runs for both targets at c = 1, 4, 16 (and 64 for Fireworks), each with full metadata.
+- `SCOREBOARD.md` has its first two rows, and nothing in the repo contains your API key.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in from `scoreboard.py`. Short prompts, 256 output tokens.
+
+| target | c | TTFT p50 | TTFT p99 (n) | tok/s p50 | e2e p50 | throughput |
+|--------|---|----------|--------------|-----------|---------|------------|
+| Spark, naive | 1 | | | | | |
+| Spark, naive | 4 | | | | | |
+| Spark, naive | 16 | | | | | |
+| Spark, naive | 64 | | | | | |
+| Fireworks | 1 | | | | | |
+| Fireworks | 4 | | | | | |
+| Fireworks | 16 | | | | | |
+| Fireworks | 64 | | | | | |
+
+What the shape should look like. These are expectations to check, not results; your numbers win.
+
+**Spark tok/s at c = 1, against your prediction.** Your ceiling was ~17 tok/s from the spec-sheet bandwidth. Naive `generate` usually lands noticeably below it, often somewhere between half and nine tenths of the ceiling. Write down measured ÷ predicted. The missing part is not memory: it is Python running the decode loop, launching hundreds of small GPU <Term w="kernels">Small programs that run on the GPU. Each layer of a forward pass launches several of them, and each launch has a fixed CPU-side cost of a few microseconds, which adds up when there are hundreds per token.</Term> per token, and waiting between them. The GPU is idle for slivers of every step.
+
+**Spark TTFT at c = 1, short prompts.** On localhost, something like 100 to 200 ms: one pass over 16 GB of weights costs ~60 ms by itself before any compute, plus the prompt's compute and Python overhead. Then look at the long prompts. Prefill is about 2 × parameters × prompt tokens operations: 2 × 8 billion × 2,000 = 32 trillion. If naive code gets a few tens of trillions of operations per second out of the GB10, that is somewhere around one second. Do the division backward from your measured TTFT to get your effective compute rate. That is a number worth knowing.
+
+**Spark at c = 4 and 16.** TTFT p50 should be close to (c − 1) × your c = 1 end-to-end time, and throughput should be flat at roughly your single-stream tok/s. If both are true, you have just measured Little's Law. At c = 16 that is several minutes to first token. The [batching lesson](/lessons/batching/) exists to delete that number.
+
+**Fireworks at c = 1.** TTFT is mostly your internet round trip plus their front door: expect a few hundred milliseconds, more on a bad connection or a busy hour. Per-stream tok/s for an 8B model is typically in the hundreds. Compare to your Spark: that ratio is the "how far behind am I" headline.
+
+**Fireworks at c = 16 and 64.** TTFT and tok/s should barely move, and throughput should grow almost in proportion to c, until you hit your account's rate limit. If you see 429s at c = 64, that is their limit on you, not their GPUs; record it.
+
+**The crossover.** Find the prompt length at which Fireworks starts winning TTFT even at c = 1. It is where their faster prefill pays for the round trip.
+
+### Where the gap comes from
+
+Every gap on your scoreboard has a cause, and every cause has a lesson. This is the map for the next few months.
+
+<Figure n="006" title="THE GAP, WIRED TO THE ROADMAP" caption="Read left to right: a symptom you will see in your results, why it happens, and the lesson that attacks it. Each lesson ends by adding a row to SCOREBOARD.md.">
+
+<BaselineGap />
+
+</Figure>
+
+| What you see | Why | Lesson that moves it |
+|---|---|---|
+| tok/s below your 17 tok/s ceiling | Python loop, kernel launches, unfused ops | [Inside vLLM and SGLang](/lessons/serving-engines/), [FlashAttention](/lessons/flash-attention/) |
+| the ceiling itself | 16 GB read per token in bf16 | [Quantization](/lessons/quantization/) |
+| one token per pass over the weights | nothing checks several guesses at once | [Speculative decoding](/lessons/speculative-decoding/) |
+| throughput flat as users grow | one request per pass over the weights | [Batching](/lessons/batching/) |
+| TTFT p99 explodes at c = 16 | every request waits for all before it | [Batching](/lessons/batching/) (continuous batching) |
+| repeated system prompts cost full prefill | the same prefix is recomputed every time | [Prefix caching](/lessons/prefix-caching/) |
+| how many users fit, at what context | the KV cache grows with every token | [The KV cache](/lessons/kv-cache/), [Memory math](/lessons/memory-math/) |
+
+You will also benchmark vLLM and SGLang on the Spark in [Inside vLLM and SGLang](/lessons/serving-engines/). They already do most of the above. You are building the naive server first so that when you read their code, you know exactly which problem each piece solves, because you measured that problem yourself.
+
+## Break It
+
+**Leave httpx's default timeout.** Run c = 16 against your server with a plain `httpx.AsyncClient()`. Requests start failing with `ReadTimeout`, because a queued request gets no bytes for minutes. If your harness drops errors, your p99 suddenly looks *great*: the slowest requests vanished from the data. Lesson: a timeout is a decision about which requests you are willing to not measure. Make it on purpose, and count failures.
+
+**Call `generate` on the event loop.** Make the endpoint `async def`, call `model.generate` with the streamer directly, and iterate the streamer in the same function. Watch two things: `curl localhost:8000/health` hangs while a generation runs, and your harness sees TTFT ≈ end-to-end, because nothing gets flushed until the loop gets control back. That is lesson 4's "stall" again, now at GPU scale.
+
+**Count events as tokens.** Have the harness compute tok/s from the number of events instead of `usage`. With the Hugging Face streamer's word-sized events, your speed reads noticeably low, because many words are more than one token. Against an API that sometimes bundles tokens, the error shifts around with load. Compare `n_chunks` to `n_out` in your records to see how far off you would have been.
+
+**Hang up halfway.** Start a long request (`max_tokens` 1,024) and kill the client after a second. Check the server logs and the GPU's utilization. Nothing in the naive server tells the generate thread that nobody is listening, so the GPU keeps producing an answer no one will read, and depending on how Starlette closes the generator, the lock may be released while it does, letting the next request run alongside a ghost. Real servers watch for disconnects and abort the request. Note it as a bug you will fix when you rewrite the server for batching.
+
+## Explain It Back
+
+Answer each out loud, as if in an interview, before opening the answer.
+
+<details>
+<summary>Fireworks has 3× better tok/s than your Spark, but your TTFT is lower at c = 1. Explain both.</summary>
+
+TTFT is network plus queue plus prefill. For a short prompt on localhost, my network is basically zero and nobody is ahead of me, and prefill of a few hundred tokens is short even on slow hardware. Fireworks pays an internet round trip and its gateway and scheduler before its fast prefill even starts, so the fixed costs dominate. Tok/s is a different number: each decode step reads every weight once, so it is set by memory bandwidth and by how few bytes you read per token. They have HBM with roughly ten times the Spark's bandwidth, may store weights in fewer bits, may use speculative decoding to get more than one token per read, and run compiled kernels instead of a Python loop. Fixed costs favor the nearby box; per-token costs favor the fast one. Make the prompt long or the answer long and Fireworks wins both.
+
+</details>
+
+<details>
+<summary>How many concurrent users can your naive server handle at a 2-second TTFT SLO?</summary>
+
+An <Term w="SLO">Service level objective: a target you promise for a metric, like "p99 time to first token under 2 seconds".</Term> of 2 seconds on TTFT means a request can wait almost not at all. One request takes about 20 seconds of service (256 tokens at ~13 tok/s). Anyone who arrives while another request is running waits for the rest of it, about 10 seconds on average. So the honest answer is one user, and only if that user's requests never overlap with anyone else's. With random arrivals, the fraction of requests that find the server busy equals its utilization, arrival rate × 20 s. For 99% of requests to find it idle, utilization must be about 1%: one request every half hour or so. Fireworks can promise the same SLO to many users because a new request joins a running batch instead of waiting for it to finish.
+
+</details>
+
+<details>
+<summary>What does a million output tokens cost you on the Spark versus the API? Show the method.</summary>
+
+Cost per hour of the Spark = purchase price ÷ the hours you expect to use it over its life, plus power draw in kW × your electricity price. Tokens per hour = measured aggregate throughput × 3,600 × the fraction of the time it is actually busy. Cost per million = cost per hour ÷ tokens per hour × 1,000,000. At the naive server's ~13 tok/s, a million tokens is about 77,000 seconds, roughly 21 hours of the machine, so whatever an hour of Spark costs, multiply by 21. Compare that with the provider's published price per million output tokens (input tokens are priced separately and are cheaper to produce, since prefill does them in bulk). Then redo it with the batched server's throughput: the hours per million shrink by roughly the throughput gain. That is exactly the economics the inference companies run, and why batching is their business.
+
+</details>
+
+<details>
+<summary>Why can't 20 samples give you a p99?</summary>
+
+With 20 sorted samples, the 99th percentile falls between the 19th and 20th, most of the way toward the 20th. So it is effectively the single slowest request, which is mostly luck: one garbage collection pause or network hiccup. To estimate a percentile you want around ten samples beyond it, so about 100 requests for p90 and 1,000 for p99. When you can't afford that, report p90 and print n next to every number.
+
+</details>
+
+<details>
+<summary>How do TTFT and throughput scale as users go from 1 to 64, on your server and on Fireworks?</summary>
+
+On the naive server, the GPU does one request at a time, so throughput stays flat at one stream's speed, and by Little's Law the time each request spends in the system is c × the service time. TTFT grows linearly with users: about (c − 1) × 20 s, so tens of minutes at c = 64. On Fireworks, each pass over the weights serves a whole batch, and decode is memory-bound, so adding users costs little extra per pass. Throughput grows nearly linearly with c and per-user latency barely moves, until their batch fills up or your rate limit kicks in. The difference is not hardware speed; it is whether one weight read serves one user or many.
+
+</details>
+
+## Go Deeper
+
+- **Fireworks AI docs, "OpenAI compatibility"** (docs.fireworks.ai/tools-sdks/openai-compatibility). The base URL, model naming, and the note that streaming responses include `usage` in the last chunk. Check the API reference there for `ignore_eos` and the model catalog for what is served on the pay-per-token tier.
+- **OpenAI API reference, chat completions streaming and the chunk object.** The format your server imitates, including `stream_options` for usage. Pair it with MDN's "Using server-sent events" for the wire format itself.
+- **Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023).** The vLLM paper. Read the first sections now for why naive serving wastes memory and throughput; read the rest when you reach the KV cache and batching lessons.
+- **Anyscale, "How continuous batching enables 23x throughput in LLM inference while reducing p50 latency" (Cade Daniel et al., 2023).** The clearest picture of why one-at-a-time serving is so wasteful, with benchmarks across serving systems.
+- **Databricks (MosaicML), "LLM Inference Performance Engineering: Best Practices" (2023).** Defines TTFT, time per output token, latency and throughput the way the industry uses them, and works through how batch size trades one for the other.
+- **Anyscale, "Reproducible Performance Metrics for LLM inference" (2023), and the LLMPerf tool.** How a team that sells inference benchmarks other people's; compare their methodology to your harness.
+- **Hugging Face transformers docs, generation and streaming (`TextIteratorStreamer`).** The exact API for the server, including the background-thread pattern. Check here first if a call in this lesson has moved.
+- **NVIDIA DGX Spark user guide and playbooks.** The supported way to get PyTorch and containers running on GB10.
+
+## Connections
+
+This lesson closes the opening chapter: it uses the latency ladder from [How slow is slow?](/lessons/latency-numbers/) for the network, threads from [Processes, threads and the GIL](/lessons/processes-threads-gil/) for the streamer, the load generator and Little's Law from [Waiting vs working](/lessons/waiting-vs-working/), and your prediction from [Why ~17 tokens per second?](/lessons/bandwidth-bound/).
+
+Everything after it in the Inference track is a row on the scoreboard. Start with [How much memory does a model need?](/lessons/memory-math/) and [The KV cache, by hand](/lessons/kv-cache/), then [Batching](/lessons/batching/), where the c = 16 row stops being embarrassing.

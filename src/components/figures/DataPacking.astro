@@ -1,0 +1,58 @@
+---
+// Static figure: four documents packed end to end into 12-token rows with <EOT> separators,
+// then two attention masks for row 1: plain causal (tokens can see the previous document)
+// vs a document (block-diagonal) mask (each token only sees its own document).
+const docs: [string, number][] = [['A', 4], ['B', 3], ['C', 7], ['D', 5]];
+const seg: { d: string; eot: boolean }[] = [];
+for (const [d, n] of docs) {
+  for (let i = 0; i < n; i++) seg.push({ d, eot: false });
+  seg.push({ d, eot: true });
+}
+const L = 12, cs = 34, x0 = 40, c = 11, my = 156;
+const rows = [seg.slice(0, L), seg.slice(L, 2 * L)];
+const row = rows[0];
+const masks = [
+  { title: 'CAUSAL OVER THE WHOLE ROW', note: 'B CAN SEE A. CHEAP, USUALLY FINE.', on: (i: number, j: number) => j <= i },
+  { title: 'DOCUMENT MASK', note: 'EACH DOC SEES ONLY ITSELF.', on: (i: number, j: number) => j <= i && row[i].d === row[j].d },
+];
+---
+<svg viewBox="0 0 640 340" role="img" aria-label="Four documents packed into fixed-length rows with end-of-text separators, and two attention masks for the first row">
+  <text x="10" y="18" class="strong">DOCUMENTS, EACH ENDING IN &lt;EOT&gt;, LAID END TO END</text>
+  {rows.map((r, ri) => (
+    <g>
+      <text x="10" y={30 + ri * 34 + 17}>R{ri + 1}</text>
+      {r.map((t, ci) => (
+        t.eot ? (
+          <g>
+            <rect x={x0 + ci * cs} y={30 + ri * 34} width={cs - 3} height="24" class="fill-blue" />
+            <text x={x0 + ci * cs + (cs - 3) / 2} y={30 + ri * 34 + 16} text-anchor="middle" font-size="9" style="fill:var(--paper)">EOT</text>
+          </g>
+        ) : (
+          <g>
+            <rect x={x0 + ci * cs} y={30 + ri * 34} width={cs - 3} height="24" class={t.d === 'A' || t.d === 'C' ? 'fill-wash' : 'fill-paper'} stroke-width="1" />
+            <text x={x0 + ci * cs + (cs - 3) / 2} y={30 + ri * 34 + 16} text-anchor="middle">{t.d}</text>
+          </g>
+        )
+      ))}
+    </g>
+  ))}
+  <text x={x0 + L * cs + 4} y="47">ROW = {L} TOKENS</text>
+  <text x={x0 + L * cs + 4} y="81">C SPILLS INTO R2</text>
+  <line x1="40" y1="108" x2="448" y2="108" class="ink dash" stroke-width="1" />
+  <text x="10" y="126" class="strong">TWO WAYS TO MASK ATTENTION IN R1</text>
+  {masks.map((m, k) => (
+    <g>
+      <text x={60 + k * 300} y={my - 10} class="strong">{m.title}</text>
+      {row.map((t, i) => (
+        <g>
+          <text x={60 + k * 300 - 6} y={my + i * c + c - 2} text-anchor="end" font-size="8">{t.eot ? 'e' : t.d}</text>
+          {row.map((_, j) => (
+            <rect x={60 + k * 300 + j * c} y={my + i * c} width={c - 1} height={c - 1} class={m.on(i, j) ? 'fill-blue' : 'fill-paper'} stroke-width={m.on(i, j) ? undefined : '0.5'} />
+          ))}
+        </g>
+      ))}
+      <text x={60 + k * 300} y={my + L * c + 16}>ROW = QUERY · COLUMN = KEY</text>
+      <text x={60 + k * 300} y={my + L * c + 34} class="blue-t">{m.note}</text>
+    </g>
+  ))}
+</svg>

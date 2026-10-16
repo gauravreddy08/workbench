@@ -1,0 +1,168 @@
+---
+// Step through one decode step of Llama 3.1 8B (bf16) on a DGX Spark: every layer's weights stream
+// from memory to the GPU, and the math for each layer takes a sliver of the time it took to arrive.
+// Usage: <BandwidthStream />
+---
+<div class="bs" data-fig="bandwidth-stream">
+  <svg viewBox="0 0 560 250" role="img" aria-label="Weights streaming layer by layer from memory to the GPU, with timelines for the memory bus and the tensor cores">
+    <text x="10" y="14" class="strong">MEMORY · 128 GB LPDDR5X</text>
+    <g data-layer="cells"></g>
+    <text x="10" y="148">EACH CELL = ONE LAYER · 436 MB</text>
+
+    <line x1="262" y1="70" x2="330" y2="70" class="ink" stroke-width="1.5" />
+    <line x1="262" y1="84" x2="330" y2="84" class="ink" stroke-width="1.5" />
+    <rect data-el="flow" x="262" y="71" width="0" height="12" class="fill-blue" />
+    <text x="296" y="62" text-anchor="middle" class="blue-t">273 GB/S</text>
+    <text x="296" y="100" text-anchor="middle">THE PIPE</text>
+
+    <rect x="336" y="22" width="214" height="118" class="fill-paper" stroke-width="1" />
+    <text x="346" y="40" class="strong">GPU · TENSOR CORES</text>
+    <text x="346" y="60" data-el="gpu-l">WAITING FOR WEIGHTS</text>
+    <g data-layer="lanes"></g>
+
+    <text x="10" y="180" class="strong">MEMORY BUS</text>
+    <rect x="110" y="168" width="440" height="16" class="ink" stroke-width="1" />
+    <g data-layer="mem"></g>
+    <text x="10" y="210" class="strong">TENSOR CORES</text>
+    <rect x="110" y="198" width="440" height="16" class="ink" stroke-width="1" />
+    <g data-layer="cmp"></g>
+    <text x="110" y="234">0 MS</text>
+    <text x="550" y="234" text-anchor="end">55 MS · ONE TOKEN PER STREAM</text>
+  </svg>
+  <p class="bs-note" aria-live="polite"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="step">Step →</button>
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <span>batch</span>
+    <button class="btn" type="button" data-b="1" aria-pressed="true">1</button>
+    <button class="btn" type="button" data-b="16">16</button>
+    <button class="btn" type="button" data-b="128">128</button>
+  </div>
+  <div class="ctl">
+    <span>elapsed <span class="readout" data-out="t">0.0 ms</span></span>
+    <span>moved <span class="readout" data-out="gb">0.00 GB</span></span>
+    <span>tensor cores busy <span class="readout" data-out="busy">-</span></span>
+    <span>tokens made <span class="readout" data-out="tok">0</span></span>
+  </div>
+</div>
+
+<style>
+  .bs svg { width: 100%; }
+  .bs-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  // Llama 3.1 8B shapes: hidden 4096, MLP 14336, 8 KV heads x 128. Per layer:
+  // attention q,k,v,o = 4096*(4096+1024+1024+4096) = 41.9M; MLP gate,up,down = 3*4096*14336 = 176.2M.
+  const LAYER_PARAMS = 41.94e6 + 176.16e6; // 218.1M
+  const HEAD_PARAMS = 128256 * 4096; // output projection (LM head), 525M
+  const BPW = 2; // bf16
+  const BW = 273e9; // spec-sheet
+  const PEAK = 125e12; // assumed dense BF16 upper bound; measure yours
+  type Seg = { name: string; bytes: number; params: number };
+  const SEGS: Seg[] = [
+    ...Array.from({ length: 32 }, (_, i) => ({ name: `LAYER ${i}`, bytes: LAYER_PARAMS * BPW, params: LAYER_PARAMS })),
+    { name: 'LM HEAD', bytes: HEAD_PARAMS * BPW, params: HEAD_PARAMS },
+  ];
+  const TOTAL_T = SEGS.reduce((s, x) => s + x.bytes / BW, 0); // ~55 ms
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  const reduce = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="bandwidth-stream"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const cellsG = q<SVGGElement>('[data-layer="cells"]');
+    const lanesG = q<SVGGElement>('[data-layer="lanes"]');
+    const memG = q<SVGGElement>('[data-layer="mem"]');
+    const cmpG = q<SVGGElement>('[data-layer="cmp"]');
+    const flow = q<SVGRectElement>('[data-el="flow"]');
+    const gpuL = q<SVGTextElement>('[data-el="gpu-l"]');
+    const note = q<HTMLElement>('.bs-note');
+    const playBtn = q<HTMLButtonElement>('[data-act="play"]');
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    let i = 0; // segments done
+    let B = 1;
+    let timer: number | undefined;
+
+    // memory cells: 32 layers in 8x4, then LM head wide, then the embedding table (only one row read)
+    const cells: SVGRectElement[] = [];
+    for (let k = 0; k < 32; k++) {
+      const c = mk('rect', { x: 10 + (k % 8) * 30, y: 24 + Math.floor(k / 8) * 22, width: 26, height: 18, class: 'fill-paper', 'stroke-width': 1 }) as SVGRectElement;
+      cellsG.appendChild(c);
+      cells.push(c);
+    }
+    const head = mk('rect', { x: 10, y: 114, width: 116, height: 18, class: 'fill-paper', 'stroke-width': 1 }) as SVGRectElement;
+    cellsG.appendChild(head);
+    cells.push(head);
+    cellsG.appendChild(mk('text', { x: 16, y: 127 }, 'LM HEAD 1.05 GB'));
+    cellsG.appendChild(mk('rect', { x: 130, y: 114, width: 116, height: 18, class: 'fill-paper dash', 'stroke-width': 1 }));
+    cellsG.appendChild(mk('text', { x: 136, y: 127 }, 'EMBED: 1 ROW'));
+
+    const x0 = 110, W = 440;
+    const render = () => {
+      cells.forEach((c, k) => c.setAttribute('class', k < i - 1 ? 'fill-wash' : k === i - 1 ? 'fill-blue' : 'fill-paper'));
+      // lanes: one dot per stream (max 128 drawn as a grid)
+      lanesG.replaceChildren();
+      const n = B;
+      const cols = n <= 16 ? n : 32;
+      const size = n <= 16 ? 10 : 4;
+      const gap = n <= 16 ? 2 : 2;
+      for (let k = 0; k < n; k++) {
+        const x = 346 + (k % cols) * (size + gap);
+        const y = 74 + Math.floor(k / cols) * (size + gap);
+        lanesG.appendChild(mk('rect', { x, y, width: size, height: size, class: i > 0 && i <= SEGS.length ? 'fill-blue' : 'fill-paper', 'stroke-width': 1 }));
+      }
+      lanesG.appendChild(mk('text', { x: 346, y: 132 }, `${B} TOKEN${B > 1 ? 'S' : ''} IN FLIGHT`));
+
+      memG.replaceChildren();
+      cmpG.replaceChildren();
+      let t = 0, moved = 0, busy = 0;
+      for (let k = 0; k < i; k++) {
+        const s = SEGS[k];
+        const dt = s.bytes / BW;
+        const ct = (2 * s.params * B) / PEAK;
+        const sx = x0 + (t / TOTAL_T) * W;
+        const sw = (dt / TOTAL_T) * W;
+        memG.appendChild(mk('rect', { x: sx, y: 169, width: Math.max(sw - 0.6, 0.5), height: 14, class: 'fill-blue' }));
+        const cw = Math.max((ct / TOTAL_T) * W, 0.8);
+        cmpG.appendChild(mk('rect', { x: sx + sw - cw, y: 199, width: cw, height: 14, class: 'fill-blue' }));
+        t += dt;
+        moved += s.bytes;
+        busy += ct;
+      }
+      flow.setAttribute('width', i > 0 && i <= SEGS.length ? '68' : '0');
+      gpuL.textContent = i === 0 ? 'WAITING FOR WEIGHTS' : i <= SEGS.length ? `${SEGS[i - 1].name} ARRIVED · MATH` : '';
+      out('t').textContent = `${(t * 1e3).toFixed(1)} ms`;
+      out('gb').textContent = `${(moved / 1e9).toFixed(2)} GB`;
+      out('busy').textContent = i ? `${((100 * busy) / t).toFixed(busy / t < 0.1 ? 2 : 0)}%` : '-';
+      out('tok').textContent = i === SEGS.length ? String(B) : '0';
+      const perLayerUs = ((2 * LAYER_PARAMS * B) / PEAK) * 1e6;
+      if (i === 0) note.textContent = 'One decode step for one token. Press Step: each layer’s weights have to cross the pipe before the GPU can use them.';
+      else if (i < SEGS.length) note.textContent = `${SEGS[i - 1].name}: ${(SEGS[i - 1].bytes / 1e6).toFixed(0)} MB took ${((SEGS[i - 1].bytes / BW) * 1e3).toFixed(2)} ms to arrive. The math on it, for ${B} token${B > 1 ? 's' : ''}, takes about ${perLayerUs.toFixed(perLayerUs < 10 ? 1 : 0)} µs. Then the GPU waits for the next layer.`;
+      else note.textContent = `Done: ${(moved / 1e9).toFixed(1)} GB moved in ${(t * 1e3).toFixed(0)} ms for ${B} token${B > 1 ? 's' : ''} (${(B / t).toFixed(0)} tok/s total, ${(1 / t).toFixed(0)} per stream). ${B === 1 ? 'Now try batch 16 and 128.' : `Same delivery, ${B}x the customers.`}`;
+    };
+    const stop = () => { if (timer) clearInterval(timer); timer = undefined; playBtn.setAttribute('aria-pressed', 'false'); };
+    const stepOnce = () => { if (i < SEGS.length) i++; else stop(); render(); };
+    q('[data-act="step"]').addEventListener('click', () => { stop(); stepOnce(); });
+    q('[data-act="reset"]').addEventListener('click', () => { stop(); i = 0; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer) return stop();
+      if (i >= SEGS.length) i = 0;
+      if (reduce) { i = SEGS.length; render(); return; }
+      playBtn.setAttribute('aria-pressed', 'true');
+      timer = window.setInterval(stepOnce, 140);
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-b]').forEach((b) => b.addEventListener('click', () => {
+      root.querySelectorAll('[data-b]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      B = Number(b.dataset.b);
+      render();
+    }));
+    render();
+  });
+</script>

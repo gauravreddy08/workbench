@@ -1,0 +1,382 @@
+---
+// Click a cell in the flat sheet: every other row that stores the same fact lights up, because
+// they must all change together. Change one row only and watch the sheet contradict itself.
+// Toggle to the normalized schema: the same fact lives in one row, and runs point at it by id
+// (arrows are foreign keys).
+---
+<div class="nr" data-fig="norm-ripple">
+  <div class="ctl nr-top">
+    <button class="btn" type="button" data-view="flat" aria-pressed="true">Flat sheet</button>
+    <button class="btn" type="button" data-view="norm" aria-pressed="false">Normalized</button>
+    <button class="btn" type="button" data-reset>Reset</button>
+  </div>
+  <p class="nr-hint">Click any <span class="nr-key">underlined</span> cell: an author, an email, a model, a param count, or a metric value.</p>
+
+  <div class="nr-flat" data-pane="flat">
+    <div class="nr-scroll"><table class="nr-t" data-flat></table></div>
+  </div>
+
+  <div class="nr-norm" data-pane="norm" hidden>
+    <div class="nr-cols">
+      <div class="nr-col">
+        <div class="nr-card"><div class="label">runs</div><table class="nr-t" data-tbl="runs"></table></div>
+        <div class="nr-card"><div class="label">metrics</div><table class="nr-t" data-tbl="metrics"></table></div>
+      </div>
+      <div class="nr-col">
+        <div class="nr-card"><div class="label">authors</div><table class="nr-t" data-tbl="authors"></table></div>
+        <div class="nr-card"><div class="label">models</div><table class="nr-t" data-tbl="models"></table></div>
+        <div class="nr-card"><div class="label">datasets</div><table class="nr-t" data-tbl="datasets"></table></div>
+      </div>
+    </div>
+    <svg class="nr-arrows" aria-hidden="true"></svg>
+  </div>
+
+  <div class="nr-panel">
+    <div class="nr-stats">
+      <span>rows holding this fact <span class="readout" data-n>-</span></span>
+      <span>writes so far <span class="readout" data-w>0</span></span>
+      <span>contradictions <span class="readout" data-c>0</span></span>
+    </div>
+    <div class="ctl">
+      <button class="btn" type="button" data-one disabled>Change this row only</button>
+      <button class="btn" type="button" data-all disabled>Change every row</button>
+    </div>
+    <p class="nr-msg" data-msg>Pick a cell to see where its fact lives.</p>
+  </div>
+</div>
+
+<style is:global>
+  .nr-top { margin-top: 0; }
+  .nr-hint { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin: 10px 0 12px; }
+  .nr-key { text-decoration: underline dotted var(--blue); text-underline-offset: 3px; }
+  .nr-scroll { overflow-x: auto; border: 1px solid var(--rule); background: var(--paper); }
+  .nr .nr-t { border-collapse: collapse; font-family: var(--mono); font-size: 11px; width: 100%; margin: 0; display: table; }
+  .nr .nr-t th { font-weight: 400; color: var(--ink-3); text-align: left; padding: 5px 7px; border-bottom: 1px solid var(--ink); white-space: nowrap; letter-spacing: 0.06em; text-transform: uppercase; font-size: 10px; }
+  .nr .nr-t td { padding: 4px 7px; border-bottom: 1px solid var(--rule); white-space: nowrap; color: var(--ink-2); }
+  .nr .nr-t td.k { cursor: pointer; text-decoration: underline dotted var(--blue); text-underline-offset: 3px; }
+  .nr .nr-t td.k:hover { color: var(--blue); }
+  .nr .nr-t td.sel, .nr .nr-t td.sel:hover { background: var(--blue); color: var(--paper); text-decoration: none; }
+  .nr .nr-t td.must { background: var(--blue-fill); color: var(--ink); outline: 1px solid var(--blue); outline-offset: -1px; }
+  .nr .nr-t td.bad { color: var(--warn); font-weight: 600; outline: 1px dashed var(--warn); outline-offset: -2px; }
+  .nr .nr-t td.pk { color: var(--ink); font-weight: 600; }
+  .nr .nr-t tr.ref td { background: var(--blue-wash); }
+  .nr-norm { position: relative; padding-left: 22px; }
+  .nr-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px 40px; align-items: start; }
+  .nr-col { display: grid; gap: 14px; min-width: 0; }
+  .nr-card { border: 1px solid var(--rule); background: var(--paper); padding: 6px 6px 4px; overflow-x: auto; }
+  .nr-card .label { font-size: 10px; color: var(--blue); margin: 0 0 4px 2px; }
+  .nr-arrows { position: absolute; left: 0; top: 0; pointer-events: none; overflow: visible; }
+  .nr-arrows path { fill: none; stroke: var(--blue); stroke-width: 1.2; }
+  .nr-arrows .head { fill: var(--blue); stroke: none; }
+  .nr-panel { margin-top: 14px; border-top: 1px dashed var(--rule); padding-top: 10px; }
+  .nr-stats { display: flex; flex-wrap: wrap; gap: 6px 22px; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .nr .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .nr .btn:disabled:hover { background: var(--paper); color: var(--blue); }
+  .nr-msg { font-family: var(--mono); font-size: 12px; line-height: 1.6; color: var(--ink-2); margin: 12px 0 0; min-height: 3.2em; }
+  .nr-msg.warn { color: var(--warn); }
+  @media (max-width: 560px) {
+    .nr-cols { grid-template-columns: 1fr; }
+  }
+</style>
+
+<script>
+  type Kind = 'name' | 'email' | 'model' | 'params' | 'value';
+  interface Author { id: number; name: string; email: string }
+  interface Model { id: number; name: string; params: string }
+  interface Run { run: number; aid: number; mid: number; did: number }
+  interface Metric { run: number; metric: string; value: string }
+  interface Flat { run: number; aid: number; mid: number; author: string; email: string; model: string; params: string; ds: string; metric: string; value: string }
+
+  const ALT: Record<string, string> = {
+    'Priya': 'Priya R.', 'Sam': 'Samuel', 'Gaurav': 'Gaurav T.',
+    'priya@tf.io': 'priya.r@tf.io', 'sam@tf.io': 'sam.o@tf.io', 'gaurav@tf.io': 'gaurav.t@tf.io',
+    '22M': '22.7M', '33M': '33.4M', '278M': '279M',
+  };
+  const flip = (v: string) => ALT[v] ?? Object.keys(ALT).find((k) => ALT[k] === v) ?? v;
+
+  function seed() {
+    const authors: Author[] = [
+      { id: 1, name: 'Priya', email: 'priya@tf.io' },
+      { id: 2, name: 'Sam', email: 'sam@tf.io' },
+      { id: 3, name: 'Gaurav', email: 'gaurav@tf.io' },
+    ];
+    const models: Model[] = [
+      { id: 1, name: 'minilm-l6', params: '22M' },
+      { id: 2, name: 'minilm-l12', params: '33M' },
+      { id: 3, name: 'bge-base', params: '278M' },
+    ];
+    const datasets = [{ id: 1, name: 'msmarco v2' }, { id: 2, name: 'tfq 2026-08' }];
+    const runs: Run[] = [
+      { run: 101, aid: 1, mid: 2, did: 1 }, { run: 102, aid: 2, mid: 1, did: 1 },
+      { run: 103, aid: 1, mid: 3, did: 2 }, { run: 104, aid: 3, mid: 2, did: 2 },
+      { run: 105, aid: 1, mid: 2, did: 1 }, { run: 106, aid: 2, mid: 2, did: 2 },
+    ];
+    const metrics: Metric[] = [
+      [101, 'ndcg@10', '.391'], [101, 'mrr@10', '.402'], [101, 'p50_ms', '12.1'],
+      [102, 'ndcg@10', '.372'], [102, 'mrr@10', '.380'],
+      [103, 'ndcg@10', '.412'], [103, 'mrr@10', '.420'], [103, 'p50_ms', '31.0'],
+      [104, 'ndcg@10', '.401'], [104, 'mrr@10', '.393'],
+      [105, 'ndcg@10', '.395'], [106, 'ndcg@10', '.388'],
+    ].map(([run, metric, value]) => ({ run: run as number, metric: metric as string, value: value as string }));
+    const flat: Flat[] = metrics.map((m) => {
+      const r = runs.find((x) => x.run === m.run)!;
+      const a = authors.find((x) => x.id === r.aid)!;
+      const mo = models.find((x) => x.id === r.mid)!;
+      return { run: r.run, aid: a.id, mid: mo.id, author: a.name, email: a.email, model: mo.name, params: mo.params, ds: datasets[r.did - 1].name, metric: m.metric, value: m.value };
+    });
+    return { authors, models, datasets, runs, metrics, flat };
+  }
+
+  const bump = (v: string) => (v.startsWith('.') ? (parseFloat(v) + 0.01).toFixed(3).slice(1) : (parseFloat(v) + 1).toFixed(1));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="norm-ripple"]').forEach((root, inst) => {
+    let S = seed();
+    let view: 'flat' | 'norm' = 'flat';
+    let sel: { kind: Kind; row: number; tbl?: string } | null = null;
+    let writes = 0;
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const nEl = root.querySelector<HTMLElement>('[data-n]')!;
+    const wEl = root.querySelector<HTMLElement>('[data-w]')!;
+    const cEl = root.querySelector<HTMLElement>('[data-c]')!;
+    const oneBtn = root.querySelector<HTMLButtonElement>('[data-one]')!;
+    const allBtn = root.querySelector<HTMLButtonElement>('[data-all]')!;
+    const normPane = root.querySelector<HTMLElement>('[data-pane="norm"]')!;
+    const svg = root.querySelector<SVGSVGElement>('.nr-arrows')!;
+
+    const say = (t: string, warn = false) => { msg.textContent = t; msg.classList.toggle('warn', warn); };
+
+    // ---------- flat ----------
+    function group(kind: Kind, i: number): number[] {
+      const f = S.flat[i];
+      const idx = S.flat.map((_, k) => k);
+      if (kind === 'name' || kind === 'email') return idx.filter((k) => S.flat[k].aid === f.aid);
+      if (kind === 'params') return idx.filter((k) => S.flat[k].mid === f.mid);
+      if (kind === 'model') return idx.filter((k) => S.flat[k].run === f.run);
+      return [i];
+    }
+    const field = (kind: Kind) => (kind === 'name' ? 'author' : kind) as keyof Flat;
+    function contradictions(): Set<string> {
+      // a cell is "bad" if rows that describe the same thing disagree about it
+      const bad = new Set<string>();
+      const check = (key: (f: Flat) => number, col: keyof Flat) => {
+        const byKey = new Map<number, Map<string, number[]>>();
+        S.flat.forEach((f, k) => {
+          const m = byKey.get(key(f)) ?? new Map<string, number[]>();
+          const v = String(f[col]);
+          m.set(v, [...(m.get(v) ?? []), k]);
+          byKey.set(key(f), m);
+        });
+        byKey.forEach((vals) => { if (vals.size > 1) vals.forEach((ks) => ks.forEach((k) => bad.add(`${k}:${col}`))); });
+      };
+      check((f) => f.aid, 'author'); check((f) => f.aid, 'email');
+      check((f) => f.mid, 'params'); check((f) => f.run, 'model');
+      return bad;
+    }
+    function countFacts(bad: Set<string>) {
+      const facts = new Set<string>();
+      bad.forEach((b) => {
+        const [k, col] = b.split(':');
+        const f = S.flat[+k];
+        const id = col === 'params' ? f.mid : col === 'model' ? f.run : f.aid;
+        facts.add(`${col}:${id}`);
+      });
+      return facts.size;
+    }
+
+    function renderFlat() {
+      const t = root.querySelector<HTMLTableElement>('[data-flat]')!;
+      const g = sel && view === 'flat' ? group(sel.kind, sel.row) : [];
+      const bad = contradictions();
+      const cols: [string, keyof Flat, Kind | null][] = [
+        ['run', 'run', null], ['author', 'author', 'name'], ['email', 'email', 'email'], ['model', 'model', 'model'],
+        ['params', 'params', 'params'], ['dataset', 'ds', null], ['metric', 'metric', null], ['value', 'value', 'value'],
+      ];
+      const head = `<tr>${cols.map(([h]) => `<th>${h}</th>`).join('')}</tr>`;
+      const body = S.flat.map((f, i) => `<tr>${cols.map(([, c, kind]) => {
+        const cls: string[] = [];
+        if (kind) cls.push('k');
+        if (sel && kind && (sel.kind === kind || (sel.kind === 'model' && kind === 'params')) && g.includes(i)) cls.push(i === sel.row && sel.kind === kind ? 'sel' : 'must');
+        if (bad.has(`${i}:${c}`)) cls.push('bad');
+        return `<td class="${cls.join(' ')}" ${kind ? `data-kind="${kind}" data-row="${i}"` : ''}>${f[c]}</td>`;
+      }).join('')}</tr>`).join('');
+      t.innerHTML = head + body;
+      cEl.textContent = String(countFacts(bad));
+    }
+
+    // ---------- normalized ----------
+    function renderNorm() {
+      const T = (name: string) => root.querySelector<HTMLTableElement>(`[data-tbl="${name}"]`)!;
+      const isSel = (tbl: string, row: number, kind: Kind) => sel && view === 'norm' && sel.tbl === tbl && sel.row === row && sel.kind === kind;
+      const refRuns = new Set<number>();
+      if (sel && view === 'norm') {
+        if (sel.tbl === 'authors') S.runs.forEach((r) => r.aid === S.authors[sel!.row].id && refRuns.add(r.run));
+        if (sel.tbl === 'models') S.runs.forEach((r) => r.mid === S.models[sel!.row].id && refRuns.add(r.run));
+        if (sel.tbl === 'runs') refRuns.add(S.runs[sel.row].run);
+      }
+      const td = (v: string | number, opts: { kind?: Kind; tbl?: string; row?: number; pk?: boolean; fk?: string } = {}) => {
+        const cls: string[] = [];
+        if (opts.kind) cls.push('k');
+        if (opts.pk) cls.push('pk');
+        if (opts.kind && isSel(opts.tbl!, opts.row!, opts.kind)) cls.push('sel');
+        const data = opts.kind ? `data-kind="${opts.kind}" data-tbl="${opts.tbl}" data-row="${opts.row}"` : '';
+        return `<td class="${cls.join(' ')}" ${data} ${opts.fk ? `data-fk="${opts.fk}"` : ''}>${v}</td>`;
+      };
+      T('authors').innerHTML = '<tr><th>id</th><th>name</th><th>email</th></tr>' + S.authors.map((a, i) =>
+        `<tr data-pk="a${a.id}">${td(a.id, { pk: true })}${td(a.name, { kind: 'name', tbl: 'authors', row: i })}${td(a.email, { kind: 'email', tbl: 'authors', row: i })}</tr>`).join('');
+      T('models').innerHTML = '<tr><th>id</th><th>name</th><th>params</th></tr>' + S.models.map((m, i) =>
+        `<tr data-pk="m${m.id}">${td(m.id, { pk: true })}${td(m.name)}${td(m.params, { kind: 'params', tbl: 'models', row: i })}</tr>`).join('');
+      T('datasets').innerHTML = '<tr><th>id</th><th>name</th></tr>' + S.datasets.map((d) =>
+        `<tr data-pk="d${d.id}">${td(d.id, { pk: true })}${td(d.name)}</tr>`).join('');
+      T('runs').innerHTML = '<tr><th>run</th><th>author</th><th>model</th><th>data</th></tr>' + S.runs.map((r, i) =>
+        `<tr data-pk="r${r.run}" class="${refRuns.has(r.run) ? 'ref' : ''}">${td(r.run, { pk: true })}${td(r.aid, { fk: 'a' + r.aid })}${td(r.mid, { kind: 'model', tbl: 'runs', row: i, fk: 'm' + r.mid })}${td(r.did, { fk: 'd' + r.did })}</tr>`).join('');
+      T('metrics').innerHTML = '<tr><th>run</th><th>metric</th><th>value</th></tr>' + S.metrics.map((m, i) =>
+        `<tr>${td(m.run, { fk: 'r' + m.run })}${td(m.metric)}${td(m.value, { kind: 'value', tbl: 'metrics', row: i })}</tr>`).join('');
+      cEl.textContent = '0';
+      requestAnimationFrame(drawArrows);
+    }
+
+    function drawArrows() {
+      if (view !== 'norm') return;
+      const box = normPane.getBoundingClientRect();
+      svg.setAttribute('width', String(normPane.scrollWidth));
+      svg.setAttribute('height', String(normPane.scrollHeight));
+      // which foreign-key cells get arrows
+      let fks: HTMLElement[] = [];
+      const all = [...normPane.querySelectorAll<HTMLElement>('td[data-fk]')];
+      if (!sel) fks = all.filter((c) => c.closest('tr')?.getAttribute('data-pk') === 'r101');
+      else if (sel.tbl === 'authors') fks = all.filter((c) => c.dataset.fk === 'a' + S.authors[sel!.row].id);
+      else if (sel.tbl === 'models') fks = all.filter((c) => c.dataset.fk === 'm' + S.models[sel!.row].id);
+      else if (sel.tbl === 'runs') fks = all.filter((c) => c.closest('tr')?.getAttribute('data-pk') === 'r' + S.runs[sel!.row].run && c.dataset.fk!.startsWith('m'));
+      else if (sel.tbl === 'metrics') fks = all.filter((c) => c.closest('tr') === normPane.querySelectorAll('[data-tbl="metrics"] tr')[sel!.row + 1]);
+      const paths: string[] = [];
+      fks.forEach((c) => {
+        const tgt = normPane.querySelector<HTMLElement>(`tr[data-pk="${c.dataset.fk}"]`);
+        const src = c.closest('tr');
+        if (!tgt || !src) return;
+        const a = src.getBoundingClientRect(), b = tgt.getBoundingClientRect(), cell = c.getBoundingClientRect();
+        const ay = cell.top + cell.height / 2 - box.top, by = b.top + b.height / 2 - box.top;
+        if (b.left > a.right) {
+          // target sits in the right-hand column: leave the row's right edge, enter the target's left edge
+          const x1 = a.right - box.left, x2 = b.left - box.left - 2;
+          const mx = (x1 + x2) / 2;
+          paths.push(`<path d="M${x1},${ay} C${mx},${ay} ${mx},${by} ${x2},${by}"/><path class="head" d="M${x2},${by} l-6,-3.5 l0,7 z"/>`);
+        } else {
+          // same column (or the stacked phone layout): loop out through the left gutter
+          const x1 = a.left - box.left, x2 = b.left - box.left - 2;
+          const off = 8 + Math.min(12, Math.abs(by - ay) / 30);
+          const gx = Math.min(x1, x2) - off;
+          paths.push(`<path d="M${x1},${ay} C${gx},${ay} ${gx},${by} ${x2},${by}"/><path class="head" d="M${x2},${by} l-6,-3.5 l0,7 z"/>`);
+        }
+      });
+      svg.innerHTML = paths.join('');
+    }
+
+    // ---------- interaction ----------
+    function describe(): string {
+      if (!sel) return '';
+      if (view === 'flat') {
+        const f = S.flat[sel.row];
+        const n = group(sel.kind, sel.row).length;
+        const what = {
+          name: `${f.author}'s name`, email: `${f.author}'s email`, params: `the size of ${f.model}`,
+          model: `which model run ${f.run} used (and so its params too)`, value: `run ${f.run}'s ${f.metric}`,
+        }[sel.kind];
+        return n === 1
+          ? `Fact: ${what}. It lives in exactly 1 row. This column is fine: it depends on the whole key (run + metric).`
+          : `Fact: ${what}. It is written in ${n} of ${S.flat.length} rows. Change it and all ${n} must change together.`;
+      }
+      if (sel.tbl === 'authors') {
+        const a = S.authors[sel.row];
+        const k = S.runs.filter((r) => r.aid === a.id).length;
+        return `Fact: ${a.name}'s ${sel.kind}. It lives in 1 row (authors.id = ${a.id}). ${k} runs point at that row by id and never copy it.`;
+      }
+      if (sel.tbl === 'models') {
+        const m = S.models[sel.row];
+        const k = S.runs.filter((r) => r.mid === m.id).length;
+        return `Fact: the size of ${m.name}. 1 row (models.id = ${m.id}). ${k} runs point at it.`;
+      }
+      if (sel.tbl === 'runs') return `Fact: which model run ${S.runs[sel.row].run} used. 1 cell, a foreign key. Its params come along through the arrow.`;
+      return `Fact: run ${S.metrics[sel.row].run}'s ${S.metrics[sel.row].metric}. 1 row, same as in the flat sheet.`;
+    }
+
+    function rowsForSel(): number {
+      if (!sel) return 0;
+      return view === 'flat' ? group(sel.kind, sel.row).length : 1;
+    }
+
+    function render() {
+      root.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.view === view)));
+      root.querySelector<HTMLElement>('[data-pane="flat"]')!.hidden = view !== 'flat';
+      normPane.hidden = view !== 'norm';
+      if (view === 'flat') renderFlat(); else renderNorm();
+      nEl.textContent = sel ? String(rowsForSel()) : '-';
+      wEl.textContent = String(writes);
+      oneBtn.disabled = !sel || (view === 'flat' && rowsForSel() === 1) || view === 'norm';
+      allBtn.disabled = !sel;
+      allBtn.textContent = view === 'norm' ? 'Change it (1 row)' : sel ? `Change all ${rowsForSel()} rows` : 'Change every row';
+    }
+
+    function applyFlat(rows: number[]) {
+      const f0 = S.flat[sel!.row];
+      if (sel!.kind === 'model') {
+        const nm = S.models[f0.mid % 3];
+        rows.forEach((k) => { const f = S.flat[k]; f.mid = nm.id; f.model = nm.name; f.params = nm.params; });
+        writes += rows.length;
+        return;
+      }
+      const col = field(sel!.kind);
+      const nv = sel!.kind === 'value' ? bump(f0.value) : flip(String(f0[col]));
+      rows.forEach((k) => { (S.flat[k] as any)[col] = nv; });
+      writes += rows.length;
+    }
+
+    function applyNorm() {
+      const s = sel!;
+      if (s.tbl === 'authors') { const a = S.authors[s.row]; if (s.kind === 'name') a.name = flip(a.name); else a.email = flip(a.email); }
+      if (s.tbl === 'models') { const m = S.models[s.row]; m.params = flip(m.params); }
+      if (s.tbl === 'runs') { const r = S.runs[s.row]; r.mid = (r.mid % 3) + 1; }
+      if (s.tbl === 'metrics') { const m = S.metrics[s.row]; m.value = bump(m.value); }
+      writes += 1;
+    }
+
+    root.addEventListener('click', (e) => {
+      const td = (e.target as HTMLElement).closest<HTMLElement>('td[data-kind]');
+      if (!td || !root.contains(td)) return;
+      sel = { kind: td.dataset.kind as Kind, row: +td.dataset.row!, tbl: td.dataset.tbl };
+      render();
+      say(describe());
+    });
+    oneBtn.addEventListener('click', () => {
+      if (!sel || view !== 'flat') return;
+      const n = rowsForSel();
+      applyFlat([sel.row]);
+      render();
+      say(`You changed 1 of ${n} rows. Now the sheet disagrees with itself (dashed cells): two answers to one question, and nothing says which is true. In a 600-row sheet nobody would notice for weeks.`, true);
+    });
+    allBtn.addEventListener('click', () => {
+      if (!sel) return;
+      if (view === 'flat') {
+        const n = rowsForSel();
+        applyFlat(group(sel.kind, sel.row));
+        render();
+        say(n === 1 ? '1 write. This fact only ever lived in one place.' : `${n} writes for one fact. Correct this time, but you had to find every copy. Miss one and you get the dashed cells.`);
+      } else {
+        applyNorm();
+        render();
+        say('1 write. Every run that points here by id now sees the new value. There is no second copy to forget, so a contradiction is impossible.');
+      }
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-view]').forEach((b) => b.addEventListener('click', () => {
+      view = b.dataset.view as 'flat' | 'norm';
+      sel = null;
+      render();
+      say(view === 'flat' ? 'Pick a cell to see where its fact lives.' : 'Each fact lives in one row. Arrows are foreign keys: a run stores the id of its author, model and dataset. Pick a cell.');
+    }));
+    root.querySelector('[data-reset]')!.addEventListener('click', () => {
+      S = seed(); sel = null; writes = 0; render(); say('Pick a cell to see where its fact lives.');
+    });
+    new ResizeObserver(() => drawArrows()).observe(normPane);
+    void inst;
+    render();
+  });
+</script>

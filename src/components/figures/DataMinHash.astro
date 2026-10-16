@@ -1,0 +1,174 @@
+---
+// MinHash intuition: two documents become sets of word shingles. Each hash function is a random
+// ordering of all possible shingles; a document's MinHash is the first of its shingles in that
+// order. The fraction of hash functions where both documents pick the same shingle estimates
+// their Jaccard similarity. Slide k to watch the estimate tighten; reseed to watch it wobble.
+---
+<div class="mh" data-fig="data-minhash">
+  <div class="mh-presets ctl" role="group" aria-label="Example pairs">
+    <button class="btn" type="button" data-preset="0" aria-pressed="true">Template stubs</button>
+    <button class="btn" type="button" data-preset="1" aria-pressed="false">One edit</button>
+    <button class="btn" type="button" data-preset="2" aria-pressed="false">Unrelated</button>
+  </div>
+  <div class="mh-docs">
+    <label class="mh-doc"><span class="label">Doc A</span><textarea data-a rows="3" spellcheck="false"></textarea></label>
+    <label class="mh-doc"><span class="label">Doc B</span><textarea data-b rows="3" spellcheck="false"></textarea></label>
+  </div>
+  <div class="mh-sh">
+    <div class="label">3-word shingles · <span class="mh-key mh-both"></span> in both · <span class="mh-key mh-one"></span> in one</div>
+    <div class="mh-chips" data-chips></div>
+  </div>
+  <div class="mh-stats">
+    <div><span class="label">True Jaccard</span><span class="readout" data-true>-</span><span class="mh-sub" data-truesub></span></div>
+    <div><span class="label">MinHash estimate</span><span class="readout" data-est>-</span><span class="mh-sub" data-estsub></span></div>
+    <div><span class="label">Typical error ±</span><span class="readout" data-err>-</span><span class="mh-sub">√(J(1−J)/k)</span></div>
+  </div>
+  <div class="label mh-rowlabel">One cell per hash function · filled = both docs picked the same shingle</div>
+  <div class="mh-cells" data-cells aria-hidden="true"></div>
+  <p class="mh-first" data-first></p>
+  <div class="ctl">
+    <label>hash functions k <input type="range" min="1" max="256" value="64" data-k /> <output data-kout>64</output></label>
+    <button class="btn" type="button" data-reseed>New random hashes</button>
+  </div>
+</div>
+
+<style>
+  .mh-docs { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  .mh-doc { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .mh-doc textarea {
+    font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--ink);
+    background: var(--paper); border: 1px solid var(--rule); padding: 8px; resize: vertical; width: 100%;
+  }
+  .mh-doc textarea:focus { outline: 2px solid var(--blue); outline-offset: -1px; }
+  .mh-sh { margin-top: 12px; }
+  .mh-chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; max-height: 132px; overflow-y: auto; }
+  .mh-chip { font-family: var(--mono); font-size: 10.5px; padding: 2px 6px; border: 1px solid var(--rule); color: var(--ink-3); background: var(--paper); white-space: nowrap; }
+  .mh-chip.both { border-color: var(--blue); background: var(--blue-fill); color: var(--ink); }
+  .mh-chip.pick { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .mh-key { display: inline-block; width: 10px; height: 10px; border: 1px solid var(--rule); vertical-align: -1px; }
+  .mh-key.mh-both { background: var(--blue-fill); border-color: var(--blue); }
+  .mh-stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 14px; }
+  .mh-stats > div { border: 1px solid var(--rule); background: var(--paper); padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .mh-stats .readout { font-size: 20px; }
+  .mh-sub { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); }
+  .mh-rowlabel { display: block; margin-top: 14px; font-size: 10.5px; }
+  .mh-cells { display: grid; grid-template-columns: repeat(32, 1fr); gap: 2px; margin-top: 6px; }
+  .mh-cells span { aspect-ratio: 1; border: 1px solid var(--rule); background: var(--paper); }
+  .mh-cells span.hit { background: var(--blue); border-color: var(--blue); }
+  .mh-first { font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; overflow-wrap: anywhere; }
+  @media (max-width: 560px) {
+    .mh-docs { grid-template-columns: 1fr; }
+    .mh-stats { grid-template-columns: 1fr 1fr; }
+    .mh-stats > div:last-child { grid-column: 1 / 3; }
+    .mh-cells { grid-template-columns: repeat(16, 1fr); }
+  }
+</style>
+
+<script>
+  const PRESETS: [string, string][] = [
+    [
+      'Omiécourt is a former commune. It is in Hauts-de-France in the Somme department in north France. On 1 January 2017, it was merged into the new commune of Hypercourt.',
+      'Hyencourt-le-Grand is a former commune. It is in Hauts-de-France in the Somme department in north France. On 1 January 2017, it was merged into the new commune of Hypercourt.',
+    ],
+    [
+      'The river flows north through the valley and joins the sea near the old harbour town, where fishing boats still land their catch every morning.',
+      'The river flows north through the valley and joins the sea near the old harbour city, where fishing boats still land their catch every morning.',
+    ],
+    [
+      'The river flows north through the valley and joins the sea near the old harbour town.',
+      'Photosynthesis is the process plants use to turn light, water and carbon dioxide into sugar.',
+    ],
+  ];
+
+  function fnv(s: string): number {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    return h >>> 0;
+  }
+  function mix(h: number, seed: number): number {
+    h = (h ^ seed) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+    h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+    return (h ^ (h >>> 16)) >>> 0;
+  }
+  function shingles(t: string, k = 3): string[] {
+    const w = t.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [];
+    const out = new Set<string>();
+    if (w.length && w.length < k) out.add(w.join(' '));
+    for (let i = 0; i + k <= w.length; i++) out.add(w.slice(i, i + k).join(' '));
+    return [...out];
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="data-minhash"]').forEach((root) => {
+    const ta = root.querySelector<HTMLTextAreaElement>('[data-a]')!;
+    const tb = root.querySelector<HTMLTextAreaElement>('[data-b]')!;
+    const kIn = root.querySelector<HTMLInputElement>('[data-k]')!;
+    const kOut = root.querySelector<HTMLOutputElement>('[data-kout]')!;
+    const chips = root.querySelector<HTMLElement>('[data-chips]')!;
+    const cells = root.querySelector<HTMLElement>('[data-cells]')!;
+    const first = root.querySelector<HTMLElement>('[data-first]')!;
+    const presetBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-preset]')];
+    let seeds: number[] = [];
+    const reseed = () => { seeds = Array.from({ length: 256 }, () => (Math.random() * 2 ** 32) >>> 0); };
+    reseed();
+
+    function render() {
+      const k = +kIn.value;
+      kOut.textContent = String(k);
+      const A = shingles(ta.value), B = shingles(tb.value);
+      const setA = new Set(A), setB = new Set(B);
+      const union = [...new Set([...A, ...B])];
+      const inter = union.filter((s) => setA.has(s) && setB.has(s)).length;
+      const J = union.length ? inter / union.length : 0;
+      const hA = A.map(fnv), hB = B.map(fnv);
+      let hits = 0;
+      const hitRow: boolean[] = [];
+      let pickA = '', pickB = '';
+      for (let i = 0; i < k; i++) {
+        let mA = Infinity, mB = Infinity, sA = '', sB = '';
+        hA.forEach((h, j) => { const v = mix(h, seeds[i]); if (v < mA) { mA = v; sA = A[j]; } });
+        hB.forEach((h, j) => { const v = mix(h, seeds[i]); if (v < mB) { mB = v; sB = B[j]; } });
+        const hit = A.length > 0 && B.length > 0 && mA === mB;
+        if (hit) hits++;
+        hitRow.push(hit);
+        if (i === 0) { pickA = sA; pickB = sB; }
+      }
+      const est = k ? hits / k : 0;
+      root.querySelector('[data-true]')!.textContent = J.toFixed(2);
+      root.querySelector('[data-truesub]')!.textContent = `${inter} shared / ${union.length} total`;
+      root.querySelector('[data-est]')!.textContent = est.toFixed(2);
+      root.querySelector('[data-estsub]')!.textContent = `${hits} of ${k} match`;
+      root.querySelector('[data-err]')!.textContent = Math.sqrt((J * (1 - J)) / k).toFixed(2);
+
+      chips.replaceChildren(...union.map((s) => {
+        const c = document.createElement('span');
+        c.className = 'mh-chip' + (setA.has(s) && setB.has(s) ? ' both' : '') + (s === pickA || s === pickB ? ' pick' : '');
+        c.textContent = s;
+        return c;
+      }));
+      cells.replaceChildren(...hitRow.map((h) => {
+        const c = document.createElement('span');
+        if (h) c.className = 'hit';
+        return c;
+      }));
+      first.textContent = A.length && B.length
+        ? `Hash #1 shuffles every shingle into a random order. First of A's: "${pickA}". First of B's: "${pickB}". ${pickA === pickB ? 'Same shingle, so this cell is filled.' : 'Different, so this cell is empty.'}`
+        : 'Type at least a few words in each box.';
+    }
+
+    presetBtns.forEach((b) => b.addEventListener('click', () => {
+      const [a, bb] = PRESETS[+b.dataset.preset!];
+      ta.value = a; tb.value = bb;
+      presetBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    [ta, tb].forEach((t) => t.addEventListener('input', () => {
+      presetBtns.forEach((x) => x.setAttribute('aria-pressed', 'false'));
+      render();
+    }));
+    kIn.addEventListener('input', render);
+    root.querySelector('[data-reseed]')!.addEventListener('click', () => { reseed(); render(); });
+    ta.value = PRESETS[0][0]; tb.value = PRESETS[0][1];
+    render();
+  });
+</script>

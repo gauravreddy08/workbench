@@ -1,0 +1,582 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import EngineMap from '../components/figures/EngineMap.astro';
+import EngineJourney from '../components/figures/EngineJourney.astro';
+
+## Today
+
+- Draw vLLM's architecture from memory: which process does what, what crosses between them, and what one trip around the engine loop does.
+- For each box in that drawing, name the lesson in this track where you built a toy version, and say what the real one adds.
+- Explain how SGLang makes different bets on the same skeleton (RadixAttention, cache-aware scheduling, structured outputs), and where TensorRT-LLM and llama.cpp fit.
+- Run vLLM and SGLang on the Spark, benchmark them with your own harness against your server and Fireworks, and add their rows to `SCOREBOARD.md`.
+- Trace one request through vLLM's source to the scheduler step, the block allocation and the forward call, then profile a running engine to see where its time actually goes.
+- Explain, at the level of "draw it on a whiteboard", tensor parallelism and disaggregated prefill/decode.
+
+Prerequisites: everything so far in this track, in your own simplified versions: [the baseline server and harness](/lessons/baseline-vs-fireworks/), [the KV cache](/lessons/kv-cache/), [batching](/lessons/batching/), [prefix caching](/lessons/prefix-caching/), [quantization](/lessons/quantization/), [speculative decoding](/lessons/speculative-decoding/). Time: an evening to get both engines running and benchmarked, an evening reading code, an hour profiling.
+
+## The Problem
+
+You have spent weeks on your server. You wrote a KV cache, then continuous batching, then a prefix cache with LRU eviction, then quantized the weights and bolted on a draft model. Every change got a row on the scoreboard. You are proud of the c = 16 row now.
+
+Then you pull a container, type one command, `vllm serve meta-llama/Llama-3.1-8B-Instruct`, and point the same harness at it. It loads in a couple of minutes. At c = 1 it is a bit faster than your best server. At c = 64 it is a lot faster, and its p99 TTFT is a fraction of yours. Nothing you did was wrong. It just does all of it at once, plus things you didn't think of, and none of it in Python on the hot path.
+
+That's not a reason to feel bad. It is the best possible moment to read their code. You know what every piece is *for*, because you measured the problem each one solves. Most people meet vLLM as a black box with 200 flags. You get to meet it as "oh, that's my batching loop, but they put it in its own process", "that's my prefix cache, but in blocks", "that's my launch overhead, gone".
+
+This lesson is about two skills. The first is knowing what production engines do that yours doesn't. The second, which lasts longer, is how to read a real systems codebase of a few hundred thousand lines without drowning: find the loop, find the data structure, follow one request.
+
+<Origin year="2022–2025" title="From one request per GPU to engines with their own schedulers">
+
+In 2022, serving a language model mostly meant what your naive server did: a batch went in, the whole batch came out when its longest member finished. Orca (Yu et al., OSDI 2022) proposed scheduling at every *iteration*, one token step at a time, so finished requests leave and new ones join mid-flight. That is continuous batching.
+
+In June 2023 a group at UC Berkeley released vLLM. Its idea, PagedAttention, borrowed virtual memory from operating systems: store the KV cache in small fixed-size pages instead of one big reserved slab per request, so memory waste drops from most of it to almost none and many more requests fit in a batch. The paper (Kwon et al., SOSP 2023) reported 2–4× the throughput of the best systems of the time. In December 2023, the LMSYS team released SGLang, whose RadixAttention kept KV cache from finished requests in a tree so later requests sharing a prefix (a system prompt, a few-shot example, a chat history) could reuse it automatically.
+
+By 2024 GPUs were so fast that the bottleneck moved to the CPU: Python scheduling, preparing inputs, launching kernels. In January 2025 the vLLM team announced V1, a re-architecture built around exactly that problem: separate processes so CPU work overlaps GPU work, a simpler scheduler, a persistent batch, CUDA graphs everywhere. This lesson describes that V1 shape. It will keep changing; the shape changes slower than the files.
+
+</Origin>
+
+## The Idea
+
+### Three processes and a loop
+
+Your server was one process. One FastAPI app, one model, a lock, a thread pushing text into a queue. Everything happened in one place, so every piece of CPU work, tokenizing, building the SSE chunk, the Python of `generate` itself, competed for the same interpreter and the same GIL ([Processes, threads and the GIL](/lessons/processes-threads-gil/)).
+
+vLLM V1 splits that into separate processes connected by sockets. Click around. Each box says what it does, which of your lessons built the toy version, and where to look in the source.
+
+<Figure n="001" title="VLLM V1, AS THREE PROCESSES" caption="The API server talks HTTP and text. The engine core decides what runs. The GPU worker turns decisions into tensors and runs the model. Messages, not shared memory, cross between them. File names are at the time of writing; verify them against the current code." wide>
+
+<EngineMap />
+
+</Figure>
+
+The split is the most important design decision in the whole engine, so here is why it exists.
+
+**The API server** speaks HTTP and text: validating JSON, applying the chat template, tokenizing, and on the way back, turning token ids into text and writing SSE chunks. All of that is CPU work, sometimes a lot of it (tokenizing a 100,000-token document takes real milliseconds).
+
+**The engine core** is a <Term w="busy loop">A loop that runs continuously, checking for work and doing it, rather than sleeping until woken. Good when the work never stops; it keeps one CPU core busy.</Term> in its own process. Each trip around the loop is one <Term w="engine step">One iteration of the engine loop: choose which requests run, do one forward pass for all of them together, and process the outputs. Each running request gets (usually) one new token per step.</Term>: ask the scheduler what to run, hand that to the GPU, wait, update every request with its new token, send outputs back. It owns the two most important data structures: the request queues and the KV block pool.
+
+**The GPU worker** owns the model weights and the GPU. It turns "these requests, this many tokens each, their KV lives in these blocks" into tensors and runs the forward pass. With one GPU, check yourself whether the worker runs inside the engine-core process or alongside it: vLLM's docs describe one worker per GPU, and for a single GPU the executor can run it in-process. With tensor parallelism (later in this lesson) there is one worker process per GPU.
+
+The processes talk over <Term w="ZMQ">ZeroMQ: a small library for sending messages between processes or machines over sockets, with queueing built in. vLLM uses it between the API server and the engine core.</Term> sockets, with requests and outputs serialized into compact messages. Why pay for serialization when threads could share memory for free? Because of the GIL. If tokenizing and detokenizing ran on threads inside the engine process, every millisecond spent on them would be a millisecond the scheduler couldn't run, and the GPU would sit idle waiting for its next instructions. In separate processes, the API server can detokenize step N's outputs while the engine core is already scheduling step N+1. Same reason your data loader uses worker processes.
+
+<Predict id="why-processes">
+
+On your naive server at c = 1, roughly what fraction of each decode step's wall time do you think the GPU was actually busy? And when vLLM moves tokenizing and detokenizing into another process, which number on your scoreboard should improve most: TTFT, tok/s at c = 1, or throughput at c = 64?
+
+<Fragment slot="answer">
+
+On the naive server, the GPU is idle for slivers of every step while Python runs the decode loop, prepares the next input and launches hundreds of kernels. You measured this indirectly in the baseline lesson as "measured ÷ predicted" tok/s; something like 10–40% idle is common for naive Hugging Face `generate`, depending on model and hardware. Measure yours in the profiling task.
+
+Moving text work out of the engine process helps most at **high concurrency**. At c = 1 detokenizing one token per step is microseconds. At c = 64, it is 64 incremental detokenizations, 64 SSE chunks and 64 socket writes per step, and if those ran in the engine loop they would add directly to every step's time. So throughput at c = 64 gains most. The c = 1 tok/s gains come from elsewhere: CUDA graphs and a lean step, coming up.
+
+</Fragment>
+</Predict>
+
+### What one step does
+
+Your continuous-batching loop from [Batching](/lessons/batching/) probably looked like this: if anything is waiting and there's room, run a prefill for it; then run one decode step for everyone. Two kinds of steps, decided by phase.
+
+vLLM V1's scheduler doesn't have phases. It has a <Term w="token budget">The maximum number of tokens the engine will process in one forward pass (vLLM: max_num_batched_tokens). Every step, the scheduler hands out tokens to requests until this runs out.</Term>. Each step, it hands out tokens:
+
+1. **Running requests first.** Each one that's decoding gets 1 token (more with speculative decoding, which checks several draft tokens at once). That's cheap, and starving them would stall their streams.
+2. **Then waiting requests, oldest first,** while the budget lasts. A new request needs its whole prompt processed. If the prompt is longer than what's left of the budget, it gets only part of it now and the rest in later steps. That's <Term w="chunked prefill">Processing a long prompt in pieces across several steps, mixed in with other requests' decode tokens, so one huge prompt can't freeze everyone else's streams.</Term>.
+3. **For each one admitted, ask the KV cache manager for room.** If there's no room, someone has to give up their memory. That's preemption, below.
+
+The output is a small record: for each scheduled request, how many tokens, and which new blocks it got. The worker runs one forward pass over *all* of those tokens together, a mix of prefill chunks and single decode tokens. The attention kernels are built to handle that mix in one call.
+
+Why is a mix a good idea? Remember from [Why ~17 tokens per second?](/lessons/bandwidth-bound/) that a decode step is limited by reading the weights, and the compute units are mostly idle during it. A prefill chunk is the opposite: lots of compute per byte read. Mixing them lets the prefill use the compute that decode was wasting, inside the same weight read. Your two-phase loop paid for the weight read twice.
+
+Now follow one request all the way through.
+
+<Figure n="002" title="ONE REQUEST'S JOURNEY" caption="Step through a single chat request: 41 prompt tokens whose first 32 are a cached system prompt, 256 output tokens, sharing each forward pass with 15 other requests. Watch which process it is in, and when KV blocks are reused, allocated and freed." wide>
+
+<EngineJourney />
+
+</Figure>
+
+Three things to take from the journey. The request crosses the process wall twice per token (out and back), and that is fine because each crossing is microseconds and overlaps GPU work. The KV memory grows one block at a time, never reserved up front, which is why so many requests fit. And the GPU never sees a "request" at all. It sees a batch of token positions and a table saying where each one's keys and values live.
+
+### Memory: blocks, and what happens when they run out
+
+You built this in [Paged attention and prefix caching](/lessons/prefix-caching/), so only the production details here.
+
+At startup, vLLM loads the weights, runs one fake forward pass at the largest batch it will allow to measure peak activation memory, and then turns the remaining memory, up to `--gpu-memory-utilization` of the total, into a pool of KV <Term w="blocks">Fixed-size pages of KV cache. Each holds the keys and values of a fixed number of tokens (16 by default on CUDA at the time of writing) for every layer.</Term>. For Llama 3.1 8B in bf16 the arithmetic is: 32 layers × 8 KV heads × 128 dimensions × 2 (K and V) × 2 bytes = 128 KiB per token, so 2 MiB per 16-token block. If 80 GB of the Spark's 128 GB went to vLLM, minus 16 GB of weights and a few GB of activations, that's roughly 30,000 blocks, around half a million tokens of KV. (Spec-sheet memory, back-of-envelope; vLLM prints the real number of blocks at startup. Read it.)
+
+A **block table** per request lists its blocks in order. Prefix caching works by hashing: each *full* block gets a hash of its tokens plus the hash of the block before it, so a hash names an entire prefix, not just 16 tokens. A new request computes its block hashes, looks them up, and reuses every hit. When a request finishes, its blocks go back to a free queue in LRU order, but keep their hashes, so they stay reusable until something needs the memory. That's the `get_computed_blocks` and `allocate_slots` pair in Figure 002.
+
+When `allocate_slots` says no, the scheduler picks a victim. With the default first-come-first-served policy, at the time of writing it's the request at the back of the running list, the most recently admitted one. Under the priority policy it's the lowest-priority one. Two ways to take its memory:
+
+<Figure n="003" title="PREEMPTION: RECOMPUTE OR SWAP" caption="The pool is full and request R1 needs a block. The newest request, R4, is preempted. Recompute throws its KV away and redoes its prefill later. Swap copies its KV to CPU memory and back. On the Spark, CPU memory and GPU memory are the same chips.">
+<svg viewBox="0 0 640 300" role="img" aria-label="A full block pool; the newest request is preempted either by discarding and recomputing, or by swapping to CPU memory">
+  <defs>
+    <marker id="ep-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+  <text x="10" y="18" class="strong">KV BLOCK POOL · FULL</text>
+  <g stroke-width="1">
+    <rect x="10" y="28" width="40" height="26" class="fill-wash" /><rect x="52" y="28" width="40" height="26" class="fill-wash" /><rect x="94" y="28" width="40" height="26" class="fill-wash" />
+    <rect x="136" y="28" width="40" height="26" class="fill-paper" /><rect x="178" y="28" width="40" height="26" class="fill-paper" />
+    <rect x="220" y="28" width="40" height="26" class="fill-wash" /><rect x="262" y="28" width="40" height="26" class="fill-wash" />
+    <rect x="304" y="28" width="40" height="26" class="fill-paper" /><rect x="346" y="28" width="40" height="26" class="fill-paper" />
+    <rect x="388" y="28" width="40" height="26" class="fill-paper dash" /><rect x="430" y="28" width="40" height="26" class="fill-paper dash" /><rect x="472" y="28" width="40" height="26" class="fill-paper dash" />
+  </g>
+  <text x="72" y="46" text-anchor="middle">R1</text><text x="156" y="46" text-anchor="middle">R2</text><text x="200" y="46" text-anchor="middle">R2</text>
+  <text x="261" y="46" text-anchor="middle">R3</text><text x="345" y="46" text-anchor="middle">R3</text>
+  <text x="450" y="46" text-anchor="middle" class="blue-t">R4 (NEWEST)</text>
+  <text x="530" y="46">R1 NEEDS +1</text>
+  <line x1="450" y1="58" x2="450" y2="84" class="ink" stroke-width="1" />
+  <line x1="160" y1="84" x2="450" y2="84" class="ink" stroke-width="1" />
+  <line x1="160" y1="84" x2="160" y2="104" class="blue" stroke-width="1.2" marker-end="url(#ep-arr)" />
+  <line x1="450" y1="84" x2="450" y2="104" class="blue" stroke-width="1.2" marker-end="url(#ep-arr)" />
+  <rect x="20" y="108" width="280" height="150" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="128" class="strong">RECOMPUTE</text>
+  <text x="32" y="150">1. free R4's blocks (hashes kept)</text>
+  <text x="32" y="168">2. R4 → front of waiting queue</text>
+  <text x="32" y="186">3. later: prefill prompt + tokens</text>
+  <text x="32" y="202">   generated so far, again</text>
+  <text x="32" y="226" class="blue-t">COST: compute (prefill is fast)</text>
+  <text x="32" y="244" class="blue-t">prefix-cache hits make it cheaper</text>
+  <rect x="330" y="108" width="290" height="150" class="fill-paper" stroke-width="1.2" />
+  <text x="342" y="128" class="strong">SWAP</text>
+  <text x="342" y="150">1. copy R4's blocks to CPU RAM</text>
+  <text x="342" y="168">2. later: copy them back</text>
+  <text x="342" y="186">3. continue decoding</text>
+  <text x="342" y="226" class="blue-t">COST: bytes over PCIe, twice</text>
+  <text x="342" y="244" class="blue-t">ON SPARK: same LPDDR5x pool</text>
+  <text x="320" y="288" text-anchor="middle">VLLM V1 (AT THE TIME OF WRITING): RECOMPUTE · VLLM V0 HAD BOTH</text>
+</svg>
+</Figure>
+
+Two ways to pay. <Term w="Recompute">Preemption by discarding a request's KV cache and putting it back in the queue; when it runs again, its prompt and generated-so-far tokens are prefilled from scratch.</Term> spends compute: the victim's prompt plus everything it generated gets prefilled again later. <Term w="Swap">Preemption by copying a request's KV blocks to CPU memory and copying them back when it resumes. Spends transfer bandwidth instead of compute.</Term> spends bandwidth: on a data-center GPU that's two trips across PCIe, which is far slower than the GPU's own memory. vLLM V0 supported both. V1, at the time of writing, recomputes: in the code, preempting a request frees its blocks and sets its count of computed tokens back to zero. Recompute is simpler, prefill is the fast part of inference, and with prefix caching on, the victim's freed blocks often survive in the cache until it comes back, so the "recompute" is partly a cache hit.
+
+<Predict id="spark-swap">
+
+On the Spark, would swap be a good idea? Think about where "CPU memory" physically is on a GB10.
+
+<Fragment slot="answer">
+
+Swap exists to move bytes out of scarce, fast GPU memory into plentiful CPU memory. On the Spark there is one pool of 128 GB LPDDR5x shared by the CPU and GPU (spec sheet). "Swapping to CPU" would copy bytes from one part of the same memory to another, burning the same ~273 GB/s of bandwidth that decode needs, and freeing nothing that couldn't simply be given to the KV pool in the first place. The right move on unified memory is to make the KV pool bigger (`--gpu-memory-utilization`, leaving headroom for the OS and everything else, since they share the pool too) and let recompute handle the rare overflow.
+
+</Fragment>
+</Predict>
+
+Preemption is a scheduler policy question in disguise. First-come-first-served is fair and simple: the newest arrival pays. A priority policy lets you say paying customers or interactive traffic never get preempted by batch jobs. SGLang's default is cache-aware, below. None is free. Every preemption is wasted work and a stall in someone's stream, which is why the `vllm:num_preemptions` counter on the `/metrics` endpoint is one of the first things to look at when a deployment's p99 goes bad.
+
+### Taking the CPU out of the loop
+
+Here is what your server still did on every decode token, even after batching: Python decided what to run, built input tensors from Python lists, copied them to the GPU, then launched every kernel of every layer one by one. Llama 3.1 8B has 32 layers and each launches a handful of kernels (norms, projections, attention, activation, adds), so a forward pass is hundreds of launches. Each costs a few microseconds of CPU time. Four hundred launches at 5 µs is about 2 ms per step (rough, check it in your profile).
+
+Is 2 ms a lot? It depends entirely on how long the GPU takes. A decode step on the Spark reads 16 GB at about 273 GB/s: about 59 ms. On an H100, with about 3.35 TB/s (spec sheet), the same read takes about 5 ms. The same 2 ms of launch overhead is 3% of a Spark step and 40% of an H100 step. Production engines were built for the second case, which is why they fight so hard for every millisecond on the CPU side, and why you should expect their c = 1 advantage on your Spark to be smaller than the hype.
+
+Four tricks, each one a box in Figure 001:
+
+- <Term w="CUDA graphs">A CUDA feature that records a whole sequence of kernel launches once, then replays all of them with a single launch. The shapes and memory addresses have to stay the same between replays.</Term>. vLLM captures one graph per batch size it expects (a list of sizes, chosen at startup), pads each real batch up to the nearest captured size, and replays it. Most of the time in startup logs labelled "capturing CUDA graphs" is this. It also uses `torch.compile` to fuse small operations before capturing ([Why is Python slow?](/lessons/python-speed/) showed you what compile does). Attention, whose shapes vary the most, can be left out of the graph and run between pieces of it; vLLM calls this piecewise capture.
+- **A persistent batch.** Instead of rebuilding input tensors from scratch every step, the model runner keeps them on the GPU and the scheduler sends only what changed: which requests joined, which left, which got new blocks. Most steps, almost nothing changes.
+- **Overlapping steps.** With async scheduling, the engine core can schedule step N+1 while the GPU is still running step N, so the GPU never waits for Python. SGLang has the same idea under the name overlap scheduler. Check each engine's docs for whether it's on by default in your version.
+- **Paged attention kernels.** The attention backend is a separate pluggable piece: FlashAttention, FlashInfer, Triton kernels and others, chosen per GPU and model. Each one reads keys and values from scattered blocks through the block table, and handles a batch where some requests contribute 2,000 prompt tokens and others contribute one. Writing one of these is the next lesson, [FlashAttention and kernels](/lessons/flash-attention/).
+
+<Predict id="eager-cost">
+
+vLLM's `--enforce-eager` flag turns CUDA graphs off. Predict how much it slows Llama 3.1 8B decode on the Spark at c = 1, and at c = 64. Then predict the same on an H100. A percentage is enough.
+
+<Fragment slot="answer">
+
+On the Spark at c = 1, a few percent, maybe up to ten: launch overhead is a couple of milliseconds out of a ~60 ms bandwidth-bound step. At c = 64 the step is still dominated by reading the weights plus a growing amount of KV, but the CPU now also has more per-step work and attention kernels for 64 sequences, so the hit is probably similar or a bit larger. On an H100, where a step is ~5 ms, the same overhead is a large fraction: losses of tens of percent are plausible at small batch. These are reasoned estimates. Measure the Spark ones in Break It; that's the point.
+
+</Fragment>
+</Predict>
+
+### SGLang: same skeleton, different bets
+
+Open SGLang and you'll find the same shape: a tokenizer manager in the HTTP process, a scheduler process running a loop, a detokenizer manager process, a model runner with CUDA graph capture, paged KV memory, an OpenAI-compatible API. The differences are in what it treats as the first-class problem.
+
+**RadixAttention.** vLLM's prefix cache is a hash table of full blocks. SGLang's is a <Term w="radix tree">A tree where each edge is labelled with a sequence of tokens, and a path from the root spells out a prefix. Shared prefixes share a path, so looking up a new prompt means walking down as far as it matches.</Term> of everything it has computed. Each node holds the token sequence on its edge and the indices of the KV memory for those tokens. A new request walks down the tree as far as it matches, reuses all the KV along the way, and only prefills the rest. When memory runs low, it evicts least-recently-used *leaves* first, so the shared trunk (the system prompt everyone uses) survives longest.
+
+<Figure n="004" title="TWO WAYS TO FIND A CACHED PREFIX" caption="vLLM hashes each full block together with the hash before it, so one lookup per block finds a shared prefix. SGLang keeps a tree of everything it has computed; a new request walks down it. Both find the longest cached prefix. The tree makes the sharing structure visible, which SGLang's scheduler uses to order requests.">
+<svg viewBox="0 0 640 260" role="img" aria-label="Hash chain of blocks compared with a radix tree of shared prefixes">
+  <text x="10" y="18" class="strong">VLLM · CHAINED BLOCK HASHES</text>
+  <rect x="10" y="32" width="86" height="34" class="fill-wash" stroke-width="1" /><text x="53" y="53" text-anchor="middle">tok 0–15</text>
+  <rect x="104" y="32" width="86" height="34" class="fill-wash" stroke-width="1" /><text x="147" y="53" text-anchor="middle">tok 16–31</text>
+  <rect x="198" y="32" width="86" height="34" class="fill-paper" stroke-width="1" /><text x="241" y="53" text-anchor="middle">tok 32–47</text>
+  <text x="53" y="86" text-anchor="middle" class="blue-t">h1=H(blk)</text>
+  <text x="147" y="86" text-anchor="middle" class="blue-t">h2=H(h1,blk)</text>
+  <text x="241" y="86" text-anchor="middle">h3=H(h2,blk)</text>
+  <text x="10" y="112">table: hash → block id</text>
+  <text x="10" y="130">hit h1, h2 · miss h3</text>
+  <text x="10" y="148">only full blocks are cached</text>
+  <line x1="315" y1="10" x2="315" y2="250" class="ink dash" stroke-width="1" />
+  <text x="330" y="18" class="strong">SGLANG · RADIX TREE</text>
+  <circle cx="350" cy="50" r="6" class="fill-paper" stroke-width="1.2" />
+  <text x="362" y="54">root</text>
+  <line x1="350" y1="56" x2="350" y2="90" class="blue" stroke-width="1.5" />
+  <rect x="330" y="90" width="140" height="28" class="fill-wash" stroke-width="1" />
+  <text x="400" y="108" text-anchor="middle">SYSTEM PROMPT</text>
+  <line x1="370" y1="118" x2="370" y2="160" class="blue" stroke-width="1.2" />
+  <line x1="440" y1="118" x2="540" y2="160" class="ink" stroke-width="1" />
+  <rect x="330" y="160" width="110" height="28" class="fill-wash" stroke-width="1" />
+  <text x="385" y="178" text-anchor="middle">user A · turn 1</text>
+  <rect x="490" y="160" width="130" height="28" class="fill-paper" stroke-width="1" />
+  <text x="555" y="178" text-anchor="middle">user B · turn 1</text>
+  <line x1="385" y1="188" x2="385" y2="210" class="ink" stroke-width="1" />
+  <rect x="330" y="210" width="110" height="28" class="fill-paper dash" stroke-width="1" />
+  <text x="385" y="228" text-anchor="middle">A · turn 2 (new)</text>
+  <text x="460" y="226">evict leaves first (LRU)</text>
+</svg>
+</Figure>
+
+**Cache-aware scheduling.** Because the tree shows which waiting requests share prefixes, SGLang's default schedule policy, at the time of writing, is longest-prefix-match: it prefers waiting requests that will hit the most cache, and there's also a depth-first ordering that groups requests sharing a subtree. Plain first-come-first-served is an option. The trade is throughput against fairness: a request with an unusual prefix can wait longer.
+
+**Structured outputs.** Ask a model for JSON and it will usually comply. "Usually" is a problem when a parser on the other end crashes. <Term w="Constrained decoding">Generating text that is guaranteed to match a format (a JSON schema, a regular expression, a grammar) by forbidding, at every step, any token that would break the format.</Term> fixes it: a grammar compiler turns your schema into a state machine, and at each step the engine builds a mask of tokens that are legal from the current state, and the sampler sets every other token's probability to zero. The SGLang paper also introduced jump-forward decoding: when the grammar allows only one possible continuation (the `"name": "` after `{`), skip the model and append those tokens directly. Both engines now support structured outputs through pluggable grammar backends (XGrammar, llguidance, Outlines); SGLang's grammar backends sit in `python/sglang/srt/constrained/` at the time of writing, vLLM's in `vllm/v1/structured_output/`. The mask is computed on the CPU while the GPU runs the forward pass, which is why you saw `get_grammar_bitmask` sitting between "execute" and "sample" if you peeked at vLLM's step.
+
+### The other two engines you'll hear about
+
+**TensorRT-LLM** is NVIDIA's engine. Historically it compiled a model ahead of time into an optimized engine for a specific GPU and set of shapes, then served it with in-flight batching (NVIDIA's name for continuous batching) and paged KV cache. Its edge is kernels: NVIDIA writes the FP8 and FP4 paths for its own hardware first. Newer releases moved toward a PyTorch-based workflow that's closer to vLLM in how you use it; check the current docs before assuming either. NVIDIA has a DGX Spark playbook for it too.
+
+**llama.cpp** is a different animal: C and C++, no Python on the hot path, designed for one or a few users on whatever hardware you have, CPU, Apple Metal, CUDA, and more. It loads models from <Term w="GGUF">llama.cpp's single-file model format: weights (usually quantized), tokenizer and metadata in one file, laid out so it can be memory-mapped and used without parsing.</Term> files that it memory-maps, so a model "loads" by mapping pages ([What happens when you save a file?](/lessons/files-and-disks/)). Its quantization formats squeeze models to 4 bits and below for machines without much bandwidth. It's the natural choice on unified-memory machines like your Mac and a good one on the Spark at batch 1. It also ships `llama-server` with an OpenAI-compatible API, which means your harness works against it unchanged. Its throughput at high concurrency is not its goal.
+
+### Beyond one GPU: tensor parallelism
+
+A 70B model in bf16 is 140 GB. It does not fit on one 80 GB GPU, and even if it did, decode would read 140 GB per token. The standard fix inside a machine is <Term w="tensor parallelism">Splitting each layer's weight matrices across several GPUs so every GPU holds a slice of every layer, computes its part of each token, and they combine partial results with fast communication.</Term>.
+
+<Figure n="005" title="TENSOR PARALLELISM, ONE MLP" caption="Split the first matrix by columns and the second by rows. Each GPU computes its half of the hidden layer with no communication, multiplies by its half of the second matrix, and gets a partial answer. One all-reduce adds the partials. Attention splits the same way, by heads. Two all-reduces per layer.">
+<svg viewBox="0 0 640 250" role="img" aria-label="An MLP split across two GPUs with one all-reduce at the end">
+  <defs>
+    <marker id="et-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+  <rect x="10" y="100" width="70" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="45" y="120" text-anchor="middle" class="strong">x</text>
+  <text x="45" y="136" text-anchor="middle">copy on both</text>
+  <line x1="80" y1="112" x2="140" y2="60" class="blue" stroke-width="1" marker-end="url(#et-arr)" />
+  <line x1="80" y1="132" x2="140" y2="186" class="blue" stroke-width="1" marker-end="url(#et-arr)" />
+  <rect x="140" y="20" width="350" height="86" class="fill-wash" stroke-width="1.2" />
+  <text x="152" y="38" class="strong">GPU 0</text>
+  <rect x="152" y="48" width="96" height="44" class="fill-paper" stroke-width="1" /><text x="200" y="66" text-anchor="middle">W1 cols</text><text x="200" y="82" text-anchor="middle">left half</text>
+  <rect x="270" y="48" width="70" height="44" class="fill-paper" stroke-width="1" /><text x="305" y="74" text-anchor="middle">act</text>
+  <rect x="362" y="48" width="114" height="44" class="fill-paper" stroke-width="1" /><text x="419" y="66" text-anchor="middle">W2 rows</text><text x="419" y="82" text-anchor="middle">top half</text>
+  <rect x="140" y="146" width="350" height="86" class="fill-wash" stroke-width="1.2" />
+  <text x="152" y="164" class="strong">GPU 1</text>
+  <rect x="152" y="174" width="96" height="44" class="fill-paper" stroke-width="1" /><text x="200" y="192" text-anchor="middle">W1 cols</text><text x="200" y="208" text-anchor="middle">right half</text>
+  <rect x="270" y="174" width="70" height="44" class="fill-paper" stroke-width="1" /><text x="305" y="200" text-anchor="middle">act</text>
+  <rect x="362" y="174" width="114" height="44" class="fill-paper" stroke-width="1" /><text x="419" y="192" text-anchor="middle">W2 rows</text><text x="419" y="208" text-anchor="middle">bottom half</text>
+  <line x1="490" y1="63" x2="540" y2="115" class="ink" stroke-width="1" />
+  <line x1="490" y1="189" x2="540" y2="135" class="ink" stroke-width="1" />
+  <rect x="540" y="100" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="585" y="118" text-anchor="middle" class="strong">ALL-REDUCE</text>
+  <text x="585" y="134" text-anchor="middle">p0 + p1</text>
+  <text x="315" y="128" text-anchor="middle" class="blue-t">NO TALKING UNTIL HERE →</text>
+</svg>
+</Figure>
+
+Why does this help decode? Each GPU reads only its share of the weights per token, so with 2 GPUs each step reads half the bytes from each GPU's memory, in parallel. The cost is the <Term w="all-reduce">A collective operation where every GPU contributes a tensor and every GPU ends up with the sum. Its time is set by the interconnect's latency and bandwidth.</Term>: two per layer, so 64 per token for a 32-layer model. Each one is small at batch 1 (one hidden vector, 4,096 × 2 bytes = 8 KB), so it's latency that matters, not bandwidth. Inside a server, GPUs talk over NVLink at hundreds of GB/s with microsecond latency, and tensor parallelism is close to free. Across two Sparks linked by their ConnectX-7 network ports, each all-reduce pays a network round trip, and 64 of them per token add up; that's why NVIDIA's multi-Spark playbooks are mainly about fitting models that don't fit in one Spark, not making small ones faster. In vLLM it's one flag, `--tensor-parallel-size`, and one worker process per GPU. The other splits, pipeline parallelism (layers on different GPUs) and expert parallelism for mixture-of-experts models, come up in [Training on many GPUs](/lessons/distributed-training/).
+
+### The frontier: splitting prefill from decode
+
+Go back to the mixed batch. Mixing prefill into decode steps is good for throughput, but every prefill chunk makes that step longer for every decoding request in it. A user mid-stream sees a stutter whenever someone else's long prompt arrives. Chunking caps the stutter but doesn't remove it. And the two phases want different hardware: prefill wants compute, decode wants bandwidth and lots of memory for KV.
+
+<Figure n="006" title="COLOCATED VS DISAGGREGATED" caption="Top: one GPU pool does both, so a long prefill stretches the decode steps around it. Bottom: a prefill pool computes the prompt's KV cache and ships it to a decode pool, which only ever runs steady decode steps. The price is moving the KV cache between machines.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Timelines of colocated and disaggregated prefill and decode">
+  <defs>
+    <marker id="ed-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+  <text x="10" y="18" class="strong">COLOCATED · ONE POOL</text>
+  <g stroke-width="1">
+    <rect x="110" y="30" width="20" height="24" class="fill-paper" /><rect x="132" y="30" width="20" height="24" class="fill-paper" /><rect x="154" y="30" width="20" height="24" class="fill-paper" />
+    <rect x="176" y="30" width="120" height="24" class="fill-blue" />
+    <rect x="298" y="30" width="20" height="24" class="fill-paper" /><rect x="320" y="30" width="20" height="24" class="fill-paper" />
+    <rect x="342" y="30" width="90" height="24" class="fill-blue" />
+    <rect x="434" y="30" width="20" height="24" class="fill-paper" /><rect x="456" y="30" width="20" height="24" class="fill-paper" />
+  </g>
+  <text x="10" y="47">GPU</text>
+  <text x="236" y="74" text-anchor="middle" class="blue-t">PREFILL + DECODE</text>
+  <text x="236" y="90" text-anchor="middle">every stream stalls here</text>
+  <line x1="10" y1="110" x2="630" y2="110" class="ink dash" stroke-width="1" />
+  <text x="10" y="132" class="strong">DISAGGREGATED · TWO POOLS</text>
+  <text x="10" y="161">PREFILL</text>
+  <g stroke-width="1">
+    <rect x="110" y="146" width="120" height="24" class="fill-blue" /><rect x="234" y="146" width="90" height="24" class="fill-blue" /><rect x="328" y="146" width="140" height="24" class="fill-blue" />
+  </g>
+  <text x="10" y="225">DECODE</text>
+  <g stroke-width="1">
+    <rect x="110" y="210" width="20" height="24" class="fill-paper" /><rect x="132" y="210" width="20" height="24" class="fill-paper" /><rect x="154" y="210" width="20" height="24" class="fill-paper" /><rect x="176" y="210" width="20" height="24" class="fill-paper" /><rect x="198" y="210" width="20" height="24" class="fill-paper" /><rect x="220" y="210" width="20" height="24" class="fill-paper" /><rect x="242" y="210" width="20" height="24" class="fill-paper" /><rect x="264" y="210" width="20" height="24" class="fill-paper" /><rect x="286" y="210" width="20" height="24" class="fill-paper" /><rect x="308" y="210" width="20" height="24" class="fill-paper" /><rect x="330" y="210" width="20" height="24" class="fill-paper" /><rect x="352" y="210" width="20" height="24" class="fill-paper" /><rect x="374" y="210" width="20" height="24" class="fill-paper" /><rect x="396" y="210" width="20" height="24" class="fill-paper" /><rect x="418" y="210" width="20" height="24" class="fill-paper" /><rect x="440" y="210" width="20" height="24" class="fill-paper" />
+  </g>
+  <line x1="230" y1="172" x2="250" y2="206" class="blue" stroke-width="1.2" marker-end="url(#ed-arr)" />
+  <text x="490" y="190" class="blue-t">KV CACHE SHIPPED</text>
+  <text x="490" y="206">across the network</text>
+  <line x1="488" y1="186" x2="248" y2="190" class="blue dash" stroke-width="1" />
+</svg>
+</Figure>
+
+<Term w="Disaggregated serving">Running prefill and decode on separate groups of GPUs (or machines), transferring each request's KV cache from the prefill group to the decode group after its prompt is processed.</Term> takes this to its conclusion. Two 2024 papers made the case: DistServe (Zhong et al., OSDI 2024) showed that separating the phases and sizing each pool for its own latency target serves more requests within both a TTFT and an inter-token-latency target; Splitwise (Patel et al., ISCA 2024) argued from production traces at Microsoft that the phases could even run on different GPU generations. Mooncake, from Moonshot AI, built a whole serving system around a distributed KV cache. The cost is shipping KV: for Llama 3.1 8B, a 2,000-token prompt is 2,000 × 128 KiB = 250 MiB of KV to move before the first decode step. That needs fast networking, and libraries like NVIDIA's NIXL exist to move it. Both vLLM (through KV connectors) and SGLang support disaggregated setups at the time of writing; the details move fast, so read their docs, not this paragraph.
+
+You won't run disaggregation on one Spark. You should be able to explain it, because it's the current answer to "TTFT and inter-token latency fight each other; what do you do at scale?"
+
+## Build It
+
+Your project folder grows two scripts and a notes file:
+
+```text
+inference/
+  bench.py, scoreboard.py, SCOREBOARD.md    # from the baseline lesson
+  engines/
+    run_vllm.sh
+    run_sglang.sh
+  TRACE.md                                  # your reading notes from task 4
+  profiles/                                 # py-spy SVGs, torch traces
+```
+
+<Task id="t1" title="Run vLLM on the Spark" agent="ok">
+
+Use NVIDIA's DGX Spark vLLM playbook (build.nvidia.com/spark, "Serve LLMs with vLLM") and the vLLM Recipes site it links to for the current image and launch flags. The GB10 GPU is a newer Blackwell variant (`sm_121`), and you want a build validated for it; a random `pip install vllm` on ARM64 may not have the right kernels. At the time of writing, the playbook uses an NGC vLLM container, and vLLM's own blog post on the Spark used an official `vllm/vllm-openai` CUDA 13 image. Tags move; pin the one you use in `run_vllm.sh`.
+
+The shape, with the image left for you to look up:
+
+```bash
+# run_vllm.sh: shape only. Take the image and recommended flags from the playbook.
+docker run --rm -it --gpus all --ipc=host -p 8001:8000 \
+  --cap-add SYS_PTRACE \
+  -e HF_TOKEN="$HF_TOKEN" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  -v "$HOME/inference/profiles:/profiles" \
+  <vllm-image-for-spark> \
+  vllm serve meta-llama/Llama-3.1-8B-Instruct \
+    --dtype bfloat16 \
+    --max-model-len 8192 \
+    --gpu-memory-utilization 0.6
+```
+
+Notes. Port 8001 so it can run next to your own server on 8000. `--cap-add SYS_PTRACE` is for py-spy later. `--gpu-memory-utilization` is a fraction of the *unified* pool on the Spark, which your OS, the container and your other processes share; start at 0.5–0.7 and read the startup log for how many KV blocks you got. Whether the image's entrypoint already includes `vllm serve` varies between images; read its docs. Prefix caching is on by default in V1, so don't pass anything for it.
+
+Smoke test, with the same curl as your own server: `curl -N localhost:8001/v1/chat/completions -H 'Content-Type: application/json' -d '...'`. Then `curl localhost:8001/metrics | grep -E 'kv_cache_usage|num_requests'` to see the engine's own view of itself.
+
+</Task>
+
+<Task id="t2" title="Run SGLang on the Spark" agent="ok">
+
+Same idea, using NVIDIA's "Serve LLMs with SGLang" playbook, which at the time of writing uses a CUDA 13 SGLang container and includes a prefix-cache multi-turn exercise and a structured-JSON one. Do both of those exercises; they take ten minutes and show you the two features SGLang is proudest of.
+
+Note the playbook's validated Llama 3.1 8B models are FP8 and NVFP4 checkpoints. For a fair row against your bf16 server, serve the original bf16 model first; then, if you did [Quantization](/lessons/quantization/), serve the FP8 one as a second row and compare it to your own FP8 number.
+
+```bash
+# run_sglang.sh: shape only. Image from the playbook. Launcher name may be
+# `python -m sglang.launch_server` or `sglang serve` depending on version.
+docker run --rm -it --gpus all --ipc=host --shm-size 16g -p 8002:30000 \
+  --cap-add SYS_PTRACE \
+  -e HF_TOKEN="$HF_TOKEN" \
+  -v "$HOME/.cache/huggingface:/root/.cache/huggingface" \
+  <sglang-image-for-spark> \
+  python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct \
+    --host 0.0.0.0 --port 30000 --mem-fraction-static 0.6
+```
+
+Check `--help` for the current names of the flags you'll use in Break It (disabling the radix cache, choosing the schedule policy, disabling CUDA graphs). SGLang's argument handling was being reorganized at the time of writing.
+
+</Task>
+
+<Task id="t3" title="Benchmark both with your harness" agent="hands">
+
+Your harness already speaks the OpenAI API, so this is mostly pointing it somewhere new. Two changes and a check first.
+
+1. **Ask for usage.** Fireworks sends `usage` in the last chunk by default. vLLM and SGLang follow OpenAI here: they only do it when the request includes `"stream_options": {"include_usage": true}`. Add it to the body for every target. Your harness computes decode speed from `usage.completion_tokens`, so without this every vLLM record will have `n_out` missing and your tok/s column will be empty or, worse, computed from chunks.
+2. **`ignore_eos` is supported** by both engines as an extra field in the request body. Keep sending it.
+3. **Check token counts.** For five responses from each engine, re-tokenize the text with the Hugging Face tokenizer and compare to `usage`. They should match exactly at temperature 0 with `ignore_eos`.
+
+Then run the same sweep as always, one target at a time (the Spark has one GPU; two engines fighting over it measures nothing). Stop each container before starting the next.
+
+```bash
+python bench.py --target spark-vllm --base-url http://localhost:8001/v1 \
+  --model meta-llama/Llama-3.1-8B-Instruct --precision bf16 --change "vLLM <version>, defaults" \
+  --prompts prompts/short.jsonl --concurrency 1,4,16,64 --n 400 --max-tokens 256 --ignore-eos
+```
+
+Repeat for `spark-sglang` on port 8002, then once more each with `prompts/long.jsonl` at c = 1 for prefill, and once with a shared-system-prompt set (the one you built for [prefix caching](/lessons/prefix-caching/)) at c = 16. Record the engine version and image tag in `--change`: next month's version will give different numbers. Append the rows to `SCOREBOARD.md`:
+
+```markdown
+| date | target | change | TTFT p50 / p99 ms (c=1) | tok/s p50 (c=1) | throughput tok/s (c=16) | notes |
+|------|--------|--------|-------------------------|-----------------|-------------------------|-------|
+|      | spark-vllm   | vLLM <ver>, defaults   |  |  |  | bf16, image <tag> |
+|      | spark-sglang | SGLang <ver>, defaults |  |  |  | bf16, image <tag> |
+```
+
+Your scoreboard prints throughput at c = 16 for its row; for this lesson also write the c = 64 throughput in the notes column, because that's where the engines pull away.
+
+</Task>
+
+<Task id="t4" title="Trace one request through vLLM's source" agent="explain">
+
+This is the reading skill. An agent may explain what a piece of code is doing when you're stuck; the map in `TRACE.md` must be yours, in your words.
+
+```bash
+git clone --depth 1 https://github.com/vllm-project/vllm.git && cd vllm
+git log -1 --format='%h %cd'      # write this at the top of TRACE.md
+```
+
+The rule for reading a big codebase: **don't start at the top.** Start from the loop, then follow one request outward in both directions. Use `grep -n` and your editor's "go to definition"; don't read files top to bottom.
+
+The map below was checked against vLLM's main branch in October 2026. Names move. If one is gone, search for the idea (`grep -rn "def schedule" vllm/v1`), and write down the new location; noticing what moved is half the lesson.
+
+| Stop | At the time of writing, look for | Answer in TRACE.md |
+|---|---|---|
+| 1. The loop | `vllm/v1/engine/core.py`: `EngineCore.step`, and `run_busy_loop` in the process subclass | What are the four calls in one step, in order? Where does it block waiting for the GPU? |
+| 2. The decision | `vllm/v1/core/sched/scheduler.py`: `Scheduler.schedule` | What is the token budget variable called, and what sets its value? Which list is walked first, running or waiting? |
+| 3. Chunked prefill | same function, where a waiting request's token count is clamped | Find the line that shortens a long prompt to fit the budget. |
+| 4. Memory | `vllm/v1/core/kv_cache_manager.py`: `get_computed_blocks`, `allocate_slots`, `free`; `vllm/v1/core/block_pool.py` | What does `allocate_slots` return when there is no room? How are block hashes chained? Where's the free queue? |
+| 5. Preemption | `schedule`, the loop around `allocate_slots`; `_preempt_request` | Which request is chosen as victim under FCFS? What happens to its computed-token count? |
+| 6. The forward call | `vllm/v1/worker/gpu_model_runner.py`: `execute_model`, `_model_forward`, then `sample_tokens` | What tensors does it build from the scheduler output? Where does it pick between a CUDA graph and eager mode? |
+| 7. Attention | `vllm/v1/attention/backends/`, and the selector that picks one | Which backend does your Spark log say it chose at startup, and why? |
+| 8. Back out | `Scheduler.update_from_output`, `vllm/v1/engine/output_processor.py` | Where is a stop condition checked? Where are token ids turned into text? |
+| 9. The front door | `vllm/entrypoints/openai/`, `vllm/v1/engine/async_llm.py` (`AsyncLLM.generate`), `core_client.py` | How does a streaming HTTP response get its tokens from another process? |
+
+For each stop, write three things: the function, one sentence of what it does, and which piece of *your* server it replaces. Then answer the one question that ties it together: **for a single decode step at c = 16, list every process boundary a token crosses and every Python function that runs on its behalf.**
+
+Two shortcuts worth knowing. `docs/design/` in the repo has short design notes on the architecture, prefix caching, CUDA graphs and multiprocessing; read `arch_overview.md` before stop 1. And `vllm/v1/core/sched/output.py` defines the `SchedulerOutput` record that crosses from the engine core to the worker: reading that one dataclass tells you more about the contract between scheduler and model runner than any amount of prose.
+
+Optional, same procedure on SGLang (`python/sglang/srt/`): `managers/scheduler.py` (the event loops and `get_next_batch_to_run`), `managers/schedule_policy.py` (the policies), `mem_cache/radix_cache.py` (the tree), `model_executor/model_runner.py`.
+
+</Task>
+
+<Task id="t5" title="Profile a running engine" agent="explain">
+
+Two profilers, two questions. py-spy answers "what is the CPU doing?" The torch profiler answers "what is the GPU doing, and when is it idle?"
+
+**py-spy, the CPU side.** py-spy is a <Term w="sampling profiler">A profiler that peeks at a running program's call stack many times a second and counts where it was. It doesn't change the program, so you can attach it to a live server.</Term> for Python. Install it on the host or in the container (`pip install py-spy`; if there's no ARM64 wheel for your Python, `cargo install py-spy`). The `SYS_PTRACE` capability from task 1 lets it attach inside the container; from the host, `sudo` works too.
+
+```bash
+ps -eo pid,args | grep -E 'VLLM::|vllm serve'   # vLLM names its processes, e.g. VLLM::EngineCore
+py-spy dump --pid <engine-core-pid>            # one snapshot of every thread's stack
+# while bench.py runs at c = 16:
+py-spy record --pid <api-server-pid> --subprocesses --native --duration 30 -o profiles/vllm-c16.svg
+```
+
+Open the SVG in a browser. It's a <Term w="flame graph">A picture of sampled call stacks: width is how often a function was on the stack, and callers sit below the functions they call. Wide bars are where time goes.</Term>. Find the engine-core process and look for three things: how much of its width is in the scheduler, how much in input preparation, and how much is waiting for the GPU. In a healthy engine, waiting is most of it. Then do the same at c = 1 and against your own batched server. The comparison is the lesson.
+
+**Torch profiler, the GPU side.** vLLM has it built in. At the time of writing (v0.13 and later) you enable it at launch and drive it over HTTP:
+
+```bash
+vllm serve ... --profiler-config '{"profiler": "torch", "torch_profiler_dir": "/profiles/torch"}'
+curl -X POST localhost:8001/start_profile
+# send only a few requests: traces get huge
+curl -X POST localhost:8001/stop_profile          # flushing takes a while; let it finish
+```
+
+Older versions used an environment variable instead; check the profiling page in vLLM's contributor docs for your version. Open the trace at ui.perfetto.dev. Zoom into one decode step on the GPU track. Write down: the step's duration, the share spent in matrix-multiply kernels, the share in attention, and the size of the gaps between kernels. Then repeat with `--enforce-eager`. The gaps are what CUDA graphs remove.
+
+</Task>
+
+<DoneWhen>
+
+- vLLM and SGLang each serve Llama 3.1 8B on the Spark, pass your harness's token-count check, and have their image tags pinned in your run scripts.
+- `SCOREBOARD.md` has rows for both engines at c = 1, 4, 16, 64, next to your naive server, your best server and Fireworks.
+- `TRACE.md` has all nine stops in your words, with the commit hash at the top, and the answer to the "one decode step at c = 16" question.
+- You have a py-spy flame graph and a Perfetto trace, and can point at the part of each that explains your biggest scoreboard gap.
+
+</DoneWhen>
+
+## Measure
+
+Same prompts, 256 output tokens, `ignore_eos`, bf16 unless noted. One engine on the GPU at a time.
+
+| target | c | TTFT p50 | TTFT p99 (n) | tok/s p50 | throughput |
+|--------|---|----------|--------------|-----------|------------|
+| Spark, naive | 1 / 16 | | | | |
+| Spark, your best server | 1 / 16 / 64 | | | | |
+| Spark, vLLM | 1 / 16 / 64 | | | | |
+| Spark, SGLang | 1 / 16 / 64 | | | | |
+| Fireworks | 1 / 16 / 64 | | | | |
+
+And from the profiles, one decode step at c = 16:
+
+| engine | step time | matmul % | attention % | GPU idle % | CPU: top function |
+|--------|-----------|----------|-------------|------------|-------------------|
+| your best server | | | | | |
+| vLLM | | | | | |
+| vLLM `--enforce-eager` | | | | | |
+
+What the shape should look like. These are reasoned ceilings and expectations, not measurements; the Spark numbers are from spec-sheet bandwidth.
+
+**c = 1 tok/s.** The ceiling is still ~17 tok/s (16 GB per token at ~273 GB/s). Both engines should get a large fraction of it, plausibly 85–95%, and beat naive `generate` clearly. If your own batched server is within 10–20% of them at c = 1, that's honest: at batch 1 on a bandwidth-bound box there isn't much left to win. Quantized rows break the ceiling, of course, because they read fewer bytes.
+
+**c = 64 throughput.** This is where the engines earn their reputation. A step at batch 64 still reads the weights once, plus the KV of 64 sequences (at ~300 tokens each, about 64 × 300 × 128 KiB ≈ 2.5 GB). So a step costs roughly (16 + 2.5) GB ÷ 273 GB/s ≈ 68 ms for 64 tokens: a ceiling around 900 tok/s. Expect a good fraction of that. Your own server probably falls further from its ceiling here than at c = 1, because the CPU work per step grows with the batch and yours is all on the hot path.
+
+**TTFT p99 at c = 64.** Chunked prefill and the token budget keep it bounded. Compare to your server: if yours runs a full prefill phase whenever someone arrives, its p99 TTFT and its inter-token stutter should both be visibly worse.
+
+**Shared system prompt.** Both engines should show a large TTFT drop on cache hits, like your prefix cache. SGLang's default cache-aware policy may do better on throughput at c = 16 with many shared prefixes, at some cost to fairness. Look at the distribution, not just the median.
+
+**Profiles.** On the Spark at c = 16, expect the GPU trace to be dominated by matrix-multiply kernels reading weights, with attention a small slice at short context that grows as contexts get long. The engine-core flame graph should be mostly waiting. Your own server's flame graph should show Python doing real work between GPU calls. `--enforce-eager` should open small gaps between kernels; on the Spark they'll be a small share of a long step, which is the H100-vs-Spark arithmetic from the Idea section, measured.
+
+**Against Fireworks.** Still far behind on per-stream tok/s; that's HBM bandwidth and probably lower precision on their side, not software. Write down the ratio at c = 1 and compare it to the ratio of memory bandwidths. If the two ratios are close, you've found the floor: what's left of the gap is hardware.
+
+## Break It
+
+**Turn off CUDA graphs.** Restart vLLM with `--enforce-eager` and rerun c = 1 and c = 64. Check your prediction. Startup also gets faster, since nothing is captured. If the slowdown is small, you've confirmed that on a slow-memory box the CPU overhead is a small slice; on a data-center GPU the same flag hurts far more.
+
+**Turn off prefix caching.** vLLM: `--no-enable-prefix-caching`. SGLang: its disable-radix-cache flag. Rerun the shared-system-prompt set. TTFT on repeated prompts jumps back to full prefill. Then look at `vllm:prefix_cache_hits` and `vllm:prefix_cache_queries` on `/metrics` with caching back on, and compute the hit rate yourself.
+
+**Starve the KV pool.** Restart vLLM with a small `--gpu-memory-utilization` (or `--num-gpu-blocks-override` to a few hundred blocks) and run c = 64 with long outputs. Watch the startup log's block count, then `vllm:num_preemptions` climb on `/metrics` and the p99 of e2e latency blow up while throughput drops: requests are recomputing prefills they already did. This is the failure mode behind "it was fine until traffic doubled".
+
+**Make it your naive server.** `--max-num-seqs 1`. vLLM now serves one request at a time. Run c = 16. TTFT climbs as (c − 1) × service time, exactly your baseline staircase, though each service is faster. Everything that makes vLLM good at serving many users is the scheduler; take it away and a fast kernel stack still queues.
+
+**Hang up mid-stream.** Start a 1,024-token request against vLLM and kill the client after a second. Watch `vllm:num_requests_running` drop: the API server notices the disconnect and aborts the request, freeing its blocks. Your naive server kept generating for a ghost. Find the abort path in the code (the engine core has an aborts queue it drains every step).
+
+## Explain It Back
+
+Answer each out loud, as if in an interview, before opening the answer.
+
+<details>
+<summary>Why does vLLM run the API server and the engine core as separate processes instead of threads?</summary>
+
+Because of the GIL and because the GPU must never wait for Python. Tokenizing, detokenizing and writing SSE chunks are CPU work that grows with the number of users. If they ran on threads in the same process as the scheduler, they would take turns holding the GIL with it, and every millisecond they held it would be a millisecond the next step wasn't scheduled and the GPU sat idle. In separate processes they run truly in parallel on other cores: the API server can turn step N's tokens into text while the engine core schedules step N+1. The price is serializing requests and outputs over sockets, which is microseconds per message and overlaps GPU work.
+
+</details>
+
+<details>
+<summary>Walk me through one engine step in vLLM.</summary>
+
+The engine core's loop calls the scheduler. The scheduler has a token budget for this forward pass. It gives each running request its next token (or a few with speculative decoding), then admits waiting requests oldest first, chunking a long prompt if the budget runs out. For each, it asks the KV cache manager for blocks, reusing cached prefix blocks by hash. If memory runs out it preempts the newest running request by freeing its blocks for recompute later. The output is a small record of which requests run, how many tokens each and which new blocks they got. The GPU worker applies that diff to its persistent batch, builds positions and block tables, runs one forward pass over the mixed batch, replaying a CUDA graph if the shape matches, and samples. The scheduler updates each request with its new token, checks stop conditions, and sends outputs back to the API server, which detokenizes and streams them.
+
+</details>
+
+<details>
+<summary>Recompute vs swap for preemption: what does each cost, and which would you pick on the Spark?</summary>
+
+Recompute throws the victim's KV away and prefills its prompt plus generated tokens again later: it costs compute, which is the cheap part of inference, and prefix caching often makes it partly free because the freed blocks are still cached when the request returns. Swap copies the KV to CPU memory and back: it costs bandwidth, two trips over PCIe on a normal server, and memory on the CPU side. On the Spark, CPU and GPU share one LPDDR5x pool, so swap would copy bytes within the same memory, using the bandwidth decode needs and freeing nothing you couldn't just give to the KV pool. Recompute, and a bigger pool.
+
+</details>
+
+<details>
+<summary>How does serving scale from one GPU to eight, and then to a cluster? What breaks at each step?</summary>
+
+On one GPU, throughput grows with batch size until the KV cache fills memory or prefill compute saturates; past that, requests queue or get preempted. Across eight GPUs in one server, you either run eight independent copies behind a load balancer (data parallelism: throughput scales nearly linearly, nothing shared, but each copy must fit on one GPU) or split one model across them with tensor parallelism (each GPU reads an eighth of the weights per token, two all-reduces per layer over NVLink, so per-token latency drops and bigger models fit). Tensor parallelism stops paying off across machines because every all-reduce becomes a network round trip, so across a cluster you go back to data parallelism over replicas, add pipeline or expert parallelism for models too big for one node, and route requests to replicas that already hold their prefix in cache. At the largest scale, prefill and decode get their own pools, and the bottleneck becomes moving KV caches between them.
+
+</details>
+
+<details>
+<summary>Why are DistServe and Splitwise interesting? What problem does disaggregation solve, and what does it cost?</summary>
+
+Prefill and decode want different things: prefill is compute-bound and bursty, decode is bandwidth-bound and steady. On the same GPUs they interfere: every prefill chunk stretches the decode steps of everyone in the batch, so TTFT and inter-token latency trade off against each other, and you can't size the hardware for both. Disaggregation runs them on separate pools, so each can be sized and tuned for its own latency target, even on different GPU types. The cost is shipping each request's KV cache from the prefill pool to the decode pool before decoding starts: for an 8B model that's 128 KiB per token, about 250 MiB for a 2,000-token prompt, so it needs fast interconnects and careful overlap, and it adds a hop to TTFT.
+
+</details>
+
+## Go Deeper
+
+- **Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023).** The vLLM paper. Read it fully now: you've built every piece, so the design choices will read as answers to problems you've had.
+- **The vLLM team, "vLLM V1: A Major Upgrade to vLLM's Core Architecture" (vLLM blog, January 2025),** and `docs/design/` in the vLLM repository (start with `arch_overview.md`, `prefix_caching.md`, `cuda_graphs.md`). Why V1 was rewritten around CPU overhead, from the people who did it. The design docs are the closest thing to a map that stays current.
+- **Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs" (NeurIPS 2024).** RadixAttention, cache-aware scheduling, compressed state machines for structured output, and the frontend language.
+- **Yu et al., "Orca: A Distributed Serving System for Transformer-Based Generative Models" (OSDI 2022).** Where iteration-level scheduling came from. Short and clear.
+- **Agrawal et al., "Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve" (OSDI 2024).** The case for chunked prefill and stall-free batching, with the interference problem measured carefully.
+- **Zhong et al., "DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving" (OSDI 2024),** and **Patel et al., "Splitwise: Efficient Generative LLM Inference Using Phase Splitting" (ISCA 2024).** The two papers behind disaggregated serving.
+- **Shoeybi et al., "Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism" (2019).** The column-then-row split in Figure 005, with the reasoning for where the all-reduces go.
+- **NVIDIA DGX Spark playbooks (build.nvidia.com/spark): "Serve LLMs with vLLM", "Serve LLMs with SGLang", and the vLLM team's "vLLM on the DGX Spark" blog post (June 2026).** The supported way to run each engine on GB10, and a frank discussion of what unified memory means for the flags.
+
+## Connections
+
+This lesson closes the loop the [baseline lesson](/lessons/baseline-vs-fireworks/) opened: its "where the gap comes from" table promised that every symptom had a cause and a lesson, and here are all the causes fixed at once, by someone else, in code you can now read. Each box in Figure 001 links back to the lesson where you built the toy version: [The KV cache](/lessons/kv-cache/), [Batching](/lessons/batching/), [Prefix caching](/lessons/prefix-caching/), [Quantization](/lessons/quantization/), [Speculative decoding](/lessons/speculative-decoding/). The process split is [Processes, threads and the GIL](/lessons/processes-threads-gil/) and [Waiting vs working](/lessons/waiting-vs-working/) applied to a GPU.
+
+Next is [FlashAttention and kernels](/lessons/flash-attention/): the attention backend is the one box in Figure 001 you haven't built, and it's where you leave Python entirely. The `/metrics` endpoint you poked at is a head start on [Logs, metrics and traces](/lessons/observability/), and the scaling story in Explain It Back continues in [Training on many GPUs](/lessons/distributed-training/).

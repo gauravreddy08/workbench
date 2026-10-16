@@ -1,0 +1,286 @@
+---
+// Goodput timeline for a long training job with random failures.
+// Sliders: checkpoint interval, checkpoint cost, MTBF (of the whole job), restart time.
+// Top: 72 hours of one simulated run (kept work, checkpoints, failures, lost work, restarts).
+// Middle: where a year of wall-clock time goes. Bottom: expected goodput vs interval, with the
+// Young/Daly optimum sqrt(2 x C x MTBF) marked. Usage: <DesignGoodputTimeline />
+---
+<div class="dg" data-fig="design-goodput">
+  <dl class="dg-out">
+    <div><dt class="label">Goodput (sim, 1 yr)</dt><dd><span class="readout big" data-out="good">-</span></dd></div>
+    <div><dt class="label">Theory at this τ</dt><dd><span class="readout" data-out="theory">-</span></dd></div>
+    <div><dt class="label">√(2·C·MTBF)</dt><dd><span class="readout" data-out="yd">-</span></dd></div>
+    <div><dt class="label">Best possible</dt><dd><span class="readout" data-out="best">-</span></dd></div>
+  </dl>
+
+  <svg class="dg-tl" viewBox="0 0 640 112" role="img" aria-label="Seventy-two hours of a simulated training run: kept work, checkpoints, failures, lost work and restarts">
+    <defs data-defs></defs>
+    <g data-axis></g>
+    <g data-bars></g>
+  </svg>
+  <div class="dg-legend" aria-hidden="true">
+    <span><i class="sw kept"></i>work kept</span>
+    <span><i class="sw ck"></i>checkpoint</span>
+    <span><i class="sw lost"></i>work lost</span>
+    <span><i class="sw rs"></i>restarting</span>
+    <span><i class="sw fail"></i>failure</span>
+  </div>
+
+  <div class="dg-split" role="img" aria-label="Share of one simulated year spent on kept work, checkpointing, lost work and restarts">
+    <div class="dg-stack">
+      <b class="kept" data-seg="kept"></b><b class="ck" data-seg="ck"></b><b class="lost" data-seg="lost"></b><b class="rs" data-seg="rs"></b>
+    </div>
+    <p class="dg-split-t mono" data-out="split"></p>
+  </div>
+
+  <svg class="dg-curve" viewBox="0 0 640 170" role="img" aria-label="Expected goodput as a function of checkpoint interval, with the current interval and the Young/Daly optimum marked">
+    <g data-curve></g>
+  </svg>
+
+  <div class="ctl dg-ctl">
+    <label>checkpoint every <input type="range" min="0" max="1000" step="1" data-in="tau" /> <output data-o="tau"></output></label>
+    <label>checkpoint cost <input type="range" min="0" max="1000" step="1" data-in="c" /> <output data-o="c"></output></label>
+    <label>job MTBF <input type="range" min="0" max="1000" step="1" data-in="m" /> <output data-o="m"></output></label>
+    <label>restart time <input type="range" min="0" max="1000" step="1" data-in="r" /> <output data-o="r"></output></label>
+  </div>
+  <div class="dg-btns">
+    <button class="btn" type="button" data-act="snap">Set τ = √(2·C·MTBF)</button>
+    <button class="btn" type="button" data-act="reroll">New failures</button>
+  </div>
+  <p class="dg-note" data-out="note"></p>
+</div>
+
+<style>
+  .dg-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 18px; margin: 0 0 14px; }
+  .dg-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .dg-out dt { font-size: 10px; }
+  .dg-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 13px; }
+  .dg-out .big { font-size: 22px; }
+  .dg svg { width: 100%; }
+  .dg-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 6px 0 0; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--ink-2); }
+  .dg-legend span { display: inline-flex; gap: 6px; align-items: center; }
+  .sw { display: inline-block; width: 14px; height: 10px; border: 1px solid var(--ink-3); }
+  .sw.kept, .dg-stack .kept { background: var(--blue-fill); }
+  .sw.ck, .dg-stack .ck { background: var(--blue); }
+  .sw.lost, .dg-stack .lost { background: repeating-linear-gradient(135deg, var(--warn) 0 1.5px, transparent 1.5px 5px); }
+  .sw.rs, .dg-stack .rs { background: var(--ink-3); opacity: 0.55; }
+  .sw.fail { width: 3px; border: 0; background: var(--warn); }
+  .dg-split { margin: 18px 0 6px; }
+  .dg-stack { display: flex; height: 16px; border: 1px solid var(--ink); background: var(--paper); overflow: hidden; }
+  .dg-stack b { display: block; height: 100%; width: 0; }
+  @media (prefers-reduced-motion: no-preference) { .dg-stack b { transition: width 0.15s ease-out; } }
+  .dg-split-t { margin: 6px 0 0; font-size: 11px; color: var(--ink-2); text-transform: none; letter-spacing: 0.02em; }
+  .dg-curve { margin-top: 10px; }
+  .dg-ctl label { flex-wrap: wrap; }
+  .dg-ctl input[type='range'] { width: 150px; }
+  .dg-ctl output { min-width: 5.5em; }
+  .dg-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+  .dg-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  // All times in minutes.
+  const RANGES = {
+    tau: [1, 24 * 60],
+    c: [1 / 60, 30],
+    m: [60, 30 * 24 * 60],
+    r: [1, 120],
+  } as const;
+  type K = keyof typeof RANGES;
+  const fromSlider = (k: K, v: number) => { const [a, b] = RANGES[k]; return a * Math.pow(b / a, v / 1000); };
+  const toSlider = (k: K, x: number) => { const [a, b] = RANGES[k]; return Math.round((1000 * Math.log(x / a)) / Math.log(b / a)); };
+
+  const fmt = (min: number) => {
+    if (min < 1) return `${Math.max(1, Math.round(min * 60))} s`;
+    if (min < 100) return `${min < 10 ? min.toFixed(1) : Math.round(min)} min`;
+    if (min < 48 * 60) return `${(min / 60).toFixed(min < 600 ? 1 : 0)} h`;
+    return `${(min / 1440).toFixed(1)} d`;
+  };
+  const pc = (x: number) => `${(x * 100).toFixed(x > 0.995 ? 2 : 1)}%`;
+
+  // Small seeded RNG so a given seed always draws the same failures.
+  const rng = (seed: number) => () => {
+    seed |= 0; seed = (seed + 0x6d2b79f5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+
+  type Ev = { k: 'kept' | 'lost' | 'ck' | 'rs' | 'fail'; a: number; b: number };
+  // Run for a fixed wall-clock horizon H. Work since the last finished checkpoint is lost on a
+  // failure; a failure during a checkpoint loses that checkpoint too; failures can hit restarts.
+  function sim(tau: number, C: number, R: number, M: number, H: number, seed: number, record: boolean) {
+    const rand = rng(seed);
+    const exp = () => -Math.log(1 - rand()) * M;
+    const ev: Ev[] = [];
+    let t = 0, kept = 0, ck = 0, lost = 0, rs = 0, fails = 0;
+    let nf = exp();
+    while (t < H) {
+      const endW = t + tau, endC = endW + C;
+      if (nf >= endC) {
+        if (record) { ev.push({ k: 'kept', a: t, b: endW }); ev.push({ k: 'ck', a: endW, b: endC }); }
+        kept += tau; ck += C; t = endC; continue;
+      }
+      fails++; lost += nf - t;
+      if (record) { ev.push({ k: 'lost', a: t, b: nf }); ev.push({ k: 'fail', a: nf, b: nf }); }
+      t = nf;
+      for (;;) {
+        nf = t + exp();
+        if (nf >= t + R) { if (record) ev.push({ k: 'rs', a: t, b: t + R }); rs += R; t += R; break; }
+        if (record) { ev.push({ k: 'rs', a: t, b: nf }); ev.push({ k: 'fail', a: nf, b: nf }); }
+        rs += nf - t; t = nf; fails++;
+      }
+      // nf now holds the next failure, drawn fresh after the restart began (memoryless).
+    }
+    const tot = kept + ck + lost + rs;
+    return { ev, kept: kept / tot, ck: ck / tot, lost: lost / tot, rs: rs / tot, fails };
+  }
+
+  // Expected goodput for exponential failures (memoryless), failures allowed during checkpoints
+  // and restarts: time to finish one tau of work = e^(R/M) * M * (e^((tau+C)/M) - 1).
+  const theory = (tau: number, C: number, R: number, M: number) => {
+    const e = Math.exp(R / M) * M * Math.expm1((tau + C) / M);
+    return isFinite(e) && e > 0 ? tau / e : 0;
+  };
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+    const n = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+    if (text !== undefined) n.textContent = text;
+    return n;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="design-goodput"]').forEach((root, idx) => {
+    const s = { tau: 180, c: 1, m: 12 * 60, r: 30, seed: 7 };
+    const q = <T extends Element>(sel: string) => root.querySelector<T>(sel)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const pid = `dg-hatch-${idx}`;
+
+    q('[data-defs]').innerHTML =
+      `<pattern id="${pid}" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">` +
+      `<line x1="0" y1="0" x2="0" y2="6" style="stroke:var(--warn)" stroke-width="2" /></pattern>`;
+
+    const WIN = 72 * 60; // the timeline shows 72 hours
+    const X0 = 8, X1 = 632, BY = 30, BH = 34;
+    const xt = (t: number) => X0 + (Math.min(t, WIN) / WIN) * (X1 - X0);
+
+    const axis = q<SVGGElement>('[data-axis]');
+    for (let h = 0; h <= 72; h += 12) {
+      const x = xt(h * 60);
+      axis.append(el('line', { x1: x, y1: BY + BH, x2: x, y2: BY + BH + 5, class: 'ink', 'stroke-width': 1 }));
+      axis.append(el('text', { x, y: BY + BH + 18, 'text-anchor': h === 0 ? 'start' : h === 72 ? 'end' : 'middle' }, `${h}H`));
+    }
+    axis.append(el('text', { x: X0, y: 14 }, 'ONE RUN, FIRST 72 HOURS'));
+
+    const drawTimeline = () => {
+      const g = q<SVGGElement>('[data-bars]');
+      g.replaceChildren();
+      g.append(el('rect', { x: X0, y: BY, width: X1 - X0, height: BH, class: 'fill-paper', 'stroke-width': 1 }));
+      const r = sim(s.tau, s.c, s.r, s.m, WIN, s.seed, true);
+      let ckPath = '', keptPath = '', rsPath = '';
+      const failX: number[] = [];
+      for (const e of r.ev) {
+        if (e.a >= WIN) break;
+        const a = xt(e.a), b = xt(e.b);
+        const w = Math.max(b - a, 0);
+        if (e.k === 'kept') keptPath += `M${a} ${BY}h${w}v${BH}h${-w}Z`;
+        else if (e.k === 'rs') rsPath += `M${a} ${BY}h${w}v${BH}h${-w}Z`;
+        else if (e.k === 'ck') { const cw = Math.max(w, 0.9); ckPath += `M${a} ${BY}h${cw}v${BH}h${-cw}Z`; }
+        else if (e.k === 'lost') { if (w > 0) g.append(el('rect', { x: a, y: BY, width: w, height: BH, fill: `url(#${pid})` })); }
+        else failX.push(a);
+      }
+      g.append(el('path', { d: keptPath, style: 'fill:var(--blue-fill)' }));
+      g.append(el('path', { d: rsPath, style: 'fill:var(--ink-3);opacity:0.55' }));
+      g.append(el('path', { d: ckPath, style: 'fill:var(--blue)' }));
+      for (const x of failX) {
+        g.append(el('line', { x1: x, y1: BY - 8, x2: x, y2: BY + BH, style: 'stroke:var(--warn)', 'stroke-width': 1.5 }));
+        g.append(el('path', { d: `M${x - 4} ${BY - 14}L${x + 4} ${BY - 14}L${x} ${BY - 7}Z`, style: 'fill:var(--warn)' }));
+      }
+      g.append(el('rect', { x: X0, y: BY, width: X1 - X0, height: BH, class: 'ink', 'stroke-width': 1 }));
+      const nf = failX.length;
+      g.append(el('text', { x: X1, y: 14, 'text-anchor': 'end', class: nf ? '' : 'blue-t' }, `${nf} FAILURE${nf === 1 ? '' : 'S'} IN 72 H`));
+    };
+
+    // Curve: expected goodput vs interval on a log axis.
+    const CX0 = 44, CX1 = 628, CY0 = 18, CY1 = 136;
+    const TMIN = 1, TMAX = 24 * 60;
+    const cx = (t: number) => CX0 + ((Math.log(t) - Math.log(TMIN)) / (Math.log(TMAX) - Math.log(TMIN))) * (CX1 - CX0);
+    const drawCurve = (yd: number, best: number) => {
+      const g = q<SVGGElement>('[data-curve]');
+      g.replaceChildren();
+      // y range: from a rounded-down floor to 100%
+      const lo = Math.max(0, Math.min(0.9, Math.floor((best - 0.25) * 10) / 10));
+      const cy = (v: number) => CY1 - ((Math.max(v, lo) - lo) / (1 - lo)) * (CY1 - CY0);
+      g.append(el('line', { x1: CX0, y1: CY1, x2: CX1, y2: CY1, class: 'ink', 'stroke-width': 1 }));
+      g.append(el('line', { x1: CX0, y1: CY0, x2: CX0, y2: CY1, class: 'ink', 'stroke-width': 1 }));
+      for (const v of [lo, (lo + 1) / 2, 1]) {
+        g.append(el('text', { x: CX0 - 6, y: cy(v) + 4, 'text-anchor': 'end' }, `${Math.round(v * 100)}%`));
+        g.append(el('line', { x1: CX0, y1: cy(v), x2: CX1, y2: cy(v), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      }
+      for (const [t, lab] of [[1, '1M'], [10, '10M'], [60, '1H'], [360, '6H'], [1440, '24H']] as [number, string][]) {
+        g.append(el('text', { x: cx(t), y: CY1 + 16, 'text-anchor': t === 1 ? 'start' : t === 1440 ? 'end' : 'middle' }, lab));
+      }
+      g.append(el('text', { x: CX0, y: 10 }, 'EXPECTED GOODPUT VS CHECKPOINT INTERVAL'));
+      let d = '';
+      for (let i = 0; i <= 200; i++) {
+        const t = TMIN * Math.pow(TMAX / TMIN, i / 200);
+        d += `${i ? 'L' : 'M'}${cx(t).toFixed(1)} ${cy(theory(t, s.c, s.r, s.m)).toFixed(1)}`;
+      }
+      g.append(el('path', { d, class: 'blue', 'stroke-width': 1.5 }));
+      if (yd >= TMIN && yd <= TMAX) {
+        const x = cx(yd);
+        g.append(el('line', { x1: x, y1: CY0, x2: x, y2: CY1, class: 'ink dash', 'stroke-width': 1 }));
+        g.append(el('text', { x: x + (x > 520 ? -4 : 4), y: CY0 + 10, 'text-anchor': x > 520 ? 'end' : 'start', class: 'strong' }, '√(2CM)'));
+      }
+      const x = cx(s.tau), y = cy(theory(s.tau, s.c, s.r, s.m));
+      g.append(el('circle', { cx: x, cy: y, r: 5, class: 'fill-blue' }));
+      g.append(el('text', { x: x + (x > 520 ? -9 : 9), y: y + 16, 'text-anchor': x > 520 ? 'end' : 'start', class: 'blue-t' }, 'YOU'));
+    };
+
+    const render = () => {
+      for (const k of ['tau', 'c', 'm', 'r'] as K[]) {
+        q<HTMLInputElement>(`[data-in="${k}"]`).value = String(toSlider(k, s[k]));
+        q<HTMLOutputElement>(`[data-o="${k}"]`).textContent = fmt(s[k]);
+      }
+      const yd = Math.sqrt(2 * s.c * s.m);
+      // numerical optimum of the exact expression
+      let best = 0, bestT = yd;
+      for (let i = 0; i <= 400; i++) {
+        const t = 0.1 * Math.pow((48 * 60) / 0.1, i / 400);
+        const g = theory(t, s.c, s.r, s.m);
+        if (g > best) { best = g; bestT = t; }
+      }
+      const long = sim(s.tau, s.c, s.r, s.m, 365 * 1440, 1000 + s.seed, false);
+      const th = theory(s.tau, s.c, s.r, s.m);
+      out('good').textContent = pc(long.kept);
+      out('theory').textContent = pc(th);
+      out('yd').textContent = fmt(yd);
+      out('best').textContent = `${pc(best)} @ ${fmt(bestT)}`;
+      for (const k of ['kept', 'ck', 'lost', 'rs'] as const) q<HTMLElement>(`[data-seg="${k}"]`).style.width = `${long[k] * 100}%`;
+      out('split').textContent =
+        `kept ${pc(long.kept)} · checkpointing ${pc(long.ck)} · lost work ${pc(long.lost)} · restarting ${pc(long.rs)} · ${long.fails.toLocaleString('en-US')} failures/yr`;
+      drawTimeline();
+      drawCurve(yd, best);
+
+      const ratio = s.tau / yd;
+      let note: string;
+      if (best < 0.5) note = `The job barely moves forward: failures arrive faster than it can do work, checkpoint and restart. No interval fixes this. Cut the restart time or the checkpoint cost, or make the job smaller.`;
+      else if (ratio > 2) note = `Checkpoints are too rare. Each failure throws away about half an interval (${fmt(s.tau / 2)}) of work, and that hatched area dominates. Slide left toward the dashed line.`;
+      else if (ratio < 0.5) note = `Checkpoints are too frequent: the blue ticks merge into a band. You are paying ${pc(long.ck)} of the cluster to insure against losses that are smaller than the premium. Slide right.`;
+      else if (long.rs > long.lost + long.ck) note = `The interval is near the optimum and the curve is flat here. What's left is restart time: ${pc(long.rs)} of the year is spent coming back. Only a faster restart (hot spares, in-memory checkpoints, quick detection) moves this number.`;
+      else note = `Near the optimum, and the curve is flat: anywhere from half to double √(2·C·MTBF) costs about a point of goodput. The remaining waste is checkpoint cost plus lost work, so make the checkpoint cheaper (async) to push the whole curve up.`;
+      out('note').textContent = note;
+    };
+
+    (['tau', 'c', 'm', 'r'] as K[]).forEach((k) => {
+      q<HTMLInputElement>(`[data-in="${k}"]`).addEventListener('input', (e) => {
+        s[k] = fromSlider(k, Number((e.target as HTMLInputElement).value));
+        render();
+      });
+    });
+    q('[data-act="snap"]').addEventListener('click', () => { s.tau = Math.min(RANGES.tau[1], Math.max(RANGES.tau[0], Math.sqrt(2 * s.c * s.m))); render(); });
+    q('[data-act="reroll"]').addEventListener('click', () => { s.seed = (s.seed * 48271 + 11) % 2147483647; render(); });
+    render();
+  });
+</script>

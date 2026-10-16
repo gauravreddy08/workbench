@@ -1,0 +1,538 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import AttnSteps from '../components/figures/AttnSteps.astro';
+import AttnViewer from '../components/figures/AttnViewer.astro';
+
+## Today
+
+- Walk one query through attention by hand: dot products, the √d scaling, the causal mask, softmax, the blend of values. Say the shape of every tensor on the way, per head and per layer.
+- Pull the real attention weights out of GPT-2 small, check them against your own from-scratch math to six decimal places, and ship them to the browser as JSON.
+- Build an attention viewer in vanilla JS and SVG: pick a layer and head, hover a token, see what it reads.
+- Find a previous-token head and an induction head in GPT-2 small with a number, not by squinting, using a repeated random-token sequence.
+- Knock those heads out and measure what breaks, and explain why a bright attention line is a clue, not a proof.
+
+Prerequisites: you've built GPT-2 ([Train a small LM, end to end](/lessons/tiny-lm/) is the closest lesson here), and [The KV cache, by hand](/lessons/kv-cache/) gives you the Q/K/V picture from the serving side. Rough time: one evening for the idea and the export, one for the viewer, one for induction scores and ablation. Everything runs on a laptop CPU.
+
+## The Problem
+
+You built GPT-2. You wrote `q @ k.transpose(-2, -1)`, you divided by something, you called `masked_fill`, the loss went down. Now someone asks the obvious question: when the model predicts the next token, what is it looking at?
+
+You have the weights. You have the numbers. And yet a surprising number of small things go fuzzy the moment you try to answer. Which axis of the attention matrix is the query? Does row 7 sum to one, or column 7? Why does almost every head, in every layer, seem to stare at the first token? If head 5.5 puts 0.96 on some token, does that mean the model "used" that token? If you delete the head, does anything change?
+
+So you dump `output_attentions=True`, get a tuple of twelve tensors of shape `(1, 12, T, T)`, plot one as a heatmap, and see a pale triangle with a bright stripe down the left edge. That picture is real data. It is also, on its own, almost useless. This lesson is about turning it into something that answers questions: a viewer you can poke, scores that find specific behaviours across all 144 heads, and an experiment that tells you whether what you see actually matters.
+
+<Origin year="2014" title="The alignment picture">
+
+Before Transformers, neural translation squeezed a whole source sentence into one fixed vector and asked a decoder to unpack it. Long sentences fell apart. In 2014 Dzmitry Bahdanau, Kyunghyun Cho and Yoshua Bengio let the decoder look back at every source word at each step, weighting them with a softmax. As a side effect, the paper printed the weights as grids: English words down one side, French across the top, bright cells where the model "aligned" them. The grids looked like a bilingual dictionary drawn by the model. People were enchanted, and attention weights became the default way to ask a network what it was thinking.
+
+Three years later "Attention Is All You Need" (Vaswani et al., 2017) made attention the whole model, many heads per layer, and tools like Jesse Vig's BertViz (2019) put the lines on screen for every head. The same year, Sarthak Jain and Byron Wallace published "Attention is not Explanation": you can often shuffle or swap a model's attention weights and get the same prediction. The field has been arguing ever since about when the picture tells the truth. The modern answer, from Anthropic's circuits work (Elhage et al., 2021; Olsson et al., 2022), is to treat attention as one readable part of a mechanism you then test by cutting.
+
+</Origin>
+
+## The Idea
+
+### Attention is a lookup with soft edges
+
+Think of a library where every book has a label on its spine and some content inside. You walk in with a question. You compare your question to every spine, and instead of taking one book, you take a little of each, more from the books whose labels match your question best.
+
+That is one <Term w="attention head">One independent attention computation inside a layer. GPT-2 small has 12 per layer, 12 layers, so 144 heads, each with its own query, key and value weights.</Term>. Each token in the sequence plays all three roles at once:
+
+- its **query** (q) is the question it brings,
+- its **key** (k) is the label on its spine,
+- its **value** (v) is the content it hands over if picked.
+
+All three are just the token's current vector multiplied by three learned matrices. "Current vector" matters: that vector is the <Term w="residual stream">The running vector for each token that every layer reads from and adds its output to. Layer 5 does not see raw words, it sees words plus everything layers 0-4 have written.</Term> at that layer, not the raw word. By layer 5, the vector for " river" can already carry "I came right after ' lamp'", and its key can advertise that.
+
+### The shapes, once and slowly
+
+Here is GPT-2 small, one layer, one sequence of T tokens. The model width is 768, there are 12 heads, so each head works in 768 / 12 = 64 dimensions, called <Term w="d_head">The size of each head's query, key and value vectors. 64 in GPT-2 small. Heads are carved out of the model width, not added on top.</Term>.
+
+<Figure n="001" title="ONE LAYER, ONE HEAD, ALL THE SHAPES" caption="The attention matrix A is T by T per head: row i is query token i, column j is key token j, and each row sums to 1. Twelve of these per layer, twelve layers.">
+<svg viewBox="0 0 360 470" role="img" aria-label="Tensor shapes through one GPT-2 attention head">
+  <rect x="80" y="10" width="200" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="31" text-anchor="middle" class="strong">X = ln_1(resid)</text>
+  <text x="290" y="31">T × 768</text>
+  <line x1="180" y1="44" x2="180" y2="66" class="ink" stroke-width="1.2" />
+  <text x="188" y="60">× W_Q, W_K, W_V</text>
+  <rect x="20" y="66" width="90" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="135" y="66" width="90" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="250" y="66" width="90" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="65" y="87" text-anchor="middle" class="strong">Q</text>
+  <text x="180" y="87" text-anchor="middle" class="strong">K</text>
+  <text x="295" y="87" text-anchor="middle" class="strong">V</text>
+  <text x="180" y="120" text-anchor="middle">EACH SPLIT INTO 12 HEADS: T × 64</text>
+  <line x1="65" y1="100" x2="150" y2="140" class="ink" stroke-width="1.2" />
+  <line x1="180" y1="100" x2="190" y2="140" class="ink" stroke-width="1.2" />
+  <rect x="100" y="140" width="160" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="161" text-anchor="middle" class="strong">S = Q Kᵀ / √64</text>
+  <text x="268" y="161">T × T</text>
+  <line x1="180" y1="174" x2="180" y2="196" class="ink" stroke-width="1.2" />
+  <rect x="100" y="196" width="160" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="217" text-anchor="middle" class="strong">S[i, j&gt;i] = −∞</text>
+  <text x="268" y="217">MASK</text>
+  <line x1="180" y1="230" x2="180" y2="252" class="ink" stroke-width="1.2" />
+  <rect x="100" y="252" width="160" height="34" class="fill-wash" stroke-width="1.5" />
+  <text x="180" y="273" text-anchor="middle" class="strong">A = softmax(S, rows)</text>
+  <text x="268" y="273">← YOU PLOT</text>
+  <text x="268" y="287">THIS</text>
+  <line x1="180" y1="286" x2="180" y2="308" class="ink" stroke-width="1.2" />
+  <line x1="295" y1="100" x2="230" y2="308" class="ink dash" stroke-width="1.2" />
+  <rect x="100" y="308" width="160" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="329" text-anchor="middle" class="strong">Z = A V</text>
+  <text x="268" y="329">T × 64</text>
+  <line x1="180" y1="342" x2="180" y2="364" class="ink" stroke-width="1.2" />
+  <rect x="60" y="364" width="240" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="385" text-anchor="middle" class="strong">concat 12 heads · W_O</text>
+  <text x="304" y="385">T×768</text>
+  <line x1="180" y1="398" x2="180" y2="420" class="ink" stroke-width="1.2" />
+  <rect x="60" y="420" width="240" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="180" y="441" text-anchor="middle" class="strong">resid += attn output</text>
+</svg>
+</Figure>
+
+Two habits will save you hours. First, **rows are queries, columns are keys**. `A[i, j]` is "how much token i reads from token j". Because of the mask, the matrix is lower-triangular: row 0 has one nonzero entry, row 10 has eleven. Second, **rows sum to one, columns don't**. A row is a probability distribution over the past. A column is "how popular is this token as a source", and it can sum to anything from 0 to T.
+
+### One row, five steps
+
+Take a single query: "sat" in `<eot> The cat sat on the`. Step through it below. The numbers are a toy (they aren't from a real model), but the arithmetic is exactly what the model does.
+
+<Figure n="002" title="ONE QUERY ROW, STEP BY STEP" caption="Click through the five stages for the query 'sat'. Then turn scaling off and watch softmax pile almost everything onto one key.">
+<AttnSteps />
+</Figure>
+
+**Step 1: dot products.** For every key j, compute q·k_j, a single number. Big positive means "my question matches your label". There's one per key, including keys in the future, because in training you compute the whole T×T grid in one matrix multiply.
+
+**Step 2: scale.** Divide by √d_head, √64 = 8. Why? If the 64 entries of q and k are roughly independent with variance 1, their dot product is a sum of 64 terms and has variance 64, so a typical size of about 8. Dividing by 8 brings scores back to "about 1", whatever d_head you chose.
+
+<Predict id="no-scale">
+Suppose you forget the √64. The scores are 8 times bigger. Softmax is unchanged in what it ranks first. What changes about the weights, and why would that hurt training?
+<Fragment slot="answer">
+
+The weights get much sharper: softmax of 8x larger numbers is like softmax at temperature 1/8. In the toy, "cat" goes from about 0.56 to about 0.98. In a real model at initialisation, nearly every row would be close to one-hot on whichever key happened to score highest. The gradient of a nearly one-hot softmax is nearly zero for every other key (a <Term w="saturated softmax">A softmax whose largest input is far bigger than the rest, so the output is almost exactly one-hot and its gradient with respect to the other inputs is almost zero.</Term>), so the head learns very slowly about the keys it isn't already staring at. Vaswani et al. give exactly this reasoning for the scaling.
+
+</Fragment>
+</Predict>
+
+**Step 3: mask.** A language model predicting token i+1 must not see token i+1 or anything after it. So set every score with j > i to −∞. This is the <Term w="causal mask">A rule that each position may only attend to itself and earlier positions. Implemented by setting future scores to minus infinity (or a huge negative number) before softmax.</Term>. In code it's `scores.masked_fill(future, -inf)`. HF's GPT-2 uses the most negative float instead of a literal −∞, which gives the same zeros after softmax.
+
+**Step 4: softmax.** Exponentiate each score and divide by the sum. Every weight is positive, the row adds to 1, and e^−∞ is 0, so masked keys get exactly nothing. Note what softmax forces: **the row must add to one even if nothing in the past is useful.** Hold that thought, it explains the brightest stripe in every attention plot.
+
+**Step 5: mix.** The head's output for "sat" is the weighted sum of value vectors, Σ_j A[i,j] · v_j. If "cat" got 0.56, then 56% of the output is cat's value vector. Then the 12 heads' outputs are glued side by side (12 × 64 = 768), multiplied by W_O, and added back into the residual stream.
+
+That's everything a single head does. Now multiply: 12 heads per layer, 12 layers, and each one is a full T×T matrix. For a 15-token sentence that's 144 little triangles. You need a way to look at them.
+
+### What real heads do
+
+Below are four of GPT-2 small's 144 heads, all looking at the same 15 tokens: the `<|endoftext|>` token, then seven arbitrary words, then the same seven words again. I ran GPT-2 small through Hugging Face `transformers` on this Mac, took the attention weights, and rounded to two decimals. Nothing else is processed.
+
+<Figure n="003" title="FOUR REAL GPT-2 HEADS" caption="Real GPT-2 small weights on '<eot> lamp river seven quiet orange window pencil' twice. Hover (or tap) a query on the right to see what it reads; hover a key on the left to see who reads it. Toggle to the heatmap for the raw matrix." wide>
+<AttnViewer />
+</Figure>
+
+Spend a few minutes here before reading on. Each head has a personality you can name.
+
+**L4 H11: the previous-token head.** Every query sends almost all its weight one step back: "river" reads "lamp", "seven" reads "river". Averaged over a longer random sequence it puts 0.99 on the previous token. Its job is bookkeeping. It copies "the token before me was X" into each position's residual stream, so later layers can ask about it.
+
+**L0 H1: the same-token head.** In the first half each token reads itself. In the second half, the second "river" splits about 50/50 between itself and the first "river". It's matching on token identity: "where else have I appeared?"
+
+**L5 H7: the sink head.** About 0.9 of every row lands on position 0, whatever the query is. This head has, on this input, nothing to do, and the softmax insists on spending the full budget of 1.0 somewhere.
+
+**L5 H5: the induction head.** This is the one to stare at. In the first half every query parks on position 0, like the sink head. In the second half something new happens: the second "lamp" (position 8) reads "river" (position 2), with weight 0.96. Not "lamp", the token *after* the earlier "lamp". The second "river" reads "seven". Every repeated token reads the token that followed its previous occurrence.
+
+<Predict id="why-next">
+Head 5.5 at the second "lamp" looks at "river", the word that came after the first "lamp". The model's job at this position is to predict the next token. Why is "river" exactly the thing it should look at? And why can't a layer-0 head do this?
+<Fragment slot="answer">
+
+Because sequences repeat. If "lamp" was followed by "river" before, the best guess for what follows "lamp" now is "river" again. The head finds the earlier occurrence and copies whatever came next. That's literally the next-token prediction.
+
+A layer-0 head can't do it because the key at "river" (position 2) has to advertise "the token *before* me was lamp". In layer 0, position 2's vector only knows it is "river" at position 2. Someone has to first write "previous token = lamp" into position 2's residual stream. That's what a previous-token head does in an earlier layer. Head 5.5 needs head 4.11 (or another earlier previous-token head) to have run first.
+
+</Fragment>
+</Predict>
+
+### Induction heads: a two-head circuit
+
+That two-step trick has a name. An <Term w="induction head">A head that, at a token A, attends to the token that came right after an earlier A, and copies it. Implements the rule "A B ... A → predict B".</Term> implements "A B … A → B". It never works alone; it's the second half of a <Term w="circuit">A small set of components (heads, MLP neurons) that together implement one identifiable behaviour, found by tracing how each one's output feeds the next.</Term>.
+
+<Figure n="004" title="THE INDUCTION CIRCUIT" caption="An earlier previous-token head writes 'my predecessor was A' into B's residual stream. Later, the induction head at the second A queries for 'predecessor was A', finds B, and copies B forward.">
+<svg viewBox="0 0 360 250" role="img" aria-label="Two heads composing: previous-token head then induction head">
+  <rect x="20" y="150" width="56" height="30" class="fill-paper" stroke-width="1.2" />
+  <rect x="96" y="150" width="56" height="30" class="fill-wash" stroke-width="1.2" />
+  <rect x="172" y="150" width="56" height="30" class="fill-paper dash" stroke-width="1" />
+  <rect x="248" y="150" width="56" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="48" y="170" text-anchor="middle" class="strong">A</text>
+  <text x="124" y="170" text-anchor="middle" class="strong">B</text>
+  <text x="200" y="170" text-anchor="middle">…</text>
+  <text x="276" y="170" text-anchor="middle" class="strong">A</text>
+  <text x="48" y="198" text-anchor="middle">lamp 1</text>
+  <text x="124" y="198" text-anchor="middle">river 2</text>
+  <text x="276" y="198" text-anchor="middle">lamp 8</text>
+  <path d="M 124 180 Q 86 226 48 180" class="ink" stroke-width="1.2" marker-end="url(#attn-ar)" />
+  <text x="86" y="238" text-anchor="middle">L4 H11 · PREV-TOKEN</text>
+  <text x="124" y="140" text-anchor="middle" class="blue-t">KEY SAYS:</text>
+  <text x="124" y="126" text-anchor="middle" class="blue-t">"AFTER A"</text>
+  <path d="M 276 150 Q 200 60 124 112" class="blue" stroke-width="1.5" marker-end="url(#attn-ar)" />
+  <text x="250" y="70" text-anchor="middle" class="blue-t">L5 H5 · INDUCTION</text>
+  <text x="250" y="86" text-anchor="middle">QUERY: "WHO CAME AFTER A?"</text>
+  <path d="M 304 165 L 340 165" class="blue" stroke-width="1.5" marker-end="url(#attn-ar)" />
+  <text x="340" y="150" text-anchor="end" class="blue-t">B</text>
+  <text x="10" y="22" class="strong">1. EARLIER LAYER: EACH TOKEN READS ITS PREDECESSOR</text>
+  <text x="10" y="40" class="strong">2. LATER LAYER: A FINDS THE KEY "AFTER A",</text>
+  <text x="10" y="54" class="strong">   COPIES B'S VALUE → PREDICTS B</text>
+  <defs>
+    <marker id="attn-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" class="fill-blue" />
+    </marker>
+  </defs>
+</svg>
+</Figure>
+
+The previous-token head changes what B's *key* looks like. That's called <Term w="K-composition">When one head's output, written into the residual stream, changes the keys a later head sees. The later head can then match on information the first head moved there.</Term>, one of three ways heads compose in Elhage et al.'s "Mathematical Framework for Transformer Circuits" (the other two: changing a later head's queries, Q-composition, or its values, V-composition). You can't see composition in any single attention plot. You see two separate patterns, a diagonal stripe in layer 4 and an off-by-one stripe in layer 5, and you have to know to connect them.
+
+Olsson et al. (2022) argue induction heads are a big part of how models do <Term w="in-context learning">Getting better at predicting later tokens in a prompt by using earlier tokens in the same prompt, with no weight updates.</Term>. They form fairly abruptly early in training, in a "phase change" visible as a bump in the loss curve, and at the same moment the model gets much better at using long contexts. They also do more than literal copying: some induction-like heads match on meaning ("fuzzy" or translated copies), not just exact tokens.
+
+### Why random tokens
+
+To find induction heads, you want a test where only induction can help. Natural text is a bad test: a head that copies "York" after "New" might be using induction, or might just know English. So: pick 50 random token ids, then repeat them. The first half is pure noise, unpredictable by any means. The second half is perfectly predictable, but *only* if the model looks back.
+
+<Predict id="loss-halves">
+GPT-2 small reads `<eot>` + 50 random tokens + the same 50 again. What's its average loss (cross-entropy, in nats) on the first half, and on the second half? For reference, guessing uniformly over a 50,257-token vocabulary scores ln(50257).
+<Fragment slot="answer">
+
+ln(50257) ≈ 10.8 nats. The first half came out around **12 nats** when I ran it, *worse* than uniform guessing, because the model confidently predicts plausible English, and random tokens aren't. The second half came out around **0.2 nats**, meaning it puts roughly e^−0.2 ≈ 0.8 probability on the right token on average. A 124M model that cannot predict a single random token goes to near-perfect recall the moment the sequence repeats. That jump is the induction circuit at work.
+
+</Fragment>
+</Predict>
+
+This gives you a score. If the repeat length is T, then in the second half, query position i holds the same token as position i − T, and the "token after the earlier copy" is at i − T + 1. So:
+
+- **previous-token score** of a head = average of `A[i, i-1]` over positions,
+- **induction score** of a head = average of `A[i, i-T+1]` over second-half positions.
+
+A head that attended uniformly would score about 1/i, around 0.01-0.02 here. Real previous-token and induction heads score above 0.8. Compute these for all 144 heads and the right ones stand out like lit windows.
+
+### The sink: where attention goes when it has nowhere to go
+
+Back to the stripe down the left edge. Over my 101-token random sequence, the average head put **0.42** of its attention on position 0. Some heads put over 0.9 there. Is position 0 that important?
+
+Mostly not. A head that has nothing useful to read still has to spend a full 1.0. The cheapest way to do "nothing" is to put the weight on a token whose value vector is small or harmless, consistently. Position 0 is the one token every query can see, so models learn to use it as a parking spot. Xiao et al. (2023) named this an <Term w="attention sink">A token, usually the first, that receives a large share of attention from many heads regardless of content, acting as a place to dump attention the softmax forces each row to spend.</Term>. They found it the hard way: when you run a model with a sliding window and evict the first token's keys and values from the KV cache, quality collapses, even though that token is meaningless. Keeping just the first four tokens' KV restored it. That's StreamingLLM.
+
+The sink also teaches the first caveat of this lesson. Here's what I measured on the 15-token sequence:
+
+| Head | Avg weight on pos 0 | Value norm at pos 0 | Avg value norm elsewhere | Share of Σ weight·‖v‖ from pos 0 |
+|---|---|---|---|---|
+| L5 H7 (sink) | 0.92 | 0.95 | 4.83 | 0.70 |
+| L5 H5 (induction) | 0.51 | 2.25 | 6.15 | 0.28 |
+| L4 H11 (prev-token) | 0.07 | 0.66 | 4.33 | 0.01 |
+
+The <Term w="value norm">The length of a token's value vector. A token can get high attention weight yet contribute little if its value vector is short.</Term> at the sink is about five times smaller than elsewhere. So 92% of the attention becomes a smaller share of what actually gets mixed in. (This "weight times norm" view is a rough proxy from Kobayashi et al., 2020; the true contribution also goes through W_O and depends on direction, not just length.) The heatmap lied by omission: it shows weights, and weights are only half of the product.
+
+### What a bright line does and does not tell you
+
+Collecting the caveats, because the viewer you're about to build will make all of them very easy to forget.
+
+1. **Weights are not contributions.** Output = Σ weight × value. A huge weight on a tiny value adds little. Even the value isn't the end: it's multiplied by W_O, and then added to a residual stream that already holds a lot. A head's whole output can be small next to the stream it joins.
+2. **Weights are not the cause.** Jain & Wallace (2019) showed that for many text classifiers you could find very different attention distributions that gave the same prediction, and that attention often disagreed with gradient-based importance. Wiegreffe & Pinter (2019), "Attention is not not Explanation", pushed back: swapping weights after training isn't a fair test, and attention can be informative if you test it properly. Both agree on the practical point: a weight is a hypothesis to test, not a finding.
+3. **Tokens are not words at deeper layers.** At layer 8, position 5's vector carries information mixed in from positions 0-4. "Head 8.4 looks at 'orange'" really means "looks at whatever is in position 5's residual stream now". Attention rollout (Abnar & Zuidema, 2020) tries to account for this by chaining matrices across layers; it's a rough approximation.
+4. **One head is not one behaviour.** A head can be a previous-token head on one input and a sink on another. Head 5.5 is an induction head *when there is a repeat*; otherwise it parks on the sink.
+5. **Heads back each other up.** As you're about to measure, delete one induction head and another covers for it.
+
+The test that actually answers "does the model use this?" is the <Term w="ablation">Deleting or neutralising a component (here: a head's output) during the forward pass and measuring how much the model's behaviour gets worse.</Term>: switch the head off and see if the loss goes up. Zero-ablation sets the head's output to zero. <Term w="mean-ablation">Replacing a head's output with its average output over many inputs, instead of zero. Less likely to knock the model into a state it never sees in training.</Term> replaces it with its typical value. Neither is perfect, but either one is a causal test, and an attention plot is not.
+
+<Predict id="ablate">
+The five strongest induction heads in GPT-2 small (by induction score) are 5.5, 6.9, 5.1, 7.10 and 7.2. Second-half loss is about 0.21. What happens to second-half loss if you zero-ablate just 5.5? All five? Five random other heads?
+<Fragment slot="answer">
+
+What I measured (8 sequences, seed 0):
+
+- just 5.5: **0.26**. Barely moves.
+- 5.5 and 6.9: **0.33**.
+- all five: **4.52**. Over 20x worse. Still far below the 12 of the first half, so there's more induction machinery than these five.
+- five random non-induction heads: **0.19 to 0.66** across three draws.
+
+The induction behaviour is spread across several heads that cover for each other. Any one head looks unimportant by ablation, even though its attention pattern is a textbook induction head. That's the mirror image of the attention-is-not-explanation problem: a picture can look important and not be (sinks), and a head can be important and not look it alone (redundancy). Wang et al. (2022) found the same thing in GPT-2's indirect-object circuit and called them "backup" heads.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+You'll make three files in one folder: an export script, a scoring and ablation script, and a small web page. Use Hugging Face's GPT-2 so you can trust the weights. If your own from-scratch GPT-2 loads the same weights, Task 2 doubles as a test of your implementation.
+
+<Task id="t0" title="Set up and get attentions out of GPT-2" agent="ok">
+
+```bash
+mkdir -p ~/attn-viz && cd ~/attn-viz
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch transformers
+```
+
+```python
+# check.py
+import torch
+from transformers import GPT2LMHeadModel, GPT2TokenizerFast
+
+tok = GPT2TokenizerFast.from_pretrained("gpt2")
+model = GPT2LMHeadModel.from_pretrained("gpt2", attn_implementation="eager").eval()
+
+ids = [tok.bos_token_id] + tok(" The cat sat on the mat")["input_ids"]
+with torch.no_grad():
+    out = model(torch.tensor([ids]), output_attentions=True)
+
+print(len(out.attentions), out.attentions[0].shape)   # 12, (1, 12, T, T)
+A = out.attentions[5][0, 5]
+print(A.sum(-1))           # each row sums to 1
+print(A.triu(1).abs().max())  # nothing above the diagonal
+```
+
+`attn_implementation="eager"` matters. The default on recent `transformers` is a fused kernel (PyTorch's scaled-dot-product attention, the same idea as [FlashAttention](/lessons/flash-attention/)) that never builds the T×T matrix, so it has nothing to give back. On the version I used (5.x), asking for attentions without eager silently returned an empty tuple. On older 4.x versions it falls back with a warning. Check the docs for yours.
+
+Note also: GPT-2's tokenizer doesn't add `<|endoftext|>` at the start for you. Add it yourself, deliberately, so position 0 is the same token in every experiment.
+
+</Task>
+
+<Task id="t1" title="Recompute one head by hand and match it" agent="hands">
+
+Before you trust a picture, prove you know exactly what it is. Take layer 5's input, compute head 5.5's attention yourself, and compare with `out.attentions[5][0, 5]`.
+
+The shape of it:
+
+```python
+out = model(x, output_attentions=True, output_hidden_states=True)
+blk = model.transformer.h[5]
+h = blk.ln_1(out.hidden_states[5])[0]          # (T, 768): layer 5's input, after its LayerNorm
+qkv = ...                                       # (T, 2304) from blk.attn.c_attn
+q, k, v = ...                                   # split, then (12, T, 64)
+scores = ...                                    # (12, T, T)
+# mask, softmax
+print((A_mine - out.attentions[5][0]).abs().max())
+```
+
+Hints, because these are the exact nitty-gritty bits that bite:
+
+- `hidden_states[l]` is the residual stream *entering* layer l (index 0 is the embeddings). The attention reads it *after* `ln_1`.
+- GPT-2's `c_attn` is a `Conv1D`, not an `nn.Linear`. Its weight is stored as (in, out) = (768, 2304), so it's `h @ W + b`, not `h @ W.T` as with `nn.Linear`. Here the wrong version fails loudly on shapes. The same transpose on a square matrix, like `c_proj`'s (768, 768), runs fine and gives quietly wrong numbers. This is the classic bug when loading OpenAI's GPT-2 weights into a from-scratch model.
+- The 2304 splits as [q | k | v], each 768, and each 768 is 12 heads × 64, head-major.
+
+</Task>
+
+<DoneWhen>
+
+- Your max difference is around 1e-6 (I got 1.5e-6, which is float32 rounding).
+- You can say, without looking, which axis is the query, what `hidden_states[5]` is, and why the mask goes above the diagonal.
+
+</DoneWhen>
+
+<Task id="t2" title="Export attention to JSON" agent="hands">
+
+Write `export.py` that takes a string (or a list of token ids) and writes `attn.json`:
+
+```json
+{
+  "tokens": ["<eot>", " lamp", " river", "..."],
+  "n_layers": 12, "n_heads": 12,
+  "attn": [[ [[1.0], [1.0, 0.0], [0.0, 1.0, 0.0]], "...12 heads" ], "...12 layers"]
+}
+```
+
+`attn[l][h][i]` is row i, and store only the first i+1 entries (the rest are zeros by construction). Round to 3 decimals. Keep the raw tokens with their leading spaces; the viewer can show spaces as a visible dot.
+
+Before you run it, do the size math. Each head stores T(T+1)/2 numbers. 144 heads. Each number is about 5-6 characters of JSON. Work it out for T = 15, 64 and 1024, then check against the file you get.
+
+</Task>
+
+<Task id="t3" title="Build the viewer" agent="review">
+
+One `index.html`, one `viz.js`, no libraries. Serve the folder with `python3 -m http.server 8000` (the page can't `fetch` a local file from `file://`).
+
+What it needs:
+
+- Two `<select>`s (or button rows) for layer and head.
+- A **lines view**: keys in a column on the left, queries on the right, a line from query i to key j with opacity equal to `A[i][j]`. Skip lines under ~0.02 or the picture turns to fog.
+- **Hover**: hovering query i shows only row i (what i reads); hovering key j shows only column j (who reads j). Print the top weights as text.
+- A **heatmap view** toggle: a T×T grid of `<rect>`s, fill opacity = weight, masked cells drawn differently from zero-weight cells. These look the same in numbers but mean different things.
+- An **all heads overview**: a 12×12 grid of tiny heatmaps, click one to select it. This is where patterns jump out: you'll see the diagonal stripes and left-edge stripes across the whole model at a glance.
+
+Shape for the core:
+
+```js
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs) { /* createElementNS + setAttribute loop */ }
+
+async function main() {
+  const data = await (await fetch("attn.json")).json();
+  let layer = 0, head = 0, focus = null;   // focus = {side: "q"|"k", i}
+  function draw() { /* clear svg, draw tokens, draw edges filtered by focus */ }
+  // wire selects and hover, then draw()
+}
+main();
+```
+
+Use `stroke-opacity` and `stroke-width` as attribute names (hyphenated). Make it work at phone width: the two-column layout fits in 360 px for ~20 tokens; for longer sequences, scroll the SVG vertically, not horizontally.
+
+When it works, have an agent review it for the classic bugs: transposed axes (does hovering query 8 show row 8?), off-by-one token labels, and the overview grid redrawing 144 × T² elements on every hover.
+
+</Task>
+
+<Task id="t4" title="Score all 144 heads" agent="hands">
+
+Write `scores.py`. Build the test input:
+
+```python
+torch.manual_seed(0)
+T = 50
+rand = torch.randint(1000, 10000, (4, T))   # 4 sequences; skip the rarest ids
+ids = torch.cat([torch.full((4, 1), 50256), rand, rand], dim=1)   # (4, 101)
+```
+
+Then, from `out.attentions` stacked to shape (12, 4, 12, 101, 101):
+
+- **previous-token score** per (layer, head): mean of `A[i, i-1]` over i ≥ 2 and over the batch.
+- **induction score** per (layer, head): mean of `A[i, i-T+1]` over the second-half query positions. Work out the exact range of i yourself; draw the 101 positions on paper first, the `<eot>` at index 0 shifts everything by one.
+- **sink score**: mean of `A[i, 0]` over i ≥ 1.
+- **loss** on each half, from the logits.
+
+Use fancy indexing (`att[:, :, :, idx, idx - 1]`) rather than Python loops over 101 positions. Print the top 6 heads for each score, and export the three 12×12 score grids to JSON so the viewer's overview can colour heads by score.
+
+</Task>
+
+<DoneWhen>
+
+- A previous-token head scores above 0.9 and at least four heads have induction score above 0.8.
+- You can find those heads in your viewer and they look like Figure 003.
+- Second-half loss is under 0.5 and first-half loss is above 10.
+
+</DoneWhen>
+
+<Task id="t5" title="Ablate heads and measure the damage" agent="hands">
+
+Now switch heads off. The cleanest place is just before `attn.c_proj` (that's W_O): its input is the 12 heads' outputs side by side, 64 columns each. Zero head h's 64 columns and the head is gone.
+
+```python
+ablate = {}   # layer -> list of heads
+
+def make_hook(layer):
+    def pre_hook(module, args):
+        # args[0]: (B, T, 768). Return a modified tuple, or None to leave it alone.
+        ...
+    return pre_hook
+
+for l, blk in enumerate(model.transformer.h):
+    blk.attn.c_proj.register_forward_pre_hook(make_hook(l))
+```
+
+Measure second-half loss with 8 sequences for: no ablation; the top induction head only; the top 2; the top 5; the top previous-token head; and three different sets of 5 random heads (excluding the induction and previous-token heads). Then add a mean-ablation version: replace the head's 64 columns with their average over many positions of *natural* text, and repeat the top-5 run.
+
+Then one composition check: ablate the top previous-token heads and recompute the induction score of 5.5. If K-composition is real, it should drop.
+
+</Task>
+
+<Task id="t6" title="Repeat on the Spark with a bigger model" agent="review">
+
+On the DGX Spark, rerun `scores.py` on `gpt2-medium` (24 layers, 16 heads) or a small modern model with RoPE, such as a ~0.5B Qwen. Remember `attn_implementation="eager"` and that memory for attentions grows as layers × heads × T². Do induction heads still appear, and in which layers, as a fraction of depth? Does the sink still sit on position 0 if the model has no BOS token? Have an agent check your indexing when the head count changes.
+
+</Task>
+
+## Measure
+
+Fill this in from Tasks 4 and 5. My numbers are from GPT-2 small on an Apple-silicon Mac CPU, `torch.manual_seed(0)`, token ids drawn from 1000-9999, T = 50. Your exact numbers will differ a little with seed and batch size; the head identities and the shape of the results should not.
+
+| What | My result | Yours |
+|---|---|---|
+| Top previous-token head (score) | L4 H11 (0.99) | |
+| Next previous-token heads | L3 H7 (0.52), L6 H8 (0.50), L2 H2 (0.49) | |
+| Top induction heads (score) | L5 H5 (0.94), L6 H9 (0.93), L5 H1 (0.92), L7 H10 (0.92), L7 H2 (0.86) | |
+| Top sink heads (avg weight on pos 0) | L5 H7 (0.91), L8 H4 (0.90), L7 H9 (0.86) | |
+| Avg weight on pos 0, all 144 heads | 0.42 | |
+| Loss, first half / second half | 12.2 / 0.20 (4 seqs) | |
+
+| Ablation (zero), 8 seqs | 2nd-half loss | Yours |
+|---|---|---|
+| none | 0.21 | |
+| L5 H5 | 0.26 | |
+| L5 H5 + L6 H9 | 0.33 | |
+| top 5 induction | 4.52 | |
+| L4 H11 (prev-token) | 0.23 | |
+| 5 random heads, 3 draws | 0.19, 0.33, 0.66 | |
+| induction score of L5 H5 after ablating L4 H11 | 0.94 → 0.82 | |
+| ... after ablating top 4 prev-token heads | 0.94 → 0.63 | |
+
+What to notice:
+
+- **Only a handful of heads per pattern score high.** The scores are bimodal: most heads near zero, a few near one. That's why scores beat eyeballing 144 plots.
+- **Induction heads sit in the middle layers (5-7), after the previous-token head (4).** That order is forced by the circuit: the key-side information has to exist before something can match on it.
+- **Ablation is far from linear.** One head: +0.05. Five heads: +4.3. The heads back each other up until too many are gone.
+- **The top previous-token head is not alone either.** Killing 4.11 alone barely touches the loss and only dents 5.5's induction score, from 0.94 to 0.82; it takes four previous-token heads to bring it to 0.63. Weaker previous-token heads in layers 2-6 carry the same information.
+- **Zero-ablation is a blunt instrument.** With the top 5 heads zeroed, the *first*-half loss also rose, from 12.0 to 14.7, on tokens no induction head could help with. Zeroing pushed the residual stream somewhere it never goes in training and the model got worse at everything. Compare with your mean-ablation numbers; the gap between the two is a measure of how off-distribution zero-ablation is.
+
+## Break It
+
+**Use the default attention implementation.** Drop `attn_implementation="eager"` and ask for attentions. On my `transformers` version, `out.attentions` came back as an empty tuple with no error, and `out.attentions[0]` raised an `IndexError` three lines later. Fused kernels never build the matrix you want to plot, which is the whole reason they are fast. The lesson: the attention matrix is a debugging artifact, not something production inference ever holds in memory.
+
+**Forget the BOS token.** Run the same 15 tokens without `<|endoftext|>` at position 0. Now "lamp" is position 0, and it becomes the sink: when I tried it, head 5.7 put 0.93 on "lamp". Your sink heads now "attend to lamp", and a naive reading says the model finds "lamp" fascinating. Same model, same words, a different story, purely from where the parking spot ended up.
+
+**Score induction on natural text.** Use a repeated English paragraph instead of random tokens. The first-half loss drops to a normal English-text level (I got 2.9 nats on a 30-token sentence), because the model can predict English without looking back. Now a low second-half loss mixes two things, recall and plain language knowledge, and a head that attends to the "next" token might just be following grammar. The clean separation between "needs induction" and "doesn't" is gone. Random tokens are the control that makes the measurement mean something.
+
+**Transpose the matrix in your viewer.** Swap rows and columns when you draw. Now the previous-token head appears to look *forward* one step and the sink appears to be "position 0 reading everything", which is impossible under the causal mask. If a plot shows a token attending to the future, your axes are flipped. The mask is a free correctness check: the upper triangle must be empty.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Walk me through what one attention head computes for one token, with shapes.</summary>
+
+Token i's residual vector, 768 numbers, goes through a LayerNorm and three learned matrices to give a query, key and value; per head each is 64 numbers. The query is dotted with every earlier token's key, giving one score per key. Scores are divided by √64 = 8 so their size doesn't grow with the head dimension. Future positions are set to minus infinity (the causal mask). Softmax turns the scores into weights that are non-negative and sum to one. The output is the weighted sum of the value vectors, 64 numbers. The 12 heads' outputs are concatenated back to 768, multiplied by W_O, and added to the residual stream. Over a whole sequence, the weights form a T×T lower-triangular matrix per head: rows are queries and sum to one, columns are keys.
+
+</details>
+
+<details>
+<summary>2. What's an induction head, and how would you find one in a model you've never seen?</summary>
+
+A head that, at a token A, attends to the token right after an earlier occurrence of A and copies it, implementing "A B ... A → B". It depends on an earlier previous-token head that writes "my predecessor was A" into B's position, so the induction head's query for A matches B's key (K-composition). To find one: feed BOS plus a random token sequence of length T repeated twice, so only looking back can help. For each head, average the attention from second-half position i to position i − T + 1. Induction heads score near 1, other heads near 1/i. Then confirm causally: ablate the top-scoring heads and check that the loss on the repeated half goes up, while ablating random heads doesn't.
+
+</details>
+
+<details>
+<summary>3. Half the heads in the model put most of their attention on the first token. Does that mean the first token matters a lot?</summary>
+
+Usually not. Softmax forces each row to spend a total weight of one even when the head has nothing useful to read, and the first token is the one every position can see, so models learn to park attention there: an attention sink. Its value vector tends to be small (in GPT-2 head 5.7 I measured about a fifth of the typical norm), so a large weight becomes a much smaller contribution. It's still functionally important as a parking spot, which is why StreamingLLM found that evicting the first tokens from a sliding-window KV cache wrecks quality, and keeping four of them fixes it. But "high weight" there means "nothing to do", not "important content".
+
+</details>
+
+<details>
+<summary>4. Can you use attention weights as an explanation of a model's prediction?</summary>
+
+As a hypothesis, yes. As a conclusion, no. Weights say where a head read from, not how much that changed the output: the contribution is weight times value, then through W_O, then added to a residual stream that may dwarf it. Tokens at deep layers are mixtures of earlier positions, so "attends to word X" is loose. Jain and Wallace showed that very different attention distributions can give the same prediction; Wiegreffe and Pinter argued that's not a fair test but agreed weights need testing. The test is causal: ablate or patch the head and measure the change. And ablating one head can understate its role, because other heads back it up: in GPT-2, zeroing one induction head barely moves the loss, zeroing five makes it 20x worse.
+
+</details>
+
+<details>
+<summary>5. You want to ship this viewer for a 32-layer, 32-head model at 4,096 tokens. How does it scale and what would you change?</summary>
+
+Storage grows as layers × heads × T²/2. For GPT-2 small at T = 64 that's 144 × 2,080 ≈ 300k numbers, about 1.5 MB of JSON. At 32 × 32 × 4,096²/2 it's about 8.6 billion numbers: roughly 34 GB in float32, more as JSON. Even computing it is a problem, because you must use eager attention, which materialises every T×T matrix (fused kernels exist precisely to avoid that). So: compute on demand per selected layer and head on a server, not everything up front; send only the top-k weights per row (most rows are dominated by a few keys), quantise to 8 bits, and render with a canvas instead of SVG once T is in the hundreds, since 8 million SVG elements will kill the browser. For the overview, precompute per-head summary scores (previous-token, induction, sink, entropy) instead of thumbnails.
+
+</details>
+
+## Go Deeper
+
+- **Nelson Elhage, Neel Nanda, Catherine Olsson et al., "A Mathematical Framework for Transformer Circuits"** (Anthropic, 2021, transformer-circuits.pub). Rewrites a transformer as heads reading from and writing to a residual stream, defines Q/K/V-composition, and derives induction heads from two-layer attention-only models. The single most useful thing to read after this lesson.
+- **Catherine Olsson, Nelson Elhage, Neel Nanda et al., "In-context Learning and Induction Heads"** (Anthropic, 2022, transformer-circuits.pub). The evidence that induction heads drive in-context learning, the phase change in training, and the prefix-matching and copying scores you approximated here.
+- **Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song Han, Mike Lewis, "Efficient Streaming Language Models with Attention Sinks"** (2023, arXiv 2309.17453). Where attention sinks got their name, and the KV-cache trick that keeps the first four tokens.
+- **Sarthak Jain and Byron C. Wallace, "Attention is not Explanation"** (NAACL 2019) and **Sarah Wiegreffe and Yuval Pinter, "Attention is not not Explanation"** (EMNLP 2019). Read them as a pair; the argument is the point.
+- **Kevin Clark, Urvashi Khandelwal, Omer Levy, Christopher D. Manning, "What Does BERT Look At? An Analysis of BERT's Attention"** (BlackboxNLP 2019). The classic catalogue of head types in a real model: positional heads, heads that dump attention on [SEP] and punctuation, heads that track syntax.
+- **Goro Kobayashi, Tatsuki Kuribayashi, Sho Yokoi, Kentaro Inui, "Attention is Not Only a Weight: Analyzing Transformers with Vector Norms"** (EMNLP 2020). The weight-times-value-norm view used in the sink table, with the finding that high-weight special tokens often carry small norms.
+- **Kevin Wang, Alexandre Variengien, Arthur Conmy, Buck Shlegeris, Jacob Steinhardt, "Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2 small"** (2022). A full circuit in the same model you used, found with ablation and path patching, including the backup heads that explain your redundancy result.
+- **TransformerLens** (Neel Nanda and contributors, on GitHub) and **BertViz** (Jesse Vig). The standard library for hooking and ablating heads in GPT-2-style models, and the standard attention viewer. Use them to check your tools after you've built your own.
+
+## Connections
+
+This builds directly on [Train a small LM, end to end](/lessons/tiny-lm/): the GPT-2 you built has every piece in Figure 001, and Task 1 is a test of whether your version matches. [The KV cache, by hand](/lessons/kv-cache/) is the same Q/K/V seen from serving: the keys and values you cache are exactly what each new query reads, and the attention sink is why sliding-window caches keep the first tokens.
+
+[FlashAttention and kernels](/lessons/flash-attention/) explains why `output_attentions` needs the slow path: FlashAttention's whole trick is never writing the T×T matrix you just plotted.
+
+Next, the natural step is activation patching: instead of zeroing a head, copy its output from a run on a different input and see what the model now predicts. That turns "this head matters" into "this head carries *this* piece of information".

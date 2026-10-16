@@ -1,0 +1,184 @@
+---
+// N requests arrive at once. Watch them get served by one sync worker, a pool of K threads,
+// or one async event loop. Optional "time.sleep in handler" shows the async trap.
+---
+<div class="wt" data-fig="waiting-timeline">
+  <div class="ctl wt-modes" role="group" aria-label="Server model">
+    <button class="btn" type="button" data-mode="sync" aria-pressed="true">Sync × 1</button>
+    <button class="btn" type="button" data-mode="threads" aria-pressed="false">Threads × K</button>
+    <button class="btn" type="button" data-mode="async" aria-pressed="false">Async loop</button>
+  </div>
+  <svg class="wt-svg" viewBox="0 0 640 300" role="img" aria-label="Timeline of requests"></svg>
+  <div class="ctl">
+    <label>N REQUESTS <input type="range" data-k="n" min="1" max="40" step="1" value="10" /><output>10</output></label>
+    <label>UPSTREAM WAIT <input type="range" data-k="t" min="0.5" max="4" step="0.5" value="2" /><output>2.0 s</output></label>
+    <label class="wt-kctl">THREADS K <input type="range" data-k="k" min="1" max="16" step="1" value="4" /><output>4</output></label>
+    <label>TIME.SLEEP IN HANDLER <input type="range" data-k="b" min="0" max="2" step="0.1" value="0" /><output>0.0 s</output></label>
+  </div>
+  <div class="ctl wt-read" aria-live="polite">
+    <span>TOTAL <span class="readout" data-r="total"></span></span>
+    <span>P50 <span class="readout" data-r="p50"></span></span>
+    <span>WORST <span class="readout" data-r="max"></span></span>
+    <span>THROUGHPUT <span class="readout" data-r="tput"></span></span>
+    <span>SERVED AT ONCE <span class="readout" data-r="peak"></span></span>
+  </div>
+</div>
+
+<style>
+  .wt-svg { width: 100%; margin-top: 10px; }
+  .wt-read { gap: 10px 20px; }
+  .wt-kctl[data-off='true'] { opacity: 0.35; }
+</style>
+
+<script>
+  type Req = { start: number; blockEnd: number; end: number };
+  const NS = 'http://www.w3.org/2000/svg';
+
+  function simulate(mode: string, n: number, t: number, k: number, b: number): Req[] {
+    const out: Req[] = [];
+    if (mode === 'sync' || mode === 'threads') {
+      // each worker serves one request at a time, start to finish
+      const workers = new Array(mode === 'sync' ? 1 : k).fill(0);
+      for (let i = 0; i < n; i++) {
+        let w = 0;
+        for (let j = 1; j < workers.length; j++) if (workers[j] < workers[w]) w = j;
+        const start = workers[w];
+        const r = { start, blockEnd: start + b, end: start + b + t };
+        workers[w] = r.end;
+        out.push(r);
+      }
+      return out;
+    }
+    // async: one loop. A "start" step holds the loop for b seconds (the blocking call),
+    // then the request waits t without the loop. Its "finish" step needs the loop free.
+    type Ev = { ready: number; seq: number; i: number; kind: 'start' | 'finish' };
+    const evs: Ev[] = [];
+    let seq = 0;
+    for (let i = 0; i < n; i++) {
+      out.push({ start: 0, blockEnd: 0, end: 0 });
+      evs.push({ ready: 0, seq: seq++, i, kind: 'start' });
+    }
+    let loop = 0;
+    while (evs.length) {
+      evs.sort((a, c) => a.ready - c.ready || a.seq - c.seq);
+      const e = evs.shift()!;
+      loop = Math.max(loop, e.ready);
+      if (e.kind === 'start') {
+        out[e.i].start = loop;
+        loop += b;
+        out[e.i].blockEnd = loop;
+        evs.push({ ready: loop + t, seq: seq++, i: e.i, kind: 'finish' });
+      } else {
+        out[e.i].end = loop;
+      }
+    }
+    return out;
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, parent: Element) {
+    const e = document.createElementNS(NS, tag);
+    for (const [a, v] of Object.entries(attrs)) e.setAttribute(a, String(v));
+    parent.appendChild(e);
+    return e;
+  }
+
+  const fmt = (s: number) => (s < 10 ? s.toFixed(1) : s.toFixed(0)) + ' s';
+
+  document.querySelectorAll<HTMLElement>('[data-fig="waiting-timeline"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.wt-svg')!;
+    const inputs = [...root.querySelectorAll<HTMLInputElement>('input[data-k]')];
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const kctl = root.querySelector<HTMLElement>('.wt-kctl')!;
+    let mode = 'sync';
+
+    function val(key: string) {
+      return parseFloat(inputs.find((i) => i.dataset.k === key)!.value);
+    }
+
+    function draw() {
+      const n = val('n'), t = val('t'), k = val('k'), b = val('b');
+      inputs.forEach((i) => {
+        const v = parseFloat(i.value);
+        i.nextElementSibling!.textContent = i.dataset.k === 't' || i.dataset.k === 'b' ? v.toFixed(1) + ' s' : String(v);
+      });
+      kctl.dataset.off = String(mode !== 'threads');
+      kctl.querySelector('input')!.disabled = mode !== 'threads';
+
+      const reqs = simulate(mode, n, t, k, b);
+      const lat = reqs.map((r) => r.end).sort((a, c) => a - c);
+      const total = lat[lat.length - 1];
+      const p50 = lat[Math.max(0, Math.ceil(0.5 * lat.length) - 1)];
+      // peak in flight = most requests whose start <= x < end (counting from when they began being served)
+      let peak = 0;
+      for (const r of reqs) {
+        const x = r.start;
+        const c = reqs.filter((q) => q.start <= x && q.end > x).length;
+        peak = Math.max(peak, c);
+      }
+
+      const W = 640, left = 44, right = 12, top = 22, axisH = 26;
+      const rowH = Math.max(4, Math.min(16, 230 / n));
+      const H = top + rowH * n + axisH + 30;
+      svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      svg.replaceChildren();
+      const scaleMax = Math.max(total, t) * 1.04;
+      const x = (s: number) => left + (s / scaleMax) * (W - left - right);
+
+      // grid + axis
+      const step = [0.5, 1, 2, 5, 10, 20, 50, 100].find((s) => scaleMax / s <= 8) ?? 200;
+      const axisY = top + rowH * n + 6;
+      for (let s = 0; s <= scaleMax; s += step) {
+        el('line', { x1: x(s), x2: x(s), y1: top - 4, y2: axisY, style: 'stroke:var(--rule)', 'stroke-width': 1 }, svg);
+        const tx = el('text', { x: x(s), y: axisY + 14, 'text-anchor': 'middle' }, svg);
+        tx.textContent = s + 's';
+      }
+      el('line', { x1: left, x2: W - right, y1: axisY, y2: axisY, class: 'ink', 'stroke-width': 1 }, svg);
+      const lab = el('text', { x: 0, y: 12, class: 'strong' }, svg);
+      lab.textContent = mode === 'sync' ? 'ONE WORKER, ONE REQUEST AT A TIME' : mode === 'threads' ? `${k} THREADS, EACH ONE AT A TIME` : 'ONE LOOP, SWITCHES WHILE WAITING';
+
+      reqs.forEach((r, i) => {
+        const y = top + i * rowH;
+        const h = Math.max(2, rowH - (rowH > 6 ? 4 : 1));
+        const cy = y + h / 2;
+        if (rowH >= 10 && (n <= 20 || i % 5 === 0)) {
+          const tl = el('text', { x: left - 6, y: cy + 4, 'text-anchor': 'end' }, svg);
+          tl.textContent = 'R' + (i + 1);
+        }
+        if (r.start > 0.001) {
+          el('line', { x1: x(0), x2: x(r.start), y1: cy, y2: cy, style: 'stroke:var(--ink-3)', 'stroke-width': 1, 'stroke-dasharray': '3 3' }, svg);
+        }
+        if (r.blockEnd > r.start) {
+          el('rect', { x: x(r.start), y, width: Math.max(1, x(r.blockEnd) - x(r.start)), height: h, style: 'fill:var(--ink)' }, svg);
+        }
+        const ws = r.blockEnd, we = r.end;
+        el('rect', { x: x(ws), y, width: Math.max(1, x(we) - x(ws)), height: h, class: 'fill-wash', 'stroke-width': 1 }, svg);
+      });
+
+      // legend
+      const ly = H - 10;
+      el('line', { x1: left, x2: left + 22, y1: ly - 4, y2: ly - 4, style: 'stroke:var(--ink-3)', 'stroke-dasharray': '3 3' }, svg);
+      el('text', { x: left + 28, y: ly }, svg).textContent = 'IN LINE';
+      el('rect', { x: left + 100, y: ly - 9, width: 22, height: 9, class: 'fill-wash', 'stroke-width': 1 }, svg);
+      el('text', { x: left + 128, y: ly }, svg).textContent = 'WAITING ON UPSTREAM';
+      el('rect', { x: left + 290, y: ly - 9, width: 22, height: 9, style: 'fill:var(--ink)' }, svg);
+      el('text', { x: left + 318, y: ly }, svg).textContent = 'BLOCKING CALL';
+
+      const set = (key: string, v: string) => (root.querySelector(`[data-r="${key}"]`)!.textContent = v);
+      set('total', fmt(total));
+      set('p50', fmt(p50));
+      set('max', fmt(total));
+      set('tput', (n / total).toFixed(1) + ' req/s');
+      set('peak', String(peak));
+    }
+
+    btns.forEach((bt) =>
+      bt.addEventListener('click', () => {
+        mode = bt.dataset.mode!;
+        btns.forEach((o) => o.setAttribute('aria-pressed', String(o === bt)));
+        draw();
+      }),
+    );
+    inputs.forEach((i) => i.addEventListener('input', draw));
+    draw();
+  });
+</script>

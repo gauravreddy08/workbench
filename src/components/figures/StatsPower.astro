@@ -1,0 +1,88 @@
+---
+// Interactive power calculator: how many questions to detect a gap of a given size, 95% confidence,
+// 80% power. Unpaired: two independent proportions. Paired: driven only by the disagreement rate.
+//   n_unpaired = (1.96 + 0.84)^2 * (pA(1-pA) + pB(1-pB)) / gap^2
+//   n_paired   = (1.96 + 0.84)^2 * (disagree - gap^2) / gap^2
+---
+<div class="spw" data-fig="stats-power">
+  <div class="spw-read">
+    <div><span class="label">Unpaired (separate CIs)</span><span class="readout" data-o="u"></span></div>
+    <div><span class="label">Paired (same questions)</span><span class="readout" data-o="p"></span></div>
+    <div><span class="label">Paired saves</span><span class="readout" data-o="x"></span></div>
+  </div>
+  <svg viewBox="0 0 640 130" role="img" aria-label="Questions needed, unpaired versus paired, on a log scale"></svg>
+  <div class="ctl">
+    <label>Baseline <input type="range" min="50" max="95" step="1" value="70" data-k="p" /><output></output></label>
+    <label>Gap to detect <input type="range" min="1" max="10" step="1" value="2" data-k="g" /><output></output></label>
+    <label>Disagree on <input type="range" min="2" max="40" step="1" value="10" data-k="q" /><output></output></label>
+  </div>
+  <p class="spw-note">95% confidence, 80% power. "Disagree on" is the share of questions where exactly one of the two models is right: measure it from any pair of runs you already have. The paired count does not depend on the baseline at all, only on how often the models disagree.</p>
+</div>
+
+<style>
+  .spw-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 14px; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 10px; }
+  .spw-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .spw-read .label { font-size: 10px; }
+  .spw-read .readout { font-size: 17px; }
+  .spw svg { width: 100%; }
+  .spw-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const K = (1.959964 + 0.841621) ** 2;
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const fmt = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : Math.ceil(n).toLocaleString());
+
+  document.querySelectorAll<HTMLElement>('[data-fig="stats-power"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const inp = Object.fromEntries(
+      [...root.querySelectorAll<HTMLInputElement>('input[data-k]')].map((i) => [i.dataset.k!, i]),
+    ) as Record<'p' | 'g' | 'q', HTMLInputElement>;
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+
+    function draw() {
+      const pa = +inp.p.value / 100;
+      const gap = +inp.g.value * 0.005;
+      const pb = Math.min(0.999, pa + gap);
+      const disc = Math.max(+inp.q.value / 100, gap + 0.001);
+      inp.p.nextElementSibling!.textContent = Math.round(pa * 100) + '%';
+      inp.g.nextElementSibling!.textContent = (gap * 100).toFixed(1) + ' pts';
+      inp.q.nextElementSibling!.textContent = Math.round(disc * 100) + '%';
+      const nu = (K * (pa * (1 - pa) + pb * (1 - pb))) / (gap * gap);
+      const np = (K * (disc - gap * gap)) / (gap * gap);
+      out('u').textContent = fmt(nu) + ' each';
+      out('p').textContent = fmt(np);
+      out('x').textContent = (nu / np).toFixed(1) + '×';
+
+      svg.replaceChildren();
+      const lo = 2, hi = 6; // log10 axis: 100 .. 1,000,000
+      const X = (n: number) => 110 + ((Math.log10(Math.max(n, 100)) - lo) / (hi - lo)) * 500;
+      svg.append(el('line', { x1: 110, y1: 96, x2: 610, y2: 96, class: 'ink', 'stroke-width': 1 }));
+      [100, 1000, 10000, 100000, 1000000].forEach((t) => {
+        svg.append(el('line', { x1: X(t), y1: 96, x2: X(t), y2: 101, class: 'ink', 'stroke-width': 1 }));
+        svg.append(el('text', { x: X(t), y: 114, 'text-anchor': 'middle' }, t >= 1e6 ? '1M' : t >= 1000 ? t / 1000 + 'K' : String(t)));
+      });
+      const bar = (y: number, n: number, label: string, cls: string) => {
+        svg.append(el('text', { x: 10, y: y + 15, class: 'strong' }, label));
+        svg.append(el('rect', { x: 110, y, width: Math.max(1, X(n) - 110), height: 22, class: cls, 'stroke-width': 1 }));
+        svg.append(el('text', { x: Math.min(X(n) + 6, 560), y: y + 15 }, fmt(n)));
+      };
+      bar(14, nu, 'UNPAIRED', 'fill-paper');
+      bar(52, np, 'PAIRED', 'fill-wash');
+      // common benchmark sizes for reference
+      [[500, '500'], [14042, 'MMLU 14K']].forEach(([n, l]) => {
+        const x = X(n as number);
+        svg.append(el('line', { x1: x, y1: 6, x2: x, y2: 92, class: 'blue dash', 'stroke-width': 1 }));
+        svg.append(el('text', { x: x + 4, y: 128, class: 'blue-t' }, l as string));
+      });
+    }
+    Object.values(inp).forEach((i) => i.addEventListener('input', draw));
+    draw();
+  });
+</script>

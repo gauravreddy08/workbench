@@ -1,0 +1,285 @@
+---
+// Interactive: a load balancer in front of 4 servers. Each server works on one request at a time
+// (like a GPU running one batch) and queues the rest. Requests are either all the same size, or an
+// "LLM mix": 90% short (40 ms) and 10% long (1,000 ms), same mean (136 ms) as the Build It app.
+// Switch algorithms and watch per-server queues. The table re-runs 20,000 requests offline for
+// every algorithm with the current settings, so the comparison is not at the mercy of luck.
+---
+<div class="lbs" data-fig="lb-sim">
+  <svg viewBox="0 0 480 236" role="img" aria-label="Four server queues behind a load balancer"></svg>
+  <div class="lbs-read">
+    <div><span class="label">Live p50</span><span class="readout" data-o="p50">–</span></div>
+    <div><span class="label">Live p99</span><span class="readout" data-o="p99">–</span></div>
+    <div><span class="label">Longest queue</span><span class="readout" data-o="maxq">–</span></div>
+    <div><span class="label">Finished</span><span class="readout" data-o="n">0</span></div>
+  </div>
+  <div class="ctl">
+    <span class="lbs-group" role="group" aria-label="Algorithm">
+      <button class="btn" type="button" data-alg="rr" aria-pressed="true">Round robin</button>
+      <button class="btn" type="button" data-alg="random" aria-pressed="false">Random</button>
+      <button class="btn" type="button" data-alg="lc" aria-pressed="false">Least conn</button>
+      <button class="btn" type="button" data-alg="p2c" aria-pressed="false">Two choices</button>
+    </span>
+  </div>
+  <div class="ctl">
+    <span class="lbs-group" role="group" aria-label="Request sizes">
+      <button class="btn" type="button" data-mix="same" aria-pressed="false">All same size</button>
+      <button class="btn" type="button" data-mix="llm" aria-pressed="true">LLM mix</button>
+    </span>
+    <button class="btn" type="button" data-k="slow" aria-pressed="false">S1 half speed</button>
+  </div>
+  <div class="ctl">
+    <label>Load <input type="range" min="50" max="95" step="5" value="75" data-k="load" /><output></output></label>
+    <button class="btn" type="button" data-k="play" aria-pressed="false">Pause</button>
+  </div>
+  <table class="lbs-table">
+    <thead><tr><th>20,000 requests</th><th>p50</th><th>p99</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <p class="lbs-note">Playing at 1/4 speed. Short block = 40 ms request, tall block = 1,000 ms. Solid = being worked on, light = waiting in that server's queue. Latency = wait + work.</p>
+</div>
+
+<style>
+  .lbs-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 10px 16px; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 8px; }
+  .lbs-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .lbs-read .label { font-size: 10px; }
+  .lbs-read .readout { font-size: 18px; }
+  .lbs-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .lbs-table { width: 100%; border-collapse: collapse; margin-top: 16px; font-family: var(--mono); font-size: 12px; display: table; }
+  .lbs-table th { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); font-weight: 400; text-align: left; border-bottom: 1px solid var(--ink); padding: 6px 8px 6px 0; }
+  .lbs-table td { border-bottom: 1px solid var(--rule); padding: 6px 8px 6px 0; color: var(--ink-2); }
+  .lbs-table tr.on td { color: var(--blue); font-weight: 600; }
+  .lbs-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const N = 4;
+  const SHORT = 40, LONG = 1000, MEAN = 0.9 * SHORT + 0.1 * LONG; // ms
+  const NAMES: Record<string, string> = { rr: 'Round robin', random: 'Random', lc: 'Least conn', p2c: 'Two choices' };
+
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const expo = (r: () => number, rate: number) => -Math.log(1 - r()) / rate;
+
+  type Cfg = { alg: string; mix: string; slow: boolean; load: number };
+  const speeds = (c: Cfg) => Array.from({ length: N }, (_, i) => (c.slow && i === 0 ? 0.5 : 1));
+  const costOf = (c: Cfg, r: () => number) => (c.mix === 'same' ? MEAN : r() < 0.9 ? SHORT : LONG);
+
+  // Pick a server given the number of outstanding requests on each.
+  function pick(alg: string, out: number[], r: () => number, rr: { i: number }) {
+    if (alg === 'rr') { const s = rr.i; rr.i = (rr.i + 1) % N; return s; }
+    if (alg === 'random') return Math.floor(r() * N);
+    if (alg === 'lc') {
+      const m = Math.min(...out);
+      const ties = out.map((v, i) => (v === m ? i : -1)).filter((i) => i >= 0);
+      return ties[Math.floor(r() * ties.length)];
+    }
+    const a = Math.floor(r() * N);
+    let b = Math.floor(r() * (N - 1)); if (b >= a) b++;
+    return out[a] <= out[b] ? a : b;
+  }
+
+  // Offline: 20k requests, exact event order, returns p50/p99 in ms.
+  function offline(c: Cfg) {
+    const r = rng(7);
+    const sp = speeds(c);
+    const lam = (c.load / 100) * sp.reduce((a, b) => a + b, 0) / MEAN; // per ms
+    const freeAt = new Array(N).fill(0);
+    const ends: number[][] = Array.from({ length: N }, () => []);
+    const rr = { i: 0 };
+    const lat: number[] = [];
+    let t = 0;
+    const total = 20000;
+    for (let k = 0; k < total; k++) {
+      t += expo(r, lam);
+      for (const q of ends) { while (q.length && q[0] <= t) q.shift(); }
+      const cost = costOf(c, r);
+      const s = pick(c.alg, ends.map((q) => q.length), r, rr);
+      const start = Math.max(freeAt[s], t);
+      const fin = start + cost / sp[s];
+      freeAt[s] = fin;
+      ends[s].push(fin);
+      if (k > total / 10) lat.push(fin - t);
+    }
+    lat.sort((a, b) => a - b);
+    return { p50: lat[Math.floor(lat.length * 0.5)], p99: lat[Math.floor(lat.length * 0.99)] };
+  }
+
+  const fmt = (ms: number) => (ms < 1000 ? `${Math.round(ms)} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : `${Math.round(ms / 1000)} s`);
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="lb-sim"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    const algBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-alg]')];
+    const mixBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-mix]')];
+    const slowBtn = root.querySelector<HTMLButtonElement>('[data-k="slow"]')!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-k="play"]')!;
+    const loadIn = root.querySelector<HTMLInputElement>('[data-k="load"]')!;
+    const tbody = root.querySelector('tbody')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+    const cfg: Cfg = { alg: 'rr', mix: 'llm', slow: false, load: 75 };
+    let playing = !reduce;
+    let visible = true;
+
+    // live state
+    type Job = { cost: number; left: number; t0: number };
+    let qs: Job[][] = [];
+    let lat: number[] = [];
+    let done = 0, simT = 0, nextArr = 0;
+    let r = rng(1);
+    const rr = { i: 0 };
+
+    function reset() {
+      qs = Array.from({ length: N }, () => []);
+      lat = []; done = 0; simT = 0; r = rng(1); rr.i = 0;
+      nextArr = 0;
+    }
+
+    function table() {
+      tbody.replaceChildren();
+      for (const alg of ['rr', 'random', 'lc', 'p2c']) {
+        const res = offline({ ...cfg, alg });
+        const tr = document.createElement('tr');
+        if (alg === cfg.alg) tr.className = 'on';
+        for (const txt of [NAMES[alg], fmt(res.p50), fmt(res.p99)]) {
+          const td = document.createElement('td'); td.textContent = txt; tr.appendChild(td);
+        }
+        tbody.appendChild(tr);
+      }
+    }
+
+    function step(dtMs: number) {
+      const sp = speeds(cfg);
+      const lam = (cfg.load / 100) * sp.reduce((a, b) => a + b, 0) / MEAN;
+      const end = simT + dtMs;
+      if (nextArr === 0) nextArr = simT + expo(r, lam);
+      // advance in small slices so arrivals see up-to-date queues
+      while (simT < end) {
+        const until = Math.min(end, nextArr);
+        let span = until - simT;
+        for (let s = 0; s < N; s++) {
+          let budget = span * sp[s];
+          const q = qs[s];
+          while (budget > 0 && q.length) {
+            const j = q[0];
+            const use = Math.min(budget, j.left);
+            j.left -= use; budget -= use;
+            if (j.left <= 1e-9) {
+              const finish = until - budget / sp[s];
+              lat.push(finish - j.t0); if (lat.length > 600) lat.shift();
+              done++; q.shift();
+            }
+          }
+        }
+        simT = until;
+        if (simT >= nextArr) {
+          const cost = costOf(cfg, r);
+          const s = pick(cfg.alg, qs.map((q) => q.length), r, rr);
+          qs[s].push({ cost, left: cost, t0: simT });
+          nextArr = simT + expo(r, lam);
+        }
+      }
+    }
+
+    function draw() {
+      svg.replaceChildren();
+      const base = 214, maxH = 150, colW = 64, gap = 40, x0 = 52;
+      svg.appendChild(el('rect', { x: 150, y: 4, width: 180, height: 26, class: 'fill-paper', 'stroke-width': 1.2 }));
+      svg.appendChild(el('text', { x: 240, y: 21, 'text-anchor': 'middle', class: 'strong' }, `LB · ${NAMES[cfg.alg].toUpperCase()}`));
+      for (let s = 0; s < N; s++) {
+        const x = x0 + s * (colW + gap);
+        const cx = x + colW / 2;
+        svg.appendChild(el('line', { x1: 240, y1: 30, x2: cx, y2: 52, class: 'ink dash', 'stroke-width': 1 }));
+        svg.appendChild(el('line', { x1: x - 4, y1: base, x2: x + colW + 4, y2: base, class: 'ink', 'stroke-width': 1.2 }));
+        const label = `S${s + 1}${cfg.slow && s === 0 ? ' ½' : ''}`;
+        svg.appendChild(el('text', { x: cx, y: base + 16, 'text-anchor': 'middle', class: 'strong' }, label));
+        let y = base - 2;
+        let hidden = 0;
+        qs[s].forEach((j, idx) => {
+          const h = Math.max(3, j.cost * 0.06);
+          if (base - 2 - (y - h) > maxH) { hidden++; return; }
+          const cls = idx === 0 ? 'fill-blue' : 'fill-wash';
+          if (idx === 0) {
+            // show progress: remaining part solid
+            const hl = Math.max(2, h * (j.left / j.cost));
+            svg.appendChild(el('rect', { x: x + 6, y: y - h, width: colW - 12, height: h, class: 'fill-wash', 'stroke-width': 0.8 }));
+            svg.appendChild(el('rect', { x: x + 6, y: y - hl, width: colW - 12, height: hl, class: cls }));
+          } else {
+            svg.appendChild(el('rect', { x: x + 6, y: y - h, width: colW - 12, height: h, class: cls, 'stroke-width': 0.8 }));
+          }
+          y -= h + 1;
+        });
+        const qtxt = `Q ${qs[s].length}${hidden ? ' ▲' : ''}`;
+        svg.appendChild(el('text', { x: cx, y: 46, 'text-anchor': 'middle', class: hidden ? 'blue-t' : '' }, qtxt));
+      }
+      const sorted = [...lat].sort((a, b) => a - b);
+      out('p50').textContent = sorted.length > 20 ? fmt(sorted[Math.floor(sorted.length * 0.5)]) : '–';
+      out('p99').textContent = sorted.length > 100 ? fmt(sorted[Math.floor(sorted.length * 0.99)]) : '–';
+      out('maxq').textContent = String(Math.max(...qs.map((q) => q.length)));
+      out('n').textContent = String(done);
+    }
+
+    let last = 0;
+    function frame(ts: number) {
+      if (!last) last = ts;
+      const dt = Math.min(100, ts - last);
+      last = ts;
+      if (playing && visible) { step(dt * 0.25); draw(); }
+      requestAnimationFrame(frame);
+    }
+
+    function changed(resetLive: boolean, redoTable: boolean) {
+      if (resetLive) reset();
+      if (redoTable) table();
+      else tbody.querySelectorAll('tr').forEach((tr, i) => tr.classList.toggle('on', ['rr', 'random', 'lc', 'p2c'][i] === cfg.alg));
+      loadIn.nextElementSibling!.textContent = `${cfg.load}%`;
+      draw();
+    }
+
+    algBtns.forEach((b) => b.addEventListener('click', () => {
+      cfg.alg = b.dataset.alg!;
+      algBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      changed(true, false);
+    }));
+    mixBtns.forEach((b) => b.addEventListener('click', () => {
+      cfg.mix = b.dataset.mix!;
+      mixBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      changed(true, true);
+    }));
+    slowBtn.addEventListener('click', () => {
+      cfg.slow = !cfg.slow;
+      slowBtn.setAttribute('aria-pressed', String(cfg.slow));
+      changed(true, true);
+    });
+    loadIn.addEventListener('input', () => { cfg.load = +loadIn.value; changed(true, true); });
+    const syncPlay = () => { playBtn.textContent = playing ? 'Pause' : 'Play'; playBtn.setAttribute('aria-pressed', String(!playing)); };
+    playBtn.addEventListener('click', () => { playing = !playing; syncPlay(); });
+
+    if ('IntersectionObserver' in window) {
+      new IntersectionObserver((es) => { visible = es[0].isIntersecting; last = 0; }).observe(root);
+    }
+
+    reset();
+    if (reduce) step(20000); // show a settled snapshot instead of animating
+    syncPlay();
+    changed(false, true);
+    requestAnimationFrame(frame);
+  });
+</script>

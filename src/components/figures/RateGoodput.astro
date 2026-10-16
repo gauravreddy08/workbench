@@ -1,0 +1,117 @@
+---
+// Goodput vs offered load for a server with capacity C = 80 req/s (8 slots x 100 ms),
+// fed at a constant rate for D seconds, clients giving up after T seconds.
+// No protection: FIFO queue grows at (lambda - C); a request arriving at time t waits
+// (lambda - C) t / C, so only arrivals before t* = C (T - S) / (lambda - C) finish in time.
+// With shedding (queue capped at 16): goodput = min(lambda, C).
+// Dots are the measured runs from the lesson (D = 10 s, T = 1 s).
+---
+<div class="rgood" data-fig="rate-goodput">
+  <svg viewBox="0 0 640 320" role="img" aria-label="Goodput versus offered load, with and without load shedding"></svg>
+  <div class="ctl">
+    <label>Load <input type="range" min="20" max="480" step="10" value="120" data-k="lam" /> <output data-o="lam">120</output>/s</label>
+    <label>Lasts <input type="range" min="2" max="120" value="10" data-k="dur" /> <output data-o="dur">10</output>s</label>
+    <label>Timeout <input type="range" min="0.5" max="5" step="0.25" value="1" data-k="tmo" /> <output data-o="tmo">1</output>s</label>
+  </div>
+  <p class="rgood-read">
+    Unprotected goodput <span class="readout" data-r="none">-</span> ·
+    with shedding <span class="readout" data-r="shed">-</span> ·
+    server still busy <span class="readout" data-r="busy">-</span>
+  </p>
+  <p class="rgood-read" data-r="why"></p>
+</div>
+
+<style>
+  .rgood .ctl input[type='range'] { width: 150px; }
+  .rgood-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const C = 80, S = 0.1, LMAX = 500, GMAX = 100;
+  const MEASURED_NONE = [[60, 60], [80, 80], [100, 35.2], [120, 21.6], [160, 14.4], [240, 11.2]];
+  const MEASURED_SHED = [[60, 60], [100, 81], [120, 81], [240, 81.6], [480, 81.6]];
+
+  function goodNone(lam: number, D: number, T: number) {
+    if (lam <= C) return lam;
+    const tStar = (C * (T - S)) / (lam - C);
+    return (lam * Math.min(tStar, D)) / D;
+  }
+  const goodShed = (lam: number) => Math.min(lam, C);
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="rate-goodput"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const s = { lam: 120, dur: 10, tmo: 1 };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const X0 = 56, X1 = 624, Y0 = 270, Y1 = 30;
+    const xl = (l: number) => X0 + (l / LMAX) * (X1 - X0);
+    const yg = (g: number) => Y0 - (g / GMAX) * (Y0 - Y1);
+
+    function draw() {
+      svg.replaceChildren();
+      // axes
+      svg.append(el('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, class: 'ink', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, class: 'ink', 'stroke-width': 1 }));
+      for (let l = 0; l <= LMAX; l += 100) svg.append(el('text', { x: xl(l), y: Y0 + 16, 'text-anchor': 'middle' }, String(l)));
+      for (let g = 0; g <= GMAX; g += 20) svg.append(el('text', { x: X0 - 8, y: yg(g) + 4, 'text-anchor': 'end' }, String(g)));
+      svg.append(el('text', { x: X1, y: Y0 + 34, 'text-anchor': 'end' }, 'OFFERED LOAD (REQ/S) →'));
+      svg.append(el('text', { x: X0, y: 18, class: 'strong' }, 'GOODPUT: ANSWERS THAT ARRIVED IN TIME (REQ/S)'));
+      // capacity and ideal
+      svg.append(el('line', { x1: X0, y1: yg(C), x2: X1, y2: yg(C), class: 'ink dash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: X1, y: yg(C) - 6, 'text-anchor': 'end' }, 'CAPACITY 80/S'));
+      svg.append(el('line', { x1: xl(0), y1: yg(0), x2: xl(GMAX), y2: yg(GMAX), style: 'stroke:var(--ink-3)', class: 'dash', 'stroke-width': 1 }));
+
+      const pts = (f: (l: number) => number) => {
+        const p: string[] = [];
+        for (let l = 0; l <= LMAX; l += 2) p.push(`${p.length ? 'L' : 'M'}${xl(l).toFixed(1)} ${yg(f(l)).toFixed(1)}`);
+        return p.join(' ');
+      };
+      svg.append(el('path', { d: pts(goodShed), class: 'blue', 'stroke-width': 2 }));
+      svg.append(el('path', { d: pts((l) => goodNone(l, s.dur, s.tmo)), class: 'ink', 'stroke-width': 1.5 }));
+      svg.append(el('text', { x: xl(300), y: yg(C) + 16, class: 'blue-t' }, 'WITH SHEDDING'));
+      const ln = goodNone(300, s.dur, s.tmo);
+      svg.append(el('text', { x: xl(300), y: Math.min(Y0 - 6, yg(ln) - 8), class: 'strong' }, 'NO PROTECTION'));
+
+      // measured dots (only for the configuration that was measured)
+      if (s.dur === 10 && s.tmo === 1) {
+        for (const [l, g] of MEASURED_NONE) svg.append(el('circle', { cx: xl(l), cy: yg(g), r: 3.5, class: 'fill-paper', 'stroke-width': 1.5 }));
+        for (const [l, g] of MEASURED_SHED) svg.append(el('circle', { cx: xl(l), cy: yg(g), r: 3.5, class: 'fill-wash', 'stroke-width': 1.5 }));
+        svg.append(el('text', { x: xl(500), y: yg(GMAX) + 4, 'text-anchor': 'end' }, 'DOTS: MEASURED ON A MACBOOK'));
+      }
+
+      // cursor
+      const x = xl(s.lam);
+      svg.append(el('line', { x1: x, y1: Y0, x2: x, y2: Y1, class: 'blue', 'stroke-width': 1 }));
+      const gn = goodNone(s.lam, s.dur, s.tmo), gs = goodShed(s.lam);
+      svg.append(el('circle', { cx: x, cy: yg(gn), r: 4, class: 'fill-blue' }));
+      svg.append(el('circle', { cx: x, cy: yg(gs), r: 4, class: 'fill-blue' }));
+
+      r('none').textContent = `${gn.toFixed(1)}/s`;
+      r('shed').textContent = `${gs.toFixed(1)}/s`;
+      r('busy').textContent = s.lam > C ? '100%' : `${Math.round((s.lam / C) * 100)}%`;
+      let why = '';
+      if (s.lam <= C) why = 'Under capacity: no queue builds, everyone is served, protection changes nothing.';
+      else {
+        const tStar = (C * (s.tmo - S)) / (s.lam - C);
+        why = `The queue grows by ${s.lam - C} requests every second. After ${Math.min(tStar, s.dur).toFixed(1)}s the wait passes the ${s.tmo}s timeout, and from then on every answer the server produces goes to a client who already left. Longer overload, worse average: in steady state goodput goes to zero while the server stays 100% busy.`;
+      }
+      r('why').textContent = why;
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        (s as any)[inp.dataset.k!] = +inp.value;
+        root.querySelector<HTMLElement>(`[data-o="${inp.dataset.k}"]`)!.textContent = inp.value;
+        draw();
+      });
+    });
+    draw();
+  });
+</script>

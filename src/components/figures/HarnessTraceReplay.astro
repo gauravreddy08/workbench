@@ -1,0 +1,172 @@
+---
+// Replay a recorded-style agent trajectory one event at a time: model text, tool calls, tool
+// results, errors. The bar shows the context the model sees on its next call; the readouts show
+// how many input tokens have been billed so far (the sum of the context at every model call).
+// Token counts are illustrative, in the right range for a small repo task.
+---
+<div class="htr" data-fig="harness-trace">
+  <div class="htr-top">
+    <span class="label">Task: make tokenize() lowercase and strip punctuation</span>
+  </div>
+  <div class="htr-bar" aria-hidden="true">
+    <div class="htr-bar-fixed" data-bar-fixed></div>
+    <div class="htr-bar-grow" data-bar-grow></div>
+  </div>
+  <div class="htr-legend label">
+    <span><i class="htr-sw htr-sw-fixed"></i>system + tool schemas</span>
+    <span><i class="htr-sw htr-sw-grow"></i>conversation so far</span>
+  </div>
+  <p class="htr-read">
+    event <span class="readout" data-r="i">0</span>/<span data-r="n">0</span> ·
+    model calls <span class="readout" data-r="calls">0</span> ·
+    context <span class="readout" data-r="ctx">0</span> tok ·
+    billed input <span class="readout" data-r="billed">0</span> tok ·
+    tool errors <span class="readout" data-r="err">0</span>
+  </p>
+  <ol class="htr-log" data-log></ol>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="back">Back</button>
+    <button class="btn" type="button" data-act="next">Next</button>
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <label>step <input type="range" min="0" max="1" value="0" data-scrub aria-label="Scrub through the trace" /></label>
+  </div>
+  <p class="htr-note" data-note></p>
+</div>
+
+<style is:global>
+  .htr-top { margin-bottom: 10px; }
+  .htr-bar { display: flex; height: 16px; border: 1px solid var(--ink); background: var(--paper); overflow: hidden; }
+  .htr-bar-fixed { background: var(--ink-3); height: 100%; transition: width 0.25s; }
+  .htr-bar-grow { background: var(--blue); height: 100%; transition: width 0.25s; }
+  .htr-legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 6px 0 0; font-size: 10.5px; }
+  .htr-sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; vertical-align: -1px; }
+  .htr-sw-fixed { background: var(--ink-3); }
+  .htr-sw-grow { background: var(--blue); }
+  .htr-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.7; }
+  .htr-log { list-style: none; margin: 12px 0 0; padding: 0; border-top: 1px solid var(--rule); max-height: 360px; overflow-y: auto; }
+  .htr-log li { display: grid; grid-template-columns: 74px minmax(0, 1fr); gap: 2px 10px; padding: 7px 0; border-bottom: 1px solid var(--rule); font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .htr-log li .k { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); padding-top: 1px; }
+  .htr-log li .b { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+  .htr-log li .tk { grid-column: 2; font-size: 10.5px; color: var(--ink-3); }
+  .htr-log li.think .b { font-family: var(--serif); font-size: 15px; font-style: italic; color: var(--ink); }
+  .htr-log li.call .k, .htr-log li.call .b { color: var(--blue); }
+  .htr-log li.error .k, .htr-log li.error .b { color: var(--warn); }
+  .htr-log li.final .b { color: var(--ink); font-weight: 600; }
+  .htr-log li.cur { background: var(--blue-wash); }
+  .htr-note { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; min-height: 3.2em; }
+  @media (max-width: 520px) {
+    .htr-log li { grid-template-columns: minmax(0, 1fr); }
+    .htr-log li .tk { grid-column: 1; }
+  }
+</style>
+
+<script>
+  type Kind = 'think' | 'call' | 'result' | 'error' | 'final';
+  // turn: which model call produced it (think/call/final) or fed it (result/error).
+  type Ev = { kind: Kind; turn: number; text: string; tok: number; note: string };
+  const FIXED = 1350; // system prompt (~300) + five tool schemas (~1,050), illustrative
+  const TASK = 60;
+  const EVENTS: Ev[] = [
+    { kind: 'think', turn: 1, tok: 18, text: 'Start by looking at the layout.', note: 'Model call 1 sees the system prompt, tool schemas and the task: about 1,410 tokens. It answers with a little text and one tool call.' },
+    { kind: 'call', turn: 1, tok: 22, text: 'list_dir(path=".")', note: 'The model does not run anything. It emits a tool_use block: a name plus JSON arguments. The harness runs it.' },
+    { kind: 'result', turn: 1, tok: 70, text: 'README.md\ntests/__init__.py\ntests/test_core.py\nwordcount/__init__.py\nwordcount/cli.py\nwordcount/core.py\nwordcount/report.py', note: 'The result goes back as a tool_result block. Small output, small cost. A list_dir that walked node_modules would cost thousands.' },
+    { kind: 'think', turn: 2, tok: 14, text: 'tokenize lives in core.py.', note: 'Model call 2 re-reads everything above. Nothing is remembered between calls except what is in this list.' },
+    { kind: 'call', turn: 2, tok: 26, text: 'read_file(path="wordcount/core.py")', note: '' },
+    { kind: 'result', turn: 2, tok: 190, text: '   1 import re\n   2 from collections import Counter\n   ...\n   6     return re.findall(r"\\S+", text)\n   ...\n  14     return sorted(counts.items(), key=lambda kv: kv[1])[:k]', note: 'Line numbers in the output cost a few tokens and save whole steps later: the model can point at line 6 instead of guessing.' },
+    { kind: 'think', turn: 3, tok: 30, text: 'Regex \\S+ keeps punctuation and case. Check who calls tokenize before changing it.', note: 'Model call 3 asks for two things at once.' },
+    { kind: 'call', turn: 3, tok: 20, text: 'search(pattern="tokenize")', note: 'Two tool_use blocks in one response: a parallel call. Both are read-only, so the harness can run them at the same time.' },
+    { kind: 'call', turn: 3, tok: 26, text: 'read_file(path="tests/test_core.py")', note: '' },
+    { kind: 'result', turn: 3, tok: 55, text: 'wordcount/__init__.py:1:from .core import tokenize, ...\nwordcount/core.py:4:def tokenize(text):\nwordcount/core.py:10:    return Counter(tokenize(text))', note: 'Both results go back in ONE user message, each tagged with the id of the call it answers.' },
+    { kind: 'result', turn: 3, tok: 160, text: '   1 import unittest\n   ...\n  10     def test_top_k_most_common_first(self):\n  ...', note: '' },
+    { kind: 'call', turn: 4, tok: 95, text: 'edit_file(path="wordcount/core.py",\n  old="return re.findall(r\'\\\\S+\', text)",\n  new="...")', note: 'The model copies the line with single quotes. The file has double quotes.' },
+    { kind: 'error', turn: 4, tok: 60, text: 'old text found 0 times in wordcount/core.py.\nClosest line is 6:\n    return re.findall(r"\\S+", text)', note: 'A useful error. Not "edit failed", but what went wrong and the closest real text. The model can fix this in one step.' },
+    { kind: 'call', turn: 5, tok: 110, text: 'edit_file(path="wordcount/core.py",\n  old="    return re.findall(r\\"\\\\S+\\", text)",\n  new="    words = (t.strip(PUNCT).lower() for t in text.split())\\n    return [w for w in words if w]")', note: 'Retry with the exact text. Recovery cost: one step and about 170 tokens of conversation.' },
+    { kind: 'result', turn: 5, tok: 8, text: 'edited wordcount/core.py', note: '' },
+    { kind: 'call', turn: 6, tok: 22, text: 'run_command(cmd="python3 -m unittest -q")', note: 'Before running a command, a permission gate in an interactive harness would ask you. This one was pre-approved.' },
+    { kind: 'result', turn: 6, tok: 140, text: 'exit code 1\nFAIL: test_top_k_most_common_first\nAssertionError: [(\'x\', 1), (\'y\', 2)] != [(\'z\', 3), (\'y\', 2)]', note: 'A failing test, but not one this edit caused. The model has to notice that.' },
+    { kind: 'think', turn: 7, tok: 45, text: 'That failure is in top_k and was already there. Not my task. Check my change directly.', note: 'Good judgment, and a place agents often go wrong: "fixing" unrelated tests, or deleting them.' },
+    { kind: 'call', turn: 7, tok: 48, text: 'run_command(cmd="python3 -c \'from wordcount.core import tokenize; print(tokenize(\\"Hello, hello! Don\\\\\'t.\\"))\'")', note: '' },
+    { kind: 'result', turn: 7, tok: 20, text: "exit code 0\n['hello', 'hello', \"don't\"]", note: '' },
+    { kind: 'final', turn: 8, tok: 70, text: 'Done. tokenize now lowercases and strips edge punctuation. Note: test_top_k_most_common_first was already failing (top_k sorts ascending). I left it alone.', note: 'No tool_use block in the response, so the loop stops. 8 model calls. Look at billed input: several times the final context, because every call paid for the whole history again.' },
+  ];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="harness-trace"]').forEach((root) => {
+    const log = root.querySelector<HTMLOListElement>('[data-log]')!;
+    const scrub = root.querySelector<HTMLInputElement>('[data-scrub]')!;
+    const note = root.querySelector<HTMLElement>('[data-note]')!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-act="play"]')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const barFixed = root.querySelector<HTMLElement>('[data-bar-fixed]')!;
+    const barGrow = root.querySelector<HTMLElement>('[data-bar-grow]')!;
+    const total = FIXED + TASK + EVENTS.reduce((a, e) => a + e.tok, 0);
+    const scale = total * 1.15;
+    scrub.max = String(EVENTS.length);
+    r('n').textContent = String(EVENTS.length);
+    let i = 0;
+    let timer: number | undefined;
+
+    // State after the first n events have happened.
+    function stateAt(n: number) {
+      let ctx = FIXED + TASK, billed = 0, calls = 0, err = 0, lastTurn = 0;
+      for (let k = 0; k < n; k++) {
+        const e = EVENTS[k];
+        const produced = e.kind === 'think' || e.kind === 'call' || e.kind === 'final';
+        if (produced && e.turn !== lastTurn) { calls++; billed += ctx; lastTurn = e.turn; }
+        if (e.kind === 'error') err++;
+        ctx += e.tok;
+      }
+      return { ctx, billed, calls, err };
+    }
+
+    function render() {
+      const s = stateAt(i);
+      barFixed.style.width = `${(FIXED / scale) * 100}%`;
+      barGrow.style.width = `${((s.ctx - FIXED) / scale) * 100}%`;
+      r('i').textContent = String(i);
+      r('calls').textContent = String(s.calls);
+      r('ctx').textContent = s.ctx.toLocaleString('en-US');
+      r('billed').textContent = s.billed.toLocaleString('en-US');
+      r('err').textContent = String(s.err);
+      scrub.value = String(i);
+      const kindLabel: Record<Kind, string> = { think: 'model', call: 'tool call', result: 'result', error: 'error', final: 'final' };
+      log.replaceChildren(...EVENTS.slice(0, i).map((e, k) => {
+        const li = document.createElement('li');
+        li.className = e.kind + (k === i - 1 ? ' cur' : '');
+        const kk = document.createElement('span'); kk.className = 'k'; kk.textContent = `${kindLabel[e.kind]} ${e.turn}`;
+        const b = document.createElement('span'); b.className = 'b'; b.textContent = e.text;
+        const tk = document.createElement('span'); tk.className = 'tk'; tk.textContent = `+${e.tok} tok`;
+        li.append(kk, b, tk);
+        return li;
+      }));
+      const cur = log.lastElementChild as HTMLElement | null;
+      if (cur) log.scrollTop = cur.offsetTop - log.offsetTop - log.clientHeight + cur.offsetHeight + 8;
+      let msg = i === 0 ? 'Press Next. The grey part of the bar is paid on every single model call.' : EVENTS[i - 1].note;
+      if (!msg) msg = 'Context keeps growing. Every byte a tool returns is re-read on every later call.';
+      note.textContent = msg;
+      root.querySelector<HTMLButtonElement>('[data-act="back"]')!.disabled = i === 0;
+      root.querySelector<HTMLButtonElement>('[data-act="next"]')!.disabled = i === EVENTS.length;
+    }
+
+    function stop() {
+      if (timer) clearInterval(timer);
+      timer = undefined;
+      playBtn.setAttribute('aria-pressed', 'false');
+      playBtn.textContent = 'Play';
+    }
+
+    root.querySelector('[data-act="next"]')!.addEventListener('click', () => { stop(); if (i < EVENTS.length) { i++; render(); } });
+    root.querySelector('[data-act="back"]')!.addEventListener('click', () => { stop(); if (i > 0) { i--; render(); } });
+    root.querySelector('[data-act="reset"]')!.addEventListener('click', () => { stop(); i = 0; render(); });
+    scrub.addEventListener('input', () => { stop(); i = +scrub.value; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer) { stop(); return; }
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) { i = EVENTS.length; render(); return; }
+      if (i >= EVENTS.length) i = 0;
+      playBtn.setAttribute('aria-pressed', 'true');
+      playBtn.textContent = 'Pause';
+      timer = window.setInterval(() => { if (i >= EVENTS.length) { stop(); return; } i++; render(); }, 1100);
+    });
+    render();
+  });
+</script>

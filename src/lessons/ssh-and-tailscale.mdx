@@ -1,0 +1,743 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import SSHHolePunch from '../components/figures/SSHHolePunch.astro';
+import SSHPaths from '../components/figures/SSHPaths.astro';
+
+## Today
+
+- Say what is actually running on your home server when you "have SSH", and walk through an SSH connection from the first packet to the shell prompt: key exchange, host keys, user keys, channels.
+- Read the scary `REMOTE HOST IDENTIFICATION HAS CHANGED` warning and know whether to worry.
+- Use `~/.ssh/config`, `-L`, `-R`, `-D` and `ProxyJump` so that reaching a Jupyter server on the Spark is one short command.
+- Explain why your laptop cannot reach your home server from a cafe without help (NAT, private addresses), and why opening a port on the router is the risky fix.
+- Explain what Tailscale really does: WireGuard tunnels between your devices, a control server that only swaps keys, hole punching, and DERP relays when that fails. Then prove it with `tailscale ping`, `netcheck` and `tcpdump`.
+
+Prerequisites: none strictly. [Packets and IP](/lessons/packets-and-ip/) and [TLS](/lessons/tls/) make a few sections click faster, and [TCP vs UDP](/lessons/tcp-vs-udp/) explains why WireGuard picked UDP. Rough time: one evening on the home server, plus half an hour with the Spark.
+
+## The Problem
+
+You have a box at home. You installed Tailscale on it and on your laptop, typed `ssh gaurav@homeserver`, and it worked. From your apartment, from the office, from a cafe. Great.
+
+Now some questions you cannot answer yet:
+
+- The first time you connected, ssh asked `Are you sure you want to continue connecting (yes/no/[fingerprint])?`. You typed `yes`. What did you just agree to?
+- One day it will say `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!` Is someone doing something nasty?
+- Is password login still turned on? If your router ever forwards port 22, how long before a bot finds it?
+- You want Jupyter running on the Spark to show up in your laptop's browser. How?
+- Before Tailscale, your laptop at the cafe could not reach the box at all. After installing an app, it can, and you never opened a port on your router. How does a packet get in? Is it going through Tailscale's servers? Can Tailscale read it?
+
+None of this is magic. It is three old ideas stacked up: a program that listens for connections (sshd), a careful handshake that makes two strangers share a secret (the same trick as TLS), and a way to sneak a conversation through two routers that were built to stop exactly that.
+
+<Origin year="1995" title="Somebody sniffed the passwords">
+
+In early 1995, Tatu Ylönen, a researcher at Helsinki University of Technology, found that someone had been running a password sniffer on the university network. Back then, people logged into remote machines with `telnet` and `rlogin`, which sent everything, including your password, across the network as plain text. Anyone on a machine along the path could read it.
+
+He wrote a replacement that encrypted the whole session and released it for free that summer. He called it Secure Shell, asked the people who hand out port numbers for one, and got 22, sitting neatly between FTP (21) and telnet (23). It spread to tens of thousands of users within months. The OpenBSD project later forked an old free version into OpenSSH (1999), which is what nearly every Linux box and Mac runs today. The protocol you use now is SSH-2, standardised in 2006.
+
+Twenty years later the problem had changed. Encryption was solved, but more and more devices sat behind home routers that made them unreachable from the outside. In 2015-2017 Jason Donenfeld designed WireGuard, a tiny VPN protocol (under 4,000 lines in the Linux kernel). In 2019, a group of ex-Google engineers started Tailscale to answer one question: what if every device you own could reach every other one directly, with WireGuard, no matter how many routers are in the way?
+
+</Origin>
+
+## The Idea
+
+### A program that waits by the door
+
+When people say "my server has SSH", they mean a program called `sshd` is running on it. The trailing `d` is for <Term w="daemon">A program that runs in the background with no terminal attached, usually started at boot, waiting to do a job. Unix names them with a trailing "d": sshd, tailscaled, systemd.</Term>.
+
+sshd's job is to sit on <Term w="port">A number from 1 to 65535 that picks which program on a machine gets an incoming connection. An IP address finds the machine; the port finds the program on it. SSH's standard port is 22.</Term> 22 and wait. In operating system terms it has asked the <Term w="kernel">The core of the operating system, the one program that talks to the hardware directly, including the network card.</Term> to <Term w="listen">To tell the kernel "if a TCP connection arrives for this port, hand it to me". A listening program is like a phone that is plugged in and switched on.</Term> on TCP port 22. When a connection arrives, the kernel hands it over, sshd starts a new child process just for that one connection, and goes back to waiting. The child does the handshake, checks who you are, then becomes a shell running as your user.
+
+You can see the listening part right now on the home server:
+
+```bash
+sudo ss -tlnp | grep ':22'
+# LISTEN 0  128  0.0.0.0:22  0.0.0.0:*  users:(("sshd",pid=812,fd=3))
+```
+
+That `0.0.0.0:22` means "port 22 on every network interface this machine has": the home Wi-Fi or Ethernet, and the Tailscale one. Keep that in mind; it matters when we harden things. (On recent Ubuntu, you may see `systemd` instead of `sshd` holding the port. That is <Term w="socket activation">systemd listens on the port itself and only starts sshd when a connection actually arrives. Same effect for you; it changes how you restart things after editing the port.</Term>. Same idea, different owner of the phone.)
+
+### The SSH connection, step by step
+
+Your laptop and the server are strangers on a network where anyone in the middle (the cafe Wi-Fi, your ISP) can read and change packets. In about half a dozen round trips, they need to:
+
+1. agree on a secret key that nobody in the middle knows,
+2. make sure the laptop is talking to the *real* server, not an impostor,
+3. make sure the server is talking to *you*,
+4. then carry your keystrokes, and maybe other traffic, inside the encryption.
+
+<Figure n="001" title="ONE SSH CONNECTION" caption="Time flows down. Grey lines are readable by anyone on the path; blue lines are encrypted. Note the order: the server proves who it is before you ever send anything that proves who you are." wide>
+<svg viewBox="0 0 640 430" role="img" aria-label="Sequence diagram of an SSH connection">
+  <rect x="40" y="10" width="120" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="100" y="30" text-anchor="middle" class="strong">LAPTOP (ssh)</text>
+  <rect x="480" y="10" width="120" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="540" y="30" text-anchor="middle" class="strong">SERVER (sshd)</text>
+  <line x1="100" y1="40" x2="100" y2="420" class="ink" stroke-width="1" />
+  <line x1="540" y1="40" x2="540" y2="420" class="ink" stroke-width="1" />
+
+  <text x="10" y="62" class="blue-t">TCP</text>
+  <line x1="100" y1="60" x2="540" y2="70" class="ink" stroke-width="1" />
+  <text x="320" y="58" text-anchor="middle">SYN</text>
+  <line x1="540" y1="76" x2="100" y2="86" class="ink" stroke-width="1" />
+  <text x="320" y="74" text-anchor="middle">SYN-ACK</text>
+  <line x1="100" y1="92" x2="540" y2="102" class="ink" stroke-width="1" />
+  <text x="320" y="91" text-anchor="middle">ACK</text>
+
+  <text x="10" y="124" class="blue-t">HELLO</text>
+  <line x1="540" y1="118" x2="100" y2="128" class="ink" stroke-width="1" />
+  <text x="320" y="116" text-anchor="middle">"SSH-2.0-OpenSSH_9.6" + MENU OF ALGORITHMS</text>
+  <line x1="100" y1="134" x2="540" y2="144" class="ink" stroke-width="1" />
+  <text x="320" y="133" text-anchor="middle">"SSH-2.0-OpenSSH_10.3" + MENU</text>
+
+  <text x="10" y="170" class="blue-t">KEX</text>
+  <line x1="100" y1="166" x2="540" y2="176" class="ink" stroke-width="1.2" />
+  <text x="320" y="164" text-anchor="middle">MY EPHEMERAL PUBLIC VALUE</text>
+  <line x1="540" y1="186" x2="100" y2="196" class="ink" stroke-width="1.2" />
+  <text x="320" y="184" text-anchor="middle">MINE + HOST PUBLIC KEY + SIGNATURE</text>
+  <rect x="200" y="204" width="240" height="26" class="fill-wash" stroke-width="1" />
+  <text x="320" y="221" text-anchor="middle" class="strong">BOTH NOW HOLD THE SAME SECRET</text>
+  <text x="112" y="248">CHECK ~/.ssh/known_hosts</text>
+
+  <text x="10" y="278" class="blue-t">AUTH</text>
+  <line x1="100" y1="272" x2="540" y2="282" class="blue" stroke-width="1.5" />
+  <text x="320" y="270" text-anchor="middle" class="blue-t">"I AM gaurav, CAN I USE KEY X?"</text>
+  <line x1="540" y1="290" x2="100" y2="300" class="blue" stroke-width="1.5" />
+  <text x="320" y="288" text-anchor="middle" class="blue-t">"X IS IN authorized_keys, PROVE IT"</text>
+  <line x1="100" y1="308" x2="540" y2="318" class="blue" stroke-width="1.5" />
+  <text x="320" y="306" text-anchor="middle" class="blue-t">SIGNATURE OVER THIS SESSION'S ID</text>
+  <line x1="540" y1="326" x2="100" y2="336" class="blue" stroke-width="1.5" />
+  <text x="320" y="324" text-anchor="middle" class="blue-t">USERAUTH SUCCESS</text>
+
+  <text x="10" y="364" class="blue-t">CHAN</text>
+  <line x1="100" y1="360" x2="540" y2="370" class="blue" stroke-width="1.5" />
+  <text x="320" y="358" text-anchor="middle" class="blue-t">OPEN CHANNEL 0: SESSION, PTY, SHELL</text>
+  <line x1="100" y1="388" x2="540" y2="388" class="blue dash" stroke-width="1.5" />
+  <line x1="540" y1="402" x2="100" y2="402" class="blue dash" stroke-width="1.5" />
+  <text x="320" y="420" text-anchor="middle">KEYSTROKES AND OUTPUT, ENCRYPTED</text>
+</svg>
+</Figure>
+
+**Step 1: TCP.** SSH rides on a normal TCP connection to port 22. Nothing special yet: just a reliable pipe of bytes.
+
+**Step 2: hello.** Each side sends one line of plain text naming its version, like `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13`. Then each sends a menu: "for key exchange I can do these, for encryption these, for signatures these". They pick the first option on the laptop's list that the server also supports. This is all readable by anyone on the path, which is why a scanner knows exactly which OpenSSH version you run the moment it connects.
+
+**Step 3: key exchange.** This is the same trick as in the [TLS lesson](/lessons/tls/), and it is worth having in your hands. Think of mixing paint. You both start with the same public base colour. You each mix in a secret colour of your own and send the mixture across. Each of you then adds your own secret to the *other's* mixture, and you both end up with the same final colour. Someone watching saw the base and both mixtures, but un-mixing paint is hard, so they can't get the final colour. The real version is <Term w="Diffie-Hellman">A method (1976) for two parties to agree on a shared secret over a public channel. Each sends a public value derived from a private random number; combining your private number with their public value gives both sides the same secret. Modern SSH uses an elliptic-curve version, often on Curve25519.</Term>, with numbers instead of paint, done fresh for every connection. That freshness gives <Term w="forward secrecy">Because the shared secret comes from random numbers thrown away after the handshake, recording today's traffic and stealing the server's keys next year still doesn't let you decrypt today's session.</Term>.
+
+From the shared secret both sides derive the actual encryption keys (for example for AES-GCM or ChaCha20-Poly1305), and from the next message on, everything is encrypted. The connection also gets a unique <Term w="session ID">A hash of everything both sides said during the key exchange. Unique to this connection, known to both ends, and used later as the thing your key signs.</Term>.
+
+**But who did you just share a secret with?** Diffie-Hellman by itself only proves that you share a secret with *whoever answered*. If someone sat in the middle, they could do one exchange with you and another with the server and pass messages along, reading everything. So in the same message as its paint mixture, the server sends its <Term w="host key">The server's own long-term key pair, created when OpenSSH was installed. The private half lives in /etc/ssh/ssh_host_ed25519_key; it identifies the machine, not any user.</Term> and a <Term w="signature">A short blob made with a private key over some data. Anyone with the matching public key can check it, but only the private key holder could have made it. Think of a wax seal that only one ring can make but anyone can recognise.</Term> over the session ID. An impostor can send *a* host key, but can't produce a valid signature for the real server's key without stealing its private key.
+
+That moves the question to: how does your laptop know which host key is the real one?
+
+### Trust on first use, and the scary warning
+
+It doesn't, the first time. That's the yes/no prompt:
+
+```text
+The authenticity of host 'homeserver (100.101.102.103)' can't be established.
+ED25519 key fingerprint is SHA256:wnZW5dld27zSuDcPtaTBgnZX34K/FMABJEVwO5Y3Ktg.
+Are you sure you want to continue connecting (yes/no/[fingerprint])?
+```
+
+The <Term w="fingerprint">A short hash of a public key, easy to compare by eye. Two keys with the same fingerprint are, for all practical purposes, the same key.</Term> is the host key's ID. Typing `yes` means "I trust that this is my server", and ssh writes the host key into `~/.ssh/known_hosts`. Every later connection checks the key the server presents against that line. This model is called <Term w="TOFU">Trust On First Use. You accept a key the first time without proof, then insist it never changes. Weak once, strong forever after.</Term>.
+
+The careful way to say yes is to compare the fingerprint with the one the server itself reports. At the server's own keyboard (or over a connection you already trust):
+
+```bash
+ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+# 256 SHA256:wnZW5dld27zSuDcPtaTBgnZX34K/FMABJEVwO5Y3Ktg root@homeserver (ED25519)
+```
+
+Now the warning. I made it happen on my Mac by running a throwaway sshd, connecting once, then giving that sshd a new host key and connecting again:
+
+```text
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+...
+Offending ED25519 key in /Users/you/.ssh/known_hosts:1
+Host key verification failed.
+```
+
+<Predict id="host-key-changed">
+You get this warning connecting to `homeserver`. List three innocent reasons it could happen, and the one bad one. What do you check before you delete the old line?
+<Fragment slot="answer">
+
+Innocent: (1) you reinstalled the OS on the server, which generated fresh host keys; (2) a *different machine* now answers to that name or address, for example your router's DHCP handed `192.168.1.50` to a new device, or you reused a hostname for a new box; (3) you deleted and re-added the machine to Tailscale and it got a different 100.x address that used to belong to another device. The bad one: something between you and the server is answering in its place (a man-in-the-middle). Before you run `ssh-keygen -R homeserver` to delete the old entry, get the fingerprint from the server itself (its console, or over another path you trust) and check it matches the new one ssh is showing you. If you can't explain why the key changed, don't connect.
+
+</Fragment>
+</Predict>
+
+### Proving it's you: keys, not passwords
+
+Once the server has proved who it is, you prove who you are. Two common ways.
+
+**Password.** You send your password, encrypted, to the server, which checks it. Two problems. A password is guessable: bots on the internet try millions of common ones. And the server sees your actual password. If you ever said `yes` to an impostor's host key, the impostor now has it.
+
+**Public key.** You make a <Term w="key pair">Two linked keys. The private key stays secret on your laptop and can make signatures. The public key can be handed to anyone and can only check signatures. Knowing the public key doesn't help you compute the private one.</Term> once, on the laptop:
+
+```bash
+ssh-keygen -t ed25519 -C "gaurav@laptop"
+# writes ~/.ssh/id_ed25519      (private: never leaves this machine)
+#    and ~/.ssh/id_ed25519.pub  (public: one line, safe to share)
+```
+
+<Term w="Ed25519">A modern signature scheme (Bernstein and colleagues, 2011) on an elliptic curve. Keys are tiny (32 bytes) and fast, and it avoids several ways older schemes could be implemented badly. The default choice for new SSH keys.</Term> keys are small. The public key file I generated on my Mac is 86 bytes, one line: `ssh-ed25519 AAAAC3Nza...SWcgV gaurav@laptop`. You append that line to `~/.ssh/authorized_keys` on the server (`ssh-copy-id home` does this for you).
+
+At login, the laptop says "I'd like to log in as gaurav with this public key". The server looks in gaurav's `authorized_keys`. If the key is there, the laptop signs a message containing the session ID with the private key, and the server checks the signature with the public key. Here is that exchange from my local test, using `ssh -v`:
+
+```text
+debug1: Offering public key: .../k ED25519 SHA256:TfaJk5JM... explicit
+debug1: Server accepts key: .../k ED25519 SHA256:TfaJk5JM... explicit
+Authenticated to 127.0.0.1 ([127.0.0.1]:2222) using "publickey".
+```
+
+Why this beats a password:
+
+- **Nothing guessable.** An Ed25519 private key has roughly 128 bits of security. A bot trying passwords is trying the wrong kind of thing entirely.
+- **Nothing reusable.** The server never sees your private key, only a signature. And the signature covers *this session's* ID, so even an impostor who captures it can't replay it to log in somewhere else.
+- **Revocable per device.** One line in `authorized_keys` per laptop. Lose a laptop, delete its line.
+
+<Figure n="002" title="FOUR FILES, TWO DIRECTIONS OF TRUST" caption="Each side keeps a private key and holds the other side's public key. known_hosts answers 'is this my server?'; authorized_keys answers 'is this gaurav?'.">
+<svg viewBox="0 0 600 260" role="img" aria-label="Key files on the laptop and server">
+  <rect x="20" y="20" width="230" height="220" class="ink" stroke-width="1.2" />
+  <text x="135" y="42" text-anchor="middle" class="strong">LAPTOP</text>
+  <rect x="350" y="20" width="230" height="220" class="ink" stroke-width="1.2" />
+  <text x="465" y="42" text-anchor="middle" class="strong">SERVER</text>
+
+  <rect x="36" y="62" width="198" height="56" class="fill-wash" stroke-width="1" />
+  <text x="46" y="82" class="strong">~/.ssh/id_ed25519</text>
+  <text x="46" y="100">YOUR PRIVATE KEY</text>
+  <rect x="36" y="160" width="198" height="56" class="fill-paper" stroke-width="1" />
+  <text x="46" y="180" class="strong">~/.ssh/known_hosts</text>
+  <text x="46" y="198">SERVER'S PUBLIC HOST KEY</text>
+
+  <rect x="366" y="62" width="198" height="56" class="fill-paper" stroke-width="1" />
+  <text x="376" y="82" class="strong">~/.ssh/authorized_keys</text>
+  <text x="376" y="100">YOUR PUBLIC KEY</text>
+  <rect x="366" y="160" width="198" height="56" class="fill-wash" stroke-width="1" />
+  <text x="376" y="180" class="strong">/etc/ssh/ssh_host_*_key</text>
+  <text x="376" y="198">HOST PRIVATE KEY</text>
+
+  <line x1="234" y1="90" x2="366" y2="90" class="blue" stroke-width="1.5" />
+  <text x="300" y="82" text-anchor="middle" class="blue-t">SIGNS</text>
+  <text x="300" y="108" text-anchor="middle">CHECKED BY</text>
+  <line x1="366" y1="188" x2="234" y2="188" class="blue" stroke-width="1.5" />
+  <text x="300" y="180" text-anchor="middle" class="blue-t">SIGNS</text>
+  <text x="300" y="206" text-anchor="middle">CHECKED BY</text>
+  <text x="300" y="140" text-anchor="middle">BLUE FILL = NEVER LEAVES</text>
+</svg>
+</Figure>
+
+**Passphrases and the agent.** A private key file is just a file; anyone who copies it is you. So `ssh-keygen` offers to encrypt it with a passphrase. Typing that passphrase on every connection gets old, so there's <Term w="ssh-agent">A small background program that holds your decrypted private keys in memory. ssh asks the agent "please sign this" instead of reading the key file, so you unlock the key once per login session, not once per connection.</Term>. On macOS, `AddKeysToAgent yes` and `UseKeychain yes` in your ssh config make the Mac's keychain remember the passphrase. One thing *not* to do casually: `ssh -A` (agent forwarding) lets the remote machine use your agent while you're connected, so anyone who is root on that machine can log in as you elsewhere for as long as you stay connected. Use `ProxyJump` instead (below).
+
+### Channels: one connection, many pipes
+
+After login, the encrypted connection is a container for <Term w="channel">An independent stream of data inside one SSH connection, with its own ID and its own flow control. Your shell is one channel; each forwarded port connection is another.</Term>s. Your interactive shell is channel 0: a "session" channel, with a request for a <Term w="pty">Pseudo-terminal. A fake terminal device the server creates so programs like vim and htop think a real keyboard and screen are attached.</Term> and a shell. `ssh home uptime` opens a session channel that runs one command instead. And the ones that make SSH a Swiss army knife: port forwards.
+
+<Figure n="003" title="THREE KINDS OF FORWARDING" caption="Every forward is a channel inside the same encrypted connection. -L brings a remote port to you, -R takes your port to them, -D turns the connection into a proxy for any destination.">
+<svg viewBox="0 0 600 300" role="img" aria-label="Local, remote and dynamic port forwarding">
+  <text x="20" y="22" class="strong">-L 8888:localhost:8888 spark</text>
+  <rect x="20" y="34" width="150" height="50" class="fill-paper" stroke-width="1" />
+  <text x="95" y="54" text-anchor="middle" class="strong">LAPTOP</text>
+  <text x="95" y="72" text-anchor="middle">BROWSER → :8888</text>
+  <rect x="420" y="34" width="160" height="50" class="fill-paper" stroke-width="1" />
+  <text x="500" y="54" text-anchor="middle" class="strong">SPARK</text>
+  <text x="500" y="72" text-anchor="middle">JUPYTER ON 127.0.0.1:8888</text>
+  <rect x="170" y="50" width="250" height="18" class="fill-wash" stroke-width="1" />
+  <text x="295" y="63" text-anchor="middle" class="blue-t">SSH TUNNEL →</text>
+
+  <text x="20" y="122" class="strong">-R 9000:localhost:3000 home</text>
+  <rect x="20" y="134" width="150" height="50" class="fill-paper" stroke-width="1" />
+  <text x="95" y="154" text-anchor="middle" class="strong">LAPTOP</text>
+  <text x="95" y="172" text-anchor="middle">DEV SERVER :3000</text>
+  <rect x="420" y="134" width="160" height="50" class="fill-paper" stroke-width="1" />
+  <text x="500" y="154" text-anchor="middle" class="strong">HOME</text>
+  <text x="500" y="172" text-anchor="middle">curl localhost:9000</text>
+  <rect x="170" y="150" width="250" height="18" class="fill-wash" stroke-width="1" />
+  <text x="295" y="163" text-anchor="middle" class="blue-t">← SSH TUNNEL</text>
+
+  <text x="20" y="222" class="strong">-D 1080 home</text>
+  <rect x="20" y="234" width="150" height="50" class="fill-paper" stroke-width="1" />
+  <text x="95" y="254" text-anchor="middle" class="strong">LAPTOP</text>
+  <text x="95" y="272" text-anchor="middle">BROWSER SOCKS :1080</text>
+  <rect x="300" y="234" width="110" height="50" class="fill-paper" stroke-width="1" />
+  <text x="355" y="264" text-anchor="middle" class="strong">HOME</text>
+  <rect x="170" y="250" width="130" height="18" class="fill-wash" stroke-width="1" />
+  <text x="235" y="263" text-anchor="middle" class="blue-t">SSH →</text>
+  <line x1="410" y1="246" x2="470" y2="240" class="ink" stroke-width="1" />
+  <line x1="410" y1="259" x2="470" y2="259" class="ink" stroke-width="1" />
+  <line x1="410" y1="272" x2="470" y2="278" class="ink" stroke-width="1" />
+  <text x="476" y="244">ROUTER 192.168.1.1</text>
+  <text x="476" y="263">ANY LAN DEVICE</text>
+  <text x="476" y="282">THE WEB, AS HOME</text>
+</svg>
+</Figure>
+
+- **`-L` (local forward).** `ssh -L 8888:localhost:8888 spark` makes ssh listen on *your laptop's* port 8888. Anything that connects there gets carried through the tunnel, and the Spark's sshd opens a connection to `localhost:8888` *as seen from the Spark*. The service on the far end can stay bound to the Spark's loopback address, invisible to everything else, and you still reach it.
+- **`-R` (remote forward).** The mirror image: `ssh -R 9000:localhost:3000 home` makes the *server* listen on its port 9000 and carries those connections back to port 3000 on your laptop. Useful for showing a dev server to a machine that can't reach you.
+- **`-D` (dynamic forward).** `ssh -D 1080 home` turns ssh into a <Term w="SOCKS proxy">A simple proxy protocol: the client says "connect me to host X port Y", and the proxy makes that connection and relays bytes. Browsers and curl can be told to send everything through one.</Term>. Point your browser at `localhost:1080` and every site you open is fetched by the home server. You can open your router's admin page from a cafe.
+
+**Files ride channels too.** `scp` and `sftp` copy files over an SSH channel (since OpenSSH 9.0, `scp` actually speaks the SFTP protocol underneath). `rsync -avz dir/ home:dir/` runs rsync over ssh and only sends the parts of files that changed, which is what you want for repeated deploys.
+
+### `~/.ssh/config`: stop typing flags
+
+Everything above can live in a config file so `ssh spark` just works. A host block is a nickname plus settings:
+
+```text
+Host home
+  HostName homeserver          # the MagicDNS name (or 100.x address)
+  User gaurav
+```
+
+Two facts about this file that bite people. First, for each setting, **the first value found wins**, reading top to bottom. So specific `Host` blocks go first and a catch-all `Host *` goes last. Second, `ProxyJump` (or `-J`) lets you hop through one machine to reach another: `ProxyJump home` on a `spark` block means "SSH to home first, then from there open a connection to the Spark's port 22 and run a second, separate SSH session through it". The second session is encrypted end to end from your laptop to the Spark, so the middle machine only relays encrypted bytes. That is why it's safer than agent forwarding.
+
+You can always ask ssh what it will actually do for a host: `ssh -G spark` prints the final, merged settings.
+
+### Locking the door
+
+An SSH server is a program running as root that talks to anyone who connects. Two recent reminders of why that matters. In July 2024, "regreSSHion" (CVE-2024-6387) was a bug in OpenSSH's own sshd on Linux that let an unauthenticated attacker run code as root, with no login needed, on versions from 8.5p1 to 9.7p1. And in March 2024, a backdoor was found planted in the `xz` compression library, designed to give its author a way into sshd on some Linux distributions; it was caught by luck shortly before it reached stable releases. Both were patched fast. Both were dangerous mainly to servers whose port 22 was open to the whole internet.
+
+So hardening has two halves: shrink what sshd will accept, and shrink who can reach sshd at all.
+
+**What sshd accepts** lives in `/etc/ssh/sshd_config`, and on Ubuntu, in drop-in files under `/etc/ssh/sshd_config.d/` that are read *first*. Same rule as the client: first value wins. Some cloud and installer images ship a `50-cloud-init.conf` that says `PasswordAuthentication yes`, which silently beats anything you write lower down in the main file. The only trustworthy view is the one sshd prints itself: `sudo sshd -T`.
+
+The settings that matter:
+
+| Setting | Set it to | Why |
+| --- | --- | --- |
+| `PasswordAuthentication` | `no` | No passwords means nothing to guess. |
+| `KbdInteractiveAuthentication` | `no` | The other door passwords can sneak through. |
+| `PermitRootLogin` | `no` | Log in as yourself, then `sudo`. The default `prohibit-password` already blocks root passwords. |
+| `AllowUsers` | `gaurav` | Only named accounts can log in at all. |
+| `MaxAuthTries` | `3` | Fewer attempts per connection (default 6). |
+| `X11Forwarding` | `no` | One less feature exposed. |
+
+**Who can reach sshd** is three tools:
+
+- <Term w="ufw">"Uncomplicated Firewall", Ubuntu's friendly front end to the Linux packet filter. You write rules like "allow anything that arrives on interface tailscale0" and it drops the rest.</Term> lets you say "accept SSH only from the tailnet and the home LAN".
+- <Term w="fail2ban">A daemon that watches login logs and, when one address fails too many times, adds a firewall rule banning it for a while.</Term> stops a single address from hammering. Recent OpenSSH (9.8+) has a smaller built-in version of this, `PerSourcePenalties`. On a server only reachable over Tailscale, fail2ban matters much less, because the bots can't reach it.
+- <Term w="unattended-upgrades">An Ubuntu/Debian package that installs security updates automatically every day. Cheap insurance against the next regreSSHion.</Term> means the next sshd bug is patched before you read about it.
+
+### Why the cafe can't see your house
+
+Now the networking half. Why couldn't you reach the server from outside before Tailscale?
+
+Your ISP gives your house *one* public <Term w="IPv4 address">A 32-bit number like 203.0.113.9 that routers use to deliver packets. There are only about 4.3 billion, far fewer than devices, which is the root of everything in this section.</Term>. Your laptop, phone, TV and server all share it. Inside the house, the router hands out <Term w="private address">Addresses from ranges reserved for local networks (10.x, 172.16-31.x, 192.168.x). Every home reuses the same ones, so they mean nothing on the public internet and routers there won't deliver to them.</Term>es like `192.168.1.50`. The router does <Term w="NAT">Network Address Translation. The router rewrites outgoing packets to come from its one public address and a port it picks, remembers that mapping, and rewrites replies back. It lets many devices share one public IP.</Term>.
+
+<Figure n="004" title="NAT: OUT IS EASY, IN IS DROPPED" caption="Going out, the router rewrites the source and writes a note. A reply that matches a note gets in. A packet that matches no note, like a cafe laptop trying to start a connection, has nowhere to go and is dropped.">
+<svg viewBox="0 0 600 250" role="img" aria-label="NAT rewriting outbound traffic and dropping unsolicited inbound traffic">
+  <rect x="20" y="40" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="80" y="58" text-anchor="middle" class="strong">SERVER</text>
+  <text x="80" y="74" text-anchor="middle">192.168.1.50</text>
+  <rect x="240" y="30" width="120" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="300" y="54" text-anchor="middle" class="strong">HOME ROUTER</text>
+  <text x="300" y="70" text-anchor="middle">LAN 192.168.1.1</text>
+  <text x="300" y="86" text-anchor="middle">WAN 203.0.113.9</text>
+  <rect x="460" y="40" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="520" y="58" text-anchor="middle" class="strong">GITHUB.COM</text>
+  <text x="520" y="74" text-anchor="middle">140.82.x.x:443</text>
+
+  <line x1="140" y1="56" x2="240" y2="56" class="blue" stroke-width="1.5" />
+  <text x="190" y="50" text-anchor="middle" class="blue-t">FROM .50:41000</text>
+  <line x1="360" y1="56" x2="460" y2="56" class="blue" stroke-width="1.5" />
+  <text x="410" y="50" text-anchor="middle" class="blue-t">FROM .9:52311</text>
+  <line x1="460" y1="74" x2="360" y2="74" class="ink" stroke-width="1" />
+  <text x="410" y="88" text-anchor="middle">REPLY TO .9:52311 ✓</text>
+
+  <rect x="200" y="110" width="200" height="40" class="fill-paper" stroke-width="1" />
+  <text x="300" y="126" text-anchor="middle" class="strong">NAT TABLE</text>
+  <text x="300" y="142" text-anchor="middle">.50:41000 ⇄ :52311 ⇄ 140.82.x.x:443</text>
+
+  <rect x="460" y="180" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="520" y="198" text-anchor="middle" class="strong">CAFE LAPTOP</text>
+  <text x="520" y="214" text-anchor="middle">→ 203.0.113.9:22</text>
+  <line x1="460" y1="202" x2="372" y2="202" class="ink" stroke-width="1.5" />
+  <line x1="360" y1="194" x2="376" y2="210" class="ink" stroke-width="2" />
+  <line x1="376" y1="194" x2="360" y2="210" class="ink" stroke-width="2" />
+  <text x="350" y="206" text-anchor="end">NO NOTE: TO WHICH DEVICE? DROP</text>
+</svg>
+</Figure>
+
+When the server opens a connection outward, the router rewrites it and keeps a note, so replies find their way back. When your laptop at the cafe sends a packet to `203.0.113.9:22`, the router has no note for it. Which of the five devices in the house is it for? It doesn't know, so it drops the packet. That's not a firewall rule you set; it's simply how NAT works, and it's accidentally one of the best security features a home network has.
+
+It can be worse. Many ISPs, especially mobile and some fiber providers, put your *router* behind another NAT of their own, called <Term w="CGNAT">Carrier-Grade NAT. The ISP shares one public address between many customers, so your router's "public" WAN address is itself a private one, usually in 100.64.0.0/10. You can't port-forward through a NAT you don't control.</Term>. If the WAN address on your router's status page differs from what `curl ifconfig.me` reports, you're behind one.
+
+### The old fix: port forwarding, and why it's risky
+
+The classic fix is a <Term w="port forward">A rule you add on the router: "any packet arriving at my public address on port X, send to this LAN device on port Y". It turns the router's accidental protection off for that port.</Term>: "anything arriving at `203.0.113.9:22` goes to `192.168.1.50:22`". Now the cafe laptop can connect.
+
+So can everyone else. Bots continuously scan every IPv4 address on common ports; a fresh server with port 22 open typically logs its first password guesses within minutes to hours (measure it yourself if you dare: `journalctl -u ssh | grep -c 'Invalid user'`). They read your exact OpenSSH version from the hello line in step 2 and know which bugs it has. Every hardening step in the last section suddenly matters a great deal more, and it does nothing against an sshd bug that strikes before login, like regreSSHion. Port forwarding also doesn't work at all behind CGNAT, and breaks when your ISP changes your public address.
+
+### WireGuard: a tunnel made of public keys
+
+Tailscale is built on <Term w="WireGuard">A VPN protocol (Donenfeld, 2017) that sends IP packets, encrypted, inside UDP packets. Each device is identified by a Curve25519 public key. It's small enough to audit and in the Linux kernel since 5.6 (2020).</Term>. The idea fits in a paragraph. Each device has a key pair. Each device has a list of peers: "this public key, reachable at this IP:port, allowed to use these inside addresses". When your laptop wants to send a packet to the server's inside address, WireGuard encrypts the *whole IP packet* with keys derived from both sides' key pairs, puts it inside a <Term w="UDP">The bare-bones transport: send a packet to an address and port, with no connection, no retries and no ordering. WireGuard wants exactly that and does its own reliability-free encryption on top.</Term> packet, and sends it to the peer's real address. The peer decrypts it and hands the inner packet to its kernel as if it had arrived on a network card.
+
+That network card is a virtual one: `tailscale0` on Linux, a `utun` device on macOS. To every program on the machine, including sshd, it's just another interface with an address. This is why sshd needed no changes to work over Tailscale. It's listening on `0.0.0.0:22`, which includes the Tailscale interface.
+
+Three properties worth knowing:
+
+- **Silent to strangers.** A WireGuard device doesn't respond to anything that isn't correctly encrypted for it by a known public key. A scanner gets no reply at all, not even "go away".
+- **Small overhead.** Each packet gains a 16-byte header and a 16-byte authentication tag, and the inner packet is padded to a multiple of 16 bytes. Plus the outer IP and UDP headers (28 bytes on IPv4). You'll measure this.
+- **Cheap handshakes.** Keys are re-agreed every couple of minutes with a one-round-trip handshake, so a stolen session key is useful only briefly.
+
+What WireGuard doesn't do is the hard part of your setup: it needs to *know* the peer's public key and real address in advance, and it needs packets to actually arrive. Both devices are behind NAT. Neither knows the other's key, and neither router will let the other in.
+
+### Tailscale: a phone book plus a lock-picking kit
+
+Tailscale splits into two planes.
+
+The <Term w="control plane">The part of a system that decides and configures (who exists, who may talk to whom, which keys) as opposed to the data plane, which carries the actual traffic.</Term> is Tailscale's <Term w="coordination server">Tailscale's central service. Devices log in to it, upload their public keys and their candidate addresses, and download the list of their peers. It never sees private keys and never carries your traffic.</Term>. When `tailscaled` (the daemon on each device) starts, it makes a WireGuard key pair, keeps the private half on the device, logs in with your Google/GitHub identity, and uploads its public key. The control server assigns it a stable address like `100.101.102.103` and sends back a map: every peer you're allowed to talk to, with their public keys, addresses and candidate endpoints. Every device keeps a connection open to the control server, so when something changes, the new map is pushed out.
+
+The <Term w="data plane">The part that carries the actual packets. In Tailscale, that's WireGuard between your devices, directly or via a relay.</Term> is WireGuard, device to device. Your SSH traffic goes from laptop to server, not through the control server. That's the answer to "can Tailscale read it?": the control server only ever had public keys, and the traffic is encrypted with private keys it never saw. (What you *are* trusting Tailscale with is the phone book. A malicious control server could hand your laptop a fake peer key. Tailscale has a feature called Tailnet Lock for people who want to remove that trust; check its docs.)
+
+That leaves getting through two NATs. Here's the trick.
+
+### Hole punching
+
+Remember the NAT rule: a packet gets in only if it matches a note the router wrote when something inside sent a packet out. So: get *both* sides to send a packet out to each other at about the same time. Each router writes a note "I sent to that address, replies are welcome". Each side's packet then arrives at the other router looking like a reply.
+
+For that, each side needs to know its own public address and port, which it can't see from inside. It asks a <Term w="STUN">Session Traversal Utilities for NAT. A server that answers one question: "from where I sit, what address and port did your packet come from?" That tells a device what its NAT turned it into.</Term> server. Tailscale's relay servers double as STUN servers. Step through it:
+
+<Figure n="005" title="TWO ROUTERS, ONE HOLE PUNCH" caption="Each router keeps a list of conversations it started. Step through to see the punch succeed. Then switch the home router to a hard NAT and watch it fail.">
+<SSHHolePunch />
+</Figure>
+
+The "hard" case is a NAT that picks a new public port for every destination (sometimes called a symmetric NAT, common on corporate and some carrier networks). What STUN reported is the port it uses *towards STUN*, which is useless for anyone else. Tailscale has extra tricks for when only one side is hard (David Anderson's "How NAT traversal works", in Go Deeper, is the classic explanation), but when both sides are hard, a direct path may be impossible.
+
+<Predict id="netcheck-hard">
+`tailscale netcheck` prints a line `MappingVariesByDestIP: ...`. Based on the figure, what does `true` mean, and what would you expect `tailscale ping` to say to a peer if both you and the peer show `true`?
+<Fragment slot="answer">
+
+`MappingVariesByDestIP: true` means your NAT gives you a different public port for different destinations: Tailscale's netcheck compares what several STUN servers saw. That's the hard NAT in the figure. If both ends are hard, hole punching usually fails, so `tailscale ping` keeps answering `via DERP(...)` and never upgrades to a direct `via ip:port`. On my Mac at home the line read `false`, the easy kind.
+
+</Fragment>
+</Predict>
+
+### DERP: the relay when punching fails
+
+When no direct path works, Tailscale falls back to a <Term w="DERP">Designated Encrypted Relay for Packets. Tailscale-run servers around the world that forward already-encrypted WireGuard packets between devices, over HTTPS (TCP 443) so they work even on networks that block UDP. They route by public key and can't decrypt anything.</Term> server. Each device keeps a connection to its nearest DERP region. The laptop wraps its WireGuard packet with "deliver to public key X" and sends it to DERP; DERP passes it down the server's open connection. Both connections are outgoing from each house's point of view, so no NAT ever has to accept anything unexpected.
+
+DERP can see which device keys talk to which, when, and how much. It can't see what's inside: the WireGuard encryption is end to end, and DERP never had the private keys. The cost is a detour. If you and the server are in the same city and the relay is a few hundred miles away, every round trip now travels to the relay and back. And relays have limited bandwidth per connection, so big `rsync`s are slower.
+
+Tailscale actually starts *every* new connection via DERP, because it works immediately, while it tries hole punching in the background. As soon as a direct path answers, it quietly switches. That's why the first `tailscale ping` to a peer often says `via DERP` and the next one says `via 203.0.113.9:41641`.
+
+Now put it all together. Toggle between the three ways of reaching the server and look at what each hop on the path can see:
+
+<Figure n="006" title="THREE WAYS HOME" caption="Same laptop, same server, three paths. Watch the cafe wire and the scan bots. Only the port forward lets strangers reach sshd; only DERP routes your packets through someone else's machine, still encrypted." wide>
+<SSHPaths />
+</Figure>
+
+<Predict id="double-encryption">
+In "Tailscale direct" mode, your SSH session is encrypted twice: once by SSH, once by WireGuard. Is that wasteful? Which one could you drop, and what would you lose?
+<Fragment slot="answer">
+
+It costs a little CPU, nothing you'll notice at keyboard speeds or even at hundreds of MB/s on modern CPUs. Each layer protects something different. WireGuard protects the packet between two *devices* and hides even that it's SSH. SSH authenticates *you as a user* to *that sshd*, and stays secure if the tunnel isn't there (on the home LAN, or if a device on your tailnet is compromised and someone on it is snooping). You could drop SSH's encryption only by switching to plain telnet over the tailnet, which nobody should do. Tailscale SSH (below) drops SSH's *authentication* layer, replacing keys with your Tailscale identity, but still encrypts.
+
+</Fragment>
+</Predict>
+
+### The rest of the Tailscale toolkit
+
+- **100.x addresses.** Tailscale hands out addresses from 100.64.0.0/10, the same range ISPs use for CGNAT. That sounds odd, but it's chosen precisely because it's unlikely to collide with your home LAN (192.168.x) or office network (10.x). Each device also gets an IPv6 address in `fd7a:115c:a1e0::/48`.
+- **<Term w="MagicDNS">Tailscale's built-in name server. Each device on your tailnet gets a name (homeserver, and a full name like homeserver.tail1234.ts.net), and tailscaled answers lookups for them at 100.100.100.100.</Term>.** It's why `ssh homeserver` works without you writing any IP down.
+- **ACLs.** By default every device on your tailnet can reach every other one on every port. The policy file in the admin console (newer docs call the rules "grants") lets you say things like "my phone can reach the home server on 443 only". Worth setting once you share the tailnet with anyone, or put an untrusted device on it.
+- **Tailscale SSH.** `sudo tailscale set --ssh` on the server makes `tailscaled` itself answer port 22 on the Tailscale address and log you in based on your tailnet identity and an `ssh` rule in the policy file. No `authorized_keys` to manage. The trade: your login now depends on your Tailscale (and Google/GitHub) account security, instead of a key file on your laptop. Your normal sshd keeps working on the LAN. Check the docs for exact flags; this area changes.
+- **Key expiry.** Device keys expire after 180 days by default, and the device drops off the tailnet until you log in again. For a headless server that's a nasty surprise; disable key expiry for it in the admin console.
+
+## Build It
+
+You'll do this on the home server (Ubuntu or Debian assumed; adjust package commands otherwise), your Mac, and the Spark. **Before touching sshd or the firewall, open a second SSH session to the server and leave it open.** An existing session survives a bad config; a new one might not. If you can, also have a keyboard and screen on the server, or at least be on the home LAN.
+
+<Task id="t0" title="Look at what you already have" agent="ok">
+
+On the server:
+
+```bash
+ssh -V; dpkg -s openssh-server | grep '^Version'   # OpenSSH version
+systemctl status ssh --no-pager | head -5   # service (or ssh.socket on newer Ubuntu)
+sudo ss -tlnp | grep ':22'                  # who listens, on which addresses
+ls /etc/ssh/sshd_config.d/                  # drop-in files read before the main config
+sudo sshd -T | grep -Ei '^(passwordauthentication|kbdinteractiveauthentication|permitrootlogin|pubkeyauthentication|maxauthtries|allowusers|x11forwarding)'
+ip -br addr                                 # interfaces: find the physical one and tailscale0
+tailscale ip -4
+```
+
+On the Mac:
+
+```bash
+ls -l ~/.ssh/
+ssh -G home 2>/dev/null | grep -E '^(hostname|user|port|identityfile)'
+```
+
+Write down: the OpenSSH version, whether password auth is currently on, which drop-in files exist, the physical interface's name (something like `eth0`, `enp3s0`, `wlan0`), and the server's 100.x address.
+
+</Task>
+
+<Task id="t1" title="Keys only: make and install an Ed25519 key" agent="hands">
+
+If `~/.ssh/id_ed25519` doesn't already exist on the Mac, make one with a passphrase. Install the public half on the server with `ssh-copy-id`, then prove the key works on its own by forcing ssh to use *only* that key and *no* passwords:
+
+```bash
+ssh -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no \
+    -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519 gaurav@homeserver true && echo KEY OK
+```
+
+Only move on when that prints `KEY OK`. Then open `~/.ssh/authorized_keys` on the server and read it. Is there anything in there you don't recognise? Every line is a key that can log in as you.
+
+Last, verify the host key the honest way: print the server's fingerprint on the server (`ssh-keygen -lf ...`, see above) and compare it with the line ssh printed the first time, or with `ssh-keygen -lF homeserver` on the Mac (that searches your known_hosts). If known_hosts is hashed and has entries under both the name and the 100.x address, both should match.
+
+</Task>
+
+<Task id="t2" title="Audit and harden sshd" agent="review">
+
+Write your own drop-in file. Name it so it sorts *before* any other file in `sshd_config.d/` (for example `10-hardening.conf`), because the first value wins. Use the settings table in The Idea, decide on each one yourself, and add a comment saying why.
+
+```text
+# /etc/ssh/sshd_config.d/10-hardening.conf
+# (your settings here, one per line, each with a comment)
+```
+
+Then the safe apply sequence:
+
+```bash
+sudo sshd -t && echo SYNTAX OK               # test before restarting
+sudo systemctl reload ssh                    # existing sessions stay up
+sudo sshd -T | grep -Ei 'passwordauth|kbdinteractive|permitroot|allowusers|maxauthtries'
+```
+
+Now prove it, from the Mac, in a *new* terminal:
+
+```bash
+ssh -o PubkeyAuthentication=no home true     # should fail: Permission denied (publickey)
+ssh home true && echo STILL IN               # should succeed
+```
+
+When I did this against a throwaway sshd on my Mac, the password attempt ended with `Permission denied (publickey).`, which is the server saying "public key is the only method I offer". Have an agent review your file and the `sshd -T` output: ask it to look for a setting that's being overridden by another file.
+
+</Task>
+
+<Task id="t3" title="Firewall, fail2ban, automatic updates" agent="explain">
+
+Set up ufw so SSH is reachable only over the tailnet and the home LAN. Write the rules yourself; the shape is "deny incoming by default, allow outgoing, allow anything on the Tailscale interface, allow port 22 from the LAN subnet". Tailscale's own ufw guide also allows UDP on its port (41641 by default) so peers can reach it directly; read it and decide. Before `sudo ufw enable`, print the rules with `sudo ufw show added` and read them out loud. Then, from your still-open second session, check you can open a third.
+
+Then:
+
+```bash
+sudo apt install fail2ban unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades     # answer Yes
+cat /etc/apt/apt.conf.d/20auto-upgrades             # both lines should be "1"
+sudo fail2ban-client status sshd
+```
+
+Ubuntu and Debian enable a default `sshd` jail. If fail2ban complains it can't find a log file, your system logs only to the journal; put `backend = systemd` under `[sshd]` in `/etc/fail2ban/jail.local` (check the fail2ban docs for your version). An agent may explain any ufw or fail2ban errors, but write the rules yourself.
+
+</Task>
+
+<Task id="t4" title="Write ~/.ssh/config for home and the Spark" agent="hands">
+
+Write a config on the Mac so that `ssh home` and `ssh spark` work with no flags, and `ssh spark` reuses one connection for repeated commands. Start from this shape and fill in the parts in angle brackets:
+
+```text
+Host home
+  HostName <tailscale name of the home server>
+  User <you>
+
+Host spark
+  HostName <tailscale name of the Spark, or its LAN IP>
+  User <you>
+  # if the Spark is NOT on your tailnet but is on the home LAN:
+  # ProxyJump home
+
+Host *
+  IgnoreUnknown UseKeychain
+  UseKeychain yes
+  AddKeysToAgent yes
+  IdentityFile ~/.ssh/id_ed25519
+  ServerAliveInterval 30
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-%C
+  ControlPersist 10m
+```
+
+Look up each `Host *` line in `man ssh_config` and be able to say what it does. The last three are <Term w="connection multiplexing">Reusing one already-authenticated SSH connection for new sessions. The first ssh does the full handshake; later ones open a new channel inside it and skip the handshake entirely.</Term>, and you'll measure what they buy you. Check your work with `ssh -G spark | grep -E '^(hostname|user|proxyjump|controlpath)'`.
+
+If you add `ProxyJump home` and it works, run `ssh -v spark true 2>&1 | grep -i 'jump\|Authenticated'` and find the two separate authentications.
+
+</Task>
+
+<Task id="t5" title="Reach Jupyter on the Spark with -L" agent="hands">
+
+On the Spark, start Jupyter bound only to loopback, so nothing on any network can reach it directly:
+
+```bash
+jupyter lab --no-browser --ip 127.0.0.1 --port 8888
+```
+
+From the Mac, write the one `ssh` command (with `-N` so it doesn't open a shell) that makes `http://localhost:8888` on the Mac reach it. Then move that forward into your `Host spark` block with `LocalForward`, so plain `ssh spark` brings Jupyter along.
+
+Prove what's going on:
+
+```bash
+lsof -nP -iTCP:8888 -sTCP:LISTEN     # on the Mac: who is listening? (it should be ssh)
+curl -sI http://<spark-100.x-address>:8888 | head -1   # direct: should fail, Jupyter is loopback-only
+```
+
+I tested the same pattern on my Mac against a local sshd: a Python web server on `127.0.0.1:8899`, forwarded with `ssh -f -N -L 9999:127.0.0.1:8899`, answered `200` at `localhost:9999`.
+
+</Task>
+
+<Task id="t6" title="See WireGuard on the wire" agent="explain">
+
+This is the one that turns Tailscale from magic into packets. Three windows: two on the home server, one on the Mac.
+
+```bash
+# Mac
+tailscale netcheck
+tailscale status
+tailscale ping homeserver        # repeat a few times
+```
+
+```bash
+# server, window 1: inside the tunnel
+sudo tcpdump -ni tailscale0 -c 20 tcp port 22
+```
+
+```bash
+# server, window 2: the physical wire (use your interface name from t0)
+sudo tcpdump -ni <eth0> -c 20 udp and not port 53
+```
+
+Now from the Mac, open a fresh `ssh home` (with `-o ControlMaster=no` so it doesn't reuse a multiplexed connection) and type a few characters.
+
+In window 1 you'll see an ordinary-looking TCP connection to port 22 from your laptop's 100.x address: a SYN, then a stream of packets. Their payload is SSH-encrypted, but the TCP headers are readable, because inside the tunnel it's just TCP. In window 2 you'll see *no* TCP port 22 at all, only UDP packets between two public (or LAN) addresses, usually with port 41641 on at least one side. Same moment, same number of packets, different disguise.
+
+Write the `length` from a few matching packets in each window into the table in Measure. If the laptop is relayed, window 2 shows nothing for it: the traffic is TCP 443 to a DERP server. Try `sudo tcpdump -ni <eth0> -c 20 tcp port 443` instead, and check `tailscale status` for the word `relay`.
+
+You'll likely see more packets than keystrokes, even when you type slowly. That's OpenSSH (9.5 and newer) sending fake "chaff" packets while you type, so an eavesdropper can't time your keystrokes. An agent may explain any line of tcpdump output; don't let it run the capture for you.
+
+</Task>
+
+<Task id="t7" title="Serve this Workbench site to your tailnet" agent="ok">
+
+Build the site on the Mac and copy it to the home server with rsync over your new `home` alias:
+
+```bash
+npm run build                                       # in the workbench repo, writes dist/
+rsync -avz --delete dist/ home:~/workbench-site/
+```
+
+On the server, serve it on the Tailscale address only:
+
+```bash
+python3 -m http.server 4321 --directory ~/workbench-site --bind "$(tailscale ip -4)"
+```
+
+Open `http://homeserver:4321/` on your phone with Tailscale on, then with Tailscale off (it should fail). Then make it survive reboots with a small systemd service (an agent can write the unit file). Note the bind address trap: if the service starts before tailscaled has brought up its address, binding to the 100.x address fails. Add `After=tailscaled.service` and `Restart=on-failure`, or bind to `0.0.0.0` and let ufw keep it to the tailnet.
+
+Optional: `tailscale serve` can put a real HTTPS address (`https://homeserver.<tailnet>.ts.net`) in front of a local port, still tailnet-only, and `tailscale funnel` can expose it to the public internet through Tailscale's servers. Their command syntax has changed across versions, so check `tailscale serve --help` and the docs before using them. Think hard before Funnel: that's a public door again, just one Tailscale holds open for you.
+
+</Task>
+
+<DoneWhen>
+
+- `ssh home` and `ssh spark` work with no flags, and `ssh -o PubkeyAuthentication=no home` is refused.
+- `sudo sshd -T` on the server shows password and keyboard-interactive auth off, root login off, and you know which file set each value.
+- ufw is enabled, and you can still get in over Tailscale from outside the house.
+- Jupyter on the Spark opens at `localhost:8888` on your Mac, and you can explain why the direct 100.x URL fails.
+- You've seen the same SSH session as TCP on `tailscale0` and as UDP on the physical interface, and filled in the Measure table.
+- Your phone opens the Workbench site over the tailnet, and doesn't without Tailscale.
+
+</DoneWhen>
+
+## Measure
+
+| Measurement | How | Prediction | Yours |
+| --- | --- | --- | --- |
+| `tailscale ping`, first pong | Mac, first ping after `tailscale down && tailscale up` | | |
+| `tailscale ping`, after upgrade | same, later pongs | | |
+| Path in `tailscale status` | direct (ip:port) or relay ("region") | | |
+| `MappingVariesByDestIP` | `tailscale netcheck`, home and cafe/phone hotspot | | |
+| Nearest DERP and its latency | `tailscale netcheck` | | |
+| `ssh home true`, fresh | `time ssh -o ControlMaster=no home true`, 5 runs | | |
+| `ssh home true`, multiplexed | `time ssh home true` with ControlMaster up | | |
+| Packet length, `tailscale0` | tcpdump, a keystroke packet | | |
+| Same packet, physical NIC | tcpdump, the matching UDP | | |
+
+Reference points from my machines, and what yours should look like:
+
+**netcheck.** On my Mac on home Wi-Fi: `UDP: true`, `MappingVariesByDestIP: false`, nearest DERP Seattle at 8.3 ms, San Francisco about 32 ms. Your list will be different; what matters is the nearest one and whether mapping varies. Try it again on a phone hotspot: mobile carriers are where you're most likely to see CGNAT and `true`.
+
+**tailscale ping.** Expect the first pong `via DERP(<region>)` with a latency of roughly (you → relay) + (relay → server), then within a few pings a pong `via <ip>:<port>` at roughly your real network round trip. On the same LAN that's a millisecond or two; across a city, often 5-20 ms. If it never upgrades, look at netcheck on *both* ends.
+
+**SSH connect time.** On my Mac against a local sshd over loopback (zero network delay), a fresh `ssh ... true` took a median of 42 ms over 10 runs, and a multiplexed one 10 ms. That 42 ms is process startup plus the crypto. Over a real network, a fresh connection adds several round trips on top: TCP, the hello and menus, the key exchange, the auth request and the signature, opening the channel. Count about 6-8 round trips (approximate; some messages overlap). So over a 20 ms path, expect a fresh connection around 42 + 7 × 20 ≈ 180 ms, while the multiplexed one stays near one round trip plus the 10 ms. Through DERP at, say, 40 ms round trip, fresh connections cross 300 ms. This is exactly the [latency ladder](/lessons/latency-numbers/): a handshake is a stack of round trips, and round trips are set by distance.
+
+**Packet length.** WireGuard's data packet is a 16-byte header, the inner IP packet padded up to a multiple of 16, and a 16-byte tag. tcpdump's `UDP, length N` is that whole thing. So for an inner packet of length L on `tailscale0`, predict N = 32 + (L rounded up to a multiple of 16) on the physical interface. Check it on three packets. The outer IPv4 and UDP headers add another 28 bytes on the actual wire, which is why Tailscale uses a smaller MTU (1280) on its interface: so the bigger outer packet still fits on normal networks.
+
+## Break It
+
+**1. Lock yourself out (safely).** In your second, still-open session, add `AllowUsers nobody` to your drop-in, `sshd -t`, reload, and try a new connection. Denied, even with the right key. Your existing session is still alive, because each connection has its own sshd child that already finished auth. Remove the line and reload. This is the reason for "always keep a second session open", and the reason `sshd -t` exists.
+
+**2. Be overridden.** Create `/etc/ssh/sshd_config.d/05-oops.conf` containing `PasswordAuthentication yes`, reload, and check `sudo sshd -T | grep passwordauth`. Your `10-hardening.conf` says `no`, but `05` sorts first and wins. Now try a password login from the Mac (`ssh -o PubkeyAuthentication=no home`): it offers a password prompt. Delete the file and reload. This is how a single cloud-init file quietly undoes hardening on real servers.
+
+**3. Force the relay.** On the server, temporarily block outgoing UDP except DNS, so hole punching can't work: `sudo iptables -I OUTPUT -p udp ! --dport 53 -j DROP`. (Do this from the LAN or with a console handy; your SSH session over Tailscale will stall for a few seconds while it fails over.) Watch `tailscale ping homeserver` from the Mac: direct pongs stop, and it falls back to `via DERP`. Time `rsync` of a 500 MB file both ways: direct, then relayed. Then remove the rule with `sudo iptables -D OUTPUT -p udp ! --dport 53 -j DROP`. You've just seen why DERP is a fallback, not the plan.
+
+**4. Change the host key.** On the server, move the Ed25519 host key aside and generate a new one (`sudo mv /etc/ssh/ssh_host_ed25519_key{,.bak}`, same for `.pub`, then `sudo ssh-keygen -A` and reload). Connect from the Mac and read the full warning. Now do the right thing: compare the new fingerprint on the server, remove the old line with `ssh-keygen -R homeserver` (and the 100.x address), reconnect, accept. Or restore the backup and watch the warning disappear. Either way, you've now seen the scary message for an innocent reason, and know exactly how to tell.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Walk me through what happens when you type `ssh home`.</summary>
+
+ssh reads `~/.ssh/config`, resolves `home` to the server's name, and MagicDNS turns that into its 100.x address. The packet goes to the Tailscale interface, tailscaled encrypts it with WireGuard and sends it as UDP straight to the server's real address (or via a DERP relay). On the server, it's decrypted and arrives at sshd on port 22 like any TCP connection. Then SSH itself: both sides send version strings and algorithm menus, do an elliptic-curve Diffie-Hellman exchange to get a shared secret, and the server signs the exchange with its host key, which my laptop checks against known_hosts. Then I authenticate: my laptop offers my public key, the server finds it in authorized_keys, my laptop signs the session ID with the private key (via ssh-agent), and the server verifies. Finally it opens a session channel, requests a pty and a shell, and my keystrokes flow encrypted inside that channel.
+
+</details>
+
+<details>
+<summary>2. Why are SSH keys better than passwords? What does the host key protect against?</summary>
+
+A password can be guessed, and the server sees it, so if you ever connect to an impostor it's stolen. With a key pair, the private key never leaves my machine; the server only gets a signature, and that signature covers this specific session's ID, so it can't be replayed anywhere. Keys have about 128 bits of strength, so guessing is hopeless, and each device's key can be revoked by deleting one line. The host key protects the other direction: it lets my laptop prove the server is the one it talked to last time, so a man-in-the-middle can't do the key exchange with me while pretending to be my server. That's why a changed host key is a warning, not a footnote.
+
+</details>
+
+<details>
+<summary>3. Why can't you reach your home server from a cafe without Tailscale, and why is port forwarding risky?</summary>
+
+The house has one public IPv4 address shared by every device through NAT. The router only lets in packets that match a connection something inside started. A new connection from the cafe matches nothing, so the router doesn't know which device it's for and drops it. Sometimes the ISP adds a second NAT (CGNAT), so you don't even have a public address. Port forwarding adds a rule sending port 22 to the server, but it does that for everyone: bots scan the whole internet constantly, read your sshd version, try passwords, and can exploit pre-login bugs like regreSSHion. Your sshd becomes your attack surface.
+
+</details>
+
+<details>
+<summary>4. How does Tailscale get through two NATs without any port forwarding? What can Tailscale's servers see?</summary>
+
+Each device makes a WireGuard key pair and registers its public key with the coordination server, which hands every device a list of peers' public keys and candidate addresses. Each device learns its own public address by asking a STUN server. Then both send UDP packets to each other's public address at about the same time; each NAT writes a note for the outgoing packet, so the other side's packet looks like a reply and gets in. That's hole punching. If a NAT changes ports per destination, it can fail, and Tailscale relays the encrypted packets through a DERP server over HTTPS. It starts on DERP and upgrades to direct when it can. The coordination server sees public keys, addresses and who's on the tailnet; DERP sees which keys talk, when and how much. Neither has the private keys, so neither can read the traffic.
+
+</details>
+
+<details>
+<summary>5. How does this scale? You go from 2 devices to 200 on a tailnet, or 200 engineers sharing a jump box. What breaks?</summary>
+
+Tailscale is a mesh: every device can talk to every other directly, so the control server only has to distribute keys. With N devices that's up to N(N-1)/2 possible tunnels, but WireGuard tunnels are cheap and only created when used, so the real costs are the netmap size each device downloads (it grows with N) and how fast changes propagate. Direct paths mean there's no central bandwidth bottleneck; DERP is the shared resource, so the fraction of hard-NAT devices matters. ACLs become essential, because the default "everyone reaches everything" is fine for one person and terrible for 200. On the SSH side, one shared jump box is a single point of failure and a bandwidth bottleneck, and authorized_keys files on 200 servers don't scale for adding and removing people. That's what SSH certificates (a CA signs short-lived user keys) or identity-based SSH like Tailscale SSH are for: you manage who can log in centrally, and keys expire on their own.
+
+</details>
+
+## Go Deeper
+
+- **Tailscale, "How Tailscale works"** by Avery Pennarun ([tailscale.com/blog/how-tailscale-works](https://tailscale.com/blog/how-tailscale-works)). The whole architecture, control plane vs data plane, in one long, friendly post.
+- **Tailscale, "How NAT traversal works"** by David Anderson ([tailscale.com/blog/how-nat-traversal-works](https://tailscale.com/blog/how-nat-traversal-works)). The best explanation of hole punching anywhere, including hard NATs, birthday-paradox port guessing and why DERP exists.
+- **Jason A. Donenfeld, "WireGuard: Next Generation Kernel Network Tunnel"**, NDSS 2017 (the whitepaper is at [wireguard.com/papers/wireguard.pdf](https://www.wireguard.com/papers/wireguard.pdf)). Short, readable, and explains every packet format you saw in tcpdump.
+- **RFC 4253, "The Secure Shell (SSH) Transport Layer Protocol"** and **RFC 4252, "Authentication Protocol"** (Ylönen and Lonvick, 2006). Read the key exchange section of 4253 and the public key method in 4252; you'll recognise every step of Figure 001.
+- **OpenSSH manual pages: `ssh(1)`, `ssh_config(5)`, `sshd_config(5)`** (also at [man.openbsd.org](https://man.openbsd.org/ssh_config)). The authoritative list of every option, including the "first obtained value" rule.
+- **Michael W. Lucas, _SSH Mastery_** (2nd ed., 2018). A short book covering keys, agents, forwarding, jump hosts and certificates with practical sysadmin taste.
+- **Qualys Security Advisory, "regreSSHion: RCE in OpenSSH's server" (CVE-2024-6387)**, July 2024. A real, readable account of how a pre-login sshd bug works, and why exposure matters more than config.
+- **Tailscale docs: "Tailscale SSH", "Tailscale Serve", "Tailscale Funnel", and "Using UFW to lock down an Ubuntu server"** on tailscale.com/kb. Check these for current command syntax.
+
+## Connections
+
+This lesson leans on [How slow is slow?](/lessons/latency-numbers/) (a handshake is a stack of round trips) and pairs with [TLS](/lessons/tls/), which uses the same Diffie-Hellman-plus-signature idea with certificates instead of known_hosts. [Packets and IP](/lessons/packets-and-ip/) goes deeper on addresses, routing and NAT, and [TCP vs UDP](/lessons/tcp-vs-udp/) explains why a tunnel protocol like WireGuard wants UDP underneath (tunnelling TCP inside TCP makes two layers of retries fight each other).
+
+It also sets up everything you'll do on the Spark from here on: the `-L` forward is how you'll reach the inference server in [Serving engines](/lessons/serving-engines/) and the dashboards in [Observability](/lessons/observability/) without opening anything to the network.

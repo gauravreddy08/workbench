@@ -1,0 +1,731 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import ContainerStack from '../components/figures/ContainerStack.astro';
+import ContainerCache from '../components/figures/ContainerCache.astro';
+
+## Today
+
+- Say in one sentence what a container is and what a VM is, and why the difference is about the kernel, not about GUIs.
+- Name the three Linux features a container is made of (namespaces, cgroups, a layered filesystem) and what each one does.
+- Build a working "container" by hand on the Spark with `unshare`, `chroot` and a cgroup, and watch your shell become PID 1.
+- Open a Docker image up with `tar` and see that it is just a stack of tarballs plus a JSON file, then write a Dockerfile that rebuilds in a second instead of two minutes.
+- Explain why containers start in milliseconds and VMs in seconds, why Docker on your Mac secretly runs a Linux VM, and how a container gets at the Spark's GPU.
+
+Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) (what a process is, PIDs, what the kernel keeps per process). Helpful: [Where do my variables live?](/lessons/stack-and-heap/). You need the Spark (or any Linux box where you have `sudo`) for the Build section; the Mac can't do the namespace parts. Rough time: one evening.
+
+## The Problem
+
+In the diagnostic, the question was "what's the difference between a container and a VM?" and the answer was:
+
+> A VM comes with an OS. A container doesn't... it comes but it's not a GUI, I believe.
+
+That's a very common answer, and half of it is right in an interesting way. A VM really does come with an OS. And a container really does "come with an OS, sort of": you write `FROM ubuntu:24.04` and inside the container `cat /etc/os-release` says Ubuntu. So which is it?
+
+Here is a scene that makes the confusion bite. On the Spark, run:
+
+```bash
+docker run --rm ubuntu:24.04 bash -c 'cat /etc/os-release | head -2; uname -r'
+docker run --rm alpine:3.20 sh -c 'cat /etc/os-release | head -2; uname -r'
+uname -r
+```
+
+The first says Ubuntu. The second says Alpine. And all three lines of `uname -r` print *exactly the same kernel version*: the Spark's own. Two different "operating systems", one kernel. Meanwhile, on your Mac, the same `docker run` prints a Linux kernel version, even though macOS isn't Linux at all.
+
+GUIs have nothing to do with it. Almost no server VM runs a GUI either, and you can run GUI apps in containers if you really want to. The real line is drawn somewhere much lower, at the kernel, and once you see it, a pile of things that look like Docker trivia (why images are small, why containers start instantly, why you can't run a Windows container on Linux, why "container escape" is a scary phrase, why the Spark needs special containers for PyTorch) all fall out of one picture.
+
+<Origin year="1974 / 2008" title="Two different answers to 'give everyone their own machine'">
+
+Virtual machines came first. In the 1960s IBM's CP-40 and CP-67 let one mainframe pretend to be many, so each user got a whole private (virtual) System/360 with its own OS. In 1974 Gerald Popek and Robert Goldberg wrote down exactly what a CPU must do to be virtualised efficiently. The PC's x86 chip famously failed their test, so VMware (1999) had to rewrite tricky guest instructions on the fly, until Intel (VT-x, 2005) and AMD (AMD-V, 2006) added hardware support and Linux grew KVM (2007).
+
+Containers came from the other direction: not "fake a machine", but "fence off a group of processes on a real one". Unix got `chroot` in 1979 (change what a process sees as `/`). FreeBSD jails (2000) and Solaris Zones (2004) added real fences. On Linux the pieces arrived one at a time: mount namespaces in 2002, then Google engineers Paul Menage and Rohit Seth's "process containers", renamed cgroups and merged in 2008 so Google could pack many jobs onto each machine without them starving each other. LXC (2008) glued the pieces together. Then in 2013 Solomon Hykes gave a five-minute talk at PyCon showing Docker, which added the missing piece: a simple way to *package* the files and ship them. The kernel features were already there. Docker made them usable.
+
+</Origin>
+
+## The Idea
+
+### An operating system is two things
+
+When people say "Ubuntu", they mean two very different things stuck together.
+
+The <Term w="kernel">The core of the OS: the one program that runs with full control of the hardware. It schedules processes, hands out memory, runs drivers, and does everything a program asks for through system calls.</Term> is one big program that owns the hardware. The rest is <Term w="userland">Everything that isn't the kernel: the C library, the shell, coreutils like ls and cp, Python, package managers, config files in /etc. Ordinary programs and files.</Term>: libraries, a shell, commands, config files, a package manager. Ubuntu, Debian, Alpine and Fedora all run (more or less) the same Linux kernel. What makes them different distributions is almost entirely their userland: which C library, which package manager, which versions of everything, what's in `/etc`.
+
+The two halves talk through one narrow doorway: <Term w="system calls">The fixed list of requests a program can make to the kernel: open a file, read bytes, allocate memory, start a process, open a socket. Linux has a few hundred.</Term>. When Python opens a file, it eventually executes an instruction that says "kernel, please do `openat` on this path", and the CPU jumps into kernel code. Linux promises to keep that doorway stable: a program compiled against the system calls of 2010 still runs on today's kernel. That promise is the whole trick behind containers. An Alpine `sh` doesn't care whose kernel answers its system calls, as long as it's a Linux kernel.
+
+Kitchen analogy, continued from the processes lesson: the kernel is the building (plumbing, electricity, gas lines, the landlord). Userland is the furniture and the stocked pantry. A distro is a particular furniture set.
+
+### Two ways to give an app its own world
+
+Now there are two ways to give three apps their own private worlds on one machine.
+
+**Build three fake buildings.** A <Term w="virtual machine">A complete pretend computer made in software: virtual CPU, virtual RAM, virtual disk, virtual network card. It boots its own kernel and OS, which believe they're on real hardware.</Term> gives each app pretend hardware, and on that pretend hardware it boots a whole OS: its own kernel and its own userland. Three VMs means four kernels running on your machine: the host's plus three guests.
+
+**Put three fenced-off apartments in one building.** A <Term w="container">A group of ordinary processes on the host, which the host kernel shows a restricted, private view of the system (their own files, PIDs, network) and limits in CPU and memory. No kernel of its own.</Term> is just processes running on the host's kernel, with a fence around them. The "OS" that comes with a container is only the userland half: the files. Three containers means one kernel.
+
+So the corrected version of the diagnostic answer: **a VM comes with a whole OS, including its own kernel, running on virtual hardware. A container comes with only the userland files of an OS, and borrows the host's kernel.**
+
+Play with the stack below. Hover (or tap) any box. Count the kernels in each mode. Then look at the Mac mode, which answers the puzzle from the problem section.
+
+<Figure n="001" title="COUNT THE KERNELS" caption="Every blue box is a kernel that has to be booted and kept in memory. A VM brings its own; a container brings only files and shares the one host kernel. Docker on a Mac is containers inside one hidden Linux VM, because macOS's kernel can't run Linux containers." wide>
+
+<ContainerStack />
+
+</Figure>
+
+### How a VM pretends: the hypervisor
+
+A kernel expects to be the boss of the hardware. It wants to write the CPU's page tables, catch every interrupt, and talk to the disk controller directly. If you just ran a second kernel as a normal program, the first one (rightly) wouldn't let it do any of that.
+
+A <Term w="hypervisor">The program that creates and runs virtual machines. It sits underneath (or beside) the guest kernels and decides what each one gets, the way a kernel decides for processes.</Term> solves this with help from the CPU. Modern CPUs have an extra privilege level above the kernel's. On ARM, like the Spark and your Mac, these are called exception levels: apps run at EL0, a kernel at EL1, a hypervisor at EL2. The guest kernel runs at EL1 inside its VM and does kernel-ish things freely. When it touches something it doesn't really own (a hardware register, a disk), the CPU traps to the hypervisor at EL2, which fakes the right answer and resumes the guest. The guest never knows.
+
+Hypervisors come in two classic flavours:
+
+- <Term w="type 1 hypervisor">A hypervisor that runs directly on the hardware, with no general-purpose OS underneath it. Examples: Xen, VMware ESXi, Microsoft Hyper-V.</Term>: runs on bare metal. Cloud machines (an EC2 instance, a GCP VM) live on these.
+- <Term w="type 2 hypervisor">A hypervisor that runs as an app on a normal OS. Examples: VirtualBox, VMware Fusion, Parallels, UTM on a Mac.</Term>: an app on your desktop OS.
+
+Linux's <Term w="KVM">Kernel-based Virtual Machine: a part of the Linux kernel (since 2007) that uses the CPU's virtualisation support to run guests. It turns Linux itself into a hypervisor; a user-space program, usually QEMU, supplies the fake devices.</Term> blurs the line: the Linux kernel itself becomes the hypervisor, and each VM is (from the host's point of view) one QEMU process. Run `ps` on a KVM host and each VM shows up as a process with as much memory as the guest was given. People argue about whether that's type 1 or type 2. The useful fact is the shape, not the label.
+
+What a VM costs: the guest's RAM is reserved up front (give a VM 4 GB and the host sets aside up to 4 GB), each guest kernel keeps its own caches and its own copy of every library it loaded, and starting one means booting: firmware, bootloader, kernel, probing virtual devices, starting an init system and its services. Seconds at best, often tens of seconds.
+
+What a VM buys: the strongest common isolation boundary there is, and the freedom to run any OS at all. A Windows VM on a Linux host is fine. A Windows *container* on a Linux host is impossible, because a Windows program makes Windows system calls and there's no Windows kernel to answer them.
+
+### How a container fences: three kernel features
+
+There is no such thing as a "container" object in the Linux kernel. There isn't a `create_container()` system call. A container is a normal process that was started with three separate kernel features turned on, and "Docker" is mostly a program that turns them on for you in a consistent way and ships the files.
+
+#### Feature 1: namespaces change what a process can see
+
+A <Term w="namespace">A kernel feature that gives a group of processes their own private copy of one kind of global system resource, so they see their own version and can't see anyone else's.</Term> wraps one kind of global thing in the kernel and gives a group of processes their own copy. Each kind is separate, and you can mix and match:
+
+| Namespace | What it isolates | What it looks like from inside |
+| --- | --- | --- |
+| `pid` | process IDs | your first process is PID 1; you can't see or signal host processes |
+| `mnt` | the mount table | you have your own `/`, mounting things doesn't affect the host |
+| `net` | network stack | your own interfaces, IP addresses, ports, routing table |
+| `uts` | hostname | `hostname box1` changes only your hostname |
+| `ipc` | shared memory, message queues | can't touch other processes' shared memory segments |
+| `user` | user and group IDs | you can be root (UID 0) inside while being an ordinary user (say UID 1000) outside |
+| `cgroup` | view of the cgroup tree | you see your own cgroup as the root |
+
+The PID namespace is the most striking one, and the one you'll make in the Build section. The kernel keeps one real process table. A process in a new PID namespace simply has *two* numbers: its real one on the host, and a small one inside. The inside view only shows its own subtree.
+
+<Figure n="002" title="ONE PROCESS, TWO PIDS" caption="The host sees every process with its real PID. Inside the new PID namespace, the same shell is PID 1 and its child is PID 2, and nothing above them exists. The other namespaces work the same way for mounts, network, hostname and users.">
+
+<svg viewBox="0 0 640 300" role="img" aria-label="Host process tree with a subtree that appears renumbered inside a PID namespace">
+  <text x="10" y="18" class="strong">HOST VIEW (ps -ef)</text>
+  <text x="380" y="18" class="strong">INSIDE THE BOX (ps)</text>
+  <rect x="2" y="28" width="300" height="200" class="ink" stroke-width="1" />
+  <text x="16" y="54">systemd</text><text x="290" y="54" text-anchor="end">PID 1</text>
+  <text x="32" y="82">└ sshd</text><text x="290" y="82" text-anchor="end">812</text>
+  <text x="48" y="110">└ bash</text><text x="290" y="110" text-anchor="end">4100</text>
+  <text x="64" y="138">└ unshare</text><text x="290" y="138" text-anchor="end">4120</text>
+  <rect x="70" y="150" width="226" height="68" class="fill-wash" stroke-width="1" />
+  <text x="82" y="172" class="strong">└ sh</text><text x="290" y="172" text-anchor="end" class="strong">4121</text>
+  <text x="98" y="202" class="strong">└ sleep</text><text x="290" y="202" text-anchor="end" class="strong">4130</text>
+  <rect x="372" y="150" width="262" height="68" class="fill-wash" stroke-width="1" />
+  <text x="386" y="172" class="strong">sh</text><text x="624" y="172" text-anchor="end" class="blue-t">PID 1</text>
+  <text x="402" y="202" class="strong">└ sleep</text><text x="624" y="202" text-anchor="end" class="blue-t">PID 2</text>
+  <line x1="300" y1="168" x2="370" y2="168" class="blue dash" stroke-width="1" />
+  <line x1="300" y1="198" x2="370" y2="198" class="blue dash" stroke-width="1" />
+  <text x="386" y="60">NOTHING ELSE EXISTS</text>
+  <text x="386" y="76">FROM IN HERE: NO SYSTEMD,</text>
+  <text x="386" y="92">NO SSHD, NO PID 4100.</text>
+  <text x="386" y="124" class="blue-t">SAME PROCESS, TWO NUMBERS</text>
+  <text x="10" y="258" class="strong">OTHER NAMESPACES:</text>
+  <rect x="150" y="244" width="62" height="22" class="fill-paper" stroke-width="1" /><text x="181" y="259" text-anchor="middle">MNT</text>
+  <rect x="220" y="244" width="62" height="22" class="fill-paper" stroke-width="1" /><text x="251" y="259" text-anchor="middle">NET</text>
+  <rect x="290" y="244" width="62" height="22" class="fill-paper" stroke-width="1" /><text x="321" y="259" text-anchor="middle">UTS</text>
+  <rect x="360" y="244" width="62" height="22" class="fill-paper" stroke-width="1" /><text x="391" y="259" text-anchor="middle">IPC</text>
+  <rect x="430" y="244" width="62" height="22" class="fill-paper" stroke-width="1" /><text x="461" y="259" text-anchor="middle">USER</text>
+  <rect x="500" y="244" width="72" height="22" class="fill-paper" stroke-width="1" /><text x="536" y="259" text-anchor="middle">CGROUP</text>
+  <text x="150" y="288">EACH ONE: A PRIVATE COPY OF ONE GLOBAL THING</text>
+</svg>
+
+</Figure>
+
+You can see a process's namespaces as files: `ls -l /proc/<pid>/ns/` shows one symlink per namespace, with an ID number. Two processes are in the same namespace exactly when those numbers match. `docker exec` is, at heart, "start a new process and join it to the namespaces of that existing one" (the `setns` system call, or the `nsenter` command).
+
+Being PID 1 is a special job, and it bites people. On a normal Linux box PID 1 is `systemd`, which adopts orphaned processes and handles signals carefully. In a container, PID 1 is usually *your app*, which was never written to do that job. You'll break this on purpose later.
+
+#### Feature 2: cgroups limit what a process can use
+
+Namespaces control what you can *see*. They don't stop you using all 128 GB of RAM or every core. That's the job of a <Term w="cgroup">Control group: a kernel feature that puts processes into a named group and enforces limits on the group's resources (CPU time, memory, I/O, number of processes), and counts what they used.</Term>.
+
+On modern Linux (cgroup version 2, which DGX OS / Ubuntu uses), cgroups are a filesystem at `/sys/fs/cgroup`. Making a group is `mkdir`. Setting a limit is writing a number into a file. Putting a process in the group is writing its PID into `cgroup.procs`. Its children inherit the group. The files you'll use:
+
+- `memory.max`: hard limit in bytes. Go over it and the kernel reclaims memory from the group, and if it can't, the <Term w="OOM killer">Out-of-memory killer: the part of the kernel that, when memory runs out (globally or inside a cgroup), picks a process and kills it with SIGKILL to free memory.</Term> kills a process in the group. This is what "container was OOMKilled" means in Kubernetes, and what `docker run --memory 4g` sets.
+- `cpu.max`: two numbers, a quota and a period in microseconds. `50000 100000` means "at most 50 ms of CPU time every 100 ms", which is half a core. `docker run --cpus 0.5` writes exactly that.
+- `memory.current`, `cpu.stat`, `memory.events`: what the group actually used, and how many times it hit the limit or got OOM-killed.
+
+Note the important difference from a VM. A VM with 4 GB *has* 4 GB of pretend RAM, reserved. A container with `memory.max` of 4 GB has a *ceiling*; if it uses 200 MB, it costs 200 MB and the rest is free for everyone else.
+
+#### Feature 3: a layered filesystem gives it files
+
+The last piece is the files: the "Ubuntu" or "Alpine" that comes with the container. The oldest trick is <Term w="chroot">"Change root": a system call (from 1979 Unix) that makes a process see a chosen directory as /. It changes only the filesystem view; a root process can escape it.</Term>: point a process at a directory full of an OS's userland, and tell it "this is `/` now". Modern runtimes use the sturdier cousin `pivot_root` inside a mount namespace, but the idea is the same: the container's `/` is just some directory on the host.
+
+But copying a whole 120 MB Python image into a fresh directory for every container would be slow and wasteful. So images are made of read-only <Term w="layers">Read-only snapshots of filesystem changes, each one a tarball of the files added, changed or deleted by one build step. An image is a stack of them.</Term>, stacked with a <Term w="union filesystem">A filesystem that shows several directories stacked on top of each other as one merged directory; a file in a higher layer hides the same path in lower ones.</Term>. On Linux that's <Term w="overlayfs">The union filesystem built into the Linux kernel (since 3.18, 2014). Takes read-only "lower" directories and one writable "upper" directory and presents a merged view.</Term>:
+
+- Each image layer is a read-only directory (the "lower" layers).
+- Each running container gets one empty, writable directory on top (the "upper").
+- Reads fall through the stack and find the topmost copy of each file.
+- Writing to a file from a lower layer first copies it up into the upper layer (<Term w="copy-up">The first write to a file that lives in a read-only lower layer copies the whole file into the writable upper layer, then modifies the copy. The original layer is never changed.</Term>), then changes the copy.
+- Deleting a file from a lower layer can't really delete it (that layer is read-only), so overlayfs puts a <Term w="whiteout">A special marker in an upper layer that means "this path is deleted": overlayfs hides the lower file. In image tarballs it's an empty file named .wh.&lt;name&gt;.</Term> in the upper layer that hides it.
+
+<Figure n="003" title="LAYERS, STACKED" caption="Each image layer is read-only and shared by every container from that image. The container's own writes land in a thin writable layer on top. Editing serve.py copied it up; deleting old.log left a whiteout. The merged view is what the process sees as /.">
+
+<svg viewBox="0 0 640 300" role="img" aria-label="Overlay filesystem with three read-only layers, a writable upper layer, and a merged view">
+  <text x="10" y="40" class="strong">MERGED VIEW</text>
+  <text x="10" y="54">what the app sees</text>
+  <text x="10" y="102" class="blue-t">CONTAINER LAYER</text>
+  <text x="10" y="116">writable, per container</text>
+  <text x="10" y="162" class="strong">LAYER 3 (RO)</text>
+  <text x="10" y="176">COPY . .</text>
+  <text x="10" y="212" class="strong">LAYER 2 (RO)</text>
+  <text x="10" y="226">pip install</text>
+  <text x="10" y="262" class="strong">LAYER 1 (RO)</text>
+  <text x="10" y="276">debian base</text>
+  <rect x="160" y="26" width="470" height="36" class="fill-wash" stroke-width="1" />
+  <rect x="160" y="88" width="470" height="36" class="blue dash" stroke-width="1" />
+  <rect x="160" y="148" width="470" height="36" class="fill-paper" stroke-width="1" />
+  <rect x="160" y="198" width="470" height="36" class="fill-paper" stroke-width="1" />
+  <rect x="160" y="248" width="470" height="36" class="fill-paper" stroke-width="1" />
+  <text x="219" y="48" text-anchor="middle" class="strong">bin/sh</text>
+  <text x="336" y="48" text-anchor="middle" class="strong">numpy/</text>
+  <text x="453" y="48" text-anchor="middle" class="strong">serve.py (new)</text>
+  <text x="570" y="48" text-anchor="middle">(gone)</text>
+  <text x="453" y="110" text-anchor="middle" class="blue-t">serve.py (copy)</text>
+  <text x="570" y="110" text-anchor="middle" class="blue-t">.wh.old.log</text>
+  <text x="453" y="170" text-anchor="middle">serve.py</text>
+  <text x="336" y="220" text-anchor="middle">numpy/</text>
+  <text x="219" y="270" text-anchor="middle">bin/sh</text>
+  <text x="570" y="270" text-anchor="middle">old.log</text>
+  <line x1="219" y1="256" x2="219" y2="56" class="ink dash" stroke-width="1" />
+  <line x1="336" y1="206" x2="336" y2="56" class="ink dash" stroke-width="1" />
+  <line x1="453" y1="98" x2="453" y2="56" class="blue" stroke-width="1.2" />
+  <line x1="570" y1="98" x2="570" y2="56" class="blue dash" stroke-width="1" />
+  <line x1="570" y1="258" x2="570" y2="120" class="ink dash" stroke-width="1" />
+  <text x="580" y="142" text-anchor="start" font-size="9">HIDDEN</text>
+</svg>
+
+</Figure>
+
+This is why a hundred containers from the same image cost almost no extra disk: they all share the same lower layers and each gets a tiny upper layer. It's also why the host's <Term w="page cache">The kernel's in-memory cache of recently read file contents. Reading the same file twice from RAM instead of disk is what makes the second read fast.</Term> works across containers: `libpython3.12.so` from a shared layer is one file on disk, so it's cached in RAM once, not once per container. A hundred VMs each have their own disk image and their own guest page cache, and cache it a hundred times.
+
+### So what is a Docker image, really?
+
+<Predict id="image-contents">
+
+You `docker pull python:3.12-slim`. Without looking anything up: what physical things is that image made of? Is there a kernel in it anywhere? Roughly how many pieces, and how big?
+
+<Fragment slot="answer">
+
+An image is a handful of tarballs and a couple of JSON files. That's all. There's no kernel and nothing that boots.
+
+- A few **layer tarballs**, one per build step that changed files. `python:3.12-slim` has only a handful (on the order of four or five: a Debian base, some packages, Python itself, a small final tweak). Each is the `tar` of the files that step added or changed, usually gzip-compressed, named by the SHA-256 hash of its contents.
+- One **config** JSON: the default command (`CMD`), environment variables, working directory, which user to run as, the CPU architecture (`arm64` or `amd64`), and the ordered list of layer hashes.
+- One **manifest** JSON that points at the config and the layers by hash (and for multi-architecture images, an index that points at one manifest per architecture).
+
+Size: around 40-50 MB compressed, a bit over 100 MB unpacked (approximate; check with `docker image ls` and the tarball sizes yourself in the Build section). Compare a minimal Ubuntu cloud VM disk image, which is several hundred MB and *does* contain a kernel, an initramfs and a bootloader.
+
+</Fragment>
+
+</Predict>
+
+The format is standardised as the <Term w="OCI image">The Open Container Initiative's image format: the vendor-neutral spec for container images (layers as tarballs, a config, a manifest, all addressed by SHA-256 hash). Docker, Podman, containerd and Kubernetes all use it.</Term> spec, so the same image runs under Docker, Podman, containerd or Kubernetes. Because layers are named by their hash, a registry or your disk only ever stores each layer once, however many images use it. That's why the second image you pull "FROM python:3.12-slim" downloads only the layers that are new.
+
+`docker run` then does roughly this:
+
+1. Make sure all the image's layers are on disk (pull the missing ones, unpack them into directories).
+2. Mount an overlay: those layers as read-only lowers, plus a fresh empty upper.
+3. Ask the kernel for new namespaces (pid, mnt, net, uts, ipc, and user if configured), and create a cgroup with the limits you asked for.
+4. Set up networking: a virtual Ethernet pair, one end inside the new network namespace and one on a bridge on the host.
+5. Switch the root to the merged overlay, drop privileges it doesn't need, and `exec` the image's command. That process is the container.
+
+Docker itself is several programs: `docker` (the CLI) talks to `dockerd`, which asks `containerd` to manage containers, which runs `runc`, the small program that actually does steps 2-5 and then exits, leaving your process running. You'll do steps 2, 3 and 5 by hand.
+
+### Layer caching: the build-side superpower
+
+A Dockerfile is a list of steps, and each step that changes files makes one layer. When you rebuild, Docker reuses a cached layer for a step if the step's instruction is the same, its inputs are the same (for `COPY`, the hashes of the copied files), *and the layer below it is the same*. The moment one step misses the cache, every step after it has to rerun, because each layer is "changes on top of exactly that parent".
+
+That last rule is why the order of lines in a Dockerfile matters so much.
+
+<Predict id="cache-order">
+
+Your Dockerfile is `FROM python:3.12-slim`, `WORKDIR /app`, `COPY . .`, `RUN pip install -r requirements.txt`, `CMD ...`. Installing your packages takes about 90 seconds. You change one line in `serve.py` and rebuild. Which steps rerun, and roughly how long does the rebuild take? How would you reorder it?
+
+<Fragment slot="answer">
+
+`COPY . .` copies `serve.py`, so its input hash changed and it misses the cache. `pip install` sits on top of it, so its parent changed, so it reruns too, even though `requirements.txt` didn't change. You pay the full ~90 s for a one-line edit.
+
+Reorder: copy only `requirements.txt`, run `pip install`, *then* `COPY . .`. Now a code edit changes only the last layer and the rebuild takes about a second. Put things that change rarely at the top and things that change often at the bottom. Try both orders in the figure.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="004" title="WHAT A REBUILD COSTS" caption="Highlighted steps rerun. A step reruns if its own inputs changed or if any step above it reran. Moving the slow, rarely-changing step above the fast, often-changing one is the whole trick. Times are illustrative.">
+
+<ContainerCache />
+
+</Figure>
+
+### Why containers start in milliseconds and VMs in seconds
+
+Now you can predict the startup gap instead of memorising it.
+
+Starting a container is: create a few namespaces (kernel bookkeeping), make a cgroup directory and write a few files, mount an overlay (no copying, just telling the kernel which directories to stack), and `exec` a program. That's a process start with some extra labels. The image files are already on disk. Nothing is booted, because the kernel is already running and has been for weeks. The cost is milliseconds; most of what you feel in `docker run` is Docker's own machinery (talking to the daemon, setting up the network), not the kernel.
+
+Starting a VM is: allocate and map its RAM, start virtual CPUs, run firmware, run a bootloader, decompress and start a kernel, have that kernel probe and initialise all its (virtual) devices, mount a root filesystem, start an init system, which starts services, which start your app. Each step is real work, and the guest has no idea it could skip any of them. A general-purpose Linux VM takes seconds to boot to a login prompt, often 10+ seconds with a full Ubuntu and cloud-init.
+
+There's a middle ground worth knowing because it's what serverless and sandboxing platforms use: a <Term w="microVM">A deliberately minimal VM: tiny virtual hardware (no USB, no graphics, a few virtio devices), a stripped-down kernel, no firmware. Keeps VM-level isolation while booting in around a hundred milliseconds.</Term>. AWS built Firecracker for Lambda; its paper reports booting to user space in about 125 ms with a few MB of memory overhead per VM. It gets there by deleting nearly everything a normal VM pretends to have.
+
+### Why Docker on your Mac runs a Linux VM
+
+Containers are Linux processes using Linux kernel features (namespaces, cgroups, overlayfs) and making Linux system calls. macOS's kernel, XNU, has none of those features and doesn't speak Linux system calls. So there's no way to run a Linux container directly on macOS.
+
+Docker Desktop (and OrbStack, Colima, Podman's "machine") all do the same thing: quietly boot one small Linux VM using Apple's <Term w="Virtualization.framework">macOS's built-in API for running virtual machines on Apple silicon, built on the CPU's hardware virtualisation support. Docker Desktop and similar tools use it to run their Linux VM.</Term>, run the real Docker daemon inside it, and have the `docker` command on your Mac talk to it over a socket. Every container you "run on your Mac" is a process inside that VM, sharing that VM's Linux kernel. That's why `uname -r` printed a Linux version. It's also why bind-mounting a big folder from your Mac into a container is slow: every file access crosses from the Linux VM to macOS through a shared-filesystem layer. (Apple's own `container` tool, announced in 2025, goes further and gives each container its own tiny VM, much like a microVM.)
+
+And because the Mac and the Spark are both ARM64, both run `arm64` images natively. Pull an image that only exists for `amd64` (Intel/AMD) and it either fails with `exec format error`, or runs under instruction-by-instruction emulation and is many times slower. A container shares the host's CPU just as it shares its kernel: nothing translates instructions for it.
+
+### The security boundary
+
+The thing a container shares, the kernel, is the thing that enforces the fence. So the security question is: how big is the surface an attacker inside can poke at?
+
+- **Container**: the whole Linux system call interface, a few hundred calls with decades of complex code behind them (filesystems, networking, `ioctl`s into drivers). A bug anywhere in there, reachable from inside, can be a way out. Real examples: the Dirty COW kernel bug (2016) and CVE-2019-5736, where a malicious container could overwrite the host's `runc` binary. Docker shrinks the surface by default: it drops most root <Term w="capabilities">Linux splits root's powers into about 40 separately grantable pieces (mount filesystems, load kernel modules, change the clock, bypass file permissions...). A process can hold some and not others.</Term>, applies a <Term w="seccomp">A kernel feature that filters which system calls a process may make. Docker's default profile blocks a few dozen risky ones.</Term> filter, and (optionally) runs containers in a user namespace so root inside is nobody outside.
+- **VM**: the attacker inside owns a whole kernel, but that kernel can only talk to virtual hardware. The surface is the hypervisor and its fake devices: much smaller, much more carefully guarded. VM escapes happen (VENOM, 2015, was a bug in QEMU's virtual floppy controller) but are rarer and worth more.
+
+Rule of thumb: containers are a great fence between *your own* services. For running *untrusted* code (customer code, agent-written code, an RL environment executing whatever a model wrote), people reach for a stronger boundary: a microVM (Firecracker, Kata Containers) or a user-space kernel like gVisor that answers the container's system calls itself so only a small, hardened subset reaches the real kernel.
+
+### Containers and GPUs
+
+A GPU is driven by a kernel driver (`nvidia.ko`) and a user-space library that talks to it (`libcuda.so`, the "driver API"). On top of that sits the CUDA runtime, cuDNN, NCCL, and PyTorch.
+
+A container shares the host kernel, so it shares the host's GPU driver. It can't bring its own: a kernel module lives in the kernel, and there is only one. The <Term w="NVIDIA Container Toolkit">NVIDIA's add-on for Docker and other runtimes. When a container asks for GPUs, it bind-mounts the host's GPU device files and driver libraries into the container just before it starts.</Term> handles the hand-off: when you say `docker run --gpus all`, it mounts the GPU device files (`/dev/nvidia*`) and the host's matching `libcuda.so` and `nvidia-smi` into the container. Everything above that (CUDA runtime, cuDNN, PyTorch) comes from the image.
+
+<Figure n="005" title="WHO BRINGS WHAT TO A GPU CONTAINER" caption="The kernel driver and its user-space library belong to the host and must match each other, so the toolkit mounts them in. The CUDA runtime, cuDNN and PyTorch are ordinary files in the image. The image's CUDA version must be one the host driver supports.">
+
+<svg viewBox="0 0 640 310" role="img" aria-label="Layers of a GPU container: image contents on top, host-mounted driver library, host kernel driver, GPU">
+  <rect x="2" y="268" width="636" height="34" class="fill-paper" stroke-width="1" />
+  <text x="320" y="289" text-anchor="middle" class="strong">GPU (GB10 BLACKWELL ON THE SPARK)</text>
+  <rect x="2" y="224" width="636" height="34" class="fill-wash" stroke-width="1" />
+  <text x="320" y="245" text-anchor="middle" class="blue-t">HOST KERNEL + nvidia.ko DRIVER</text>
+  <rect x="2" y="104" width="200" height="40" class="fill-paper" stroke-width="1" />
+  <text x="102" y="121" text-anchor="middle" class="strong">HOST DRIVER LIBS</text>
+  <text x="102" y="136" text-anchor="middle">libcuda.so, nvidia-smi</text>
+  <rect x="2" y="34" width="200" height="40" class="fill-paper" stroke-width="1" />
+  <text x="102" y="51" text-anchor="middle" class="strong">CONTAINER TOOLKIT</text>
+  <text x="102" y="66" text-anchor="middle">runs at container start</text>
+  <rect x="236" y="10" width="402" height="200" class="blue dash" stroke-width="1.2" />
+  <text x="248" y="26" class="blue-t">CONTAINER</text>
+  <rect x="250" y="34" width="374" height="30" class="fill-paper" stroke-width="1" />
+  <text x="437" y="53" text-anchor="middle">YOUR CODE: train.py</text>
+  <rect x="250" y="70" width="374" height="30" class="fill-paper" stroke-width="1" />
+  <text x="437" y="89" text-anchor="middle">PYTORCH (BUILT FOR ARM64 + BLACKWELL)</text>
+  <rect x="250" y="106" width="374" height="30" class="fill-paper" stroke-width="1" />
+  <text x="437" y="125" text-anchor="middle">CUDA RUNTIME, cuDNN, NCCL</text>
+  <text x="630" y="148" text-anchor="end" font-size="9">↑ FROM THE IMAGE</text>
+  <rect x="250" y="156" width="374" height="44" class="fill-wash" stroke-width="1" />
+  <text x="437" y="174" text-anchor="middle" class="blue-t">libcuda.so + /dev/nvidia*</text>
+  <text x="437" y="190" text-anchor="middle" class="blue-t">MOUNTED IN FROM THE HOST</text>
+  <line x1="202" y1="124" x2="248" y2="170" class="blue" stroke-width="1.2" />
+  <line x1="102" y1="74" x2="102" y2="104" class="ink dash" stroke-width="1" />
+  <text x="110" y="93">MOUNTS</text>
+  <line x1="437" y1="200" x2="437" y2="224" class="ink" stroke-width="1.2" />
+  <text x="446" y="216">SYSCALLS (ioctl)</text>
+</svg>
+
+</Figure>
+
+This is why the Spark leans on containers so heavily. The Spark is an unusual machine: an ARM64 CPU plus a Blackwell GPU. For a while, generic `pip install torch` wheels often didn't include ARM64 builds with kernels for the newest GPU architectures, and building PyTorch from source for that combination is a long, fiddly job. NVIDIA's <Term w="NGC">NVIDIA GPU Cloud catalog: NVIDIA's registry of prebuilt, tested containers (PyTorch, TensorRT-LLM, vLLM, Triton and more) at nvcr.io, rebuilt monthly against matching CUDA, cuDNN and NCCL versions.</Term> containers ship PyTorch already built and tested for exactly this hardware. On the Spark, `docker run --gpus all nvcr.io/nvidia/pytorch:<tag>-py3` is the main supported way to get a working GPU PyTorch, and NVIDIA's DGX Spark documentation and playbooks use it throughout. The state of plain pip wheels for ARM64 + Blackwell changes over time; check NVIDIA's Spark docs for what they currently recommend.
+
+The one rule to remember: the image's CUDA version must be one the host driver supports. Newer drivers run older CUDA images; an image built against a CUDA newer than your driver fails with an error about the driver being too old. When that happens, the fix is on the host (update the driver), not in the container, because the driver is the host's.
+
+## Build It
+
+All on the Spark, in `~/workbench/containers/`. You need `sudo`. Everything you'll make is cleaned up with `rmdir`, `umount`, or by exiting a shell; nothing touches the host's real config. Some of these commands are verified only from documentation and man pages, not on a Spark, so if a flag behaves differently, `man unshare` wins over this page.
+
+<Task id="t0" title="Get a minimal root filesystem" agent="ok">
+
+You need a directory that contains a whole Linux userland and nothing else. Alpine is ideal: about 8 MB unpacked.
+
+If Docker works on the Spark (it should on DGX OS; you may need to add yourself to the `docker` group):
+
+```bash
+mkdir -p ~/workbench/containers/rootfs && cd ~/workbench/containers
+CID=$(docker create alpine:3.20)          # a stopped container, never started
+docker export "$CID" | sudo tar -C rootfs -xf -
+docker rm "$CID"
+```
+
+Without Docker, download the "Mini root filesystem" tarball for **aarch64** from alpinelinux.org/downloads and unpack it into `rootfs/` with `sudo tar -C rootfs -xzf alpine-minirootfs-*.tar.gz`.
+
+Look at what you got:
+
+```bash
+ls rootfs                      # bin dev etc home lib ... a whole /
+cat rootfs/etc/os-release      # Alpine
+du -sh rootfs                  # small
+file rootfs/bin/busybox        # an ARM aarch64 executable
+ls rootfs/boot 2>/dev/null     # no kernel anywhere
+```
+
+</Task>
+
+<Predict id="chroot-ps">
+
+You run `sudo chroot rootfs /bin/sh`, then inside it `mount -t proc proc /proc` and `ps`. What processes do you expect to see? What PID is your shell?
+
+<Fragment slot="answer">
+
+You see *every process on the Spark*: systemd as PID 1, your SSH session, Docker, everything. Your shell has some large ordinary PID. `chroot` only changed which directory you see as `/`. It didn't create any new namespace, so `/proc` (which the kernel fills in live from its one process table) shows the host's processes. You also share the host's network, hostname and users. A chroot is a different set of furniture in the same open-plan office.
+
+</Fragment>
+
+</Predict>
+
+<Task id="t1" title="Chroot alone: see how little it hides" agent="hands">
+
+Enter the rootfs with `chroot` and poke around. Check your prediction.
+
+```bash
+sudo chroot rootfs /bin/sh
+# now inside
+cat /etc/os-release
+mount -t proc proc /proc
+ps
+hostname
+ip addr        # busybox ip
+```
+
+Then, from a second terminal on the host, find your chroot shell in `ps -ef` and note its PID. Exit the chroot, and run `sudo umount rootfs/proc` on the host.
+
+Do **not** run `hostname something` inside: there's no UTS namespace yet, so it would rename the Spark.
+
+</Task>
+
+<Task id="t2" title="Add namespaces: become PID 1" agent="hands">
+
+Now write `box.sh`: a script that starts `/bin/sh` from your rootfs inside new PID, mount, UTS, IPC and network namespaces, mounts a fresh `/proc` inside, and sets a hostname. You're writing it; here are the pieces.
+
+- `unshare` (from util-linux) creates namespaces and runs a command in them. You'll want `--pid`, `--fork`, `--mount`, `--uts`, `--ipc`, `--net`. Read `man unshare` for what `--fork` is for (or skip it on purpose in Break It).
+- Inside the new namespaces, run `chroot rootfs /bin/sh -c '...'`, and in that inner script mount proc, set the hostname, then `exec /bin/sh` so the interactive shell replaces the setup script.
+- Order matters: the `mount` of `/proc` must happen *inside* the new mount and PID namespaces, or it shows the host's processes again.
+
+Shape:
+
+```bash
+#!/bin/sh
+# box.sh: run as root
+ROOT="$(pwd)/rootfs"
+exec unshare ... chroot "$ROOT" /bin/sh -c '
+  mount -t proc proc /proc
+  hostname box1
+  exec /bin/sh
+'
+```
+
+Then, inside your box:
+
+```bash
+ps            # who is PID 1?
+hostname      # box1
+ip addr       # only lo, and it's DOWN: an empty network namespace
+echo $$       # your shell's PID inside
+sleep 1000 &  # leave something running
+```
+
+And from a second host terminal:
+
+```bash
+hostname                                    # the Spark's name, unchanged
+ps -ef | grep 'sleep 1000'                  # the same sleep, with a big host PID
+sudo ls -l /proc/<hostpid-of-sleep>/ns/     # namespace IDs of the sleep
+ls -l /proc/self/ns/                        # yours: pid/mnt/net/uts differ, user matches
+sudo nsenter -t <hostpid-of-sleep> -a sh    # join all its namespaces: you've written docker exec
+```
+
+(`nsenter -a` joins the namespaces but keeps the host's root directory unless the target's root is picked up too; if `ls /` shows the host, add `-r` and check `man nsenter`.)
+
+</Task>
+
+<Task id="t3" title="Add a cgroup: cap memory and CPU" agent="hands">
+
+Extend `box.sh` so the box runs inside a cgroup called `mybox` with a 64 MB memory limit, no swap, and half a core.
+
+Check cgroup v2 and which controllers your group can use:
+
+```bash
+stat -fc %T /sys/fs/cgroup                   # cgroup2fs means v2
+cat /sys/fs/cgroup/cgroup.controllers        # what exists
+cat /sys/fs/cgroup/cgroup.subtree_control    # what children may use; want cpu and memory
+```
+
+If `cpu` or `memory` is missing from `subtree_control`, enable it with `echo "+cpu +memory" | sudo tee /sys/fs/cgroup/cgroup.subtree_control`.
+
+The pieces you need, in your own order:
+
+- `mkdir /sys/fs/cgroup/mybox`
+- write `64M` to `memory.max`, `0` to `memory.swap.max`, `50000 100000` to `cpu.max`
+- write the PID of the script itself (`$$`) into `mybox/cgroup.procs` *before* the `exec unshare`, so everything it starts inherits the group
+
+Then test both limits from inside the box:
+
+```bash
+# CPU: one busy loop. Watch it in htop on the host.
+yes > /dev/null &
+
+# Memory: `tail` has to hold its whole "last line" in RAM, and /dev/zero has no newlines.
+head -c 200M /dev/zero | tail
+```
+
+If busybox's `tail` doesn't balloon the way GNU's does (check `memory.peak`), hold the bytes in a shell variable instead: `x=$(head -c 200M /dev/zero | tr '\0' a)`.
+
+On the host, read what happened:
+
+```bash
+cat /sys/fs/cgroup/mybox/cpu.stat        # nr_throttled climbing: the quota biting
+cat /sys/fs/cgroup/mybox/memory.events   # oom_kill 1 after the tail
+cat /sys/fs/cgroup/mybox/memory.peak     # highest usage seen (newer kernels)
+```
+
+Clean up after you exit the box: `sudo rmdir /sys/fs/cgroup/mybox` (it only works once no process is left in it).
+
+</Task>
+
+<Task id="t4" title="Find the same knobs in a real Docker container" agent="explain">
+
+Prove Docker is doing exactly what you did.
+
+```bash
+docker run -d --name probe --memory 64m --cpus 0.5 alpine:3.20 sleep 1000
+PID=$(docker inspect -f '{{.State.Pid}}' probe)
+echo "host PID: $PID"
+cat /proc/$PID/cgroup                          # its cgroup path
+cat /sys/fs/cgroup$(cut -d: -f3 /proc/$PID/cgroup)/memory.max   # 67108864
+cat /sys/fs/cgroup$(cut -d: -f3 /proc/$PID/cgroup)/cpu.max      # 50000 100000
+sudo ls -l /proc/$PID/ns/
+docker exec probe ps                           # sleep is PID 1
+docker rm -f probe
+```
+
+Ask an agent to explain anything in the output you can't account for (for example the cgroup path naming, or why `docker exec ps` shows `ps` itself too). Don't have it write code.
+
+</Task>
+
+<Task id="t5" title="Take an image apart" agent="hands">
+
+```bash
+mkdir -p ~/workbench/containers/img && cd ~/workbench/containers/img
+docker pull python:3.12-slim
+docker history python:3.12-slim        # one row per build step, with sizes
+docker save python:3.12-slim -o py.tar
+ls -lh py.tar
+tar -xf py.tar && ls
+```
+
+Recent Docker versions write the OCI layout (`index.json`, `oci-layout`, `blobs/sha256/...`) and also a Docker-style `manifest.json`; older ones write a directory per layer. Find out which you got. Then, by yourself:
+
+1. Use `python3 -m json.tool` on `manifest.json` (or follow `index.json`) to find the config blob and the ordered list of layer blobs.
+2. Read the config: find `Cmd`, `Env`, `architecture`, and `rootfs.diff_ids`.
+3. Run `file blobs/sha256/*` to tell JSON from tar from gzip, and `ls -lh` to see layer sizes.
+4. `tar -tf <a layer blob> | head -50` (add `z` if it's gzip). Find the layer that contains `python3.12`.
+5. `tar -tf <blob> | grep '\.wh\.'` across all layers. Any whiteouts? Which step deleted what?
+6. Confirm `sha256sum` of a blob equals its filename. That's content addressing.
+
+Bonus, to see overlayfs without Docker:
+
+```bash
+mkdir -p ovl/{lower,upper,work,merged}
+echo base > ovl/lower/a.txt; echo doomed > ovl/lower/b.txt
+sudo mount -t overlay overlay -o lowerdir=ovl/lower,upperdir=ovl/upper,workdir=ovl/work ovl/merged
+echo changed | sudo tee ovl/merged/a.txt; sudo rm ovl/merged/b.txt
+ls -l ovl/lower ovl/upper     # a.txt copied up; b.txt is a 0,0 character device: a whiteout
+cat ovl/lower/a.txt           # still "base"
+sudo umount ovl/merged
+```
+
+</Task>
+
+<Task id="t6" title="Write a Dockerfile that rebuilds in a second" agent="review">
+
+Containerise a small FastAPI server that loads a tiny model and scores query-document pairs (a stand-in for your cross-encoder; NumPy dot products on random vectors are fine). `requirements.txt`: `fastapi`, `uvicorn`, `numpy`, plus something heavier so the install takes a while (`scikit-learn` or `pandas` works).
+
+1. Write it first the naive way (`COPY . .` before `pip install`). Build once. Change one line of `serve.py`. Rebuild with `time docker build -t ranker .` and note the time and which steps say `CACHED`.
+2. Reorder it so dependencies install before the code is copied. Repeat the measurement.
+3. Add a `.dockerignore` (at least `.git`, `__pycache__`, `.venv`, any data or checkpoint files). Explain to yourself why a stray 2 GB checkpoint in the folder would bust the cache *and* slow every build even with good ordering.
+4. Add a BuildKit cache mount so even a real requirements change reuses pip's download cache: `RUN --mount=type=cache,target=/root/.cache/pip pip install -r requirements.txt`. Check the current Dockerfile reference for the exact syntax.
+5. Run it as a non-root user, and make `docker stop` fast (see Break It).
+
+Then have an agent review the Dockerfile for cache-busting mistakes, image size, and PID 1 signal handling.
+
+</Task>
+
+<Task id="t7" title="Run a GPU container" agent="ok">
+
+Check the toolkit, then run NVIDIA's PyTorch container. Pick the tag from the NGC catalog page for PyTorch or from NVIDIA's DGX Spark docs (tags look like `25.xx-py3`, one per month).
+
+```bash
+nvidia-ctk --version
+docker run --rm --gpus all nvcr.io/nvidia/pytorch:<tag>-py3 \
+  python -c "import torch, platform; print(platform.machine(), torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+# Look at what the toolkit mounted in:
+docker run --rm --gpus all nvcr.io/nvidia/pytorch:<tag>-py3 \
+  sh -c 'ls -l /dev | grep -i nvidia; mount | grep -iE "nvidia|libcuda" | head; nvidia-smi | head -5'
+```
+
+Compare `nvidia-smi`'s driver version inside and outside the container: they're the same, because it's the same driver. Note the image size from `docker image ls` (it's big, tens of GB, because it carries CUDA, cuDNN, NCCL and a full PyTorch build).
+
+</Task>
+
+<Task id="t8" title="Optional: time a VM boot" agent="explain">
+
+To feel the gap rather than read it. Two options on the Spark, both rough:
+
+- **multipass** (Canonical's quick-VM tool, a snap): `sudo snap install multipass`, then `time multipass launch --name vm1` (the first one includes an image download; launch a second to see a cleaner number), then `multipass exec vm1 -- systemd-analyze` to see how long the guest's own boot took, split into kernel and userspace.
+- **QEMU + KVM** directly, with an Ubuntu cloud image for arm64. More fiddly (UEFI firmware, cloud-init seed). Have an agent explain the flags if you go this way.
+
+Clean up with `multipass delete --purge vm1`.
+
+</Task>
+
+<DoneWhen>
+
+- `box.sh` gives you a shell that is PID 1, has its own hostname and an empty network, runs Alpine's userland on the Spark's kernel, and is throttled to half a core and killed past 64 MB.
+- You found the same cgroup files Docker wrote for a real container, and joined a container's namespaces with `nsenter`.
+- You took `python:3.12-slim` apart and can point to its config, its layers, and a whiteout (or explain why there isn't one).
+- Your Dockerfile rebuilds in about a second after a code edit, and you measured the before and after.
+- `torch.cuda.is_available()` printed `True` inside an NGC container on the Spark.
+
+</DoneWhen>
+
+## Measure
+
+<Predict id="startup">
+
+Guess each, before measuring: how long does `unshare` + `chroot` take to run `/bin/true` in a fresh set of namespaces? `docker run --rm alpine true`? A VM booting to a shell?
+
+<Fragment slot="answer">
+
+Approximate, and worth measuring because the gaps are the lesson:
+
+- **Raw namespaces + chroot**: a few milliseconds. It's a couple of process starts plus kernel bookkeeping. Creating a network namespace is the most expensive part; drop `--net` and it gets cheaper.
+- **`docker run --rm alpine true`**: a few hundred milliseconds, sometimes more. Almost all of that is Docker: the CLI talks to the daemon, which talks to containerd, which runs runc, plus network setup (a veth pair and bridge), plus logging and cleanup. The kernel part is the same few milliseconds as yours.
+- **A VM**: seconds. `systemd-analyze` in a fresh Ubuntu VM typically reports a few seconds of kernel plus several seconds of userspace; `multipass launch` takes much longer overall because it also creates the disk and runs cloud-init. A Firecracker-style microVM sits in between, around a hundred milliseconds.
+
+So: roughly 1,000x between your hand-made box and a VM, with Docker's convenience costing about 100x of your box.
+
+</Fragment>
+
+</Predict>
+
+Time startup with a loop so one-off costs don't dominate. `hyperfine` (`sudo apt install hyperfine`) does it nicely; otherwise `time` a loop of 20 and divide.
+
+```bash
+cd ~/workbench/containers
+hyperfine -N --warmup 3 \
+  'sudo unshare --pid --fork --mount --uts --ipc chroot rootfs /bin/true' \
+  'sudo unshare --pid --fork --mount --uts --ipc --net chroot rootfs /bin/true' \
+  'docker run --rm alpine:3.20 true' \
+  'docker run --rm --network none alpine:3.20 true'
+```
+
+`sudo` itself adds a little to the first two; run `hyperfine` under `sudo -s` to remove it.
+
+Fill this in:
+
+| Thing | Prediction | Spark | Mac |
+| --- | --- | --- | --- |
+| `uname -r` in an Ubuntu container vs host | | | |
+| your shell's PID inside `box.sh` / on the host | | | n/a |
+| CPU % of `yes` under `cpu.max 50000 100000` | | | n/a |
+| `oom_kill` count after the `tail` test | | | n/a |
+| `python:3.12-slim`: layers / compressed MB / unpacked MB | | | |
+| naive Dockerfile rebuild after code edit (s) | | | |
+| reordered Dockerfile rebuild after code edit (s) | | | |
+| `unshare` + `chroot` `/bin/true` (ms) | | | n/a |
+| same, with `--net` (ms) | | | n/a |
+| `docker run --rm alpine true` (ms) | | | |
+| VM: `multipass launch` (s) / guest `systemd-analyze` (s) | | | |
+| NGC PyTorch image size (GB) | | | n/a |
+
+What the numbers should tell you:
+
+**`uname -r` is identical inside and out on the Spark.** That one line is the whole lesson. On the Mac it shows the Docker VM's Linux kernel, a version unrelated to macOS.
+
+**PID 1 inside, some big number outside.** Same process. The kernel just keeps two numbers for it.
+
+**`yes` sits at about 50% of one core** in `htop` on the host, and `cpu.stat`'s `nr_throttled` keeps climbing: every 100 ms period, the group uses its 50 ms and is then paused until the next period. That pause is the reason a CPU-limited container can have ugly tail latency even when average CPU looks fine: a request that arrives just after the quota runs out waits up to the rest of the period. Think about that next time you set `--cpus` on a latency-sensitive server.
+
+**The `tail` dies, `oom_kill` is 1.** The rest of the box survives (the kernel killed the biggest process in the group, not the box). If `memory.swap.max` weren't 0, the group might swap and crawl instead of dying, which is usually worse.
+
+**Rebuild times**: naive should be dominated by `pip install` (tens of seconds to minutes depending on packages and network); reordered should be about a second, nearly all of it Docker's own overhead and sending the build context.
+
+**Startup**: see the Predict answer above. If `docker run` is much slower than a few hundred ms, check whether it's pulling, or whether a logging driver or network plugin is slow. If your `--net` row is much slower than the others, that's namespace creation for networking, which has historically been the costliest kind.
+
+## Break It
+
+**Forget `--fork`.** Run `sudo unshare --pid chroot rootfs /bin/sh`, then type `ls`, then `ls` again. The first works; the second fails with something like `can't fork: Out of memory`. Why: `unshare` itself can't move into the new PID namespace (a process's PID never changes), so the namespace starts empty and the *first child* created in it becomes its PID 1. Your first `ls` was that child. When it exited, PID 1 of the namespace died, the kernel tore the namespace down, and any further fork into it fails with `ENOMEM`. `--fork` makes `unshare` fork first so the shell itself becomes PID 1. Lesson: in a PID namespace, PID 1 dying means the whole container dies, which is exactly how a Docker container's lifetime is tied to its main process.
+
+**PID 1 ignores your signals.** On the host: `sudo unshare --pid --fork --mount-proc sleep 1000 &`, find the `sleep`'s host PID, and `sudo kill -TERM <pid>`. Nothing happens. `kill -KILL` works. The kernel protects a namespace's PID 1 from any signal it hasn't installed a handler for (SIGKILL and SIGSTOP from outside excepted). Normal programs rely on the default action for SIGTERM ("die"), but PID 1 gets no default actions. This is why `docker stop` on a Python server often hangs for 10 seconds and then kills it: Docker sent SIGTERM, your PID 1 Python process had no handler, Docker gave up waiting and sent SIGKILL. No graceful shutdown, dropped requests. Fixes: handle SIGTERM in your app (Python: `signal.signal(signal.SIGTERM, ...)`; uvicorn and most servers already do), or run with `docker run --init`, which puts a tiny init (`tini`) at PID 1 to forward signals and reap zombies. Try `docker run --rm alpine sleep 1000` then `time docker stop` it, with and without `--init`.
+
+**Wrong architecture.** On the Spark: `docker run --rm --platform linux/amd64 alpine uname -m`. You'll get either `exec format error` (no emulator installed) or `x86_64` after a slow start (QEMU user-mode emulation registered through `binfmt_misc`). Either way the lesson is the same: the container shares the host's CPU, so a binary for another instruction set can't just run. Every image you use on the Spark or the Mac must have an `arm64` variant, or you pay for emulation. When you build images on your Mac to deploy on an x86 cloud box, you have the same problem in reverse (`docker buildx build --platform linux/amd64`).
+
+**Bust the cache on purpose.** In your good Dockerfile, add `ARG BUILD_TIME` and `RUN echo $BUILD_TIME` near the top, and build with `--build-arg BUILD_TIME=$(date +%s)`. Every build now reruns everything below that line. Then the subtler version: split `RUN apt-get update` and `RUN apt-get install -y curl` into two lines, build, and add a package to the install line a week later. The `update` layer is cached from a week ago, so `install` may fail on stale package lists. Lesson: the cache compares the *instruction text and inputs*, not the outside world. That's why you see `apt-get update && apt-get install ...` in one `RUN`.
+
+## Explain It Back
+
+<details>
+<summary>1. What's the difference between a container and a VM? (Correct the GUI answer.)</summary>
+
+It's not about GUIs; neither usually has one. A VM is a whole pretend computer: a hypervisor fakes hardware, and the VM boots its own kernel and its own OS on it. A container is just a group of normal processes on the host, running on the host's kernel; the kernel uses namespaces to give them a private view (their own files, PIDs, network, hostname) and cgroups to cap their CPU and memory. A container "comes with an OS" only in the sense of userland files (Ubuntu's libc and apt, say), never a kernel. So containers are lighter and start in milliseconds, but share one kernel, which means a weaker isolation boundary and no running a different OS.
+
+</details>
+
+<details>
+<summary>2. Walk me through what happens when you type docker run python:3.12-slim python serve.py.</summary>
+
+The CLI asks the Docker daemon to run it. The daemon makes sure the image's layers are on disk (pulling any missing ones by hash), then via containerd and runc: mounts an overlay with the image layers as read-only lowers and a fresh writable upper; creates new pid, mount, network, uts and ipc namespaces; creates a cgroup and writes any limits (`--memory`, `--cpus`) into it; sets up a veth pair to a bridge for networking; switches root to the merged overlay, drops capabilities and applies a seccomp filter; and finally execs `python serve.py`, which becomes PID 1 in the container. runc exits; the process now talks to the host kernel directly, with no layer in between.
+
+</details>
+
+<details>
+<summary>3. Why does Docker on a Mac need a VM, and what does that cost you?</summary>
+
+Containers are Linux processes using Linux kernel features and Linux system calls. macOS's kernel (XNU) has none of that, so Docker Desktop boots a small Linux VM with Apple's Virtualization.framework and runs every container inside it, sharing that VM's kernel. Costs: memory reserved for the VM, slower file access when you bind-mount Mac folders (they cross the VM boundary), networking that goes through an extra hop, and the images must be arm64 or they run under emulation. On Linux, like the Spark, there's no VM: containers are native processes.
+
+</details>
+
+<details>
+<summary>4. You need to run 1,000 isolated sandboxes at once, each executing code an agent wrote. Containers, VMs, or something else? How does it scale?</summary>
+
+Think about density, startup and trust. Full VMs: each needs a guest kernel and OS, so a few hundred MB of RAM minimum each (1,000 of them is hundreds of GB) and seconds to boot each; too heavy. Plain containers: overhead is close to just the processes themselves, a few MB beyond what the code uses, shared image layers on disk and in page cache, startup in tens to hundreds of milliseconds, so 1,000 fits easily on one big box. But the code is untrusted, and all 1,000 share the host kernel's full system-call surface; one kernel bug is an escape into your infrastructure. So the usual answer is the middle: microVMs (Firecracker, Kata) at roughly a hundred milliseconds of boot and a few MB of overhead each, or gVisor to shrink the syscall surface, plus cgroup limits on CPU, memory and number of processes so one sandbox can't starve the rest. The scaling limits then become memory per sandbox, the host's process and file-descriptor limits, and how fast you can create and destroy them.
+
+</details>
+
+<details>
+<summary>5. How does a container use the GPU if it can't have its own driver? What breaks?</summary>
+
+The GPU driver is a kernel module, and a container shares the host kernel, so it uses the host's driver. The NVIDIA Container Toolkit bind-mounts the GPU device files and the host's matching user-space driver library (`libcuda.so`) into the container at start. The image brings everything above that: CUDA runtime, cuDNN, NCCL, PyTorch. What breaks: an image built for a newer CUDA than the host driver supports fails to initialise CUDA (fix the host driver, not the image); an image without an arm64 build won't run natively on the Spark. That's why on the Spark you use NVIDIA's NGC containers, which are built and tested for ARM64 + Blackwell.
+
+</details>
+
+## Go Deeper
+
+- **Linux man pages: `namespaces(7)`, `pid_namespaces(7)`, `user_namespaces(7)`, `cgroups(7)`, `unshare(1)`, `nsenter(1)`**, at [man7.org/linux/man-pages](https://man7.org/linux/man-pages/). The real reference, written by Michael Kerrisk. `pid_namespaces(7)` explains the PID 1 signal rules from Break It precisely.
+- **Michael Kerrisk, "Namespaces in operation"**, a multi-part series on LWN.net (2013). Walks through each namespace with small C programs using `clone`, `unshare` and `setns`. The best way to see the system calls under the `unshare` command.
+- **Linux kernel docs: "Control Group v2"** ([docs.kernel.org/admin-guide/cgroup-v2.html](https://docs.kernel.org/admin-guide/cgroup-v2.html)) and **"Overlay Filesystem"** ([docs.kernel.org/filesystems/overlayfs.html](https://docs.kernel.org/filesystems/overlayfs.html)). Every file you wrote to in Task 3, and the exact copy-up and whiteout rules.
+- **Liz Rice, "Containers From Scratch"** (talk, GOTO 2018, and others), and her book **_Container Security_** (O'Reilly, 2020). She builds a container in a few dozen lines of Go, live. The book is the clearest treatment of the security boundary section.
+- **[OCI Image Format Specification](https://github.com/opencontainers/image-spec)**. Short and readable. After Task 5 you'll recognise every file it describes.
+- **Gerald Popek and Robert Goldberg, "Formal Requirements for Virtualizable Third Generation Architectures"** (CACM, 1974), and **Paul Barham et al., "Xen and the Art of Virtualization"** (SOSP 2003). The theory of when a CPU can be virtualised, and the paper that made VMs cheap enough to build the cloud on.
+- **Alexandru Agache et al., "Firecracker: Lightweight Virtualization for Serverless Applications"** (NSDI 2020). How AWS got VM isolation at near-container speed for Lambda, with measured boot times and memory overhead.
+- **NVIDIA docs: "NVIDIA Container Toolkit"** (installation and architecture pages on docs.nvidia.com), the **DGX Spark User Guide** and the **DGX Spark playbooks** at build.nvidia.com/spark, and the **PyTorch container** page in the NGC catalog. The authoritative, current word on which container tags to use on the Spark and how GPU access is wired.
+
+## Connections
+
+This builds directly on [Processes, threads and the GIL](/lessons/processes-threads-gil/): a container is processes, and everything there (PIDs, fork, signals, what the kernel keeps per process) is what namespaces relabel and cgroups meter. The page cache argument connects to [How slow is slow?](/lessons/latency-numbers/), and the memory-sharing story will make more sense after [Virtual memory](/lessons/virtual-memory/) and [Files and disks](/lessons/files-and-disks/).
+
+Next in this track, [CI/CD](/lessons/ci-cd/) is mostly "build this Dockerfile, fast, every commit", so the layer-caching rules pay off immediately. The CPU-quota throttling you measured is a tail-latency source you'll recognise in [Tail latency](/lessons/tail-latency/). And the sandboxing question in Explain It Back is the real design problem behind [RL environments](/lessons/rl-environments/) and [agent harnesses](/lessons/agent-harness/): somewhere, model-written code has to run, and you now know what kind of box to put it in.

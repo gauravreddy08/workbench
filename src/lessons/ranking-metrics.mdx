@@ -1,0 +1,764 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import RankLab from '../components/figures/RankLab.astro';
+import RankBootstrap from '../components/figures/RankBootstrap.astro';
+
+## Today
+
+- Derive precision@k, recall@k, MRR, MAP and NDCG from nothing, say in one sentence what each rewards and what it ignores, and pick the right one for web search, question answering, or retrieval for RAG.
+- Explain every piece of NDCG: why gains are graded, why the discount is a logarithm, and why you divide by the ideal.
+- Build an eval set the way TREC does: sample real queries across head, torso and tail, pool candidates from several systems, write labeling guidelines, and measure whether two labelers agree (Cohen's kappa).
+- Know what offline metrics can't see (clicks, position bias) and what unjudged documents do to a new model's score.
+- Report "my cross-encoder vs the baseline" as a delta with a 95% confidence interval from a paired bootstrap over queries, not as two numbers side by side.
+
+Prerequisites: none formally. It helps to have [Why are the evaluator and the model different systems?](/lessons/why-evals-are-separate/) in mind, and this lesson hands off to [Is that improvement real?](/lessons/statistics-for-evals/). Rough time: an evening for the idea and the from-scratch metrics, a weekend for the public benchmark, and a week of calendar time (mostly waiting for a second labeler) for the real eval set.
+
+## The Problem
+
+You've been training the cross-encoder for three weeks. Training loss is down, validation loss is down, and on the twenty queries you keep in a notebook cell, the new model's top results look better. You put "v2 NDCG@10: 0.421 (v1: 0.412)" in a Slack thread.
+
+Then come the questions, and every one of them is fair.
+
+"Which NDCG? Linear gain or exponential?" "Which queries? The twenty in your notebook were the ones v1 was bad at, right?" "Who labeled them?" "v2 pulls up a lot of documents v1 never showed. Were those ever judged? If not, your scorer counted them as irrelevant." And the one that ends the meeting: "Is +0.009 bigger than the noise?"
+
+You can't answer any of them yet, and none of them are about the model. They're about the measuring stick. A ranker is only "better" relative to a metric, computed on a set of queries, against a set of labels. Change any of those three and the winner can flip. That's the uncomfortable truth of ranking work: **the eval set matters more than the metric, and both matter more than the third decimal place**.
+
+In the diagnostic you named NDCG, MRR and MAP correctly. This lesson is the "that's why I know it" part: you'll derive each one, feel what it rewards by dragging results around, build the measuring stick for your real model, and attach error bars to the answer.
+
+<Origin year="1960s–1992" title="Cranfield, and then TREC">
+
+In the early 1960s, Cyril Cleverdon at the College of Aeronautics in Cranfield, England, wanted to compare ways of indexing aeronautics papers. He couldn't watch thousands of engineers search, so he froze the problem: a fixed collection of about 1,400 documents, a fixed set of questions, and for each question a human list of which documents were relevant. Any indexing system could then be run against the same questions and scored the same way. That recipe (documents, queries, judgments, a metric) is still called the Cranfield paradigm, and every offline ranking eval you'll ever run is a descendant of it.
+
+It worked for 1,400 documents. It breaks at a million, because nobody can judge every document for every query. In 1992 NIST started TREC, the Text REtrieval Conference, and solved the scale problem with pooling: let every participating system submit its ranking, take the top 100 from each, judge only that union, and treat everything else as not relevant. That shortcut has a cost you'll meet head-on in this lesson. And in 2000–2002 Kalervo Järvelin and Jaana Kekäläinen, in Tampere, published cumulated gain: a way to score a ranking when relevance comes in grades rather than yes/no, and when the top of the list matters more than the bottom. You know it as NDCG.
+
+</Origin>
+
+## The Idea
+
+### The four things every ranking eval has
+
+Before any formula, the vocabulary. Every offline eval is four objects.
+
+1. A set of **queries**.
+2. For each query, a <Term w="run">The ranked list your system returns for each query. In TREC files, one line per (query, document, rank, score). "Run" because it's one run of one system.</Term>: your system's ranked list of documents, say the top 100.
+3. For each query, <Term w="qrels">Short for "query relevance judgments": for each query, which documents a human (or a labeling process) said are relevant, and how relevant. The answer key.</Term>: the answer key. Some (query, document) pairs, each with a <Term w="relevance grade">A number for how well a document answers the query. Binary is 0 or 1; graded is usually 0 to 3, from "not relevant" to "perfect answer".</Term>.
+4. A **metric** that turns one ranked list plus its qrels into one number per query, which you then average over queries.
+
+Note the order in point 4: every metric is computed **per query** first and averaged second. The average hides a distribution, and that distribution is where "how sure?" lives.
+
+Here's the running example. The query is `is the python gil gone`. Your ranker returned ten documents, and a labeler graded them 0 to 3:
+
+| Rank | Document | Grade |
+| --- | --- | --- |
+| 1 | Python 3.14 docs: free threading | 3 |
+| 2 | Monty Python cast list | 0 |
+| 3 | PEP 703 summary post | 2 |
+| 4 | Python 2.7 download page | 0 |
+| 5 | 2016 Gilectomy talk | 1 |
+| 6–7 | snake species, GIL meme thread | 0, 0 |
+| 8 | Free-threaded build HOWTO | 2 |
+| 9–10 | fish anatomy, SEO spam | 0, 0 |
+
+Four documents are relevant at all (grade 1 or more). To keep the arithmetic honest, assume those four are the only relevant documents that exist for this query. In real life you never know that for sure, and that's the unjudged-documents problem we'll get to.
+
+### Precision@k and recall@k: counting hits
+
+The simplest question: of the top k results, how many are any good?
+
+<Term w="precision@k">The fraction of the top k results that are relevant. "Of what I showed, how much was good?"</Term> is hits in the top k divided by k. With k = 5 we have hits at ranks 1, 3 and 5, so P@5 = 3/5 = 0.6.
+
+<Term w="recall@k">The fraction of all relevant documents that made it into the top k. "Of everything good that exists, how much did I find?"</Term> is hits in the top k divided by the total number of relevant documents, called R. Here R = 4, so R@5 = 3/4 = 0.75.
+
+They're the two sides of a trade. Precision asks about what you showed; recall asks about what you missed. Showing more results (raising k) can only keep or raise recall, and usually drags precision down.
+
+Two things neither of them sees. First, **order within the top k**: swap ranks 1 and 5 and P@5 doesn't move. Second, **grades**: a perfect answer and a barely-related one each count as one hit. Recall has a third blind spot: it needs R, and R is only as good as your judgments.
+
+When are they the right tool anyway? Recall@k is exactly the right question for a **first-stage retriever** whose output is going to be reranked. If the BM25 or bi-encoder stage returns 100 candidates to your cross-encoder, order within those 100 doesn't matter (your model will reorder them). The only question is whether the good documents are in there at all. Recall@100 of the first stage is the ceiling on everything the reranker can achieve. Keep that in mind: it's going to show up in your measurements.
+
+### MRR: where is the first good answer?
+
+Sometimes the user wants exactly one thing. A navigational query ("tinyfish docs"), a factual question ("when was PEP 703 accepted"), a single answer passage for a QA system. Once they've found it, they stop. Everything below the first good result is irrelevant to their experience.
+
+The <Term w="reciprocal rank">1 divided by the rank of the first relevant result. First result relevant gives 1; second gives 0.5; tenth gives 0.1; none gives 0.</Term> captures that. In our example the first relevant document is at rank 1, so RR = 1. If the Python docs had been at rank 3 instead, RR would be 1/3.
+
+Average RR over queries and you get <Term w="MRR">Mean reciprocal rank: the average of reciprocal rank over all queries. Popularised by the TREC-8 question answering track (1999).</Term>. Usually you cap it: MRR@10 means "if nothing relevant is in the top 10, this query scores 0". MS MARCO's official passage-ranking metric is MRR@10, which makes sense, because MS MARCO has on average about one labeled relevant passage per query.
+
+Notice the shape of 1/rank: the drop from rank 1 to 2 costs 0.5, but the drop from rank 9 to 10 costs about 0.01. MRR is brutally top-heavy. And it ignores everything after the first hit: a list with one relevant document at rank 1 and nine junk documents gets the same score as a list with ten perfect documents.
+
+### AP and MAP: precision at every hit
+
+What if the user wants **all** the relevant documents, ranked as high as possible? A patent examiner, a lawyer doing discovery, or a RAG system that wants every useful passage. You'd like a single number that rewards finding them all and finding them early.
+
+<Term w="average precision">For one query: walk down the list, and every time you hit a relevant document, write down the precision at that point. Add those up and divide by the total number of relevant documents (R). Missed documents contribute 0.</Term> does exactly that. Walk down our list:
+
+| Hit at rank | Hits so far | Precision at that rank |
+| --- | --- | --- |
+| 1 | 1 | 1/1 = 1.000 |
+| 3 | 2 | 2/3 = 0.667 |
+| 5 | 3 | 3/5 = 0.600 |
+| 8 | 4 | 4/8 = 0.500 |
+
+AP = (1 + 0.667 + 0.6 + 0.5) / 4 = 0.692. Mean that over queries and you have <Term w="MAP">Mean average precision: AP averaged over queries. The workhorse metric of TREC through the 1990s and 2000s.</Term>.
+
+The detail that trips people up: **you divide by R, not by the number of hits you found**. If one relevant document were never retrieved, it would still be in the denominator, contributing a 0. That's how AP punishes missed documents. It's also why AP depends on knowing R, so it inherits recall's dependence on complete judgments. And it's binary: a grade-3 and a grade-1 are both "a hit".
+
+### DCG: building a metric for graded relevance
+
+None of the metrics so far use the grades. Let's build one that does, from scratch, one decision at a time. Imagine a user reading the list top to bottom.
+
+**Decision 1: each document contributes its usefulness.** Call it the <Term w="gain">How much value one document gives the user. Simplest choice: the grade itself (0, 1, 2, 3). Another common choice is 2^grade − 1, which makes a perfect answer worth much more than a merely relevant one.</Term>. If we just add up gains over the top k, we get "cumulative gain": 3 + 0 + 2 + 0 + 1 = 6 for the top 5. But that ignores order again: the same five documents in any order score 6.
+
+**Decision 2: a document lower down is worth less, because fewer people get that far.** So multiply each gain by a <Term w="discount">A weight that shrinks with rank, standing in for "how likely is the user to look this far down". In DCG it is 1 / log2(rank + 1).</Term> that shrinks with rank. Add up gain × discount and you have DCG, discounted cumulative gain:
+
+```text
+DCG@k = sum over rank i = 1..k of   gain(i) / log2(i + 1)
+```
+
+**Why a logarithm?** You need something that starts at 1, always decreases, and doesn't fall to zero too fast. Look at the options. 1/rank (the MRR shape) says rank 10 is worth a tenth of rank 1, which means everything past rank 3 barely matters. A linear drop (1, 0.9, 0.8, ...) hits zero at some arbitrary k and treats a 1→2 swap the same as a 9→10 swap, which no user believes. The log is the gentle middle: it drops fast at the top and flattens out below.
+
+| Rank | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9 | 10 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1/log2(rank+1) | 1.000 | 0.631 | 0.500 | 0.431 | 0.387 | 0.356 | 0.333 | 0.315 | 0.301 | 0.289 |
+| 1/rank | 1.000 | 0.500 | 0.333 | 0.250 | 0.200 | 0.167 | 0.143 | 0.125 | 0.111 | 0.100 |
+
+Rank 10 still keeps almost 30% of its value under the log; under 1/rank it keeps 10%. The log is a design choice, not a law of nature: a reasonable model of a user who gets bored gradually. It stuck because it behaves well (Wang and colleagues showed in 2013 that it has good theoretical consistency properties), and later metrics like rank-biased precision replace it with a patience knob you can tune.
+
+**Why `rank + 1`?** Because log2(1) = 0, and dividing by zero at rank 1 is bad. Shifting by one gives rank 1 a discount of exactly 1. (The 2002 paper actually left the first few ranks undiscounted; the `log2(rank + 1)` form is what later practice settled on.)
+
+Now run our example at k = 5 with gain = grade:
+
+```text
+rank:      1      2      3      4      5
+grade:     3      0      2      0      1
+discount:  1.000  0.631  0.500  0.431  0.387
+gain×disc: 3.000  0      1.000  0      0.387      DCG@5 = 4.387
+```
+
+### NDCG: dividing by the best you could have done
+
+DCG has one problem: its scale depends on the query. A query with ten perfect documents can reach a DCG of 15; a query with one relevant document can't get past 3. Averaging raw DCG over queries lets the "easy, many-answers" queries drown everyone else out.
+
+So we normalise. Take the same grades, sort them from best to worst, and compute the DCG of that perfect ordering: the <Term w="ideal DCG">The DCG of the best possible ranking for this query: all judged documents sorted by grade, highest first, cut at k. Written IDCG@k.</Term>. Then divide.
+
+```text
+ideal order: 3, 2, 2, 1, 0 ...
+IDCG@5 = 3×1 + 2×0.631 + 2×0.5 + 1×0.431 + 0 = 5.693
+NDCG@5 = DCG@5 / IDCG@5 = 4.387 / 5.693 = 0.771
+```
+
+Now every query lives on the same 0-to-1 scale, where 1 means "you produced the best ordering possible for the documents we know about". That last clause matters: the ideal is computed from **all the judged documents in the qrels**, not from the ones you happened to retrieve. If your system missed the HOWTO at rank 8 entirely, the ideal still includes it, and your NDCG is lower for having missed it. Compute the ideal from your own run instead and you get a famous bug, which you'll commit on purpose in Break It.
+
+<Predict id="swap-cost">
+
+Start from the example list. Which costs more NDCG@10: swapping the documents at ranks 1 and 3 (the grade-3 and a grade-2), or moving the grade-2 HOWTO from rank 8 down to rank 10? Guess roughly how big each loss is.
+
+<Fragment slot="answer">
+
+The top swap costs much more. Swapping 1 and 3 changes 3×1.0 + 2×0.5 = 4.0 into 2×1.0 + 3×0.5 = 3.5, a DCG loss of 0.5, and NDCG@10 falls from 0.881 to about 0.794. Moving the HOWTO from 8 to 10 changes 2×0.315 into 2×0.289, a loss of about 0.05, and NDCG@10 only falls to about 0.872. The discount is steepest at the top, so the same amount of "wrongness" costs roughly ten times more there. Try both in the figure below.
+
+</Fragment>
+
+</Predict>
+
+Now play with it. Drag rows by the handle to reorder (or focus a handle and use the arrow keys), click a grade to cycle it, and slide k. The bars show each document's gain (dashed outline) and what's left after the discount (solid fill). Watch which numbers move when you swap two documents inside the top k, versus across the cut.
+
+<Figure n="001" title="RANKING METRIC LAB" caption="Ten results for one query. Swapping two results inside the top k leaves P@k and R@k unchanged but moves AP and NDCG; RR only cares about the first relevant row. Flip the gain to 2^g − 1 and the grade-3 result starts to dominate everything." wide>
+
+<RankLab />
+
+</Figure>
+
+Things to try:
+
+- Press **Sort ideal**. NDCG hits exactly 1.000 at every k. AP and RR hit 1 too. P@k does not: with only four relevant documents, P@10 can never exceed 0.4. Precision is capped by how many relevant documents exist, which makes it awkward to average across queries.
+- Set every grade to 0 except one, then drag that row from 1 to 10. RR goes 1, 0.5, 0.333, ... while NDCG goes 1, 0.631, 0.5, ...: with a single relevant document, NDCG@k is exactly the log discount and RR is exactly 1/rank. Two different patience models, written as two curves.
+- Switch to **2^g − 1**. The grade-3 document's gain jumps from 3 to 7, grade 2 becomes 3, grade 1 stays 1. Under exponential gain, getting the one perfect answer to the top matters far more than anything else. That's a statement about your users, not about math: choose it when "the" answer exists (navigational, factual), and use linear gain when many documents are useful in roughly equal measure. Both are in wide use. trec_eval and pytrec_eval use linear gain by default; many learning-to-rank papers and LightGBM's ranking objective use the exponential form. **Always say which one you used.**
+
+<Predict id="one-rel">
+
+On MS MARCO, almost every query has exactly one labeled relevant passage, graded 1. On such a query, how do NDCG@10 and RR@10 differ? Could a model improve one and not the other?
+
+<Fragment slot="answer">
+
+With one relevant document of grade 1 at rank r, DCG = 1/log2(r+1) and the ideal DCG is 1 (the document at rank 1). So NDCG@10 = 1/log2(r+1) and RR = 1/r. Both are functions of the same single number r, and both move in the same direction, so on a single-relevant query a model can't improve one while hurting the other. They weigh moves differently, though: moving the document from rank 2 to rank 1 is worth +0.5 RR but only +0.37 NDCG, while moving it from rank 10 to rank 5 is worth +0.1 RR and +0.10 NDCG. Averaged over many queries, the two can disagree about which of two models is better. MRR favours the model that nails rank 1 more often; NDCG is more forgiving of near misses.
+
+</Fragment>
+
+</Predict>
+
+### What each metric rewards, and which to use
+
+| Metric | Uses grades? | Order matters? | Needs R? | Rewards | Ignores |
+| --- | --- | --- | --- | --- | --- |
+| P@k | no | no (only the cut) | no | a clean top k | order inside k, grades, missed docs |
+| R@k | no | no (only the cut) | yes | finding everything by k | order, grades, junk shown |
+| RR / MRR | no | yes, first hit only | no | one good answer, very early | everything after the first hit |
+| AP / MAP | no | yes, every hit | yes | all relevant docs, early | grades; sensitive to missing judgments |
+| NDCG@k | yes | yes, smoothly | via the ideal | the best docs at the very top | anything below k |
+
+And the matching to jobs:
+
+- **Web search** (your world): users scan a short page, results come in shades of usefulness, and the top 3 get most of the attention. NDCG@10 with graded labels is the standard, with MRR as a sanity check for navigational queries. This is also why TREC's Deep Learning track reports NDCG@10.
+- **Question answering**, one answer wanted: MRR@10 (or "success@1": is the first result right?).
+- **Retrieval for RAG**: the reader is an LLM, not a human. It doesn't get bored at rank 4, but it does have a context budget of, say, 10 passages. So the first question is recall@10 (or recall@k for your k): is the evidence in the context at all? NDCG still helps if you put the best passage first or the model has a position bias of its own (models tend to use information at the start and end of the context more than the middle).
+- **First-stage retrieval feeding your reranker**: recall@100 or recall@1000. Order doesn't matter; the reranker will fix it.
+
+### Where your model sits: bi-encoders, cross-encoders, and the funnel
+
+A web search engine can't run a big model over billions of pages per query. So ranking is a funnel, and your cross-encoder lives near the narrow end.
+
+<Figure n="002" title="WHERE A CROSS-ENCODER SITS" caption="A bi-encoder embeds query and document separately, so documents can be embedded once, offline. A cross-encoder reads the query and the document together, so it is more accurate and has to run once per pair, at query time. That is why it reranks a short list instead of searching the corpus." wide>
+
+<svg viewBox="0 0 640 330" role="img" aria-label="Bi-encoder versus cross-encoder, and the retrieval funnel">
+  <text x="20" y="20" class="strong">BI-ENCODER (RETRIEVE)</text>
+  <rect x="20" y="34" width="110" height="26" class="fill-paper" stroke-width="1" />
+  <text x="75" y="51" text-anchor="middle">QUERY</text>
+  <rect x="160" y="34" width="110" height="26" class="fill-paper" stroke-width="1" />
+  <text x="215" y="51" text-anchor="middle">DOCUMENT</text>
+  <line x1="75" y1="60" x2="75" y2="78" class="ink" stroke-width="1" />
+  <line x1="215" y1="60" x2="215" y2="78" class="ink" stroke-width="1" />
+  <rect x="20" y="78" width="110" height="30" class="fill-wash" stroke-width="1" />
+  <text x="75" y="97" text-anchor="middle">ENCODER</text>
+  <rect x="160" y="78" width="110" height="30" class="fill-wash" stroke-width="1" />
+  <text x="215" y="97" text-anchor="middle">ENCODER</text>
+  <line x1="75" y1="108" x2="75" y2="126" class="ink" stroke-width="1" />
+  <line x1="215" y1="108" x2="215" y2="126" class="ink" stroke-width="1" />
+  <text x="75" y="140" text-anchor="middle" class="blue-t">VECTOR q</text>
+  <text x="215" y="140" text-anchor="middle" class="blue-t">VECTOR d</text>
+  <line x1="75" y1="148" x2="135" y2="168" class="ink" stroke-width="1" />
+  <line x1="215" y1="148" x2="155" y2="168" class="ink" stroke-width="1" />
+  <circle cx="145" cy="176" r="9" class="fill-paper" stroke-width="1" />
+  <text x="145" y="180" text-anchor="middle">·</text>
+  <text x="145" y="204" text-anchor="middle" class="strong">SCORE = q · d</text>
+  <text x="20" y="226">DOCS EMBEDDED ONCE, OFFLINE</text>
+  <text x="20" y="242">SEARCH = NEAREST VECTORS (FAST)</text>
+
+  <text x="360" y="20" class="strong">CROSS-ENCODER (RERANK)</text>
+  <rect x="360" y="34" width="260" height="26" class="fill-paper" stroke-width="1" />
+  <text x="490" y="51" text-anchor="middle">[CLS] QUERY [SEP] DOCUMENT</text>
+  <line x1="490" y1="60" x2="490" y2="78" class="ink" stroke-width="1" />
+  <rect x="360" y="78" width="260" height="56" class="fill-wash" stroke-width="1" />
+  <text x="490" y="102" text-anchor="middle">ONE TRANSFORMER</text>
+  <text x="490" y="120" text-anchor="middle">EVERY QUERY TOKEN SEES EVERY DOC TOKEN</text>
+  <line x1="490" y1="134" x2="490" y2="160" class="ink" stroke-width="1" />
+  <rect x="440" y="160" width="100" height="30" class="fill-paper" stroke-width="1" />
+  <text x="490" y="179" text-anchor="middle" class="strong">SCORE</text>
+  <text x="360" y="226">ONE FORWARD PASS PER (QUERY, DOC)</text>
+  <text x="360" y="242" class="blue-t">MORE ACCURATE, MUCH MORE EXPENSIVE</text>
+
+  <line x1="20" y1="262" x2="620" y2="262" style="stroke:var(--rule)" stroke-width="1" />
+  <rect x="20" y="276" width="140" height="40" class="fill-paper" stroke-width="1" />
+  <text x="90" y="293" text-anchor="middle" class="strong">CORPUS</text>
+  <text x="90" y="308" text-anchor="middle">BILLIONS OF PAGES</text>
+  <rect x="190" y="280" width="130" height="32" class="fill-paper" stroke-width="1" />
+  <text x="255" y="295" text-anchor="middle">BM25 / BI-ENC</text>
+  <text x="255" y="307" text-anchor="middle">TOP ~1000</text>
+  <rect x="350" y="284" width="120" height="24" class="fill-wash" stroke-width="1.5" />
+  <text x="410" y="300" text-anchor="middle" class="strong">YOU: TOP ~100</text>
+  <rect x="500" y="287" width="80" height="18" class="fill-paper" stroke-width="1" />
+  <text x="540" y="300" text-anchor="middle">SHOW 10</text>
+  <line x1="160" y1="296" x2="186" y2="296" class="ink" stroke-width="1" />
+  <line x1="320" y1="296" x2="346" y2="296" class="ink" stroke-width="1" />
+  <line x1="470" y1="296" x2="496" y2="296" class="ink" stroke-width="1" />
+  <text x="255" y="328" text-anchor="middle">METRIC: RECALL@K</text>
+  <text x="470" y="328" text-anchor="middle" class="blue-t">METRIC: NDCG@10, MRR@10</text>
+</svg>
+
+</Figure>
+
+A <Term w="bi-encoder">A model that turns the query and each document into separate vectors and scores a pair by their dot product (or cosine). Documents can be embedded once ahead of time and searched with a nearest-neighbour index.</Term> encodes the query and the document separately. The document's vector never sees the query, so all the "does this match?" reasoning has to be squeezed into one dot product at the end. In exchange, you embed the corpus once and search it in milliseconds.
+
+A <Term w="cross-encoder">A model that reads the query and a document together as one input and outputs a relevance score directly. Every query token can attend to every document token, which makes it more accurate, but it must run once per (query, document) pair at query time.</Term> concatenates them, `[CLS] query [SEP] document`, and runs one transformer over both. With attention you know what that buys: the token "gil" in the query can attend directly to "Global Interpreter Lock" in the document, and to "fish" in the wrong one. The cost: nothing can be precomputed. Reranking 100 candidates is 100 forward passes, per query, at query time. That's why it sits after the retriever and why its metrics are NDCG@10 and MRR@10 rather than recall.
+
+Two consequences for evaluating your model. First, **your reranker's score is capped by the retriever's recall**. If the right page isn't in the top 100 that BM25 hands you, no amount of cross-encoder training will put it at rank 1. Always report first-stage recall@100 next to reranked NDCG@10, or you won't know which stage to blame. Second, a fair comparison holds the candidates fixed: v1 and v2 should rerank the **same** candidate lists, so the only thing that differs is the reranker. (There's a middle ground, "late interaction" models like ColBERT, that keep per-token document vectors so some query-document interaction survives precomputation. Worth knowing the name.)
+
+### Offline metrics versus what users do
+
+Everything so far is <Term w="offline evaluation">Scoring a system against a fixed set of queries and human (or model) labels, without any live users. Repeatable and cheap per run, but only as good as the labels.</Term>. The alternative is watching real users.
+
+Online signals are things like <Term w="CTR">Click-through rate: the fraction of result impressions (or searches) that get a click.</Term>, dwell time (how long someone stays on the page they clicked; a click followed by a quick return to the results usually means "that was wrong"), and <Term w="abandonment">A search where the user clicks nothing. Can mean failure ("nothing looked good") or success ("the answer was in the snippet"), which is what makes it hard to read.</Term>.
+
+Clicks are tempting labels: free, plentiful, from real users. But they're biased in a way that's easy to forget. <Term w="position bias">Users click higher-ranked results more often regardless of how good they are, simply because they see them first and trust the ranking.</Term> means a click on rank 1 is weak evidence, and a click on rank 8 is strong evidence. Joachims and colleagues showed this with eye-tracking in 2005: when they secretly swapped the top two results, users still clicked the top position more. So if you train or evaluate on clicks from the current ranker, you mostly learn "what the current ranker puts at the top". A new model that surfaces a great page from rank 30 gets no credit, because nobody ever clicked a page they never saw.
+
+Offline evals are how you iterate: twenty checkpoints compared before lunch. Online tests (A/B tests, or <Term w="interleaving">An online test that merges two rankers' results into one list for each user and sees which ranker's results get clicked more. Much more sensitive than a standard A/B test, because each user compares both.</Term>) are how you confirm that the offline win is real for users. If offline NDCG says v2 wins and an online test says users don't care, the usual culprit is the eval set: it doesn't look like real traffic, or its labels don't reflect what users value. Which brings us to the most important part of this lesson.
+
+### Building the eval set
+
+Your metric is only as good as three choices: which queries, which documents get judged, and how they're judged.
+
+#### Which queries: sample real traffic, by strata
+
+Query traffic follows a long tail. A few queries ("weather", "youtube") are searched millions of times; most distinct queries are searched once or twice ever.
+
+<Figure n="003" title="HEAD, TORSO, TAIL" caption="Sorted by frequency, a few head queries carry a huge share of traffic and the tail holds most of the distinct queries. Sampling searches uniformly gives you mostly head; sampling distinct queries gives you mostly tail. Stratify, then weight." wide>
+
+<svg viewBox="0 0 640 230" role="img" aria-label="Long-tail query frequency curve split into head, torso and tail">
+  <line x1="50" y1="180" x2="620" y2="180" class="ink" stroke-width="1" />
+  <line x1="50" y1="20" x2="50" y2="180" class="ink" stroke-width="1" />
+  <text x="44" y="30" text-anchor="end">HIGH</text>
+  <text x="44" y="178" text-anchor="end">LOW</text>
+  <text x="58" y="18">SEARCHES PER QUERY</text>
+  <rect x="52" y="22" width="58" height="158" class="fill-wash" stroke-width="0" opacity="0.6" />
+  <rect x="110" y="22" width="150" height="158" class="fill-wash" stroke-width="0" opacity="0.3" />
+  <path d="M54 28 C 70 70, 90 110, 120 135 C 160 160, 230 168, 300 172 C 400 175, 520 177, 618 178" class="blue" stroke-width="1.5" />
+  <line x1="110" y1="22" x2="110" y2="180" class="ink dash" stroke-width="1" />
+  <line x1="260" y1="22" x2="260" y2="180" class="ink dash" stroke-width="1" />
+  <text x="81" y="198" text-anchor="middle" class="strong">HEAD</text>
+  <text x="185" y="198" text-anchor="middle" class="strong">TORSO</text>
+  <text x="440" y="198" text-anchor="middle" class="strong">TAIL</text>
+  <text x="81" y="214" text-anchor="middle">FEW QUERIES</text>
+  <text x="185" y="214" text-anchor="middle">MIDDLE</text>
+  <text x="440" y="214" text-anchor="middle">MOST DISTINCT QUERIES, SEEN ONCE OR TWICE</text>
+  <text x="130" y="60">"youtube", "weather"</text>
+  <text x="300" y="150">"python gil removed 3.14 benchmark"</text>
+  <text x="620" y="228" text-anchor="end">QUERIES SORTED BY FREQUENCY →</text>
+</svg>
+
+</Figure>
+
+The traps are all about sampling.
+
+- **Hand-picked queries** (the notebook twenty) are the worst. You picked them because they were interesting, which usually means "v1 failed on them". Any model will look better on the queries chosen for its predecessor's failures. That's a selection effect, not a measurement.
+- **Uniform over searches** (pick random log lines) gives you mostly head queries, because head queries are most of the log lines. Head queries tend to be easy and already well served. Your eval would say "everything is great" while the tail burns.
+- **Uniform over distinct queries** gives you mostly tail, which is where rankers differ most but which undersells what most users experience.
+
+The standard answer: split real logs into <Term w="strata">Groups you sample from separately, here by query frequency (head, torso, tail), so each group gets enough queries to measure, regardless of its share of the whole.</Term> by frequency (for example: head = the queries making up the top third of traffic, torso = the next third, tail = the rest), sample a fixed number from each, and report metrics **per stratum** plus an overall number weighted by traffic share. Sample from real logs, from a recent window, after removing anything private. Then freeze the set: an eval set that changes every week can't compare this week's model to last month's. Keep a few hundred queries locked away that you never look at while developing, for the same reason you keep a test set in ML.
+
+At TinyFish there's a twist worth thinking about: many of your "users" may be agents, not people. Agent queries are longer, more literal, and often come in bursts from one task. Sample them as their own stratum, because they may want different things from a ranking (complete coverage over one nice snippet).
+
+#### Which documents get judged: pooling
+
+For each sampled query, you can't judge the whole web. You judge a <Term w="pool">The set of documents that actually get labeled for a query: the union of the top results from several different systems. Anything outside the pool is unjudged.</Term>.
+
+<Figure n="004" title="POOLING, AND THE UNJUDGED HOLE" caption="Judge the union of the top results from several different systems. A new system that finds documents none of the pooled systems returned gets those documents scored as not relevant, whether or not they are." wide>
+
+<svg viewBox="0 0 640 270" role="img" aria-label="Three systems pooled into judged set, a new system with unjudged documents">
+  <text x="20" y="18" class="strong">TOP 5 FROM EACH SYSTEM</text>
+  <text x="50" y="38" text-anchor="middle">BM25</text>
+  <text x="130" y="38" text-anchor="middle">BI-ENC</text>
+  <text x="210" y="38" text-anchor="middle">CE v1</text>
+  <rect x="25" y="46" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="50" y="61" text-anchor="middle">d1</text>
+  <rect x="25" y="72" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="50" y="87" text-anchor="middle">d2</text>
+  <rect x="25" y="98" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="50" y="113" text-anchor="middle">d3</text>
+  <rect x="25" y="124" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="50" y="139" text-anchor="middle">d4</text>
+  <rect x="25" y="150" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="50" y="165" text-anchor="middle">d5</text>
+  <rect x="105" y="46" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="130" y="61" text-anchor="middle">d2</text>
+  <rect x="105" y="72" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="130" y="87" text-anchor="middle">d6</text>
+  <rect x="105" y="98" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="130" y="113" text-anchor="middle">d1</text>
+  <rect x="105" y="124" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="130" y="139" text-anchor="middle">d7</text>
+  <rect x="105" y="150" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="130" y="165" text-anchor="middle">d8</text>
+  <rect x="185" y="46" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="210" y="61" text-anchor="middle">d6</text>
+  <rect x="185" y="72" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="210" y="87" text-anchor="middle">d1</text>
+  <rect x="185" y="98" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="210" y="113" text-anchor="middle">d9</text>
+  <rect x="185" y="124" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="210" y="139" text-anchor="middle">d2</text>
+  <rect x="185" y="150" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="210" y="165" text-anchor="middle">d3</text>
+  <line x1="245" y1="110" x2="278" y2="110" class="ink" stroke-width="1" />
+  <text x="262" y="102" text-anchor="middle">∪</text>
+  <rect x="282" y="56" width="140" height="106" class="fill-wash" stroke-width="1" />
+  <text x="352" y="76" text-anchor="middle" class="strong">POOL: 9 DOCS</text>
+  <text x="352" y="96" text-anchor="middle">d1 d2 d3 d4 d5</text>
+  <text x="352" y="112" text-anchor="middle">d6 d7 d8 d9</text>
+  <text x="352" y="136" text-anchor="middle" class="blue-t">HUMANS GRADE</text>
+  <text x="352" y="150" text-anchor="middle" class="blue-t">ALL 9, 0-3</text>
+  <text x="480" y="38" text-anchor="middle" class="strong">NEW: CE v2</text>
+  <rect x="455" y="46" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="480" y="61" text-anchor="middle">d6</text>
+  <rect x="455" y="72" width="50" height="22" class="fill-paper dash" stroke-width="1" /><text x="480" y="87" text-anchor="middle" class="blue-t">d42 ?</text>
+  <rect x="455" y="98" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="480" y="113" text-anchor="middle">d1</text>
+  <rect x="455" y="124" width="50" height="22" class="fill-paper dash" stroke-width="1" /><text x="480" y="139" text-anchor="middle" class="blue-t">d57 ?</text>
+  <rect x="455" y="150" width="50" height="22" class="fill-paper" stroke-width="1" /><text x="480" y="165" text-anchor="middle">d2</text>
+  <line x1="510" y1="83" x2="540" y2="83" class="ink" stroke-width="1" />
+  <line x1="510" y1="135" x2="540" y2="135" class="ink" stroke-width="1" />
+  <text x="545" y="80">NEVER JUDGED,</text>
+  <text x="545" y="94">SCORED AS 0</text>
+  <text x="545" y="132">MAYBE GREAT</text>
+  <text x="20" y="208">FIX: REPORT JUDGED@10 FOR EVERY SYSTEM. IF THE NEW ONE IS LOW, JUDGE ITS HOLES</text>
+  <text x="20" y="226">BEFORE TRUSTING THE COMPARISON (OR USE A METRIC BUILT FOR GAPS, LIKE BPREF).</text>
+  <text x="20" y="250" class="blue-t">POOL FROM SYSTEMS THAT FAIL DIFFERENTLY: LEXICAL + DENSE + YOUR MODELS.</text>
+</svg>
+
+</Figure>
+
+Take the top 10 or 20 from several systems that work differently (BM25, a bi-encoder, your current cross-encoder, maybe a commercial search API), union them, and judge only the union. Diversity is the point. BM25 finds exact-match pages that embeddings miss; embeddings find paraphrases BM25 misses. The more different the pooled systems, the fewer relevant documents stay hidden.
+
+Pooling has a sting in its tail. Any document outside the pool is <Term w="unjudged">A (query, document) pair nobody labeled. Standard scorers like trec_eval treat it as grade 0 (not relevant), which is a guess, not a fact.</Term>, and standard scorers treat unjudged as not relevant. That's fine for systems that were in the pool. It's unfair to a **new** system, which is exactly what your v2 is. If v2 is better because it finds good pages v1 never surfaced, those pages are unjudged, and v2 gets penalised for its best feature.
+
+There's a simple diagnostic: <Term w="judged@k">The fraction of a system's top-k results that have any label in the qrels. If it's much lower for a new system than for the pooled ones, its metrics are biased downward.</Term>. Compute it for every system you report. If v2's judged@10 is 0.97 and v1's is 1.00, fine. If v2's is 0.70, its NDCG is meaningless until you judge the holes. Fortunately, judging the holes is cheap: it's only v2's unjudged top-10 documents, and adding them to the qrels improves the eval set for every future model too. (Metrics designed to ignore unjudged documents, like bpref from Buckley and Voorhees in 2004, or simply dropping unjudged documents from the ranking before scoring, are the alternatives. Judging the holes is usually best.)
+
+MS MARCO is the cautionary tale. Its labels come from people who marked one passage that answered the question, so most queries have exactly one positive and many relevant passages are unlabeled. Strong rerankers routinely put an unlabeled-but-correct passage at rank 1 and get MRR "penalised" for it. That's part of why the TREC Deep Learning track re-judged a small set of queries deeply with graded labels.
+
+#### How documents get judged: guidelines and grades
+
+A label is only meaningful if two people would give the same one. That takes a written <Term w="labeling guideline">The rulebook labelers follow: what each grade means, worked examples for each, and explicit rules for the confusing cases. The single most important document in an eval set.</Term>. A good one for web search:
+
+- **States the user's intent.** "Imagine the person typed this query and is about to click. Would this page satisfy them?" Not "is this page on topic?" A page can be on topic and useless.
+- **Defines each grade with examples from your own data.**
+  - 3, **Perfect**: this page is the answer, or the destination they were looking for. Nothing else needed.
+  - 2, **Highly relevant**: substantially answers the query; maybe they'd want one more source.
+  - 1, **Related**: on topic, partially useful, or outdated.
+  - 0, **Not relevant**: wrong meaning, spam, broken, or useless for this query.
+  This is close to the four-level scale TREC Deep Learning used (perfectly relevant, highly relevant, related, irrelevant).
+- **Has rules for the hard cases**, because that's where labelers diverge: ambiguous queries ("python" the snake vs the language: grade against the most likely intent, or the intent-mix), outdated pages (a correct 2019 answer to "is the gil gone" is now wrong), duplicates, paywalls, pages that are correct but low quality, pages in the wrong language.
+- **Says what labelers see**: the query only, or also context like the user's location or time? Your users (or agents) had context the labeler doesn't; decide deliberately.
+
+Grade every pooled document, not just the top few, and grade documents in random order with system names hidden, so the labeler can't favour "the new model's" results.
+
+#### Do two labelers agree? Cohen's kappa
+
+Write the guide, then give the same 50 queries' pooled documents to two labelers independently. If they disagree a lot, your guideline is ambiguous, and a metric built on those labels has a noise floor that no model improvement can rise above.
+
+Raw agreement ("they gave the same grade 75% of the time") is misleading, because some agreement happens by chance. If both labelers mark 90% of documents "not relevant", they'll agree on most documents even if they're guessing. <Term w="Cohen's kappa">Agreement between two labelers, corrected for the agreement you'd expect by chance from each labeler's label frequencies. 1 = perfect, 0 = no better than chance.</Term> fixes that:
+
+```text
+kappa = (p_observed - p_chance) / (1 - p_chance)
+```
+
+A worked example, binary labels on 100 documents: both said relevant on 40, both said not relevant on 35, A yes / B no on 15, A no / B yes on 10. Observed agreement is (40 + 35) / 100 = 0.75. Labeler A said "yes" 55% of the time, B said "yes" 50%. If they labeled independently at those rates, they'd agree by chance 0.55 × 0.50 + 0.45 × 0.50 = 0.50 of the time. So kappa = (0.75 − 0.50) / (1 − 0.50) = **0.50**. Half of the possible above-chance agreement.
+
+For graded labels, use <Term w="weighted kappa">A version of kappa where near-misses (2 vs 3) count as partial agreement and far misses (0 vs 3) count as full disagreement. Quadratic weights penalise big gaps most.</Term>: a 2-versus-3 disagreement shouldn't count as much as a 0-versus-3. In scikit-learn that's `cohen_kappa_score(a, b, weights="quadratic")`. On a simulated set of 500 graded labels where the second labeler was off by one grade about 40% of the time, I measured unweighted kappa 0.61, linear 0.78, quadratic 0.90. Same labels, three numbers, so **always say which one**.
+
+A rough, commonly used reading (Landis and Koch, 1977, and it really is rough): 0.41–0.60 "moderate", 0.61–0.80 "substantial", above 0.80 "almost perfect". Relevance is genuinely subjective, so don't expect 0.9. Ellen Voorhees showed in 2000 that TREC assessors often disagree substantially about individual documents, and yet **the ranking of systems** barely changed when you swapped whose judgments you used. Disagreement adds noise to every system roughly equally. It doesn't usually flip which system wins, as long as the differences between systems are real and the eval set has enough queries. Low kappa is a reason to fix the guide, not a reason to give up.
+
+What to do with the disagreements: look at them. Every disagreement is a sentence missing from the guideline. Go through them together, add a rule or an example, relabel, recompute. Two or three rounds usually gets you from "moderate" to "substantial".
+
+#### LLM labels, calibrated by humans
+
+Labeling thousands of (query, document) pairs by hand is slow. LLMs can do it, and in 2023 Paul Thomas and colleagues at Microsoft reported that carefully prompted GPT-4 relevance labels agreed with careful human labelers about as well as typical crowd workers did, at a small fraction of the cost. That's now standard practice, with three conditions:
+
+1. **Give the model your guideline**, verbatim, with the worked examples. The model is a labeler like any other.
+2. **Calibrate against humans** on your 50-query pilot. Compute kappa between the LLM and each human, and between the two humans. If LLM-vs-human kappa is close to human-vs-human, the LLM is "another reasonable labeler". If not, look at where it disagrees. Recheck every time you change the prompt or the model.
+3. **Watch for circularity.** If your cross-encoder was distilled from (or trained on labels from) the same LLM that's now judging it, the eval will reward agreeing with that LLM, blind spots included. That's exactly the trap in [Why are the evaluator and the model different systems?](/lessons/why-evals-are-separate/). Keep a human-labeled slice as the anchor and check that the LLM-judged and human-judged slices agree on which model wins.
+
+### How sure? Per-query deltas and the paired bootstrap
+
+Back to "+0.009". The mean NDCG@10 is an average over queries, and queries differ wildly: some are easy (both models get 1.0), some are impossible (both get 0), and a few are where the models actually differ. The question isn't "is 0.421 bigger than 0.412" (it obviously is). It's "if I had drawn a different 300 queries from the same traffic, would v2 still win?"
+
+The key move: **compare the models query by query**. For each query, compute `delta = NDCG(v2) − NDCG(v1)`. Because both models are scored on the same query, the query's difficulty cancels out. An impossible query is 0 − 0 = 0 for both. This is called a <Term w="paired comparison">Comparing two systems on the same items, item by item, then analysing the differences. Removes the item-to-item variation that both systems share, which is usually most of the variation.</Term>, and it's much more sensitive than comparing two averages.
+
+Then ask how much the mean delta would wobble with a different sample of queries. You don't have another sample, but you can simulate one with the <Term w="bootstrap">Estimating uncertainty by resampling your data with replacement many times, recomputing the statistic each time, and looking at the spread of results. Efron, 1979.</Term>: draw N queries from your N queries **with replacement** (some appear twice, some not at all), compute the mean delta, repeat 10,000 times. The middle 95% of those means is a 95% confidence interval for the improvement.
+
+<Predict id="ci-width">
+
+Say the per-query NDCG@10 deltas have a standard deviation of about 0.12 (typical-ish when about half the queries tie exactly), and the true improvement is +0.02. Roughly how many queries do you need before the 95% interval stops crossing zero?
+
+<Fragment slot="answer">
+
+The interval's half-width is about 2 × SD / sqrt(N) (two standard errors). You need 2 × 0.12 / sqrt(N) to drop below 0.02, so sqrt(N) above 12, so N above about 150. In practice you want comfortably more, say 300–500, because the estimated SD is itself noisy and real improvements are often smaller than 0.02. Halving the detectable difference means four times the queries. Check this in the figure: at 100 queries the interval usually crosses zero; by 400 it usually doesn't.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="005" title="PAIRED BOOTSTRAP OVER QUERIES" caption="Top: one delta per query, with a spike at zero where both rankers tie. Bottom: the mean delta recomputed on 2,000 resamples of those queries. The blue bar is the 95% interval. More queries narrow it; a new draw of queries moves it." wide>
+
+<RankBootstrap />
+
+</Figure>
+
+Three habits that come out of this:
+
+- **Report the delta and its interval**, not two scores: "v2 − v1 NDCG@10 = +0.009, 95% CI [−0.004, +0.022], 300 queries, paired bootstrap". Anyone can read that sentence and know what you know.
+- **Look at the per-query deltas**, not just their mean. Wins, losses and ties. Sort the losses and read the ten worst queries. That's where your next training data comes from.
+- **Report per stratum.** Head, torso, tail, agents. An overall +0.01 can be +0.05 on the tail and −0.02 on the head, which may or may not be the trade you want.
+
+The bootstrap isn't the only valid test. The paired t-test and the paired randomization (permutation) test are the other two in common use, and Smucker, Allan and Carterette showed in 2007 that on TREC data the three mostly agree. The bootstrap's appeal is that it hands you an interval directly and works for any metric. The next lesson, [Is that improvement real?](/lessons/statistics-for-evals/), goes into the statistics properly: why these work, multiple comparisons, and how many queries you need before you run anything.
+
+### The benchmarks you'll see cited
+
+- **MS MARCO** (Microsoft, 2016): real Bing questions with human-written answers. The passage-ranking task has about 8.8 million passages; the commonly used "dev small" set has 6,980 queries, with sparse, mostly single, binary labels. Official metric: MRR@10. BM25 scores around 0.19; the first BERT cross-encoder reranker (Nogueira and Cho, 2019) jumped to about 0.36, which is the moment cross-encoders took over reranking.
+- **TREC Deep Learning** (2019 onward): the same corpus, but a few dozen queries per year (43 for the 2019 passage task), each judged deeply by NIST assessors on the four-level scale, pooled from all participating systems. Metric: NDCG@10. Fewer queries, far more complete judgments: the opposite trade from MS MARCO.
+- **BEIR** (Thakur and colleagues, 2021): 18 datasets across very different domains (science fact-checking, medical, finance, argument retrieval, duplicate questions, entity search), used to test "zero-shot" retrieval: train on MS MARCO, evaluate everywhere else. Metric: NDCG@10. Its famous findings: BM25 is a stubbornly strong baseline out of domain, many dense bi-encoders trained on MS MARCO fall below it, BM25 plus a cross-encoder reranker was strongest on average, and pools built from older lexical systems disadvantage new dense models (the unjudged problem, at benchmark scale).
+
+You're going to use one BEIR dataset as a public sandbox, then build your own eval set for the real thing.
+
+## Build It
+
+Put everything in one folder, say `~/workbench/ranking/`. The Mac is fine for all of the public-benchmark work (the dataset is small); use the Spark for your real model.
+
+<Task id="t0" title="Set up, and get a small BEIR dataset" agent="ok">
+
+```bash
+mkdir -p ~/workbench/ranking && cd ~/workbench/ranking
+python3 -m venv .venv && source .venv/bin/activate
+pip install numpy pytrec_eval-terrier ranx rank_bm25 sentence-transformers scikit-learn
+mkdir -p data && cd data
+curl -LO https://public.ukp.informatik.tu-darmstadt.de/thakur/BEIR/datasets/scifact.zip
+unzip scifact.zip && cd ..
+```
+
+SciFact is a BEIR dataset of scientific claims (queries) and paper abstracts (documents): 5,183 documents and 300 test queries with qrels, small enough to run every model on a laptop in a few minutes. Files are `corpus.jsonl` (`_id`, `title`, `text`), `queries.jsonl` (`_id`, `text`) and `qrels/test.tsv` (`query-id`, `corpus-id`, `score`, with a header line). Only use queries that appear in `test.tsv`.
+
+The TREC formats you'll use from here on, one line per row, whitespace-separated:
+
+```text
+# qrels: query_id  0  doc_id  grade        (the 0 is a legacy "iteration" column)
+q1 0 d17 3
+q1 0 d42 0
+# run:   query_id  Q0  doc_id  rank  score  run_name
+q1 Q0 d17 1 12.83 bm25
+q1 Q0 d99 2 11.02 bm25
+```
+
+`pip install pytrec_eval-terrier` installs a maintained build of `pytrec_eval`; the import name is still `pytrec_eval`. If the package name has changed, check its PyPI page. `ranx` compiles its metrics with Numba on first use, so the first call takes a minute or two; later calls are fast.
+
+</Task>
+
+<Task id="t1" title="Write the metrics from scratch" agent="hands">
+
+One file, no libraries except `math`. Every function takes one query's ranked list and that query's judgments.
+
+```python
+# metrics.py
+import math
+
+Ranking = list[str]          # doc ids, best first
+Judgments = dict[str, int]   # doc id -> grade (0..3). Missing = unjudged = 0.
+
+def precision_at_k(ranking: Ranking, qrels: Judgments, k: int) -> float: ...
+def recall_at_k(ranking: Ranking, qrels: Judgments, k: int) -> float: ...
+def reciprocal_rank(ranking: Ranking, qrels: Judgments, k: int | None = None) -> float: ...
+def average_precision(ranking: Ranking, qrels: Judgments) -> float: ...
+def dcg_at_k(grades: list[int], k: int, gain: str = "linear") -> float: ...
+def ndcg_at_k(ranking: Ranking, qrels: Judgments, k: int, gain: str = "linear") -> float: ...
+def judged_at_k(ranking: Ranking, qrels: Judgments, k: int) -> float: ...
+
+def run_to_rankings(run: dict[str, dict[str, float]]) -> dict[str, Ranking]:
+    """Scores -> ranked lists. Decide and document your tie-breaking rule."""
+    ...
+```
+
+Rules to get right (each one is a real bug someone has shipped):
+
+- "Relevant" for the binary metrics means grade ≥ 1.
+- R (for recall and AP) counts relevant documents **in the qrels**, not in the ranking.
+- The ideal DCG sorts **all judged grades for the query** from the qrels, not the grades of what you retrieved.
+- A query with no relevant documents: decide what to return and be consistent. (trec_eval skips queries that aren't in the qrels at all.)
+- Test on the running example from this page: at k = 5 you should get P = 0.6, R = 0.75, RR = 1.0, AP = 0.692 (over the whole list), NDCG@5 = 0.771, and NDCG@10 = 0.881. With gain `2^g − 1`, NDCG@10 = 0.909.
+
+</Task>
+
+<Task id="t2" title="Validate against pytrec_eval and ranx" agent="explain">
+
+Your metrics are only trustworthy once they agree with the tools everyone else uses. Generate a random fuzz case (50 queries, 40 documents each, 15 graded at random 0–3, random scores), then compare per query:
+
+```python
+import pytrec_eval
+ev = pytrec_eval.RelevanceEvaluator(qrels, {"P_10", "recall_10", "recip_rank", "map", "ndcg_cut_10"})
+per_query = ev.evaluate(run)   # {qid: {"P_10": ..., "ndcg_cut_10": ...}}
+
+from ranx import Qrels, Run, evaluate
+print(evaluate(Qrels(qrels), Run(run), ["ndcg@10", "map", "mrr@10", "precision@10", "recall@10"]))
+```
+
+Both take `qrels` as `{qid: {docid: grade}}` and `run` as `{qid: {docid: score}}`. Assert the max absolute difference per metric is under `1e-9`. When I did this, my from-scratch P@10, recall@10, AP and NDCG@10 matched pytrec_eval to within floating-point rounding (about 2e-16), which confirms trec_eval's `ndcg_cut` uses linear gain and the `log2(rank + 1)` discount. Note: trec_eval's `recip_rank` is **not** cut at 10; compare against your uncut version. If something doesn't match, an agent can explain what trec_eval does differently (tie-breaking is the usual culprit; see Break It), but fix your code yourself.
+
+</Task>
+
+<Task id="t3" title="BM25 vs bi-encoder vs cross-encoder on SciFact" agent="review">
+
+Write `bench.py` with three runs over the 300 test queries, each keeping the top 100 per query:
+
+1. **BM25** with `rank_bm25.BM25Okapi` over `title + " " + text`, tokenised with a lowercase `\w+` regex.
+2. **Bi-encoder**: `SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")`, embed all 5,183 documents once with `normalize_embeddings=True`, embed the queries, score with a matrix product, take the top 100.
+3. **BM25 + cross-encoder**: `CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")`, call `.predict([(query, doc_text), ...])` on BM25's 100 candidates per query, rerank by that score.
+
+```python
+def bm25_run(queries, corpus) -> dict[str, dict[str, float]]: ...
+def biencoder_run(queries, corpus, model_name: str) -> dict[str, dict[str, float]]: ...
+def rerank_run(queries, corpus, candidates, model_name: str) -> dict[str, dict[str, float]]: ...
+```
+
+Evaluate all three with **your** metrics: NDCG@10, MRR@10, MAP, recall@10, recall@100, judged@10. Time each stage. Write your predictions into the Measure table before running. Then ask an agent to review the code for unfair comparisons (different candidate sets, leaking test qrels into anything, tie handling).
+
+</Task>
+
+<Task id="t4" title="Paired bootstrap" agent="hands">
+
+```python
+def paired_bootstrap(a: dict[str, float], b: dict[str, float], n_boot: int = 10_000,
+                     seed: int = 0) -> tuple[float, float, float]:
+    """a, b: per-query metric for two systems over the SAME query ids.
+    Returns (mean of b - a, 2.5th percentile, 97.5th percentile) of the bootstrap means."""
+    ...
+```
+
+Hints: build one array of per-query deltas, then `rng.integers(0, n, size=(n_boot, n))` gives every resample's indices at once, and `.mean(axis=1)` gives every resample's mean. Also print wins, losses and ties. Run it for cross-encoder minus BM25, bi-encoder minus BM25, and cross-encoder minus bi-encoder. Then run it on a random 30-query subset and watch the interval.
+
+</Task>
+
+<Task id="t5" title="Write a labeling guide and run a 50-query pilot" agent="review">
+
+Now the real ranker.
+
+1. **Sample**: from a recent window of real query logs (after removing anything personal), bucket queries by frequency into head, torso and tail, plus agent traffic if you can tell it apart. Sample about 12–13 from each bucket for the pilot. Write down the exact rule, and save the seed.
+2. **Pool**: for each query, take the top 10 from at least three systems: the first-stage retriever alone, your current production cross-encoder, and your new model (plus any external search API you can legally use as a reference). Dedupe. That's roughly 15–25 documents per query.
+3. **Guide**: write a 1–2 page labeling guide: the user-intent framing, the 0–3 scale with two real examples per grade from your own data, and rules for at least five hard cases (ambiguous, outdated, duplicate, low quality, paywalled or broken).
+4. **Label**: you and one colleague label every pooled pair independently, in a shuffled order, with system names hidden. A spreadsheet with columns `query_id, doc_id, url, snippet, grade, note` is enough.
+5. **Agree**: compute unweighted and quadratic-weighted kappa with `sklearn.metrics.cohen_kappa_score`. Read every disagreement of 2 or more grades together, update the guide, relabel those, recompute.
+6. **Optional, recommended**: run an LLM labeler with the guide as its prompt over the same pairs and compute its kappa against each of you.
+
+Have an agent review the guide for ambiguity before you start labeling: ask it to find query-document cases where two careful readers of your guide would give different grades.
+
+</Task>
+
+<Task id="t6" title="Report your model vs the baseline, with intervals" agent="review">
+
+Using the adjudicated pilot labels (or, once the pilot is calibrated, a larger set: aim for 300+ queries), write a qrels file and one run file per system, and produce a one-screen report:
+
+- First-stage recall@100 (the ceiling).
+- For production CE and new CE: NDCG@10 (state the gain), MRR@10, judged@10.
+- New minus production: mean delta, 95% paired-bootstrap CI, wins / losses / ties, overall and per stratum.
+- The five queries where the new model lost the most, with a one-line reason each.
+
+Have an agent review the report the way a skeptical reviewer would. Every question from The Problem should have an answer on the page.
+
+</Task>
+
+<DoneWhen>
+
+- `metrics.py` matches pytrec_eval on the fuzz case for P@10, recall@10, AP and NDCG@10, and hits every number from the running example.
+- You have a filled-in SciFact table and bootstrap intervals for all three comparisons.
+- You have a written labeling guide, a 50-query pilot labeled by two people, and both kappas.
+- You can state your model's improvement over the baseline as a delta with a 95% CI, with judged@10 for both systems, and explain what each number means without notes.
+
+</DoneWhen>
+
+## Measure
+
+### The public benchmark
+
+Fill in the predictions first, then your results.
+
+| System (SciFact test, 300 queries) | Predicted NDCG@10 | NDCG@10 | MRR | MAP | Recall@10 | Recall@100 | Time |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| BM25 (rank_bm25) | | | | | | | |
+| Bi-encoder (all-MiniLM-L6-v2) | | | | | | | |
+| BM25 top 100 + cross-encoder (ms-marco-MiniLM-L-6-v2) | | | | | | | |
+
+For reference, one run on an M-series MacBook (sentence-transformers picks the Apple GPU by default), using exactly the recipe in the task. MRR here is trec_eval's uncut reciprocal rank; MRR@10 will be a hair lower. Yours should be close if you used the same models and tokenisation, but not identical.
+
+| System (SciFact test, 300 queries) | NDCG@10 | MRR (uncut) | MAP | Recall@10 | Recall@100 | Wall time |
+| --- | --- | --- | --- | --- | --- | --- |
+| BM25 (rank_bm25) | 0.652 | 0.623 | 0.613 | 0.774 | 0.873 | ~8 s (index + 300 queries) |
+| Bi-encoder (all-MiniLM-L6-v2) | 0.645 | 0.611 | 0.603 | 0.783 | 0.925 | ~29 s (embed 5,183 docs) |
+| BM25 top 100 + cross-encoder | 0.676 | 0.653 | 0.637 | 0.791 | 0.873 | ~240 s (30,000 pairs) |
+
+What should stand out:
+
+**The cross-encoder wins, but by less than you'd guess.** About +0.024 NDCG@10 over BM25. The BEIR paper reports BM25 at 0.665 and BM25 + cross-encoder at 0.688 on SciFact (with Elasticsearch's BM25 and a different reranker), so the same story with a slightly different tokeniser. SciFact is scientific claims; the cross-encoder was trained on Bing questions. Out-of-domain, a big chunk of the cross-encoder's advantage disappears. Expect a bigger gap on in-domain data, like your web queries.
+
+**The bi-encoder ties BM25 on NDCG but wins on recall@100** (0.925 vs 0.873). It's worse at putting the best abstract first and better at getting it into the top 100 at all. That's precisely the job of a first stage. Try reranking the **bi-encoder's** top 100 with the cross-encoder: the recall ceiling rises from 0.873 to 0.925, and the reranked NDCG should rise with it.
+
+**The cost is all in the cross-encoder.** About 8 ms per (query, document) pair on my Mac, so 100 candidates is most of a second per query, versus a single matrix product for the bi-encoder. That ratio is why the funnel exists. On the Spark's GPU with batching it's far faster, but the ratio holds.
+
+**Recall@100 is identical for BM25 and BM25 + cross-encoder.** Of course: reranking reorders the same 100 documents. If those two numbers ever differ in your code, your reranker is not reranking the same candidates.
+
+### The bootstrap
+
+| Comparison | Mean delta NDCG@10 | 95% CI | Wins / losses / ties | Same, 30 random queries |
+| --- | --- | --- | --- | --- |
+| Cross-encoder − BM25 | | | | |
+| Bi-encoder − BM25 | | | | |
+| Cross-encoder − bi-encoder | | | | |
+
+Mine, 10,000 resamples:
+
+| Comparison | Mean delta NDCG@10 | 95% CI | Wins / losses / ties |
+| --- | --- | --- | --- |
+| Cross-encoder − BM25 | +0.024 | [−0.005, +0.053] | 59 / 49 / 192 |
+| Bi-encoder − BM25 | −0.007 | [−0.045, +0.031] | 70 / 71 / 159 |
+| Cross-encoder − bi-encoder | +0.030 | [−0.005, +0.066] | 74 / 58 / 168 |
+
+This surprised me, and it's the most useful result in the lesson: **with 300 queries, not one of these differences is clearly distinguishable from zero.** A published-paper-sized gap (+0.024) on a standard benchmark, and the 95% interval still reaches below zero. Why so wide? Look at the ties: 192 of 300 queries tie exactly, and SciFact queries mostly have one or two relevant documents, so when they don't tie, NDCG jumps by large amounts. The standard deviation of the per-query delta was about 0.26 (not the 0.12 from the Predict), and 2 × 0.26 / sqrt(300) ≈ 0.030, which is the half-width you see.
+
+With random 30-query subsets, the cross-encoder − BM25 mean bounced between −0.006 and +0.079 across three draws, with intervals about ±0.07 wide. A 30-query notebook eval can tell you almost nothing about a 0.02 improvement.
+
+### The pilot and the real model
+
+| Pilot | Value |
+| --- | --- |
+| Queries / pooled pairs | |
+| Raw agreement (you vs colleague) | |
+| Cohen's kappa, unweighted / quadratic | |
+| After one guideline revision | |
+| LLM vs you, quadratic kappa (optional) | |
+
+| Real ranker | Production CE | New CE | Delta (95% CI) |
+| --- | --- | --- | --- |
+| First-stage recall@100 | same | same | — |
+| NDCG@10 (gain: ___) | | | |
+| MRR@10 | | | |
+| Judged@10 | | | — |
+| NDCG@10, head / torso / tail | | | |
+
+What to expect: kappa in the 0.4–0.6 range on the first round is normal for unweighted 4-level labels, with quadratic-weighted noticeably higher (on my simulated labels, 0.61 unweighted became 0.90 quadratic). Most disagreements will cluster in two or three guideline gaps, and fixing those moves kappa more than anything else. On 50 queries, expect your real-model interval to be wide, probably crossing zero unless the improvement is large. That's the pilot's job: to calibrate the guide and estimate the per-query standard deviation so you can compute how many queries the full set needs (see the Predict above: N ≈ (2 × SD / smallest delta you care about)²).
+
+## Break It
+
+**1. Compute the ideal from your own run.** Change `ndcg_at_k` so IDCG is computed from the grades of the documents you retrieved, instead of all judged documents in the qrels. Rerun on SciFact. Every system's NDCG goes up, and the ones with the worst recall go up the most. A system that found only one of three relevant documents and put it first now scores a perfect 1.0, because the "ideal" it's compared against is built from its own incomplete list. A system that found none has an ideal of 0, and you'll have to special-case the division by zero, which is a hint that something is off. This bug is common in homegrown eval code. The test that catches it: a system that retrieves nothing relevant must score 0.
+
+**2. Break ties differently.** Make a run where many documents share the same score (round BM25 scores to one decimal place). Score it with your code, which sorts one way, and with pytrec_eval, which ignores the rank column and breaks ties on score by document id (in reverse lexicographic order: I checked, three tied documents a, b, c come out as c, b, a). The numbers differ. Lesson: two "identical" evaluations can disagree because of ordering conventions. Real rankers rarely produce exact ties, but quantised or rounded scores, or a reranker that saturates at 1.0, do.
+
+**3. Hide the new system's best documents.** Take the cross-encoder run. For each query, find any relevant documents in its top 10 that are **not** in BM25's or the bi-encoder's top 10, and delete those rows from the qrels, as if the pool had been built without the cross-encoder. Rescore all three systems. The cross-encoder's NDCG drops; the others barely move. Its judged@10 falls too, which is the diagnostic that would have warned you. This is exactly what happens to v2 when your eval set was pooled from v1.
+
+**4. Evaluate on hand-picked queries.** Choose the 20 SciFact queries where BM25 does worst, and compare the cross-encoder to BM25 on just those. The improvement looks enormous, and even the bootstrap interval looks convincing. Now compare the cross-encoder to the bi-encoder on those same 20. The interval answers "how much would this wobble if I resampled these queries", not "is this set representative". No statistics can fix a biased sample; only sampling can.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Derive NDCG for me. Why graded gains, why a log discount, why divide by the ideal?</summary>
+
+Each result contributes its usefulness, its gain, which is its grade (or 2^grade − 1 if you want the perfect answer to dominate). Users look at the top more than the bottom, so each gain is multiplied by a discount that shrinks with rank: 1/log2(rank + 1), which is 1 at rank 1, 0.63 at rank 2, 0.5 at rank 3, and still about 0.29 at rank 10. The log is a modelling choice: it falls fast at the top and flattens out, unlike 1/rank, which treats everything past rank 3 as nearly worthless. The sum is DCG. Its scale depends on how many relevant documents a query has, so divide by the DCG of the ideal ordering of all judged documents for that query. That gives 0 to 1 per query, so queries can be averaged fairly.
+
+</details>
+
+<details>
+<summary>2. When would you use MRR instead of NDCG, and when recall@k?</summary>
+
+MRR when the user wants one answer and stops: navigational queries, factual QA, or datasets like MS MARCO with one labeled positive per query. It only looks at the first relevant result. NDCG when several results are useful to different degrees and the top few matter most, which is web search with graded labels. Recall@k when order doesn't matter but presence does: a first-stage retriever whose candidates get reranked, or a RAG retriever filling a fixed context window. Recall@100 of the first stage is the ceiling for anything the reranker can do.
+
+</details>
+
+<details>
+<summary>3. Your new cross-encoder scores +0.009 NDCG@10. What do you check before you believe it?</summary>
+
+That the queries were sampled from real traffic, not hand-picked, and that the gain and k are stated. That both models reranked the same candidate lists. Judged@10 for both: if the new model's top 10 has many unjudged documents, it's being scored down for finding things the pool never saw, so judge those and rescore. That the labels have reasonable inter-annotator agreement and, if an LLM labeled them, that it isn't the same model the reranker was distilled from. Then the per-query deltas: paired bootstrap for a 95% CI on the mean delta, wins/losses/ties, and per-stratum results. If the interval crosses zero, the honest answer is "no detectable difference on this set".
+
+</details>
+
+<details>
+<summary>4. How does this scale? You have 300 judged queries and want to detect a 0.005 improvement.</summary>
+
+The interval's half-width is about 2 × SD / sqrt(N). With a per-query delta SD around 0.1, 300 queries gives about ±0.012, too wide for 0.005. To get to ±0.005 you need sqrt(N) ≈ 40, so about 1,600 queries: detecting a difference half as big needs four times the queries. Each query costs labeling (say 20 pooled documents × a minute each, so 1,600 queries is over 500 labeler-hours), so you scale by using LLM labels calibrated against a human-labeled anchor slice, by reusing qrels across model versions and only judging new holes, and by keeping the variance down: paired comparisons on fixed candidate sets, and graded labels (which make per-query deltas smaller and smoother than one-positive binary labels). Beyond that, an online interleaving test is far more sensitive per unit of effort than growing the offline set.
+
+</details>
+
+<details>
+<summary>5. Why can't you just use clicks as relevance labels?</summary>
+
+Because of position bias: people click higher results more no matter how good they are, so clicks mostly reflect what the current ranker already shows. A document that the current system ranks at 30 gets no clicks, so a new model that correctly promotes it gets no credit. Clicks also mix in snippet quality, and an abandoned search can mean failure or "the snippet answered it". Clicks are still valuable: as an online test (A/B or interleaving), or as training data after correcting for position bias, but offline human-style judgments on a sampled query set are what let you compare models fairly and repeatably.
+
+</details>
+
+## Go Deeper
+
+- **"Cumulated gain-based evaluation of IR techniques"**, Kalervo Järvelin and Jaana Kekäläinen, ACM Transactions on Information Systems, 2002. The NDCG paper. Short, readable, and you'll notice their discount isn't quite the one everyone uses today.
+- **Introduction to Information Retrieval**, Christopher Manning, Prabhakar Raghavan and Hinrich Schütze, Cambridge University Press, 2008, chapter 8 ("Evaluation in information retrieval"). Free online from the Stanford NLP group. The clearest textbook treatment of precision, recall, MAP, pooling and kappa in one place.
+- **"BEIR: A Heterogeneous Benchmark for Zero-shot Evaluation of Information Retrieval Models"**, Nandan Thakur, Nils Reimers, Andreas Rücklé, Abhishek Srivastava and Iryna Gurevych, NeurIPS Datasets and Benchmarks, 2021. Read the results table and the section on annotation bias toward lexical systems.
+- **"Overview of the TREC 2019 Deep Learning Track"**, Nick Craswell, Bhaskar Mitra, Emine Yilmaz, Daniel Campos and Ellen Voorhees, 2020. How a modern, deeply judged test collection is built, and how MS MARCO's sparse labels compare.
+- **"Passage Re-ranking with BERT"**, Rodrigo Nogueira and Kyunghyun Cho, 2019 (arXiv). Two pages that started the cross-encoder era: the exact architecture you're training, and the MS MARCO jump it produced.
+- **"Accurately Interpreting Clickthrough Data as Implicit Feedback"**, Thorsten Joachims, Laura Granka, Bing Pan, Helene Hembrooke and Geri Gay, SIGIR 2005. The eye-tracking study behind "clicks are biased by position".
+- **"Variations in relevance judgments and the measurement of retrieval effectiveness"**, Ellen Voorhees, Information Processing and Management, 2000. Why labelers disagree and system rankings survive it.
+- **"A Comparison of Statistical Significance Tests for Information Retrieval Evaluation"**, Mark Smucker, James Allan and Ben Carterette, CIKM 2007. Bootstrap, randomization and t-tests on real TREC runs; which to trust. And for LLM labels: **"Large language models can accurately predict searcher preferences"**, Paul Thomas, Seth Spielman, Nick Craswell and Bhaskar Mitra (Microsoft), 2023.
+
+## Connections
+
+- Builds on [Why are the evaluator and the model different systems?](/lessons/why-evals-are-separate/): an LLM labeler that shares your model's blind spots is the ranking version of that trap.
+- Leads into [Is that improvement real?](/lessons/statistics-for-evals/), which takes the paired bootstrap apart, and [LLM judges](/lessons/llm-judges/), for building and calibrating the labeler properly.
+- The first stage of the funnel is [vector search](/lessons/vector-search/): bi-encoders, nearest-neighbour indexes, and why their recall@100 caps your reranker.
+- Your cross-encoder's latency budget per query (100 forward passes) is a [back-of-envelope](/lessons/back-of-envelope/) problem, and its tail is a [tail latency](/lessons/tail-latency/) problem.

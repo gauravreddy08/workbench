@@ -1,0 +1,687 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import ThreadsScheduler from '../components/figures/ThreadsScheduler.astro';
+import ThreadsRace from '../components/figures/ThreadsRace.astro';
+
+## Today
+
+- Say what a process is, what a thread is, and exactly which parts of memory each one owns and shares.
+- Explain how one CPU core runs many programs "at once", what a context switch costs, and the difference between concurrency and parallelism.
+- Make a race condition happen on purpose, then fix it with a lock.
+- Explain the GIL: what it locks, why it exists, when it lets go, and what free-threaded Python changes.
+- Predict, before running anything, whether threads, processes, or neither will speed up a given Python job, and check yourself against a stopwatch on your Mac and the Spark.
+
+Prerequisites: [Where do my variables live?](/lessons/stack-and-heap/) (the address space picture: code, globals, heap, stack). Rough time: one evening to read and build, plus a session on the Spark.
+
+## The Problem
+
+You have a preprocessing script. It reads 2 million query-document pairs, cleans the text, and hashes each one so you can dedupe before training the cross-encoder. It takes 40 minutes. The Spark has 20 CPU cores. You open Activity Monitor (or `htop`) and see one core at 100% and nineteen doing nothing.
+
+So you do the obvious thing. You wrap the loop in a `ThreadPoolExecutor(max_workers=20)`. It takes 41 minutes.
+
+Then you try a `ProcessPoolExecutor(max_workers=20)` instead. It takes 3 minutes. Same function, same data, one word changed.
+
+Then, emboldened, you use the same thread pool to fetch 5,000 web pages for a scraping job, and that one goes from 40 minutes to 2. Threads are useless for one job and magic for the other. If you can't explain why, you will keep guessing, and the guesses will be wrong in expensive ways: a `DataLoader` that starves the GPU, a server that falls over at 50 users, a script that deadlocks once a week.
+
+The explanation has three layers. What the operating system gives you (processes and threads). How it shares a few cores among many of them (the scheduler). And one specific decision CPython made in the early 1990s (the GIL).
+
+<Origin year="1960s" title="Many programs, one very expensive computer">
+
+Early computers ran one job at a time. While a job waited for a tape drive, the CPU, the most expensive thing in the building, sat idle. Time-sharing systems like CTSS at MIT (1961) and later Multics and Unix fixed this by keeping several programs loaded at once and switching between them many times a second, each fenced off in its own memory. That fenced-off running program got a name: a process.
+
+Threads came later, in the 1980s and 90s (Mach, then POSIX threads standardised in 1995), when people wanted several flows of control *inside* one program that could share its memory cheaply, for example a server handling many clients, or a GUI that stays responsive while it computes. Python added threads in the early 90s, and to keep its interpreter simple and safe, it put one big lock around the whole thing. That lock is the GIL, and we are still talking about it thirty years later.
+
+</Origin>
+
+## The Idea
+
+### A program is a recipe, a process is someone cooking it
+
+A <Term w="program">A file on disk containing machine code (or, for Python, the interpreter binary plus your .py files). Inert. It does nothing until the OS loads it.</Term> is a file. `python3` is a program. `train.py` is a file the program reads. Neither one does anything while it sits on disk.
+
+When you type `python3 train.py`, the <Term w="kernel">The core of the operating system. The one program that talks to hardware directly and decides who gets the CPU and memory.</Term> creates a <Term w="process">A running instance of a program, plus everything the OS tracks for it: its own memory, its open files, an ID, and at least one thread.</Term>. Run the same command in two terminals and you get two processes from one program, the way two cooks can follow the same recipe in two separate kitchens.
+
+That is the analogy for this lesson, so let's set it up properly. A **process is a kitchen**: it has walls, its own pantry, its own equipment. A **thread is a cook** working in that kitchen. A kitchen needs at least one cook to get anything done. Several cooks in one kitchen share the pantry and the counters, which is fast (no walking to another building) and dangerous (two cooks grab the same bowl).
+
+Here is what the kernel actually keeps for each kitchen.
+
+<Figure n="001" title="ONE PROGRAM, TWO PROCESSES" caption="The same program on disk becomes two processes. Each gets its own ID, its own private memory, its own table of open files, and starts with one thread. Neither can see the other's memory.">
+<svg viewBox="0 0 640 270" role="img" aria-label="One program file on disk loaded into two separate processes">
+  <rect x="10" y="100" width="130" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="75" y="125" text-anchor="middle" class="strong">python3</text>
+  <text x="75" y="142" text-anchor="middle">+ train.py</text>
+  <text x="75" y="160" text-anchor="middle">ON DISK</text>
+  <line x1="140" y1="125" x2="222" y2="60" class="ink" stroke-width="1.2" />
+  <line x1="140" y1="145" x2="222" y2="205" class="ink" stroke-width="1.2" />
+  <text x="160" y="80">RUN</text>
+  <text x="160" y="196">RUN</text>
+  <g>
+    <rect x="225" y="12" width="400" height="112" class="fill-wash" stroke-width="1.2" />
+    <text x="237" y="32" class="strong">PROCESS · PID 4121</text>
+    <rect x="237" y="44" width="120" height="66" class="fill-paper" stroke-width="1" />
+    <text x="297" y="64" text-anchor="middle">ADDRESS SPACE</text>
+    <text x="297" y="80" text-anchor="middle">code globals</text>
+    <text x="297" y="96" text-anchor="middle">heap stack</text>
+    <rect x="367" y="44" width="120" height="66" class="fill-paper" stroke-width="1" />
+    <text x="427" y="64" text-anchor="middle">OPEN FILES</text>
+    <text x="427" y="80" text-anchor="middle">0 stdin 1 stdout</text>
+    <text x="427" y="96" text-anchor="middle">2 stderr 3 data.csv</text>
+    <rect x="497" y="44" width="116" height="66" class="fill-paper" stroke-width="1" />
+    <text x="555" y="64" text-anchor="middle">THREADS</text>
+    <text x="555" y="80" text-anchor="middle">T1 (main)</text>
+    <text x="555" y="96" text-anchor="middle">user, cwd, env</text>
+  </g>
+  <g>
+    <rect x="225" y="146" width="400" height="112" class="fill-wash" stroke-width="1.2" />
+    <text x="237" y="166" class="strong">PROCESS · PID 4188</text>
+    <rect x="237" y="178" width="120" height="66" class="fill-paper" stroke-width="1" />
+    <text x="297" y="198" text-anchor="middle">ADDRESS SPACE</text>
+    <text x="297" y="214" text-anchor="middle">code globals</text>
+    <text x="297" y="230" text-anchor="middle">heap stack</text>
+    <rect x="367" y="178" width="120" height="66" class="fill-paper" stroke-width="1" />
+    <text x="427" y="198" text-anchor="middle">OPEN FILES</text>
+    <text x="427" y="214" text-anchor="middle">0 stdin 1 stdout</text>
+    <text x="427" y="230" text-anchor="middle">2 stderr</text>
+    <rect x="497" y="178" width="116" height="66" class="fill-paper" stroke-width="1" />
+    <text x="555" y="198" text-anchor="middle">THREADS</text>
+    <text x="555" y="214" text-anchor="middle">T1 (main)</text>
+    <text x="555" y="230" text-anchor="middle">user, cwd, env</text>
+  </g>
+  <line x1="420" y1="124" x2="420" y2="146" class="ink dash" stroke-width="1" />
+  <text x="430" y="139">WALL: NO SHARED MEMORY</text>
+</svg>
+</Figure>
+
+Four things to notice.
+
+1. **A PID.** The <Term w="PID">Process ID. A number the kernel hands out so you (and `kill`, `ps`, `top`) can name a process.</Term> is just a number, but it is how every tool refers to the process.
+2. **Its own address space.** In [Where do my variables live?](/lessons/stack-and-heap/) you saw the layout: code at the bottom, globals, the heap growing up, the stack growing down. Each process gets a whole private copy of that picture. Address `0x10a3f2c0` in process 4121 and the same address in 4188 point to different physical RAM, because the kernel and the CPU's <Term w="MMU">Memory management unit. Hardware in the CPU that translates the addresses a program uses (virtual addresses) into real RAM locations, using a per-process table the kernel sets up.</Term> translate addresses through a different table for each process. That is the wall. One process cannot scribble on another's memory, which is why a crash in one Python script doesn't take down your browser.
+3. **Open files.** Every file, socket, or pipe a process has open gets a small integer, a <Term w="file descriptor">A small number (0, 1, 2, 3...) that a process uses to refer to an open file, socket, or pipe. 0, 1 and 2 are stdin, stdout and stderr.</Term>. The table of them belongs to the process.
+4. **At least one thread.** The kernel doesn't run processes. It runs threads. A process with zero threads is just a reserved room nobody is cooking in.
+
+### What a thread owns, and what it shares
+
+A <Term w="thread">One sequence of instructions being executed, with its own position in the code and its own stack. Threads live inside a process and share its memory.</Term> is the part that actually executes. To execute code you need exactly three private things:
+
+- An <Term w="instruction pointer">A CPU register holding the address of the next machine instruction to run. Also called the program counter. It is the "you are here" marker in the code.</Term>: where you are in the code.
+- The CPU <Term w="registers">A handful of tiny, ultra-fast storage slots inside the CPU core (a few dozen on ARM64) where the values being worked on right now live.</Term>: the values you are in the middle of computing.
+- A **stack**: your chain of function calls and their local variables, exactly the stack from the last lesson. The <Term w="stack pointer">A register holding the address of the top of this thread's stack.</Term> says where its top is.
+
+Everything else is shared with every other thread in the same process: the code, the globals, the heap, the open files. Here is the address space from last lesson, now with three cooks in the kitchen.
+
+<Figure n="002" title="ONE PROCESS, THREE THREADS" caption="Each thread has its own stack and its own registers (including where it is in the code). The heap, globals, code and open files belong to the process and are shared by all of them. Every Python object lives on the shared heap, so every thread can reach every object.">
+<svg viewBox="0 0 640 380" role="img" aria-label="Address space with three thread stacks and a shared heap, globals and code">
+  <rect x="150" y="20" width="200" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="250" y="46" text-anchor="middle" class="strong">STACK · T1 (MAIN)</text>
+  <rect x="150" y="74" width="200" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="250" y="95" text-anchor="middle" class="strong">STACK · T2</text>
+  <rect x="150" y="118" width="200" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="250" y="139" text-anchor="middle" class="strong">STACK · T3</text>
+  <rect x="150" y="162" width="200" height="56" class="fill-paper dash" stroke-width="1" />
+  <text x="250" y="194" text-anchor="middle">UNUSED</text>
+  <rect x="150" y="228" width="200" height="64" class="fill-paper" stroke-width="1.2" />
+  <text x="250" y="254" text-anchor="middle" class="strong">HEAP</text>
+  <text x="250" y="272" text-anchor="middle">every python object</text>
+  <rect x="150" y="292" width="200" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="250" y="311" text-anchor="middle" class="strong">GLOBALS</text>
+  <rect x="150" y="322" width="200" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="250" y="341" text-anchor="middle" class="strong">CODE</text>
+  <text x="250" y="372" text-anchor="middle">ONE ADDRESS SPACE</text>
+  <line x1="136" y1="20" x2="136" y2="152" class="blue" stroke-width="1.2" />
+  <line x1="136" y1="20" x2="142" y2="20" class="blue" stroke-width="1.2" />
+  <line x1="136" y1="152" x2="142" y2="152" class="blue" stroke-width="1.2" />
+  <text x="128" y="82" text-anchor="end" class="blue-t">PRIVATE</text>
+  <text x="128" y="98" text-anchor="end" class="blue-t">ONE PER</text>
+  <text x="128" y="114" text-anchor="end" class="blue-t">THREAD</text>
+  <line x1="136" y1="228" x2="136" y2="352" class="ink" stroke-width="1.2" />
+  <line x1="136" y1="228" x2="142" y2="228" class="ink" stroke-width="1.2" />
+  <line x1="136" y1="352" x2="142" y2="352" class="ink" stroke-width="1.2" />
+  <text x="128" y="284" text-anchor="end" class="strong">SHARED</text>
+  <text x="128" y="300" text-anchor="end" class="strong">BY ALL</text>
+  <g>
+    <rect x="440" y="24" width="180" height="58" class="fill-paper" stroke-width="1.2" />
+    <text x="452" y="42" class="strong">T1</text>
+    <text x="452" y="58">IP  SP  REGISTERS</text>
+    <text x="452" y="74">state: running</text>
+    <rect x="440" y="96" width="180" height="58" class="fill-paper" stroke-width="1.2" />
+    <text x="452" y="114" class="strong">T2</text>
+    <text x="452" y="130">IP  SP  REGISTERS</text>
+    <text x="452" y="146">state: waiting on socket</text>
+    <rect x="440" y="168" width="180" height="58" class="fill-paper" stroke-width="1.2" />
+    <text x="452" y="186" class="strong">T3</text>
+    <text x="452" y="202">IP  SP  REGISTERS</text>
+    <text x="452" y="218">state: ready</text>
+  </g>
+  <line x1="440" y1="50" x2="352" y2="42" class="blue" stroke-width="1" />
+  <line x1="440" y1="120" x2="352" y2="92" class="blue" stroke-width="1" />
+  <line x1="440" y1="192" x2="352" y2="136" class="blue" stroke-width="1" />
+  <text x="396" y="40" text-anchor="middle" class="blue-t">SP</text>
+  <line x1="460" y1="226" x2="360" y2="336" class="ink dash" stroke-width="1" />
+  <text x="420" y="292">IP → CODE</text>
+  <rect x="440" y="300" width="180" height="52" class="fill-paper" stroke-width="1.2" />
+  <text x="452" y="320" class="strong">OPEN FILES (SHARED)</text>
+  <text x="452" y="338">0 1 2 3 data.csv 4 socket</text>
+</svg>
+</Figure>
+
+Two consequences fall straight out of this picture.
+
+**Threads are cheap to create and cheap to talk between.** Making a thread means allocating a stack and a small kernel record, not a whole new address space. On an M-series Mac, starting a Python thread takes around 40 microseconds (measure it yourself in the Build). And two threads can share data with zero copying: a list built by one thread is the very same object on the very same heap for the other.
+
+**Threads can trample each other.** That same sharing means two threads can read and write the same object at the same moment with nothing to stop them. We'll make that happen shortly.
+
+Processes are the mirror image: expensive to create, expensive to talk between (you have to copy data across the wall), and safe by default.
+
+### One core, many threads: the scheduler
+
+Your Mac has somewhere around 8 to 16 cores. `ps` on a quiet laptop shows hundreds of processes and thousands of threads. How do thousands of cooks share a dozen stoves?
+
+By taking turns, very fast. The part of the kernel that decides who goes next is the <Term w="scheduler">The part of the kernel that decides, many times a second, which ready thread runs on which core next, and for how long.</Term>. At any moment every thread is in one of three states:
+
+- **Running**: on a core right now.
+- **Ready**: could run, waiting for a free core.
+- **Blocked** (or waiting): can't run until something happens, like bytes arriving on a socket, a disk read finishing, or a timer going off. A blocked thread uses *no* CPU.
+
+A running thread gets a <Term w="time slice">How long the scheduler lets a thread run before it may swap in another ready thread. Roughly a few milliseconds on Linux and macOS; it varies with OS, version and load.</Term> of a few milliseconds. When the slice runs out, or when the thread blocks on its own (it asked to read a socket and the data isn't there yet), the kernel performs a <Term w="context switch">Saving one thread's registers, instruction pointer and stack pointer into memory, and loading another's, so a core can switch from running one thread to another.</Term>: it saves the outgoing thread's registers to memory, loads the incoming thread's registers, and jumps to its instruction pointer. The cook steps away from the stove, leaves a note saying exactly where they were, and the next cook picks up their own note.
+
+How expensive is that? Approximate numbers, and they vary a lot by hardware and OS:
+
+| Switch | Direct cost (rough) | Why |
+| --- | --- | --- |
+| Thread to thread, same process | ~1-5 µs | Save and load registers, run the scheduler. Memory map stays the same. |
+| Process to process | a few µs direct, more in effect | Also switch the address-translation tables. Cached translations in the <Term w="TLB">Translation lookaside buffer. A small cache in the CPU of recent virtual-to-physical address translations. Switching processes can invalidate it.</Term> may be thrown out, and the new process finds the CPU caches full of someone else's data. |
+
+From [How slow is slow?](/lessons/latency-numbers/): a few microseconds is thousands of RAM reads, but tiny next to a 5 ms slice or a 50 ms network round trip. Context switching is cheap enough that thousands per second is fine, and expensive enough that hundreds of thousands per second will eat a core.
+
+### Concurrency vs parallelism
+
+Now two words that get used interchangeably and shouldn't be.
+
+- <Term w="Concurrency">Having several tasks in progress over the same period, so their lifetimes overlap. They might take turns on one core.</Term> is about **structure**: several tasks are *in progress* at once. One cook juggling three dishes, stirring one while another simmers, is concurrent.
+- <Term w="Parallelism">Several tasks literally executing at the same instant, on different cores.</Term> is about **execution**: several tasks are *running at the same instant*. Three cooks at three stoves is parallel.
+
+Concurrency is possible on one core. Parallelism needs more than one. And the key insight for everything that follows: **concurrency alone is enough to speed up waiting**, because while one task waits, another can use the core. **Only parallelism speeds up working**, because the total amount of computing has to be split across more cores.
+
+That split, waiting vs working, has names. A job is <Term w="CPU-bound">Its speed is limited by how fast the CPU computes. Give it a faster or extra core and it finishes sooner.</Term> if it spends its time computing (counting primes, tokenizing text, parsing JSON in pure Python). A job is <Term w="I/O-bound">Its speed is limited by waiting for input/output: network, disk, another service. The CPU is mostly idle.</Term> if it spends its time waiting (HTTP calls, database queries, reading files from a network drive).
+
+### The GIL
+
+Here is the twist. In standard CPython there is one lock, the <Term w="GIL">Global Interpreter Lock. A single lock inside CPython that a thread must hold to run Python bytecode. Only one thread per process holds it at a time.</Term>, and a thread must hold it to execute Python <Term w="bytecode">The simple instructions CPython compiles your .py code into (LOAD_FAST, BINARY_OP, ...) and then runs one by one in a loop.</Term>. One kitchen, one recipe book, and only the cook holding the book may cook. Other cooks can still *wait* for the oven without the book. But to chop, stir, or do anything else that is Python code, you need the book.
+
+So in a single Python process, no matter how many threads you start and how many cores you have, **at most one thread is running Python code at any instant**. Threads still give you concurrency. They do not give you parallelism for Python code.
+
+Play with it. Start with CPU-bound work, 4 threads, 4 cores, GIL on. Then flip the GIL off. Then switch to I/O-bound work and flip it back on.
+
+<Figure n="003" title="SCHEDULER TIMELINE" caption="A toy scheduler. Solid bars are a thread running Python on some core. Dashed bars are waiting on I/O, which needs no core and no GIL. Grey bars are ready but stuck: no free core, or (with the GIL on) another thread holds the lock. With CPU-bound work and the GIL on, extra cores change nothing. With I/O-bound work, threads overlap their waiting and finish far sooner than serial, GIL or not." wide>
+
+<ThreadsScheduler />
+
+</Figure>
+
+Three things to take away from the timeline:
+
+1. **CPU work, GIL on:** wall time equals serial time. Four threads on four cores take as long as one thread doing it all, because they take turns holding the lock. (Real CPython is often a little *worse* than serial here, because handing the lock back and forth has a cost.)
+2. **CPU work, GIL off:** with enough cores, wall time divides by the number of threads. This is what processes give you today, and what free-threaded Python promises.
+3. **I/O work, either way:** each thread computes for a moment, then waits. The waits overlap. A dozen threads waiting on a dozen sockets is concurrency, and the GIL barely matters because waiting doesn't need it.
+
+### When the GIL lets go
+
+The GIL is not held forever by whoever grabs it. CPython releases it in two situations.
+
+**On a timer.** Since Python 3.2, a thread that holds the GIL while others are waiting is asked to drop it after a <Term w="switch interval">How long a thread may hold the GIL while another thread wants it before being asked to give it up. Default 5 ms; see sys.getswitchinterval().</Term> of 5 ms (`sys.getswitchinterval()` returns `0.005`). This is what gives you concurrency between CPU-bound threads: they share one core's worth of Python, fairly.
+
+**Around anything slow that doesn't touch Python objects.** C code inside CPython and inside extension libraries can explicitly release the GIL before doing a long operation, and take it back after. This is the part that makes Python threads useful in practice. Things that release it:
+
+- Blocking I/O: `socket.recv`, `requests.get` (underneath), file reads and writes, `subprocess` waits.
+- `time.sleep`.
+- `hashlib` on large buffers (CPython releases it for inputs over about 2 KB), `zlib` compression.
+- Most heavy NumPy operations (large array math, matrix multiplies that call into BLAS) and PyTorch ops, which run in C++ or on the GPU.
+
+<Figure n="004" title="WHERE THE GIL SITS" caption="Python threads queue for one lock to enter the interpreter. Work that leaves the interpreter (waiting on a socket, sleeping, a big NumPy or PyTorch op in C, CUDA kernels on the GPU) gives the lock back while it runs, so it can happen in parallel with the one thread that is running Python.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Threads queue for the GIL to enter the interpreter; I/O and C extensions run outside it">
+  <rect x="10" y="40" width="70" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="45" y="60" text-anchor="middle" class="strong">T1</text>
+  <rect x="10" y="90" width="70" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="45" y="110" text-anchor="middle" class="strong">T2</text>
+  <rect x="10" y="140" width="70" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="45" y="160" text-anchor="middle" class="strong">T3</text>
+  <rect x="10" y="190" width="70" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="45" y="210" text-anchor="middle" class="strong">T4</text>
+  <line x1="80" y1="55" x2="186" y2="110" class="blue" stroke-width="1.5" />
+  <line x1="80" y1="105" x2="150" y2="122" class="ink dash" stroke-width="1" />
+  <line x1="80" y1="155" x2="150" y2="134" class="ink dash" stroke-width="1" />
+  <text x="96" y="186">QUEUED FOR</text>
+  <text x="96" y="200">THE LOCK</text>
+  <rect x="160" y="96" width="34" height="40" class="fill-blue" />
+  <text x="177" y="152" text-anchor="middle" class="blue-t">GIL</text>
+  <rect x="200" y="30" width="230" height="170" class="fill-wash" stroke-width="1.2" />
+  <text x="315" y="54" text-anchor="middle" class="strong">CPYTHON INTERPRETER</text>
+  <text x="315" y="80" text-anchor="middle">bytecode loop</text>
+  <text x="315" y="98" text-anchor="middle">refcounts on every object</text>
+  <text x="315" y="116" text-anchor="middle">memory allocator</text>
+  <text x="315" y="134" text-anchor="middle">dicts, lists, ints</text>
+  <text x="315" y="170" text-anchor="middle" class="blue-t">ONE THREAD AT A TIME</text>
+  <line x1="80" y1="205" x2="470" y2="250" class="ink" stroke-width="1" />
+  <rect x="470" y="30" width="160" height="250" class="fill-paper dash" stroke-width="1" />
+  <text x="550" y="52" text-anchor="middle" class="strong">OUTSIDE (NO GIL)</text>
+  <text x="482" y="80">socket recv / send</text>
+  <text x="482" y="100">file read / write</text>
+  <text x="482" y="120">time.sleep</text>
+  <text x="482" y="140">hashlib (big input)</text>
+  <text x="482" y="160">numpy matmul, BLAS</text>
+  <text x="482" y="180">torch ops in C++</text>
+  <text x="482" y="200">CUDA kernels on GPU</text>
+  <text x="482" y="240" class="blue-t">RUNS IN PARALLEL</text>
+  <text x="482" y="256" class="blue-t">WITH THE GIL HOLDER</text>
+  <line x1="430" y1="115" x2="468" y2="115" class="ink" stroke-width="1" />
+  <text x="449" y="108" text-anchor="middle">↔</text>
+  <text x="200" y="230">T4 IS BLOCKED IN recv():</text>
+  <text x="200" y="246">IT GAVE THE LOCK BACK</text>
+</svg>
+</Figure>
+
+### Why does the GIL exist?
+
+Because of how CPython frees memory. In the last lesson you saw every Python object on the heap carries a header. One field of that header is a <Term w="reference count">A counter in every CPython object of how many references point to it. When it drops to 0 the object is freed immediately.</Term>. Every time you assign a variable, put an object in a list, or pass it to a function, its count goes up; every time a reference goes away, it goes down. Hitting zero frees the object.
+
+That counter is touched constantly, by every line of Python. If two threads do `count = count + 1` on the same object's counter at the same time, one update can be lost (you'll see exactly how in the next section). A lost decrement leaks memory forever. A lost increment frees an object while someone is still using it, and the program reads garbage or crashes.
+
+There were two ways to make that safe. Put a small lock (or an <Term w="atomic operation">A CPU instruction that reads and modifies a memory location as one indivisible step that no other core can interrupt halfway. Safe, but slower than a plain increment.</Term>) on every refcount change, which slows down every single Python program, including the vast majority that never use threads. Or put one lock around the whole interpreter. Guido van Rossum chose the second in the early 1990s, when nearly every computer had one core and parallelism was irrelevant. It had a huge side benefit: C extension authors could write code assuming nobody else was touching Python objects at the same time. A lot of the ecosystem (NumPy among it) grew up on that assumption.
+
+People have tried to remove it many times. Larry Hastings' "Gilectomy" (around 2016) replaced the GIL with fine-grained locks and got correct multi-threaded Python that was much slower single-threaded. That trade-off is the whole story: removing the GIL is easy, removing it *without making everyone else slower and breaking every C extension* is the hard part.
+
+### Free-threaded Python
+
+That hard part is now largely done. <Term w="PEP 703">"Making the Global Interpreter Lock Optional in CPython", by Sam Gross, accepted in 2023. Describes a CPython build with no GIL.</Term> proposed a build of CPython with no GIL, using tricks to keep single-thread speed tolerable: biased reference counting (the thread that owns an object updates its count cheaply; other threads use slower atomic updates), "immortal" objects whose counts never change (like `None` and small ints), and per-object locks inside lists and dicts.
+
+The status, as of late 2026, as best I can state it (check the current Python docs, this is moving):
+
+- **Python 3.13** (October 2024) shipped the free-threaded build as **experimental**. It's a separate binary, usually called `python3.13t`.
+- **Python 3.14** (October 2025), under PEP 779, made the free-threaded build **officially supported**, but still **optional and not the default**. The normal `python3` you install still has a GIL. Single-threaded code runs somewhat slower on the free-threaded build (the docs quoted roughly 5-10% for 3.14).
+- C extensions have to be rebuilt and marked as safe without the GIL. If you import one that isn't, the interpreter can turn the GIL back on for the whole process. `sys._is_gil_enabled()` tells you which you got.
+
+You'll run the free-threaded build in the Build section, and it is the cleanest possible demonstration that the GIL, not threads, was the bottleneck.
+
+### Race conditions, and locks
+
+Free-threaded or not, threads share memory, and shared memory has a classic failure. Take `counter += 1`. It looks like one step. It's three:
+
+1. **Read** `counter` from the heap into a register (in Python: onto the interpreter's stack).
+2. **Add** 1 to it.
+3. **Write** the result back to `counter`.
+
+If thread A reads 41, then thread B reads 41 before A writes, both compute 42, and both write 42. Two increments, one effect. That is a <Term w="race condition">A bug where the result depends on the exact timing or interleaving of threads. Usually rare, which is why it's hard to catch.</Term>: the answer depends on who got there first. Try to find the bad order yourself, then turn the lock on and try again.
+
+<Figure n="005" title="THE LOST UPDATE" caption="Step each thread through read, add, write by hand. Any order where both threads read before either writes loses an update. With the lock on, the read-add-write becomes a critical section that only one thread can be inside, and no order can lose.">
+
+<ThreadsRace />
+
+</Figure>
+
+The fix is a <Term w="lock">Also called a mutex (mutual exclusion). An object only one thread can hold at a time. Others that try to acquire it block until it is released.</Term>. Wrap the read-add-write in `with lock:` and it becomes a <Term w="critical section">A stretch of code that must not be run by two threads at once, because it reads and then writes shared state.</Term>: only one thread inside at a time. The cost is that threads now wait for each other there, so you keep critical sections short.
+
+Two notes that will matter when you run this for real.
+
+**The GIL is not a lock for your code.** It protects the interpreter's insides, not your logic. It can be handed to another thread between your read and your write. In recent CPython versions (3.10 onward), the interpreter only offers to switch threads at certain points, such as the jump back to the top of a loop, so a bare `counter += 1` in a tight loop happens to almost never race on a normal build. That is an accident of implementation, not a promise, and it disappears entirely on the free-threaded build. To see the race reliably on a normal build, you'll put something between the read and the write that releases the GIL, like `time.sleep(0)`.
+
+**Processes don't have this problem by default**, because they don't share memory. Which brings us to the other way out.
+
+### Processes: the other way around the GIL
+
+Each Python process has its own interpreter and therefore its own GIL. Run 8 worker processes and you have 8 interpreters, each running Python on its own core, in true parallel. That's what `multiprocessing` and `ProcessPoolExecutor` do. The price is the wall between kitchens.
+
+<Figure n="006" title="WORKER PROCESSES" caption="Each worker is a separate process with its own interpreter and its own GIL, so they run Python in parallel. Arguments and results cross the wall by being pickled into bytes, pushed through a pipe, and unpickled on the other side. Shared memory skips the copy by mapping the same physical pages into both processes.">
+<svg viewBox="0 0 640 330" role="img" aria-label="Parent process exchanging pickled data with three workers over pipes, and a shared memory block mapped into all">
+  <rect x="10" y="80" width="150" height="120" class="fill-wash" stroke-width="1.2" />
+  <text x="85" y="102" text-anchor="middle" class="strong">PARENT</text>
+  <text x="85" y="120" text-anchor="middle">interpreter + GIL</text>
+  <text x="85" y="136" text-anchor="middle">your data</text>
+  <text x="85" y="170" text-anchor="middle">pool.map(f, chunks)</text>
+  <g>
+    <rect x="440" y="16" width="190" height="64" class="fill-wash" stroke-width="1.2" />
+    <text x="535" y="38" text-anchor="middle" class="strong">WORKER 1</text>
+    <text x="535" y="56" text-anchor="middle">own interpreter + GIL</text>
+    <rect x="440" y="108" width="190" height="64" class="fill-wash" stroke-width="1.2" />
+    <text x="535" y="130" text-anchor="middle" class="strong">WORKER 2</text>
+    <text x="535" y="148" text-anchor="middle">own interpreter + GIL</text>
+    <rect x="440" y="200" width="190" height="64" class="fill-wash" stroke-width="1.2" />
+    <text x="535" y="222" text-anchor="middle" class="strong">WORKER 3</text>
+    <text x="535" y="240" text-anchor="middle">own interpreter + GIL</text>
+  </g>
+  <line x1="160" y1="110" x2="440" y2="48" class="ink" stroke-width="1" />
+  <line x1="160" y1="140" x2="440" y2="140" class="ink" stroke-width="1" />
+  <line x1="160" y1="170" x2="440" y2="232" class="ink" stroke-width="1" />
+  <rect x="236" y="120" width="128" height="40" class="fill-paper" stroke-width="1" />
+  <text x="300" y="136" text-anchor="middle" class="strong">PICKLE → PIPE</text>
+  <text x="300" y="152" text-anchor="middle">→ UNPICKLE</text>
+  <text x="300" y="186" text-anchor="middle">A COPY, EVERY CALL</text>
+  <rect x="160" y="286" width="470" height="32" class="fill-paper dash" stroke-width="1" />
+  <text x="395" y="306" text-anchor="middle" class="blue-t">SHARED MEMORY · SAME PAGES MAPPED INTO EVERY PROCESS · NO COPY</text>
+  <line x1="85" y1="200" x2="85" y2="300" class="blue dash" stroke-width="1" />
+  <line x1="85" y1="300" x2="160" y2="300" class="blue dash" stroke-width="1" />
+  <line x1="535" y1="264" x2="535" y2="286" class="blue dash" stroke-width="1" />
+</svg>
+</Figure>
+
+You pay twice.
+
+**Startup.** A new process needs a new interpreter. There are three <Term w="start method">How multiprocessing creates a worker: fork (clone the parent), spawn (start a fresh python and re-import your module), or forkserver (fork from a clean helper process).</Term>s:
+
+- `fork`: clone the parent process. Fast (well under a millisecond to tens of ms depending on how big the parent is), and the child starts with a copy of everything the parent had in memory. The kernel makes this cheap with <Term w="copy-on-write">Parent and child share the same physical memory pages after fork, and a page is only actually copied when one of them writes to it.</Term>. The catch: only the thread that called `fork` exists in the child. If another thread was holding a lock at that moment, the child inherits a locked lock that nobody will ever release. Deadlock.
+- `spawn`: start a brand new `python` and have it import your main module. Safe, slow: on an M-series Mac a bare pool of workers takes around 60-90 ms to start in my test, and if your module imports `torch` at the top, every worker pays that import too, often a second or more.
+- `forkserver`: start one clean helper process early, then fork workers from it. Safe and fairly fast.
+
+The defaults differ by OS, which is why the same script behaves differently on your Mac and the Spark. macOS has defaulted to `spawn` since Python 3.8. Linux defaulted to `fork` for decades, and Python 3.14 changed the Linux default to `forkserver`. Verify on each machine with `multiprocessing.get_start_method()`, and check the `multiprocessing` docs for your version.
+
+**Communication.** Workers can't see the parent's heap, so every argument and every return value is serialised with <Term w="pickle">Python's built-in way of turning an object into bytes and back. Works on most objects; costs time proportional to the object's size and complexity.</Term>, written into a <Term w="pipe">A one-way byte channel the kernel provides between processes. One side writes bytes, the other reads them.</Term>, read, and unpickled. For small arguments (two integers saying which chunk to process) this is nothing. For a million-element list per task, it can cost more than the work.
+
+The escape hatch is <Term w="shared memory">A region of physical RAM that the kernel maps into several processes' address spaces at once, so they read and write the same bytes with no copying.</Term>: `multiprocessing.shared_memory`, or a NumPy array backed by it, or PyTorch's `tensor.share_memory_()`. The bytes live in one place and every process sees them. You're back to sharing, so you're back to needing locks if anyone writes.
+
+### Where this shows up in ML
+
+**`DataLoader(num_workers=8)` uses processes**, not threads. Each worker is a separate Python process running your `Dataset.__getitem__`: decoding images, tokenizing text, augmenting. That's CPU-bound pure-Python-ish work, exactly what the GIL would serialise. The batches come back as tensors placed in shared memory, so only a small handle is pickled, not the data. (When `pin_memory=True`, a *thread* in the main process copies batches into page-locked memory, and that's fine because the copy happens in C with the GIL released.)
+
+A real-world bite from the stack-and-heap lesson: under `fork`, workers share the parent's dataset via copy-on-write. But merely *reading* a Python object changes its reference count, which writes to the object's header, which forces the kernel to copy that page. A dataset stored as a giant Python list of strings slowly gets copied into every worker, and memory use climbs with `num_workers`. Storing it as NumPy arrays (one object, no per-item refcounts) avoids that.
+
+**The tokenizers warning.** If you've seen `huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...`, that's the fork-with-threads problem from above. The fast tokenizer runs its own thread pool (in Rust, outside the GIL). When the `DataLoader` forks workers after that pool started, the library turns its parallelism off in the children to avoid inheriting a locked lock. Set `TOKENIZERS_PARALLELISM=false` to choose explicitly, or avoid tokenizing in the parent before the fork.
+
+**Why your training loop is fine with the GIL.** The Python in a training step mostly *launches* work: "multiply these tensors", "run this attention kernel". CUDA launches are asynchronous, the GPU runs the kernels while Python moves on to queue the next one, and the heavy CPU-side ops release the GIL. One Python thread can usually keep a GPU busy. When it can't (lots of tiny kernels, so Python's per-launch overhead dominates), the fixes are CUDA graphs and `torch.compile`, not more threads.
+
+<Predict id="cpu-threads">
+Counting primes below 2,000,000 in pure Python takes about 5 seconds on one core. On a 14-core Mac, how long do you expect with 8 threads? With 8 processes? Write numbers.
+<Fragment slot="answer">
+
+With 8 threads: about 5 seconds, maybe a hair more. It's pure Python, CPU-bound, so the threads take turns holding the GIL and only one runs at a time.
+
+With 8 processes: around 1 second on my M-series Mac, so 5x, not 8x. Some of that is process startup and pickling, but most of it is that the work isn't split evenly (bigger numbers take longer to test, so the chunk with the biggest numbers finishes last) and that not all the cores are equally fast. You'll see both effects in Measure.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Everything goes in one folder, say `~/workbench/threads/`. Use `concurrent.futures` throughout: it gives threads and processes the same interface, so the only thing that changes between experiments is one class name.
+
+<Task id="t0" title="Set up the folder, the core count, and a slow server" agent="ok">
+
+First, know your machine. Cores differ: an M-series Mac has a mix of fast performance cores and slower efficiency cores, and the DGX Spark's spec sheet lists 20 ARM cores (10 Cortex-X925 performance cores and 10 Cortex-A725 efficiency cores).
+
+```python
+# cores.py
+import os, sys, multiprocessing as mp
+print("logical cores:", os.cpu_count())
+print("python:", sys.version.split()[0])
+print("GIL enabled:", getattr(sys, "_is_gil_enabled", lambda: True)())
+print("start method:", mp.get_start_method())
+print("switch interval:", sys.getswitchinterval())
+```
+
+On macOS, `sysctl hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu` gives performance vs efficiency core counts. On the Spark, `nproc` and `lscpu`.
+
+Next, a deliberately slow local HTTP server: every request sleeps 200 ms, like a slow API or a model endpoint. It uses one thread per request so it can serve many clients at once.
+
+```python
+# slow_server.py
+import time
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        time.sleep(0.2)  # pretend to be a slow upstream
+        body = b"ok\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):  # keep the terminal quiet
+        pass
+
+class Server(ThreadingHTTPServer):
+    request_queue_size = 256  # default backlog is 5; macOS resets connections past it
+
+if __name__ == "__main__":
+    print("listening on http://127.0.0.1:8077")
+    Server(("127.0.0.1", 8077), Handler).serve_forever()
+```
+
+Run it in its own terminal and leave it running.
+
+</Task>
+
+<Task id="t1" title="A CPU-bound job: serial, threads, processes" agent="hands">
+
+Write a pure-Python prime counter and run it three ways. Pure Python is the point: no NumPy, nothing that drops the GIL.
+
+```python
+# cpu.py
+import time
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+N = 2_000_000
+
+def count_primes(lo: int, hi: int) -> int:
+    """Count primes in [lo, hi) by trial division up to sqrt(n)."""
+    ...
+
+def chunks(k: int) -> list[tuple[int, int]]:
+    """Split [0, N) into k contiguous ranges."""
+    ...
+
+def run(executor_cls, workers: int) -> float:
+    """Time one run: map count_primes over chunks(workers), sum the results."""
+    ...
+
+if __name__ == "__main__":
+    # 1. serial: count_primes(0, N), timed with time.perf_counter()
+    # 2. ThreadPoolExecutor with 4 and 8 workers
+    # 3. ProcessPoolExecutor with 4 and 8 workers
+    # print the prime count every time (it must be 148933) and the seconds
+    ...
+```
+
+Hints:
+
+- `ex.map(count_primes, los, his)` takes two iterables. `zip(*chunks(k))` turns a list of pairs into two tuples.
+- Keep the `if __name__ == "__main__":` guard. On macOS with `spawn`, each worker re-imports this file, and without the guard every worker would try to start its own pool.
+- Before you run it, write your predictions in the table in Measure.
+
+</Task>
+
+<Task id="t2" title="An I/O-bound job: 50 requests to the slow server" agent="hands">
+
+Same three-way comparison, but the job is fetching `http://127.0.0.1:8077/` 50 times. Use `urllib.request.urlopen` (standard library, no installs).
+
+```python
+# io_job.py
+import time, urllib.request
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+URL = "http://127.0.0.1:8077/"
+
+def fetch(i: int) -> int:
+    """GET URL, return the number of bytes in the body."""
+    ...
+
+if __name__ == "__main__":
+    # serial: 50 fetches in a loop
+    # threads: 8 workers, then 50 workers
+    # processes: 8 workers, then 50 workers
+    ...
+```
+
+Before running, work out the serial time from the server's sleep. Then work out what 8 threads should take (how many "rounds" of 8 does it take to do 50?). Write both down.
+
+Then add one more measurement: how long does a `ProcessPoolExecutor(8)` take to start and run a function that does nothing? That's your process startup tax.
+
+</Task>
+
+<Task id="t3" title="Cause a race, then fix it" agent="hands">
+
+Write a script where 8 threads each increment one global counter 1,000 times, so the right answer is 8,000.
+
+```python
+# race.py
+import threading, time
+
+counter = 0
+lock = threading.Lock()
+
+def unsafe(n: int) -> None:
+    """Read counter into a local, call time.sleep(0), write local + 1 back. n times."""
+    ...
+
+def safe(n: int) -> None:
+    """Same thing, but the read-sleep-write happens inside `with lock:`."""
+    ...
+
+def plain(n: int) -> None:
+    """Just `counter += 1`, n times. No sleep, no lock."""
+    ...
+
+def trial(fn, n: int, threads: int = 8) -> int:
+    """Reset counter, start `threads` threads running fn(n), join them, return counter."""
+    ...
+```
+
+`time.sleep(0)` releases the GIL, so it opens a window between the read and the write for another thread to slip in. Print the result of each function against the expected total.
+
+Then run `plain` with `n = 1_000_000` on your normal Python, and again on the free-threaded build. With `uv`: `uv python install 3.14t`, then `uv run --python 3.14t race.py` (check `uv`'s docs if the spelling has changed). Explain the difference out loud.
+
+</Task>
+
+<Task id="t4" title="Watch threads and processes live" agent="explain">
+
+Seeing the threads makes them real. Add `time.sleep(30)` at the start of each worker in a copy of `io_job.py` (so they sit still long enough to look at), run it with 8 threads, and in another terminal find its PID with `pgrep -f io_job`.
+
+- **macOS:** `ps -M <pid>` lists every thread of that process, one per line. Count them. You should see your 8 workers, the main thread, and possibly a few more.
+- **Linux (the Spark):** `ps -T -p <pid>` lists threads (each has its own ID, the SPID), `ls /proc/<pid>/task | wc -l` counts them, and `top -H -p <pid>` shows CPU per thread. In `htop`, press `H` to toggle showing threads.
+- Now switch the pool to `ProcessPoolExecutor(8)` and run `ps -ef | grep io_job` (or `pstree -p <pid>` on Linux). Count processes instead.
+
+While `cpu.py` runs its 8-thread version, watch `top`/`htop`: the process sits at roughly 100% CPU total (one core's worth) no matter how many threads. With 8 processes you see 8 Python processes each near 100%.
+
+Optional, and very satisfying: `pip install py-spy`, then `py-spy dump --pid <pid>` prints the current Python stack of every thread in a running process, without stopping it. On macOS it needs `sudo`. Run it on the 8-thread I/O job and you'll see 7 threads parked in a socket read and one doing something else.
+
+</Task>
+
+<Task id="t5" title="Repeat on the Spark, and scale up" agent="review">
+
+Copy the folder to the Spark (`scp -r` over Tailscale) and rerun `cores.py`, `cpu.py` and `race.py`. Then extend `cpu.py` to sweep process counts 1, 2, 4, 8, 12, 16, 20, and print speedup over serial for each. Have an agent review your sweep code for anything that would make the timings unfair (for example, timing pool startup in some runs and not others).
+
+</Task>
+
+<DoneWhen>
+
+- `cpu.py`, `io_job.py` and `race.py` run on both machines and print timings or counts.
+- You wrote predictions before each first run, and the Measure table is filled in.
+- You saw the thread count of a live Python process with `ps` and can say where each thread came from.
+- You can explain every number in your table without hand-waving.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Time each configuration at least twice and keep the faster run (the first run sometimes pays one-off costs like loading files into the page cache).
+
+| Job | Machine | Serial | 4 threads | 8 threads | 4 procs | 8 procs | Prediction (8 procs) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Primes below 2M | Mac | | | | | | |
+| Primes below 2M | Spark | | | | | | |
+| 50 × slow GET | Mac | | | | | | |
+| 50 × slow GET | Spark | | | | | | |
+
+For reference, one run on an M-series MacBook (10 performance + 4 efficiency cores), Python 3.14 with the GIL. Yours will differ; the *shape* should not.
+
+| Job | Serial | 4 threads | 8 threads | 4 procs | 8 procs |
+| --- | --- | --- | --- | --- | --- |
+| Primes below 2M | 5.3 s | 5.3 s | 5.3 s | 2.0 s | 1.1 s |
+| 50 × slow GET (200 ms each) | 10.5 s | — | 1.45 s | — | 1.55 s |
+
+And the same prime job on the free-threaded 3.14 build: serial 4.8 s, 4 threads 1.7 s, 8 threads 1.0 s. Threads scale like processes once the GIL is gone.
+
+What the numbers should tell you:
+
+**Primes, threads: no speedup at all.** This is the GIL, exactly as in Figure 003 with CPU work and the GIL on. If `top` showed the process at about 100% CPU (one core), that's the same fact from another angle.
+
+**Primes, processes: big speedup, but less than the worker count.** On my run, 4 processes gave 2.7x, not 4x. The main reason is uneven chunks: trial division costs more for bigger numbers (each test loops up to the square root), so the chunk `[1.5M, 2M)` takes longer than `[0, 500k)`, and the pool waits for the slowest worker. You'll fix this in Break It. Smaller reasons: process startup and pickling (tiny here, since the arguments are two ints), and efficiency cores being slower than performance cores. On the Spark, expect the same story at larger scale: going from 10 to 20 processes adds the 10 efficiency cores, which help but less than the first 10.
+
+**Slow GETs, serial: 50 × 0.2 s = 10 s.** Plus a little for connection setup.
+
+**Slow GETs, 8 threads: about 1.4 s.** 50 requests in rounds of 8 is 7 rounds (`ceil(50/8)`), and 7 × 0.2 s = 1.4 s. The threads spent nearly all their time blocked in a socket read with the GIL released, so they overlapped perfectly. With 50 threads it's one round, about 0.2 s.
+
+**Slow GETs, 8 processes: about the same as 8 threads, slightly worse.** Processes work for waiting too, they're just a more expensive way to get it: you paid process startup (my bare 8-worker pool took about 85 ms to start and finish a no-op) for no benefit, since the GIL wasn't the bottleneck. With 50 processes the gap grows: on my run 50 threads took 0.22 s and 50 processes 0.67 s.
+
+**Race.** `unsafe` should print something far below 8,000 (I got around 1,000: almost every update lost). `safe` prints exactly 8,000. `plain` on the normal build very likely prints exactly 8,000,000, which is the luck-of-implementation effect described earlier. On the free-threaded build, `plain` lost most of its updates on my Mac (about 1.27M out of 8M survived). Same code, and the only change is that nothing serialises the threads anymore.
+
+**Spark scaling sweep.** Plot speedup against process count. You should see near-linear growth at first, then a bend. Where does it bend, and is it at 10?
+
+## Break It
+
+**1. Fix (and then exaggerate) the load imbalance.** Change `chunks(k)` so the pool gets 64 small chunks instead of `k` big ones, but keep `k` workers. Rerun 4 and 8 processes. The speedup should move closer to the worker count, because a worker that finishes early just grabs the next chunk. Then go the other way: 1,000 tiny chunks of 2,000 numbers each. It gets slower again. Each task now costs a pickle round trip and a trip through the pool's queue, and those per-task costs start to matter. There's a sweet spot, and `ex.map(..., chunksize=...)` exists to help you find it.
+
+**2. Make pickling cost more than the work.** Build 8 lists of 1,000,000 ints and `ex.map(sum, lists)` with 8 threads, 8 processes, and serially. Processes lose badly: on my Mac, threads took 24 ms, serial 26 ms, processes 88 ms. Summing a list is fast C code. Pickling 8 lists of a million ints (about 5 MB each), pushing them through a pipe and unpickling them is not. Lesson: processes win when the work per byte sent is large. Send indices or file paths, not data, and let workers load their own input.
+
+**3. Forget the main guard.** Delete `if __name__ == "__main__":` from `cpu.py` and run the process version on your Mac. With `spawn`, each worker imports your file to find `count_primes`, which runs your top-level code, which tries to create another pool. Python stops this with a `RuntimeError` about "the current process has finished its bootstrapping phase". On Linux with plain `fork` the same script might seem to work, which is exactly how "works on the Spark, crashes on my Mac" bugs are born.
+
+**4. Oversubscribe the cores.** Write a job where each task does a NumPy matrix multiply on a 2,000 × 2,000 matrix, and run 20 of them in a 20-process pool on the Spark. Then rerun with `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1` set in the environment. The second run is likely faster. NumPy's matrix multiply calls BLAS, which starts its own threads (often one per core), so 20 processes times 20 BLAS threads is 400 threads fighting over 20 cores, and the scheduler spends time context switching instead of computing. This is why PyTorch's DataLoader workers and many job schedulers set thread counts to 1 per worker.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What's the difference between a process and a thread? What does each one own?</summary>
+
+A process is a running program with its own private memory (address space), its own open files, a PID, and at least one thread. A thread is one line of execution inside a process: it owns only its stack, its registers and its position in the code. All threads in a process share the heap, globals, code and open files. So threads are cheap to create and can share data with no copying, but can corrupt shared data; processes are isolated and safe, but expensive to start and must copy data to communicate.
+
+</details>
+
+<details>
+<summary>2. What is the GIL, why does CPython have it, and when is it released?</summary>
+
+A single lock a thread must hold to run Python bytecode, so only one thread per process runs Python at a time. It exists mainly because every object has a reference count that changes constantly; one global lock made those updates safe without slowing down single-threaded code, and let C extensions assume nobody else is touching Python objects. It's released every 5 ms by default if another thread wants it, and around blocking or long C operations: socket and file I/O, `time.sleep`, large `hashlib` inputs, most heavy NumPy and PyTorch ops. Free-threaded CPython (PEP 703; experimental in 3.13, officially supported but optional in 3.14) removes it, at some single-thread cost.
+
+</details>
+
+<details>
+<summary>3. Your preprocessing script is slow. When do you reach for threads, processes, or async?</summary>
+
+First find out what it's slow *at*: watch `top` or profile. If one core is pegged running Python code (tokenizing, parsing, regex, cleaning text), it's CPU-bound: use processes (`ProcessPoolExecutor`, or `DataLoader` workers), give each worker a chunk index or a file path rather than the data, and keep chunks big enough that pickling is negligible. If the heavy work is already in C that releases the GIL (NumPy, hashlib on big buffers, a Rust tokenizer's batch call), threads may be enough and avoid the copying. If it's mostly waiting (downloading, calling an API, reading from S3), it's I/O-bound: threads work well up to hundreds of concurrent requests; for thousands, async is cheaper, because each waiting request costs a small object instead of a whole thread. And if it's both, combine: processes for compute, threads or async inside for the waiting.
+
+</details>
+
+<details>
+<summary>4. A CPU-bound pure-Python job takes 60 s on one core. What's the best case on the Spark with 20 processes, and why won't you hit it?</summary>
+
+The ideal is 60 / 20 = 3 s. You won't get there because: (a) half the Spark's cores are efficiency cores, slower than the other half, so the 20 workers don't finish together; (b) the work might not split evenly, and the pool waits for the slowest chunk; (c) starting 20 processes and pickling arguments and results costs real time, more under `spawn` or with heavy imports; (d) any serial part of the program (reading the input, merging results) doesn't speed up at all, which is Amdahl's law: if 10% is serial, you can never beat 10x; (e) if the workers stream through lots of memory, they compete for the same memory bandwidth. A realistic answer is "somewhere around 4-6 s, and I'd measure the scaling curve to see where it bends".
+
+</details>
+
+<details>
+<summary>5. Why does PyTorch's DataLoader use processes, yet a training loop with one Python thread keeps the GPU busy?</summary>
+
+Data loading runs your Python code (`__getitem__`: decode, tokenize, augment) and is CPU-bound, so threads would be serialised by the GIL; separate processes each have their own GIL and run in parallel, and they hand back batches through shared memory so the tensors aren't copied through a pipe. The training loop is different: Python just launches GPU kernels, which run asynchronously while Python queues the next ones, and heavy CPU-side ops release the GIL. The GIL only hurts when Python itself is the thing doing the work.
+
+</details>
+
+## Go Deeper
+
+- **Remzi H. Arpaci-Dusseau and Andrea C. Arpaci-Dusseau, _Operating Systems: Three Easy Pieces_ (OSTEP)**, free at [pages.cs.wisc.edu/~remzi/OSTEP](https://pages.cs.wisc.edu/~remzi/OSTEP/). Read "The Abstraction: The Process", "Limited Direct Execution" (how context switches actually happen), "Concurrency: An Introduction" and "Locks". The clearest OS book there is.
+- **David Beazley, "Understanding the Python GIL"**, PyCon 2010 (talk and slides, on his site dabeaz.com). The talk that measured the old GIL fighting itself on multicore machines and made everyone understand what the lock does. Old, still the best mental model.
+- **Sam Gross, [PEP 703: Making the Global Interpreter Lock Optional in CPython](https://peps.python.org/pep-0703/)**. Unusually readable for a PEP: explains exactly why refcounting needed the GIL and the tricks that remove it.
+- **[PEP 779: Criteria for supported status for free-threaded Python](https://peps.python.org/pep-0779/)** and the Python docs HOWTO **"Python support for free threading"** for the current state of the no-GIL build.
+- **Python docs: [threading](https://docs.python.org/3/library/threading.html), [multiprocessing](https://docs.python.org/3/library/multiprocessing.html) (especially "Contexts and start methods"), [concurrent.futures](https://docs.python.org/3/library/concurrent.futures.html)**. Check the start-method section against your Python version; it changed in 3.14.
+- **PyTorch docs, `torch.utils.data`, section "Multi-process data loading"** ([pytorch.org/docs/stable/data.html](https://pytorch.org/docs/stable/data.html)). How workers, `worker_init_fn`, `pin_memory` and the copy-on-access memory issue work.
+- **Larry Hastings, "Removing Python's GIL: The Gilectomy"**, PyCon 2016. A first-hand account of why the obvious approach makes Python slower.
+
+## Connections
+
+This lesson leans on [Where do my variables live?](/lessons/stack-and-heap/): threads are "one address space, many stacks", and the GIL exists because of the refcount in every heap object's header. The context-switch costs only make sense next to [How slow is slow?](/lessons/latency-numbers/).
+
+It sets up [Waiting vs working](/lessons/waiting-vs-working/), with a question you should now be able to feel. Threads are a fine way to wait: each blocked thread costs no CPU, and the GIL doesn't care. But each one still costs a stack (Linux reserves 8 MB of address space for one by default, though only the pages it touches use real RAM), a kernel record, a turn in the scheduler, and a context switch every time it wakes up. Fifty threads waiting on fifty requests is easy. Your LLM app needs to wait on 10,000 slow model calls at once. Is 10,000 threads really the best way to wait, or is there something much cheaper?
+
+Later, [Why ~17 tokens per second?](/lessons/bandwidth-bound/) explains reason (e) in question 4: why adding cores stops helping once every core is waiting on the same memory.

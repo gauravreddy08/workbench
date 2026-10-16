@@ -1,0 +1,741 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import DraftOverlap from '../components/figures/DraftOverlap.astro';
+import DraftFit from '../components/figures/DraftFit.astro';
+
+## Today
+
+- Say precisely what makes a draft model good: not "smart", but *close to the target's distribution*. Show that the acceptance rate α is exactly `Σ min(p, q)`, which is one minus the total variation distance between the two.
+- Explain knowledge distillation: training a student on the teacher's full probability vectors instead of on single "correct" tokens, why that carries far more signal per example, what temperature does, and the difference between forward and reverse KL.
+- Build a distillation dataset from your own 8B: generate answers on prompts like your real traffic, then store the 8B's top-64 logits per token in about 388 bytes instead of 250 KB.
+- Fine-tune Llama 3.2 1B two ways (plain cross-entropy on the 8B's text, and KL on its logits), build a second draft from the 8B's own first 4 layers, and measure α before and after for each.
+- Plug the winner into your speculative decoder, record the end-to-end speedup on `SCOREBOARD.md`, and, as a stretch, train Medusa heads that draft with no second model at all.
+
+Prerequisites: [Speculative decoding](/lessons/speculative-decoding/) (you need your `spec_greedy`, `spec_sample` and `sweep.py`, and the α, K, c speedup formula). Helpful: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) and [Memory math for models](/lessons/memory-math/). This is probably your first LLM training run, so it's also a soft introduction to [the full training loop](/lessons/tiny-lm/). Time: an evening for the idea, a weekend for the build (most of it waiting for the Spark).
+
+## The Problem
+
+Your K sweep from the speculative decoding lesson ended somewhere like this: Llama 3.2 1B drafting for Llama 3.1 8B, greedy, α̂ around 0.7, c around 0.3, best K of 2 or 3, about 1.4x. A real gain. And the calculator told you which levers are left. Lowering c means engineering on the draft's step (CUDA graphs, fused kernels). Raising α means a better draft.
+
+So you print the rejections. Pick twenty rounds where d1 was thrown out and look at what the 1B proposed against what the 8B wanted. You might see something like this:
+
+- The 8B starts answers with "Here's a" and the 1B guesses "Sure".
+- The 8B likes a markdown header before a list; the 1B goes straight to "1."
+- In code, the 8B writes `math.pi * r ** 2` and the 1B writes `3.14 * r * r`.
+
+None of the 1B's guesses are *wrong*. They are fine English and working Python. They are just not what *this* 8B would say. The 1B is a perfectly decent writer with its own habits, and you asked it to impersonate a different writer whose habits it has never studied.
+
+That reframes the job. You don't need a smarter draft. You need a better impersonator. And you own the thing it should impersonate: the 8B is sitting on your Spark, happy to show its work on as much text as you like, including its full probability vector at every step, not just the token it picked. Training a small model to copy a big model's probabilities has a name, and it is older than LLMs.
+
+<Predict id="p-better-or-closer">
+Two candidate drafts for your 8B. Draft A is a 1B model that scores higher than your 8B on a reasoning benchmark (suppose someone trained a brilliant 1B). Draft B is a 1B model that scores worse on every benchmark, but was trained only to copy your 8B's output probabilities. Which gives the higher acceptance rate? Could the "brilliant" one ever be a bad draft?
+
+<Fragment slot="answer">
+
+Almost certainly **draft B**. Acceptance doesn't reward being right; it rewards agreeing with the target. A draft that answers *better* than the target will propose tokens the target wouldn't, and every one of those is rejected. Speculative decoding emits the target's distribution exactly, whatever the draft does, so the draft's quality as a writer is invisible in the output. Only its similarity to the target shows up, and only as speed. Yes, a brilliant 1B can be a bad draft.
+
+</Fragment>
+</Predict>
+
+<Origin year="2006 → 2015 → 2023" title="Teaching small models to copy big ones">
+
+In 2006 Cristian Buciluă, Rich Caruana and Alexandru Niculescu-Mizil had a problem: their best classifiers were huge ensembles of hundreds of models, far too slow to deploy. Their fix, in a paper called "Model Compression", was to label a large pile of unlabeled data with the ensemble's *outputs* and train one small neural network to reproduce them. The small model got most of the ensemble's accuracy at a fraction of the cost.
+
+In 2015 Geoffrey Hinton, Oriol Vinyals and Jeff Dean gave the idea its modern form and its name, "Distilling the Knowledge in a Neural Network". Their key observation was that the teacher's *wrong* answers carry information. An image classifier that says "dog 0.9, wolf 0.09, car 0.0001" is telling you that this dog looks a bit like a wolf and nothing like a car. A one-hot label ("dog") throws that away. They called the information in the small probabilities "dark knowledge", and added a temperature knob to make it more visible.
+
+Speculative decoding (2022) created a setting where this matters more than anywhere else, because the draft's only job is to match the teacher's distribution. In 2023 Yongchao Zhou and colleagues at Google published DistillSpec, which distills drafts specifically for speculative decoding and reports 10 to 45% more speedup than an undistilled draft. In 2024, Medusa (Tianle Cai et al.) and EAGLE (Yuhui Li et al.) went further and trained small drafting modules that read the target's own internal state. You'll build versions of the first and taste the second.
+
+</Origin>
+
+## The Idea
+
+### What a good draft is, exactly
+
+Recall the rule from the last lesson. At each step the draft proposes x from its distribution q; the target keeps it with probability `min(1, p(x)/q(x))`. The chance that a proposal is kept, averaged over what the draft might propose, is
+
+```text
+P(keep)  =  Σ_x q(x) · min(1, p(x)/q(x))  =  Σ_x min(p(x), q(x))
+```
+
+That's the area of the shared part of the two bar charts, the solid blue in Figure 003 of the last lesson. There is a standard name for how far apart two distributions are in exactly this sense. The <Term w="total variation distance">Half the sum of absolute differences between two probability lists: ½ Σ |p(x) − q(x)|. It's the largest possible difference in the probability the two give to any single event. 0 means identical, 1 means no overlap at all.</Term>, TV for short, is `½ Σ |p − q|`. A two-line identity connects them: for any two numbers, `|p − q| = p + q − 2·min(p, q)`, so summing over the vocabulary,
+
+```text
+TV(p, q)  =  ½ (1 + 1 − 2 Σ min(p, q))  =  1 − Σ min(p, q)
+
+so   α  =  1 − TV(p, q)
+```
+
+Leviathan et al. state this in their paper too. (I checked the identity numerically on random 50-token distributions; the two sides agree to 16 digits, as they must.)
+
+Read that as a design spec. The acceptance rate at one step is a pure function of *how far apart* the two probability vectors are, in one specific sense. Not of how good the draft is at anything. Average it over the steps your server actually sees, and you have the α in the speedup formula. To raise α, make q close to p, on the text your server writes. That's the whole job.
+
+This also explains why some tokens are easy and some hard. After "The capital of France is", both models put 0.8+ on " Paris": huge overlap. After "Here is a poem about", both are spread out over hundreds of tokens, and the overlap of two spread-out distributions with different preferences is small. The draft is "wrong" there in the sense that it has different taste.
+
+<Figure n="001" title="CLOSE ENOUGH TO BE KEPT" caption="Illustrative numbers at one step. Solid blue is min(p, q), the probability a draft is proposed and kept, so its total is α. Wash is where the draft over-proposes; dashed is where it under-proposes. Distilling moves q's logits toward p's. Speedup uses last lesson's formula with this α at every step." wide>
+
+<DraftOverlap />
+
+</Figure>
+
+Things to try:
+
+- **The start.** An off-the-shelf small model, α = 0.63. Over-proposing NONE and SELF costs as much as under-proposing MATH: both are probability in the wrong place.
+- **Distill halfway (0.50).** α = 0.82, and the KL from p to q drops from 0.32 to 0.08 nats. At K = 3, c = 0.3, the speedup goes from about 1.2x to about 1.6x. Same model size, same c, one change: it imitates better.
+- **K and c.** With the distilled draft, push K up. The best K grows, because long runs now survive. Then raise c and watch a slow draft eat the gain.
+
+### Learning from the teacher's whole answer
+
+The obvious way to make the 1B write like the 8B: have the 8B write a lot of text, and fine-tune the 1B on it with the ordinary language-modelling loss. That works, and it has a name: <Term w="sequence-level distillation">Kim and Rush, 2016. Train the student on full outputs generated by the teacher, using the normal next-token loss. The teacher's text replaces human-written text.</Term>. The 1B learns the 8B's habits ("Here's a", the markdown header) because the training text is full of them.
+
+But look at what each training example tells the student. The ordinary loss is <Term w="cross-entropy">The standard next-token loss: minus the log of the probability the model gave to the token that actually came next. Low when the model put high probability on it.</Term> against a <Term w="one-hot">A probability list that is 1 for one entry and 0 for all others. A "label" that says only which token came next, and nothing about the alternatives.</Term> label. The 8B sampled " math" at some step, so the label says "math: 1, everything else: 0". But the 8B *knew* more than that. It had a full vector: " math" 0.46, " r" 0.14, " 3" 0.10, and so on. Sampling one token from it threw nearly all of it away.
+
+<Term w="knowledge distillation">Training a small "student" model to match a big "teacher" model's output probabilities, not just its chosen outputs. The teacher's full probability vector is the training target.</Term> keeps it. Instead of the one-hot label, the target at each position is the teacher's whole vector, the <Term w="soft labels">The teacher's full probability vector used as a training target, instead of a single correct answer. Also called soft targets. "Soft" because the probability is spread over many entries.</Term>. The loss measures how far the student's vector is from the teacher's. The natural choice is the <Term w="KL divergence">A measure of how different one probability distribution is from another, in nats (natural log) or bits. Zero only if they are identical; never negative; not symmetric, so KL(p‖q) and KL(q‖p) are different numbers.</Term>:
+
+```text
+KL(p ‖ q)  =  Σ_x p(x) · log( p(x) / q(x) )
+           =  Σ_x p(x) · (−log q(x))   −   Σ_x p(x) · (−log p(x))
+              └── cross-entropy against p ──┘   └── teacher's entropy: constant ──┘
+```
+
+The second line is worth staring at. KL against the teacher is cross-entropy where the label is the whole vector p instead of a one-hot, minus a constant the student can't change. So "distillation loss" is just "the loss you already know, with a soft label". The gradient with respect to the student's logits is the familiar `q − p`, the same shape as ordinary training's `q − onehot`. One line of code changes.
+
+Why it matters so much: a one-hot label is one sample from p. The student has to see the same kind of context many times before the counts reveal p's shape. A soft label hands it p directly.
+
+<Predict id="p-soft-vs-hard">
+A toy setup. 300 contexts, a vocabulary of 1,000, and a teacher with a spread-out distribution in each context. A student that can represent any distribution per context (a lookup table) learns from n examples per context. With one-hot labels, it learns the empirical frequencies of n samples. With soft labels, it sees p itself. What α does each reach with n = 1? With n = 64?
+
+<Fragment slot="answer">
+
+I ran this in numpy. With one-hot labels, α (averaged over contexts) was **0.12 at n = 1**, 0.39 at n = 16, **0.64 at n = 64**, and still only 0.81 at n = 256. With soft labels, the table matches p exactly after **one** example per context: α = 1.
+
+Real networks aren't lookup tables; they share what they learn across similar contexts, which shrinks the gap a lot. But the direction holds, and it's why you'll see the KL run beat the CE run on the same amount of 8B text in your Measure table. Each soft label is worth many hard ones.
+
+</Fragment>
+</Predict>
+
+### Temperature, and the T² factor
+
+Hinton's paper had one more knob. A trained model's distribution is often very peaky: 0.97 on one token and tiny amounts spread over the rest. The tiny amounts carry the dark knowledge, but they contribute almost nothing to the loss, so the student barely learns them. Their fix was to divide both models' logits by a <Term w="distillation temperature">A number T > 1 that divides the logits before softmax during distillation, flattening both the teacher's and student's distributions so the small probabilities matter more in the loss.</Term> T before the softmax. T = 2 or 4 flattens both distributions, which makes the small entries visible to the loss. One side effect: dividing logits by T shrinks the gradients by about 1/T², so they multiply the loss by T² to keep its scale.
+
+For a draft model, be careful with this knob. Hinton wanted the student to learn the teacher's *knowledge*, and evaluated it on its top answer. You want the student to match the teacher's *distribution* at the temperature you serve, because that's what α is computed on. A student trained to match flattened distributions has been optimizing for something slightly different. So start at T = 1 (the real distribution), and if you try T = 2, measure α at your serving temperature, not at 2. One of the Break It experiments does exactly this.
+
+### Which way round the KL goes
+
+KL isn't symmetric, and the two directions push the student differently when it is too small to copy the teacher perfectly. Which, for a 1B imitating an 8B, it always is.
+
+- **Forward KL**, `KL(p ‖ q)`, averages `log(p/q)` weighted by the teacher's p. It is huge wherever the teacher has real probability and the student has almost none. So the student is pushed to cover everything the teacher might say, even if that means spreading thin. This is called <Term w="mode-covering">Behavior of forward KL: the student spreads its probability to cover every place the teacher has mass, even if it must put mass in between where the teacher has none.</Term>. It's what Hinton used, and what "soft-label cross-entropy" computes.
+- **Reverse KL**, `KL(q ‖ p)`, is weighted by the student's own q. It is huge wherever the student puts probability on something the teacher considers unlikely, and it doesn't care what the student ignores. So the student hides inside the teacher's biggest peak and gives up the rest: <Term w="mode-seeking">Behavior of reverse KL: the student concentrates on one high-probability region of the teacher and ignores the others, rather than putting mass anywhere the teacher wouldn't.</Term>. MiniLLM (Gu et al., 2024) argued for this direction for distilling LLMs.
+
+Which matches acceptance? Neither, exactly. α = 1 − TV, and TV is symmetric: it charges the same for a unit of probability in the wrong place whichever direction it's wrong in. Both KLs are bounds on it (by <Term w="Pinsker's inequality">A classic result: TV(p, q) ≤ √(KL/2), for either direction of KL. Driving either KL to zero forces TV to zero, but two students with the same KL can have quite different TV.</Term>), so driving either to zero drives α to 1. But at the student's limit, when neither can reach zero, they disagree about which mistakes to make, and that changes α.
+
+The figure is the cleanest version of that. The teacher has two bumps. The student can only make one bump (a mean and a width). Pick an objective; the figure finds the best student under it and reports α.
+
+<Figure n="002" title="TOO SMALL TO COPY: WHICH MISTAKES?" caption="A one-bump student fit to a two-bump teacher by grid search. Forward KL straddles; reverse KL picks a side; maximizing α directly does whichever pays more. The table shows all three at the current weight." wide>
+
+<DraftFit />
+
+</Figure>
+
+What you should see (and what I got in numpy at the same settings):
+
+- **Second bump 0.35.** Forward KL straddles both bumps: α = 0.557, and its top token sits in the valley where the teacher has almost nothing. Reverse KL takes the big bump: α = 0.650. Maximizing α directly: 0.656, close to reverse KL.
+- **Second bump 0.50.** Now forward KL (0.558) beats reverse KL (0.500), and maximizing α directly agrees with forward KL. Giving up half the mass is too expensive.
+- **The greedy column.** If you serve greedily, acceptance is just "does the draft's top token match the target's top token". Forward KL's straddling student can fail that badly even when its α at temperature 1 is fine.
+
+Real students aren't one-bump toys, and the effect is milder. DistillSpec's finding was exactly this kind of answer: the best divergence depends on the task and on how you decode (greedy or sampling, which temperature). There's no universal winner. That's a measurement, not a debate, so in the Build you train with forward KL (the standard, and easiest with stored logits) and you can try others cheaply afterward. You can even train on `1 − Σ min(p, q)` directly, the true objective; DistillSpec includes TV among the losses it compares.
+
+### Whose text to learn on
+
+Distillation needs contexts: prefixes at which you ask the teacher "what would you say next?" Which prefixes?
+
+The draft is used at very specific moments: after the real text so far (which the target wrote), for d1; and after the real text plus the draft's *own* earlier guesses, for d2 through dK. So you want the draft to be good on the target's text, on prompts like your traffic, and ideally on its own half-finished guesses too.
+
+Three choices, in order of how closely they match that:
+
+1. **Generic text** (web pages, books). What the 1B was pretrained on. Wrong prompts, wrong writer.
+2. **The target's generations** on prompts like your traffic. Right prompts, right writer. This is what you'll build: <Term w="off-policy">Training on text produced by some other process than the model being trained, here by the teacher. Cheap to produce once and reuse, but the student never sees its own mistakes.</Term> data, made once, reused for every experiment.
+3. **The draft's own generations, scored by the target.** The student writes, the teacher reports its probability vector at every position of the student's text, and the student is trained toward those vectors. This is <Term w="on-policy distillation">Training the student on text it generated itself, with the teacher's probabilities at each position as the target. It teaches the student what the teacher would do after the student's own mistakes. Agarwal et al. 2024 (GKD); used by DistillSpec.</Term>. It fixes a problem with choice 2 called <Term w="exposure bias">A model trained only on someone else's text has never seen prefixes containing its own typical mistakes, so it handles them badly when it meets them at run time.</Term>: a student trained only on the teacher's text has never seen a prefix containing its own slips, but at d2 through dK of every round, it is reading exactly that.
+
+DistillSpec (Zhou et al. 2023) found that drafts trained on student-generated data did as well as or better than teacher-generated data, and student data is much cheaper to make, since the small model is the one writing. The catch for you is plumbing: on-policy data has to be regenerated as the student changes, so you need the teacher running during training. On the Spark both fit easily (16 GB plus a few GB), so it's a stretch task, after the off-policy version works.
+
+### The dataset, and why you store only the top 64
+
+Here is the pipeline you'll build.
+
+<Figure n="003" title="FROM YOUR 8B TO A DRAFT" caption="Generate once, score once, train many times. Storing the 8B's top-64 logits (plus one normalizer) per position costs 388 bytes instead of 250 KB, which turns a 640 GB dataset into a 1 GB one.">
+
+<svg viewBox="0 0 560 320" role="img" aria-label="Pipeline: prompts go to the 8B which generates text, the 8B re-reads the text to produce top-64 logits, both feed draft training, which is evaluated offline and then in the speculative decoder">
+  <rect x="10" y="20" width="150" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="40" text-anchor="middle" class="strong">PROMPTS</text>
+  <text x="85" y="57" text-anchor="middle">~10K, LIKE YOUR TRAFFIC</text>
+  <line x1="160" y1="45" x2="192" y2="45" class="ink" stroke-width="1.2" />
+  <polygon points="192,41 200,45 192,49" class="fill-blue" />
+  <rect x="200" y="20" width="160" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="40" text-anchor="middle" class="blue-t">8B GENERATES</text>
+  <text x="280" y="57" text-anchor="middle">BATCHED · T = 1</text>
+  <line x1="360" y1="45" x2="392" y2="45" class="ink" stroke-width="1.2" />
+  <polygon points="392,41 400,45 392,49" class="fill-blue" />
+  <rect x="400" y="20" width="150" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="475" y="40" text-anchor="middle" class="strong">TEXT</text>
+  <text x="475" y="57" text-anchor="middle">~2M TOKENS · 8 MB</text>
+
+  <line x1="475" y1="70" x2="475" y2="90" class="ink" stroke-width="1.2" />
+  <line x1="475" y1="90" x2="280" y2="90" class="ink" stroke-width="1.2" />
+  <line x1="280" y1="90" x2="280" y2="102" class="ink" stroke-width="1.2" />
+  <polygon points="276,102 280,110 284,102" class="fill-blue" />
+  <rect x="200" y="110" width="160" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="130" text-anchor="middle" class="blue-t">8B RE-READS IT</text>
+  <text x="280" y="147" text-anchor="middle">ONE PREFILL PER SEQ</text>
+  <line x1="360" y1="135" x2="392" y2="135" class="ink" stroke-width="1.2" />
+  <polygon points="392,131 400,135 392,139" class="fill-blue" />
+  <rect x="400" y="110" width="150" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="475" y="130" text-anchor="middle" class="strong">TOP-64 / TOKEN</text>
+  <text x="475" y="147" text-anchor="middle">388 B, NOT 250 KB</text>
+
+  <line x1="475" y1="160" x2="475" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="475" y1="180" x2="85" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="85" y1="180" x2="85" y2="192" class="ink" stroke-width="1.2" />
+  <polygon points="81,192 85,200 89,192" class="fill-blue" />
+  <text x="300" y="175">LOGITS (b)</text>
+  <path d="M 420 70 L 420 84 L 30 84 L 30 192" class="ink dash" stroke-width="1" fill="none" />
+  <polygon points="26,192 30,200 34,192" class="fill-blue" />
+  <text x="36" y="98">TEXT (a)</text>
+
+  <rect x="10" y="200" width="150" height="60" class="fill-blue" />
+  <text x="85" y="220" text-anchor="middle" style="fill:var(--paper)">TRAIN DRAFT</text>
+  <text x="85" y="236" text-anchor="middle" style="fill:var(--paper)">(a) CE ON TEXT</text>
+  <text x="85" y="251" text-anchor="middle" style="fill:var(--paper)">(b) KL ON TOP-64</text>
+  <line x1="160" y1="230" x2="192" y2="230" class="ink" stroke-width="1.2" />
+  <polygon points="192,226 200,230 192,234" class="fill-blue" />
+  <rect x="200" y="205" width="160" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="280" y="225" text-anchor="middle" class="strong">OFFLINE α</text>
+  <text x="280" y="242" text-anchor="middle">Σ min(p,q), HELD-OUT</text>
+  <line x1="360" y1="230" x2="392" y2="230" class="ink" stroke-width="1.2" />
+  <polygon points="392,226 400,230 392,234" class="fill-blue" />
+  <rect x="400" y="205" width="150" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="475" y="225" text-anchor="middle" class="blue-t">SPEC DECODER</text>
+  <text x="475" y="242" text-anchor="middle">→ SCOREBOARD</text>
+
+  <rect x="10" y="276" width="540" height="34" class="ink dash" stroke-width="1" />
+  <text x="22" y="297">STRETCH · ON-POLICY: THE DRAFT WRITES THE TEXT, THE 8B SCORES IT LIVE</text>
+</svg>
+
+</Figure>
+
+The memory math is the reason for the top-64 box, and it's a good example of the habit from [Memory math for models](/lessons/memory-math/): multiply it out before you write the code.
+
+<Predict id="p-logit-disk">
+You generate 10,000 answers of about 200 tokens: 2 million positions. Llama 3's vocabulary has 128,256 entries. How much disk does it take to store the 8B's full logit vector at every position, in bf16? And how much if you store only the top 64 entries per position, each as a token id plus a value?
+
+<Fragment slot="answer">
+
+Full: 128,256 × 2 bytes = **250 KB per position**. Times 2 million positions = **about 640 GB**. More than the Spark's 128 GB of memory, and a slow thing to stream from disk every epoch.
+
+Top 64: each entry is a token id and a value. The id needs 4 bytes (`int32`), because 128,256 doesn't fit in the 65,535 that a 2-byte `uint16` can hold. The value takes 2 bytes in fp16. So 64 × 6 = 384 bytes, plus 4 bytes for one more number explained below: **388 bytes per position**, **0.78 GB in total**. About 660 times smaller, and it fits in RAM.
+
+</Fragment>
+</Predict>
+
+The other number per position is the teacher's <Term w="logsumexp">log Σ exp(logit) over the whole vocabulary: the normalizer of the softmax. With it, any single logit can be turned into an exact probability: p(x) = exp(logit(x) − logsumexp).</Term>. With it, your 64 stored logits become 64 *exact* probabilities, and one minus their sum is the exact <Term w="tail mass">The total probability the teacher gives to all tokens outside the stored top 64. Unknown token by token, but its total is known if you stored the logsumexp.</Term> the teacher spreads over the other 128,192 tokens. Without it, all you could do is renormalize the 64 to sum to 1, which quietly claims the teacher puts zero probability everywhere else.
+
+Is 64 enough? A useful fact: if the student matched the renormalized top-k of the teacher perfectly, its α would be exactly the teacher's top-k mass (the student would give the top-k a bit *more* than p on each, and the shared part is all of p's top-k). So the average top-64 mass on your data is roughly a ceiling on what training from stored logits can teach, and you'll measure it. For peaky chat text it's likely high, with a tail of open-ended positions where it isn't. Keeping the tail mass as its own term in the loss (one "everything else" bucket) recovers a little of the rest.
+
+Why store at all, instead of running the 8B live during training? You could: the Spark holds both. But a training step for a 1B costs about 6 × 1.2 B ≈ 7 GFLOP per token (forward and backward), while one 8B forward costs about 2 × 8 B = 16 GFLOP per token. Running the teacher live roughly triples the cost of every epoch of every experiment. Scoring once and storing is the cheap, reusable choice, and live teachers are for on-policy training, where the text keeps changing.
+
+### What shape should a draft be
+
+Two drafts you'll build, and a few you'll meet.
+
+<Figure n="004" title="FOUR WAYS TO DRAFT" caption="Bytes per draft step are bf16 spec-sheet arithmetic from the configs. A and B are separate small models; C and D are small modules that read the target's own hidden state.">
+
+<svg viewBox="0 0 560 400" role="img" aria-label="Four draft architectures: a separate small model, a truncated copy of the target, Medusa heads on the target's last hidden state, and an EAGLE one-layer feature drafter">
+  <rect x="4" y="4" width="272" height="188" class="fill-paper" stroke-width="1" />
+  <text x="16" y="24" class="strong">A · SEPARATE SMALL MODEL</text>
+  <rect x="16" y="44" width="54" height="44" class="fill-wash" stroke-width="1" />
+  <text x="43" y="70" text-anchor="middle">EMBED</text>
+  <line x1="70" y1="66" x2="86" y2="66" class="ink" stroke-width="1" />
+  <rect x="86" y="38" width="104" height="56" class="fill-wash" stroke-width="1" />
+  <text x="138" y="62" text-anchor="middle">16 LAYERS</text>
+  <text x="138" y="78" text-anchor="middle">2048 WIDE</text>
+  <line x1="190" y1="66" x2="206" y2="66" class="ink" stroke-width="1" />
+  <rect x="206" y="44" width="58" height="44" class="fill-wash" stroke-width="1" />
+  <text x="235" y="70" text-anchor="middle">HEAD</text>
+  <text x="16" y="120">LLAMA 3.2 1B · 1.24B PARAMS</text>
+  <text x="16" y="136">≈ 2.5 GB READ PER DRAFT STEP</text>
+  <text x="16" y="152">SEES ONLY TOKENS</text>
+  <text x="16" y="176" class="blue-t">YOU BUILD: t5, t6</text>
+
+  <rect x="284" y="4" width="272" height="188" class="fill-paper" stroke-width="1" />
+  <text x="296" y="24" class="strong">B · TRUNCATED TARGET</text>
+  <rect x="296" y="44" width="58" height="44" class="ink dash" stroke-width="1" />
+  <text x="325" y="64" text-anchor="middle">8B</text>
+  <text x="325" y="78" text-anchor="middle">EMBED</text>
+  <line x1="354" y1="66" x2="370" y2="66" class="ink" stroke-width="1" />
+  <rect x="370" y="38" width="104" height="56" class="fill-wash" stroke-width="1" />
+  <text x="422" y="62" text-anchor="middle">LAYERS 1-4</text>
+  <text x="422" y="78" text-anchor="middle">4096 WIDE</text>
+  <line x1="474" y1="66" x2="486" y2="66" class="ink" stroke-width="1" />
+  <rect x="486" y="44" width="58" height="44" class="ink dash" stroke-width="1" />
+  <text x="515" y="64" text-anchor="middle">8B</text>
+  <text x="515" y="78" text-anchor="middle">HEAD</text>
+  <text x="296" y="120">FIRST 4 OF THE 8B'S 32 LAYERS</text>
+  <text x="296" y="136">≈ 2.8 GB PER STEP · 4 LAYERS, NOT 16</text>
+  <text x="296" y="152">DASHED = SHARED WITH 8B, FROZEN</text>
+  <text x="296" y="176" class="blue-t">YOU BUILD: t6</text>
+
+  <rect x="4" y="206" width="272" height="188" class="fill-paper" stroke-width="1" />
+  <text x="16" y="226" class="strong">C · MEDUSA HEADS</text>
+  <rect x="16" y="246" width="70" height="80" class="fill-blue" />
+  <text x="51" y="282" text-anchor="middle" style="fill:var(--paper)">8B</text>
+  <text x="51" y="298" text-anchor="middle" style="fill:var(--paper)">32 LAYERS</text>
+  <line x1="86" y1="286" x2="104" y2="286" class="ink" stroke-width="1" />
+  <text x="108" y="290" class="strong">h</text>
+  <line x1="120" y1="286" x2="134" y2="256" class="ink" stroke-width="1" />
+  <line x1="120" y1="286" x2="134" y2="286" class="ink" stroke-width="1" />
+  <line x1="120" y1="286" x2="134" y2="316" class="ink" stroke-width="1" />
+  <rect x="134" y="244" width="66" height="22" class="fill-wash" stroke-width="1" />
+  <text x="167" y="259" text-anchor="middle">HEAD 1</text>
+  <rect x="134" y="275" width="66" height="22" class="fill-wash" stroke-width="1" />
+  <text x="167" y="290" text-anchor="middle">HEAD 2</text>
+  <rect x="134" y="306" width="66" height="22" class="fill-wash" stroke-width="1" />
+  <text x="167" y="321" text-anchor="middle">HEAD 3</text>
+  <text x="208" y="259">→ t+2</text>
+  <text x="208" y="290">→ t+3</text>
+  <text x="208" y="321">→ t+4</text>
+  <text x="16" y="350">TINY BLOCKS ON THE LAST HIDDEN STATE</text>
+  <text x="16" y="366">NO SEPARATE DRAFT PASS: c ≈ 0</text>
+  <text x="16" y="386" class="blue-t">STRETCH: t9</text>
+
+  <rect x="284" y="206" width="272" height="188" class="fill-paper" stroke-width="1" />
+  <text x="296" y="226" class="strong">D · EAGLE</text>
+  <rect x="296" y="244" width="86" height="26" class="fill-blue" />
+  <text x="339" y="261" text-anchor="middle" style="fill:var(--paper)">8B FEATURE f</text>
+  <rect x="296" y="280" width="86" height="26" class="fill-wash" stroke-width="1" />
+  <text x="339" y="297" text-anchor="middle">NEXT TOKEN</text>
+  <line x1="382" y1="257" x2="400" y2="275" class="ink" stroke-width="1" />
+  <line x1="382" y1="293" x2="400" y2="281" class="ink" stroke-width="1" />
+  <rect x="400" y="256" width="62" height="40" class="fill-wash" stroke-width="1" />
+  <text x="431" y="274" text-anchor="middle">1 LAYER</text>
+  <text x="431" y="288" text-anchor="middle">DRAFT</text>
+  <line x1="462" y1="276" x2="478" y2="276" class="ink" stroke-width="1" />
+  <rect x="478" y="262" width="66" height="28" class="ink dash" stroke-width="1" />
+  <text x="511" y="280" text-anchor="middle">8B HEAD</text>
+  <path d="M 431 296 L 431 322 L 339 322 L 339 306" class="blue dash" stroke-width="1" fill="none" />
+  <text x="350" y="336" class="blue-t">LOOP: PREDICTED f FEEDS BACK</text>
+  <text x="296" y="356">DRAFTS IN THE TARGET'S FEATURE SPACE</text>
+  <text x="296" y="372">REUSES THE 8B'S EMBED AND HEAD</text>
+  <text x="296" y="386" class="blue-t">READ ABOUT IT</text>
+</svg>
+
+</Figure>
+
+**A: a separate small model** is what you have: Llama 3.2 1B, 16 layers, 2048 wide, with its own embedding table shared with its output layer (<Term w="tied embeddings">Using the same matrix for the input embedding lookup and the output layer that produces logits. Saves parameters; Llama 3.2 1B does it, Llama 3.1 8B does not.</Term>). Its only input is tokens. Distillation will make it a better impersonator. Hard rule: it **must use the same tokenizer** as the target. Token id 1234 has to mean the same string to both, or every comparison of p and q is comparing different things. Llama 3.2 and Llama 3.1 share one; check anyway, the way your `common.py` already does.
+
+**B: a truncated copy of the target.** Take the 8B, keep its embedding table, its first N layers, its final normalization and its output layer, and throw away layers N+1 through 32. Now it's a draft. Its arithmetic, for N = 4: each 8B layer is about 218 M parameters (attention projections plus the big MLP), so 4 layers are 0.87 B. The output layer is 4096 × 128,256 ≈ 525 M parameters, 1.05 GB in bf16, read every step. The embedding table is a lookup, so only one row is read per token. Total read per draft step: about 2.8 GB, a bit more than the 1B's 2.5 GB.
+
+So why bother? Two reasons. First, it is <Term w="shallow and wide">Few layers, each with a large hidden size. At batch 1, a draft step's time is partly set by how many layers run one after another, since each layer launches its own kernels; a shallow model has fewer sequential steps for the same bytes.</Term>: 4 layers instead of 16, so a quarter of the per-layer kernel launches. Your c measurement in the last lesson probably showed the 1B was far slower than its bytes predicted, for exactly this reason. Second, it starts *inside the target*: same embeddings, same output layer, and its first 4 layers are literally the target's. In the same process you can point the draft's embedding and head at the target's tensors, so they cost zero extra memory. You'll freeze those and train only the 4 layers.
+
+<Predict id="p-truncated-init">
+Before any training, you run the truncated 4-layer copy as a draft. Its last layer's output goes straight into the 8B's final normalization and output layer, skipping 28 layers. What acceptance rate do you expect? Better or worse than the off-the-shelf 1B?
+
+<Fragment slot="answer">
+
+Much worse, likely terrible. The output layer was trained to read the hidden state *after layer 32*. After layer 4 the hidden state is in a very different form: early layers are mostly still working out what the tokens are, not what comes next. Researchers who look at this (the "logit lens" idea: apply the output layer to intermediate layers) see early-layer predictions that are mostly nonsense or just echo the input token. Expect α far below the 1B's until you train. That's the point of the experiment: how much can a few hours of distillation teach 4 layers to do the job of 32? Measure it before and after.
+
+</Fragment>
+</Predict>
+
+**C: Medusa heads** (Cai et al., 2024) drop the separate draft entirely. During verification the target already computes its final hidden state at every position, the vector right before the output layer. Medusa bolts a few tiny <Term w="Medusa heads">Small extra modules on the target's final hidden state. Head k takes the hidden state at position t and predicts the token at t + k + 1, skipping over the tokens in between. The target itself stays frozen (Medusa-1) or is fine-tuned jointly (Medusa-2).</Term> onto that vector. In the paper each head is one residual block: it adds a small learned correction to the vector, `h + SiLU(W·h)`, where SiLU is a smooth ReLU-like curve and W is a 4096 × 4096 matrix (17 M parameters), followed by its own copy of an output layer. Head 1 guesses the token two ahead, head 2 three ahead, and so on, all from the same h. Train them on the target's own text while the target stays frozen. Since they ride on the verify pass you were running anyway, there is no separate draft loop: c is close to zero.
+
+The trade: head 2 has to guess the token three positions ahead *without knowing* the two tokens in between. That's much harder than a draft model that sees its own previous guesses, so per-head accuracy falls quickly with distance. Medusa compensates by having each head propose its top few candidates and verifying a small tree of combinations in one pass (<Term w="tree attention">Verifying several candidate continuations in one target pass by laying them out as a tree and using an attention mask so each branch only sees its own ancestors.</Term>). The paper reports about 2.2x for Medusa-1 and 2.3 to 3.6x for Medusa-2. One honest caveat: for sampling, Medusa's default "typical acceptance" rule is a relaxation that is not exactly the target's distribution. With greedy decoding, or with the standard rejection rule you already wrote, it stays exact.
+
+**D: EAGLE** (Li et al., 2024) is among the strongest practical drafting methods today. A draft that only sees tokens has to rebuild, from scratch, everything the target already worked out. So EAGLE's draft is a single transformer layer that reads the target's top-layer *features* (plus the embedding of the next token), predicts the next feature vector, and turns it into a token using the target's own output layer. Then it loops on its own predicted features to draft further. It sees what the target was "thinking", not just what it said. EAGLE-2 made the draft tree's shape depend on the draft's confidence, and EAGLE-3 changed the training so the draft practices on its own predictions, the same "learn from your own slips" idea as on-policy distillation. vLLM and SGLang ship EAGLE support; you'll meet it in [Inside vLLM and SGLang](/lessons/serving-engines/).
+
+You'll build A and B, and C as a stretch. D is the natural next step if you want to go further, and the reason it works is something you'll feel in t9: the target's hidden state is a far richer input than a few tokens.
+
+### Measuring a draft without running speculation
+
+Running the full speculative decoder for every candidate is slow and noisy. There's a shortcut you get for free from the identity at the top of this lesson.
+
+Take held-out text the target generated. Run both models over it with the true prefix at every position (this is <Term w="teacher forcing">Feeding a model the true previous tokens at each step, instead of its own outputs, so every position can be scored in one parallel pass.</Term>, the same mini-prefill trick as verification). At every position you now have both full vectors p and q. Compute `Σ min(p, q)` there: that is exactly the probability the first draft of a round would be kept at that position. Average it. That's an <Term w="offline α">The acceptance rate estimated directly from both models' probability vectors on held-out target text, without running speculative decoding. Exact for the first draft position; an approximation for later ones.</Term>, with no sampling noise from the accept/reject coin flips at all.
+
+For greedy serving, the matching number is <Term w="top-1 agreement">The fraction of positions where the draft's most likely token equals the target's most likely token. The acceptance rate for greedy speculative decoding.</Term>: how often `argmax q == argmax p`. Compute that on held-out text the target generated *greedily*, since that's the text your greedy server will see.
+
+Offline α is what you'll use to compare training runs. The real decoder then confirms it, and adds the two things offline α can't see: positions 2 through K, where the prefix contains the draft's own guesses, and c.
+
+<Predict id="p-offline-vs-online">
+Your distilled draft gets offline top-1 agreement of 0.80 on held-out greedy text. Then you run the real greedy decoder with K = 4 and measure acceptance separately at each draft position: how often d1 is kept (when judged), how often d2 is kept (when judged), and so on. Will position 1 match 0.80? Will position 4 be higher or lower?
+
+<Fragment slot="answer">
+
+**Position 1 should match closely**, because it is the same question: the prefix is real target text, and the draft guesses one token. Small differences come from the prompt mix and from bf16 noise.
+
+**Later positions could go either way, and the reason is interesting.** d4 is only judged when d1-d3 were all kept, which happens mostly in easy stretches (boilerplate, the end of a word, code syntax). That selection pushes conditional acceptance *up*. But by then the draft is conditioning on its own guesses, which pushes it slightly down. On chat text, the "easy stretch" effect often wins, so don't be surprised if acceptance per position is flat or rises. This is also why measured tokens per round don't match the independent-α formula exactly.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Add to your `inference/` folder:
+
+```text
+inference/
+  draft/
+    prompts.py         # t1: build train / held-out prompt sets
+    generate.py        # t2: 8B writes the answers (vLLM, batched)
+    score_topk.py      # t3: 8B re-reads them, store top-64 logits
+    offline_alpha.py   # t4: Σ min(p,q) and top-1 agreement, held-out
+    train_draft.py     # t5, t6: CE / KL fine-tune, truncated target
+    onpolicy.py        # t7 (stretch)
+    medusa.py          # t9 (stretch)
+  spec/                # from the last lesson: sweep.py gains per-position stats (t8)
+  checkpoints/
+```
+
+The models: **Llama 3.1 8B Instruct** (the target and teacher, the model your scoreboard tracks) and **Llama 3.2 1B Instruct** (the student). Everything runs in the same NVIDIA PyTorch container as before. Training a 1B in bf16 with AdamW needs roughly 16 bytes per parameter for weights, gradients and optimizer state (about 20 GB), plus activations; the [training memory lesson](/lessons/training-memory/) does that math properly. Comfortable on 128 GB, even with the 8B loaded alongside for scoring.
+
+<Task id="t1" title="Prompts like your traffic, and a held-out set" agent="ok">
+
+A draft is only as good as its match to the prompts your server really gets. Your traffic is chat-style questions (that's what `prompts/short.jsonl` imitates), so start from a public chat-prompt collection. `HuggingFaceH4/ultrachat_200k` is a common one; check its license and card first. If you have real request logs from your server, mix them in: they're the best possible data.
+
+```python
+# draft/prompts.py
+import json, random
+from datasets import load_dataset
+
+random.seed(0)
+ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
+firsts = [ex["messages"][0]["content"] for ex in ds if 20 < len(ex["messages"][0]["content"]) < 2000]
+
+# never train on what you benchmark with
+bench = {json.loads(l)["prompt"] for l in open("../prompts/short.jsonl")}   # adjust field name
+firsts = [p for p in dict.fromkeys(firsts) if p not in bench]               # dedupe, drop bench prompts
+random.shuffle(firsts)
+
+splits = {"train": firsts[:10_000], "heldout": firsts[10_000:10_500]}
+for name, ps in splits.items():
+    with open(f"prompts_{name}.jsonl", "w") as f:
+        for p in ps: f.write(json.dumps({"prompt": p}) + "\n")
+```
+
+The held-out set is for measuring α only. It must never be trained on. Neither must your benchmark prompts: if they leak into training, the scoreboard row will be measuring memorization.
+
+</Task>
+
+<Task id="t2" title="Let the 8B write the training text" agent="ok">
+
+10,000 answers at batch 1 and 13 tokens per second would take about two days. Batch it. vLLM's offline mode is the easiest way, and you saw why it's fast in [Inside vLLM and SGLang](/lessons/serving-engines/). (If vLLM won't run in your container, Hugging Face `generate` with a batch of 32 to 64 and left padding works; it's just slower.)
+
+```python
+# draft/generate.py  -- check the vLLM docs for your version; the shape is stable, names drift.
+import json, sys
+from vllm import LLM, SamplingParams
+
+split, temp = sys.argv[1], float(sys.argv[2])       # e.g. train 1.0, heldout 1.0, heldout 0.0
+prompts = [json.loads(l)["prompt"] for l in open(f"prompts_{split}.jsonl")]
+llm = LLM(model="meta-llama/Llama-3.1-8B-Instruct", dtype="bfloat16", max_model_len=4096)
+params = SamplingParams(temperature=temp, top_p=1.0, top_k=-1, max_tokens=256, seed=0)
+outs = llm.chat([[{"role": "user", "content": p}] for p in prompts], params)
+
+with open(f"gen_{split}_T{temp}.jsonl", "w") as f:
+    for o in outs:
+        f.write(json.dumps({"prompt_ids": o.prompt_token_ids,
+                            "resp_ids": list(o.outputs[0].token_ids)}) + "\n")
+```
+
+Run it three times: `train 1.0` (the training text), `heldout 1.0` (for offline α at temperature 1), and `heldout 0.0` (greedy, for top-1 agreement, matching your greedy benchmark). Store token ids, not strings: re-tokenizing decoded text can split it differently, and then your stored logits line up with the wrong tokens.
+
+Why temperature 1 for training even though you serve greedily? Sampled text covers more of the contexts the 8B can reach, and the KL target at each position is the whole distribution anyway, so the student learns what the 8B would do at every branch. If your scoreboard is greedy-only, an extra run on greedy text is a fair experiment. Note how long generation takes: that's your 8B's batched throughput, a number worth having.
+
+</Task>
+
+<Task id="t3" title="Score it once: store the 8B's top-64 logits" agent="hands">
+
+For every training sequence, run the 8B once over `prompt_ids + resp_ids` (one forward pass, teacher forcing) and keep, for each position that *predicts a response token*, the top-64 logits, their token ids, and the logsumexp of the full row.
+
+The alignment is where everyone gets it wrong once. Row i of the logits is the model's prediction for token i + 1. So if the response starts at index `s = len(prompt_ids)`, the rows you want are `s − 1` through `len(ids) − 2`: that's `len(resp_ids)` rows, one per response token.
+
+```python
+@torch.inference_mode()
+def score_one(target, prompt_ids, resp_ids, k=64):
+    """Returns (topk_ids int32 [R, k], topk_logits fp16 [R, k], lse fp32 [R]) where R = len(resp_ids).
+    Row j describes the 8B's distribution for response token j, given everything before it."""
+    ...
+```
+
+Write the results into three preallocated `numpy.memmap` files (ids, logits, lse) plus an offsets array saying where each sequence starts, so training can read any sequence without loading everything. Do the topk and logsumexp in fp32. Sequences can be scored one at a time (each is a ~400-token prefill, far from memory-bound), or batched with padding if you want it faster.
+
+While you're there, record the **top-64 mass** at each position, `exp(logsumexp(topk_logits) − lse)`. Report its mean and its 10th percentile. That number is close to a ceiling on what training from these files can achieve.
+
+Self-check before the full run: for one sequence, assert that `topk_ids[j, 0]` (the 8B's top choice) equals `resp_ids[j]` on most rows of a *greedy* sequence. If it matches on only a few rows, your alignment is off by one.
+
+</Task>
+
+<Task id="t4" title="Offline α: measure the off-the-shelf draft" agent="hands">
+
+Before training anything, measure where you start. On the held-out sets, teacher-forced, both models over the same ids:
+
+```python
+@torch.inference_mode()
+def offline_alpha(draft, target, seqs, T=1.0):
+    """seqs: list of (prompt_ids, resp_ids). For every response position, compute
+       a_t   = Σ_x min(p_t(x), q_t(x))     with p, q = softmax(logits / T), full vocab, fp32
+       top_t = argmax p_t == argmax q_t
+    Return mean a_t, mean top_t, mean KL(p_t ‖ q_t), and the per-position a_t array."""
+    ...
+```
+
+Use `gen_heldout_T1.0.jsonl` for α at temperature 1, and `gen_heldout_T0.0.jsonl` for top-1 agreement. Use the *full* logits here (500 sequences is small enough to score live), not the stored top-64, so the measurement doesn't share the approximation the training uses.
+
+Record the off-the-shelf 1B. Save the per-position α array too: a histogram of it is worth looking at. You'll see a big spike near 1 (easy tokens) and a long spread below (taste).
+
+</Task>
+
+<Task id="t5" title="Train the 1B two ways: CE on text, KL on logits" agent="review">
+
+One script, two loss functions, same data, same steps, same learning rate. Only the loss changes, so the comparison is fair.
+
+```python
+def ce_loss(student_logits, resp_ids):
+    """(a) Sequence-level distillation: ordinary next-token cross-entropy on the 8B's text.
+    student_logits: [R, V] rows predicting each response token (same alignment as t3)."""
+    return F.cross_entropy(student_logits.float(), resp_ids)
+
+def kl_loss(student_logits, t_ids, t_logits, t_lse, T=1.0):
+    """(b) Token-level distillation: forward KL(p ‖ q) over the stored top-64 plus one tail bucket.
+    t_ids [R, k] int64, t_logits [R, k], t_lse [R]."""
+    logq = F.log_softmax(student_logits.float() / T, dim=-1)        # full vocab
+    logq_k = logq.gather(-1, t_ids)                                 # student at the teacher's top-k
+    p_k = torch.exp(t_logits.float() / T - t_lse[:, None])          # exact at T = 1 (see note)
+    # tail: p_tail = 1 − Σ p_k, q_tail = 1 − Σ exp(logq_k). Add p_tail · log(p_tail / q_tail).
+    # loss = Σ_k p_k · (log p_k − logq_k) + tail term, averaged over rows, times T².
+    ...
+```
+
+Note: the stored logsumexp is for T = 1. At other temperatures you only have the top-k, so renormalize over it (and drop the tail term). That's one reason to stay at T = 1.
+
+The training loop: response tokens only (mask the prompt), sequences packed or padded to ~512 tokens, AdamW, learning rate around 1e-5 with a short warmup and cosine decay, bf16 weights, 1 to 2 epochs over the 2M tokens. Compute logits in chunks if memory gets tight: a batch of 8 × 512 positions × 128,256 × 4 bytes is 2.1 GB of fp32 logits. Log training loss and, every few hundred steps, offline α on 50 held-out sequences, so you see α move during training, not just at the end.
+
+Rough cost: 2M tokens × 2 epochs × 7 GFLOP per token is about 30 PFLOP. If your loop sustains a few tens of TFLOP/s, that's tens of minutes per run. Measure your tokens per second in the first 100 steps and predict the run time before you walk away.
+
+After both runs: have an agent review `train_draft.py` for the classic bugs: prompt tokens not masked, logits and labels off by one, the tail term with the sign flipped, the T² factor missing.
+
+</Task>
+
+<Task id="t6" title="A second draft: the 8B's own first 4 layers" agent="hands">
+
+Build draft B from Figure 004. In outline:
+
+```python
+import copy
+def truncated_draft(target, n_layers=4):
+    """A copy of the target with only its first n decoder layers. Embedding, final norm and
+    output layer are the target's own tensors (shared, frozen). Only the layers train."""
+    d = copy.deepcopy(target)          # simplest; or build from config and load weights
+    d.model.layers = d.model.layers[:n_layers]
+    d.config.num_hidden_layers = n_layers
+    # share and freeze: point d.model.embed_tokens.weight and d.lm_head.weight at the target's
+    # parameters, set requires_grad=False on them and on d.model.norm, train only d.model.layers
+    ...
+```
+
+(Deep-copying a 16 GB model needs 16 GB more memory for a moment; you have it. Check that a forward pass on a short prompt works and that the cache length matches.)
+
+Measure offline α **before training**, as you predicted. Then train it with the KL loss from t5, same data, a somewhat higher learning rate (the layers have a lot to learn; try 5e-5 to 1e-4). Measure again. Also time one draft step against the 1B's, in the same eager setup as your c measurement last lesson. Is it faster per step, even though it reads slightly more bytes?
+
+</Task>
+
+<Task id="t7" title="Stretch: on-policy distillation" agent="hands">
+
+Take your best KL-trained 1B and continue training on its own text. Each outer step: the student samples answers for a batch of training prompts (batched, T = 1); the 8B, loaded alongside, runs one forward over each of those sequences to get its logits at every response position; you take a KL step on that batch. The student's text, the teacher's probabilities.
+
+```python
+def onpolicy_step(student, target, prompt_batch, opt, T=1.0, max_new=128):
+    """1) student generates (no grad), 2) target scores (no grad, full logits or top-64),
+    3) KL(p ‖ q) on the student's own sequences, one optimizer step."""
+    ...
+```
+
+This is GKD in its simplest form. Generation is the slow part: keep `max_new` short and the batch large. Run it for a few hundred steps and compare offline α, and especially acceptance at draft positions 2-4 in t8, against the off-policy KL draft. DistillSpec's claim is that this helps; check it on your traffic.
+
+</Task>
+
+<Task id="t8" title="Into the speculative decoder and onto the scoreboard" agent="review">
+
+Extend `sweep.py` from the last lesson in one way: per-position counts. For each draft position i in 1..K, count how many times it was *judged* (all earlier drafts in the round kept) and how many times it was *kept*. Acceptance at position i is kept / judged.
+
+Then run the sweep for: the off-the-shelf 1B, the CE-trained 1B, the KL-trained 1B, the trained truncated draft, and (if you did it) the on-policy draft. For each, record α̂, acceptance per position, tokens per round, c, and speedup over plain decoding, and find its best K.
+
+Take the best one into `server_spec.py` (load the checkpoint instead of the stock 1B; nothing else changes) and run the same benchmark as before:
+
+```bash
+python bench.py --target spark-spec-distilled --base-url http://localhost:8000/v1 \
+  --model meta-llama/Llama-3.1-8B-Instruct --precision bf16 \
+  --prompts prompts/short.jsonl --concurrency 1,4,16 --n 200 --max-tokens 256 --ignore-eos \
+  --change "spec decoding: distilled 1B draft (KL, top-64), K=<yours>, greedy"
+```
+
+Append the row to `SCOREBOARD.md`, with offline α, α̂ and K in the notes, directly under last lesson's speculative row so the two compare at a glance.
+
+</Task>
+
+<Task id="t9" title="Stretch: Medusa heads on the frozen 8B" agent="hands">
+
+Train three heads that guess 2, 3 and 4 tokens ahead from the 8B's final hidden state, then use them as the draft in `spec_greedy`.
+
+**Data, with memory math first.** The heads only need the 8B's final hidden state at each position (4096 numbers) and the token ids. 2M positions × 4096 × 2 bytes = about 16 GB in bf16. That fits in RAM, so collect the hidden states once (`output_hidden_states=True`; in Hugging Face's Llama the last entry of `hidden_states` is taken after the final norm, but check: `lm_head(hidden_states[-1])` must equal the logits) and train the heads without ever running the 8B again. Training is then fast.
+
+```python
+class MedusaHead(nn.Module):
+    """h + SiLU(W h), then the 8B's frozen output layer. Head k predicts token t + 1 + k from h_t."""
+    def __init__(self, d=4096):
+        super().__init__()
+        self.w = nn.Linear(d, d)
+        nn.init.zeros_(self.w.weight); nn.init.zeros_(self.w.bias)   # starts as the identity
+    def forward(self, h):
+        return h + F.silu(self.w(h))
+
+# loss for head k on a sequence: cross_entropy(lm_head(head_k(H[:-(k+1)])), ids[k+1:])
+```
+
+The paper gives each head its own trainable copy of the output layer. On a bandwidth-bound Spark, that would add 1.05 GB of reads per head per step, three heads adding about 20% to every 16 GB verify pass. Sharing the frozen output layer avoids it, and if you stack the three heads' outputs into one matrix and multiply by the output layer once, the weight is read once. A small trade of accuracy for bandwidth; note which you chose.
+
+**Drafting.** The verify pass already returns the row that produced the fix (or bonus) token. Take the hidden state at that row, run the three heads, and their argmaxes are next round's d1, d2, d3. The next verify pass feeds `[fix_token, d1, d2, d3]`. No draft model, no draft loop, no draft cache to roll back. Measure per-position acceptance (expect head 1 to do best and each later head worse), tokens per round and speedup, and compare with your distilled 1B.
+
+</Task>
+
+<DoneWhen>
+
+- You can derive `α = Σ min(p, q) = 1 − TV(p, q)` on paper and explain why it means "imitate", not "be good".
+- `score_topk.py` produced a top-64 dataset whose size matches your prediction, with mean and 10th-percentile top-64 mass recorded, and an alignment self-check that passes.
+- `offline_alpha.py` reports α at T = 1 and top-1 agreement for the off-the-shelf 1B, the CE draft, the KL draft, and the truncated draft before and after training.
+- The speculative decoder has per-position acceptance, and you have a K sweep for every draft you trained.
+- `SCOREBOARD.md` has a distilled-draft row under last lesson's speculative row.
+
+</DoneWhen>
+
+## Measure
+
+**The dataset** (t2, t3).
+
+| item | value |
+|---|---|
+| training prompts / held-out prompts | 10,000 / 500 |
+| response tokens (train) | |
+| 8B batched generation throughput (tok/s) | |
+| top-64 dataset size on disk (predicted ≈ 388 B × tokens) | |
+| mean top-64 mass / 10th percentile | |
+| scoring time (8B, one pass per sequence) | |
+
+**Offline α** (t4-t7). Held-out, teacher forced, full logits.
+
+| draft | α at T = 1 | top-1 agreement (greedy text) | KL(p ‖ q) nats | train time |
+|---|---|---|---|---|
+| Llama 3.2 1B, off the shelf | | | | - |
+| 1B + CE on 8B text (a) | | | | |
+| 1B + KL on top-64 (b) | | | | |
+| 1B + KL, T = 2 (Break It) | | | | |
+| 4-layer truncated, before training | | | | - |
+| 4-layer truncated + KL | | | | |
+| 1B + on-policy (stretch) | | | | |
+
+**In the decoder** (t8, t9). Greedy, 20 short prompts, 256 tokens each, each draft at its own best K.
+
+| draft | best K | acc. pos 1 | pos 2 | pos 3 | pos 4 | tokens / round | c | speedup |
+|---|---|---|---|---|---|---|---|---|
+| none (plain) | - | - | - | - | - | 1.00 | - | 1.00 |
+| 1B off the shelf | | | | | | | | |
+| 1B + CE | | | | | | | | |
+| 1B + KL | | | | | | | | |
+| 4-layer truncated + KL | | | | | | | | |
+| Medusa heads (stretch) | | | | | | | | |
+
+**What to expect.** These are rough expectations to check, not results.
+
+- **Dataset size.** Within a few percent of 388 bytes × tokens, or something is padded. Top-64 mass: probably high on average for chat answers, with a long low tail on open-ended positions. If the mean is well under 0.9, try k = 128.
+- **CE vs KL.** Both should raise α over the off-the-shelf 1B, because both teach the 8B's habits. Expect KL to beat CE at the same number of steps, by more on α at T = 1 than on top-1 agreement (CE on sampled text is already a decent signal for "what's the top token"). How much? DistillSpec's 10 to 45% extra speedup is the published range for their setups; a gain of several points of α is a reasonable thing to hope for. Measure.
+- **The truncated draft.** Near-useless before training, as predicted. After training it should improve a lot. Whether it passes the 1B depends on how much 4 layers can learn from 2M tokens; it starts with the target's own representations, but it has far fewer parameters doing the work than the 1B's 16 layers. Its c may be noticeably lower than the 1B's in eager PyTorch. Whichever wins, the comparison is the lesson.
+- **Offline vs online.** Offline top-1 agreement should match position-1 acceptance in the greedy decoder to within a couple of points. Later positions: flat or rising is common, for the selection reason in the last Predict.
+- **Speedup.** Use last lesson's calculator, or Figure 001 here. At c = 0.3, going from α = 0.7 to 0.8 takes the best speedup from about 1.37x (K = 2) to about 1.55x (K = 3). At c = 0.15, the same α change goes from about 1.75x to 2.1x. A distilled draft helps more the cheaper your draft step is, so this lesson and a lower c multiply.
+- **Medusa.** Head 1 alone may rival the distilled 1B's position-1 acceptance or fall short of it; heads 2 and 3 will be clearly worse, since they guess blind. But c is near zero, so even modest acceptance can win. Without tree verification you're leaving some of Medusa's gain on the table; that's fine for a first build.
+- **Scoreboard.** Tok/s at concurrency 1 should rise by roughly the ratio of the new speedup to the old one. Throughput at 16 is still bounded by the lock. Same story as last lesson: faster per request, not wider.
+
+## Break It
+
+**Off by one.** In `kl_loss`, shift the teacher rows by one position relative to the student's (use rows `s` through `len − 1` instead of `s − 1` through `len − 2`). Train for a few hundred steps. The loss still goes down, which is the scary part: the student is learning to predict the token *after* the next one, which is possible, just hard. Offline α collapses. Lesson: a falling loss proves the student learned *something*. Only α tells you it learned the right thing. Keep the alignment self-check from t3.
+
+**Hinton's temperature, wrong job.** Distill with T = 4 (renormalizing over the top-64, times T²), then measure offline α at T = 1 and top-1 agreement. Compare with the T = 1 run. The student has learned to match flattened distributions, which usually means it spreads too much probability at serving temperature, and α drops, especially at T = 1. Lesson: the distillation temperature is a choice about *what* to copy. For a draft, copy what you serve.
+
+**Top-1 only.** Set k = 1 in the KL loss and drop the tail term. That's cross-entropy against the teacher's argmax, a one-hot label again (just a different one from the sampled token). Watch α at T = 1 fall back toward the CE run while top-1 agreement holds up or even improves. Lesson: the soft part of soft labels is exactly what makes a draft good at sampling.
+
+**Leak the benchmark.** Add your `prompts/short.jsonl` prompts (with the 8B's answers) to the training set and retrain. Your scoreboard speedup jumps. Then run the sweep on a fresh set of 20 chat prompts the draft has never seen, and watch it come back down. Lesson: drafts memorize. A speedup measured on training prompts is a speedup on your test, not on your traffic. (A real server sees repeats, which is why caching and n-gram lookup exist, but that's a different claim, and you should measure it as one.)
+
+## Explain It Back
+
+Answer each out loud before opening it.
+
+<details>
+<summary>1. What makes a draft model good, and why isn't "a better model" the answer?</summary>
+
+The draft is kept with probability Σ min(p, q), the overlap of its distribution q with the target's p. That's exactly 1 minus the total variation distance between them. So the only thing that matters is how close q is to p on the text the server sees. Not accuracy, not benchmark scores. A draft that "answers better" than the target proposes tokens the target wouldn't, and they get rejected. And because speculative decoding outputs the target's distribution exactly, the draft's quality never shows up in the text, only in the speed. The job is imitation.
+
+</details>
+
+<details>
+<summary>2. Why does distilling on the teacher's logits beat fine-tuning on the teacher's text, with the same amount of text?</summary>
+
+Fine-tuning on text uses one-hot labels: each position says "this token came next", which is one sample from the teacher's distribution. The student needs to see many similar contexts before those samples reveal the shape of p. Distillation uses the whole vector p as the label, so a single position tells it how likely every alternative was. Mathematically, KL(p ‖ q) is cross-entropy with p as the label minus a constant, and the gradient on the logits is q − p instead of q − onehot. In a toy with a lookup-table student, one soft label matched p exactly while 64 one-hot samples only reached α ≈ 0.64. Real networks generalize across contexts so the gap is smaller, but it's the same direction.
+
+</details>
+
+<details>
+<summary>3. Forward or reverse KL for a draft model?</summary>
+
+Forward KL(p ‖ q) is mode-covering: it punishes the student for missing anything the teacher might say, so a too-small student spreads out. Reverse KL(q ‖ p) is mode-seeking: it punishes putting mass where the teacher wouldn't, so the student locks onto the biggest peak. Acceptance is 1 − TV, which is symmetric and isn't either KL; both bound it, so both drive α to 1 if the student is big enough. When it isn't, they make different mistakes: in a two-bump toy, reverse KL won when one bump was dominant and forward KL won when they were equal. For greedy serving, a spread-out student can even get the top token wrong. DistillSpec found the best choice depends on the task and the decoding strategy. So: start with forward KL (easiest with stored logits), measure α at the temperature you serve, and try others.
+
+</details>
+
+<details>
+<summary>4. How does this scale: you want to distill on 1 billion tokens instead of 2 million. What changes?</summary>
+
+Storage first. Full logits would be 1B × 250 KB = 250 TB, impossible. Top-64 with ids, values and a logsumexp is 388 bytes per token, about 390 GB: possible on disk, too big for the Spark's memory, so you'd stream it. Teacher scoring costs about 16 GFLOP per token, 1.6 × 10^19 FLOPs, many hours to days on one box; generating the text with the 8B is slower still, since decode is the expensive part. Student training is about 7 GFLOP per token. At that scale on-policy distillation looks better, since the student generates (cheaper) and the teacher only scores, and you'd shard across GPUs. The returns also diminish: α is capped by what a 1B can represent, so at some point a bigger draft or an EAGLE-style feature drafter beats more tokens. And at high serving batch sizes the whole speedup shrinks, so the value of the work depends on your load.
+
+</details>
+
+<details>
+<summary>5. Medusa heads vs a distilled draft model: when would you pick each?</summary>
+
+A draft model sees its own previous guesses, so its acceptance stays decent several tokens ahead, but it costs a separate sequential forward pass per draft token (c of 0.15-0.4 on your box) and a separate KV cache to manage. Medusa heads read the target's final hidden state, ride on the verify pass you were doing anyway (c ≈ 0, no second cache), and are cheap to train on cached hidden states, but head k guesses k + 1 tokens ahead blind, so acceptance falls fast with k. Medusa compensates with tree verification. On a single-user, bandwidth-bound box where c is your biggest problem, heads are attractive. If you need long accepted runs, or can't modify the serving model's forward pass, a separate draft is simpler. EAGLE sits between: it reads the target's features like Medusa, but drafts autoregressively like a draft model, which is why it usually wins on acceptance.
+
+</details>
+
+<details>
+<summary>6. Why train on the draft's own generations, when the target's text is the thing you want to imitate?</summary>
+
+Because of where the draft is used. The first guess in a round follows real target text, but guesses 2 through K follow the draft's own earlier guesses. A draft trained only on the target's text has never seen prefixes containing its own typical slips (exposure bias), so it handles them worse. On-policy distillation has the draft write, the target score every position of what it wrote, and trains the draft toward the target's distribution on exactly those prefixes. It also happens to be cheaper, since the small model does the writing. The cost is plumbing: the data changes as the draft changes, so the teacher has to run live during training.
+
+</details>
+
+## Go Deeper
+
+- **"Distilling the Knowledge in a Neural Network"**, Geoffrey Hinton, Oriol Vinyals, Jeff Dean, 2015 (arXiv 1503.02531). Short and readable. Soft targets, temperature, the T² factor, and the "dark knowledge" argument.
+- **"Model Compression"**, Cristian Buciluă, Rich Caruana, Alexandru Niculescu-Mizil, KDD 2006. The original: label lots of data with a big model's outputs and train a small one to copy them.
+- **"Sequence-Level Knowledge Distillation"**, Yoon Kim and Alexander Rush, EMNLP 2016. Why training on the teacher's generated text works, and how it relates to token-level KL. Your (a) vs (b) comparison, for translation.
+- **"DistillSpec: Improving Speculative Decoding via Knowledge Distillation"**, Yongchao Zhou et al., ICLR 2024 (arXiv 2310.08461). This lesson's direct source: distilling drafts for acceptance, on-policy data, and the comparison of FKL, RKL, JSD and TV across tasks and decoding strategies.
+- **"On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes"** (GKD), Rishabh Agarwal et al., ICLR 2024 (arXiv 2306.13649). The general method behind t7, and a clean discussion of exposure bias in distillation. TRL ships a `GKDTrainer` based on it.
+- **"MiniLLM: Knowledge Distillation of Large Language Models"**, Yuxian Gu, Li Dong, Furu Wei, Minlie Huang, ICLR 2024. The case for reverse KL when distilling generative models, with good intuition about mode-seeking.
+- **"Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"**, Tianle Cai et al., ICML 2024 (arXiv 2401.10774). The heads, tree attention, typical acceptance, and Medusa-1 vs Medusa-2. The code repo (FasterDecoding/Medusa) is small enough to read.
+- **"EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty"**, Yuhui Li, Fangyun Wei, Chao Zhang, Hongyang Zhang, ICML 2024 (arXiv 2401.15077), then EAGLE-2 and EAGLE-3. Why drafting on features beats drafting on tokens. The natural next build after this lesson.
+
+## Connections
+
+Built on: [Speculative decoding](/lessons/speculative-decoding/) (the acceptance rule, α, the K sweep, your decoder) and [Memory math for models](/lessons/memory-math/) (the 640 GB vs 0.78 GB decision). The bandwidth argument for sharing Medusa's output layer is [Why ~17 tokens per second?](/lessons/bandwidth-bound/) again.
+
+This was a small, complete training run: data generation, a scoring pass, a training loop, held-out evaluation, and a downstream metric that isn't the loss. [Train a small LM, end to end](/lessons/tiny-lm/) does the same loop from raw text at larger scale, [Training memory](/lessons/training-memory/) explains the 16 bytes per parameter you budgeted for, and [Fine-tuning and LoRA](/lessons/lora/) shows how to do this kind of fine-tune with a tiny fraction of the trainable parameters. The habit of judging a model by a held-out metric that matches the real goal, not by its training loss, is the whole subject of [why evals are separate](/lessons/why-evals-are-separate/).
+
+On the inference side, [Inside vLLM and SGLang](/lessons/serving-engines/) is where you'd deploy a real EAGLE or Medusa draft, and [Quantization](/lessons/quantization/) stacks with all of it: a 4-bit draft lowers c, and a lower c makes every point of α you trained for worth more.

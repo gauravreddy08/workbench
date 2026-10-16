@@ -1,0 +1,195 @@
+---
+// Token bucket: tokens drip in at `rate` per second up to `burst`; each arriving request
+// takes one token or is rejected (429). Deterministic 10-second simulation, redrawn on every
+// slider change; "Play" sweeps a cursor across it and the bucket glyph shows the level there.
+---
+<div class="rbucket" data-fig="rate-bucket">
+  <svg viewBox="0 0 640 300" role="img" aria-label="Token bucket level over time, with accepted and rejected requests"></svg>
+  <div class="ctl">
+    <label>Refill <input type="range" min="1" max="20" value="4" data-k="rate" /> <output data-o="rate">4</output>/s</label>
+    <label>Burst <input type="range" min="1" max="30" value="10" data-k="burst" /> <output data-o="burst">10</output></label>
+  </div>
+  <div class="ctl">
+    <span>Arrivals</span>
+    <button class="btn" type="button" data-pat="steady" aria-pressed="true">Steady 6/s</button>
+    <button class="btn" type="button" data-pat="bursty" aria-pressed="false">Bursts of 12</button>
+    <button class="btn" type="button" data-pat="spike" aria-pressed="false">Spike</button>
+    <button class="btn" type="button" data-play>Play</button>
+  </div>
+  <p class="rbucket-read">
+    Offered <span class="readout" data-r="off">-</span> ·
+    accepted <span class="readout" data-r="acc">-</span> ·
+    rejected (429) <span class="readout" data-r="rej">-</span>
+  </p>
+  <p class="rbucket-read" data-r="why"></p>
+</div>
+
+<style>
+  .rbucket-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const DUR = 10;
+
+  function arrivals(p: string): number[] {
+    const a: number[] = [];
+    if (p === 'steady') for (let i = 0; i < DUR * 6; i++) a.push((i + 0.5) / 6);
+    if (p === 'bursty') for (let k = 0; k < 5; k++) for (let i = 0; i < 12; i++) a.push(k * 2 + 0.3 + i * 0.03);
+    if (p === 'spike') {
+      for (let i = 0; i < DUR * 2; i++) a.push((i + 0.25) / 2);
+      for (let i = 0; i < 30; i++) a.push(4 + i * 0.02);
+    }
+    return a.sort((x, y) => x - y);
+  }
+
+  function simulate(rate: number, burst: number, arr: number[]) {
+    let tokens = burst, last = 0;
+    const pts: [number, number][] = [[0, burst]];
+    const out: { t: number; ok: boolean }[] = [];
+    const refillTo = (t: number) => {
+      const full = last + (burst - tokens) / rate;
+      if (tokens < burst && full < t) { pts.push([full, burst]); }
+      tokens = Math.min(burst, tokens + (t - last) * rate);
+      last = t;
+      pts.push([t, tokens]);
+    };
+    for (const t of arr) {
+      refillTo(t);
+      const ok = tokens >= 1;
+      if (ok) { tokens -= 1; pts.push([t, tokens]); }
+      out.push({ t, ok });
+    }
+    refillTo(DUR);
+    return { pts, out };
+  }
+
+  function levelAt(pts: [number, number][], t: number) {
+    let v = pts[0][1];
+    for (let i = 0; i < pts.length; i++) {
+      if (pts[i][0] > t) {
+        const [t0, v0] = pts[i - 1], [t1, v1] = pts[i];
+        return t1 === t0 ? v0 : v0 + ((t - t0) / (t1 - t0)) * (v1 - v0);
+      }
+      v = pts[i][1];
+    }
+    return v;
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="rate-bucket"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const s = { rate: 4, burst: 10, pat: 'steady' };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const patBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-pat]')];
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-play]')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let res = simulate(s.rate, s.burst, arrivals(s.pat));
+    let cursorT = DUR;
+    let raf = 0;
+
+    const X0 = 118, X1 = 628, TOP = 34, BOT = 160, MAXV = 30;
+    const xt = (t: number) => X0 + (t / DUR) * (X1 - X0);
+    const yv = (v: number) => BOT - (v / MAXV) * (BOT - TOP);
+
+    let cursor: SVGLineElement, glyphFill: SVGRectElement, glyphText: SVGTextElement;
+
+    function draw() {
+      res = simulate(s.rate, s.burst, arrivals(s.pat));
+      svg.replaceChildren();
+      // bucket glyph
+      svg.append(el('text', { x: 50, y: 22, 'text-anchor': 'middle', class: 'strong' }, 'BUCKET'));
+      svg.append(el('path', { d: `M18 ${yv(MAXV)} L18 ${BOT} L82 ${BOT} L82 ${yv(MAXV)}`, class: 'ink', 'stroke-width': 1.2 }));
+      svg.append(el('line', { x1: 14, y1: yv(s.burst), x2: 86, y2: yv(s.burst), class: 'blue dash', 'stroke-width': 1 }));
+      glyphFill = el('rect', { x: 19, y: BOT, width: 62, height: 0, class: 'fill-blue' }) as SVGRectElement;
+      svg.append(glyphFill);
+      glyphText = el('text', { x: 50, y: BOT + 16, 'text-anchor': 'middle', class: 'blue-t' }, '') as SVGTextElement;
+      svg.append(glyphText);
+      svg.append(el('text', { x: 50, y: BOT + 32, 'text-anchor': 'middle' }, 'TOKENS'));
+      svg.append(el('text', { x: 50, y: BOT + 48, 'text-anchor': 'middle' }, `REFILL +${s.rate}/s`));
+
+      // level chart
+      svg.append(el('text', { x: X0, y: 22, class: 'strong' }, 'TOKENS IN BUCKET'));
+      svg.append(el('line', { x1: X0, y1: BOT, x2: X1, y2: BOT, class: 'ink', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: X0, y1: yv(s.burst), x2: X1, y2: yv(s.burst), class: 'blue dash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: X1, y: yv(s.burst) - 5, 'text-anchor': 'end', class: 'blue-t' }, `BURST = ${s.burst}`));
+      const d = res.pts.map(([t, v], i) => `${i ? 'L' : 'M'}${xt(t).toFixed(1)} ${yv(v).toFixed(1)}`).join(' ');
+      svg.append(el('path', { d, class: 'blue', 'stroke-width': 1.5 }));
+
+      // arrivals
+      const AY = 200, RY = 236;
+      svg.append(el('text', { x: X0 - 8, y: AY + 4, 'text-anchor': 'end' }, 'OK'));
+      svg.append(el('text', { x: X0 - 8, y: RY + 4, 'text-anchor': 'end' }, '429'));
+      svg.append(el('line', { x1: X0, y1: AY, x2: X1, y2: AY, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: X0, y1: RY, x2: X1, y2: RY, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      for (const a of res.out) {
+        const x = xt(a.t);
+        if (a.ok) svg.append(el('rect', { x: x - 1, y: AY - 9, width: 2.2, height: 18, class: 'fill-blue' }));
+        else svg.append(el('rect', { x: x - 1.5, y: RY - 8, width: 3, height: 16, class: 'ink', 'stroke-width': 1 }));
+      }
+      for (let t = 0; t <= DUR; t += 2) {
+        svg.append(el('text', { x: xt(t), y: 270, 'text-anchor': 'middle' }, `${t}s`));
+      }
+      svg.append(el('text', { x: X1, y: 290, 'text-anchor': 'end' }, 'TIME →'));
+
+      cursor = el('line', { x1: xt(cursorT), y1: TOP - 6, x2: xt(cursorT), y2: 248, class: 'ink', 'stroke-width': 1 }) as SVGLineElement;
+      svg.append(cursor);
+      setCursor(cursorT);
+
+      const acc = res.out.filter((a) => a.ok).length, rej = res.out.length - acc;
+      r('off').textContent = `${res.out.length} in ${DUR}s`;
+      r('acc').textContent = String(acc);
+      r('rej').textContent = String(rej);
+      let why = `Over ${DUR}s the bucket can admit at most burst + rate × time = ${s.burst} + ${s.rate} × ${DUR} = ${s.burst + s.rate * DUR}. `;
+      if (rej === 0) why += 'Everything fit: the average is under the refill rate and no burst was deeper than the bucket.';
+      else if (s.pat === 'steady') why += 'Steady traffic above the refill rate: the burst drains once, then rejections come at the excess rate.';
+      else why += 'Bursts are fine while tokens are saved up; a burst deeper than the bucket spills over as 429s even if the average is low.';
+      r('why').textContent = why;
+    }
+
+    function setCursor(t: number) {
+      cursorT = t;
+      const x = xt(t);
+      cursor.setAttribute('x1', String(x));
+      cursor.setAttribute('x2', String(x));
+      const v = levelAt(res.pts, t);
+      const h = (v / MAXV) * (BOT - TOP);
+      glyphFill.setAttribute('y', String(BOT - h));
+      glyphFill.setAttribute('height', String(Math.max(0, h)));
+      glyphText.textContent = v.toFixed(1);
+    }
+
+    function play() {
+      cancelAnimationFrame(raf);
+      if (reduce) { setCursor(DUR); return; }
+      const start = performance.now();
+      const step = (now: number) => {
+        const t = Math.min(DUR, ((now - start) / 1000) * 1.5);
+        setCursor(t);
+        if (t < DUR) raf = requestAnimationFrame(step);
+      };
+      raf = requestAnimationFrame(step);
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        (s as any)[inp.dataset.k!] = +inp.value;
+        root.querySelector<HTMLElement>(`[data-o="${inp.dataset.k}"]`)!.textContent = inp.value;
+        draw();
+      });
+    });
+    patBtns.forEach((b) => b.addEventListener('click', () => {
+      s.pat = b.dataset.pat!;
+      patBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    playBtn.addEventListener('click', play);
+    draw();
+  });
+</script>

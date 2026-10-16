@@ -1,0 +1,203 @@
+---
+// HBM traffic counter: bytes moved by naive attention vs a FlashAttention-style forward pass,
+// as sequence length grows. One layer, 32 heads, batch 1, fp16. Simple counting model;
+// see the lesson for what it ignores.
+// Usage: <FlashTraffic />
+---
+<div class="fx" data-fig="flash-traffic">
+  <div class="fx-row">
+    <span class="label">Head dim d</span>
+    <div class="fx-btns" data-group="d">
+      <button class="btn" type="button" data-v="64">64</button>
+      <button class="btn" type="button" data-v="128" aria-pressed="true">128</button>
+    </div>
+  </div>
+  <div class="fx-row">
+    <span class="label">Naive</span>
+    <div class="fx-btns" data-group="naive">
+      <button class="btn" type="button" data-v="4" aria-pressed="true">Fused softmax · 4 N² passes</button>
+      <button class="btn" type="button" data-v="8">Eager + scale + mask · 8</button>
+    </div>
+  </div>
+  <div class="fx-row">
+    <span class="label">K, V re-reads</span>
+    <div class="fx-btns" data-group="kv">
+      <button class="btn" type="button" data-v="hbm" aria-pressed="true">From HBM (worst)</button>
+      <button class="btn" type="button" data-v="l2">Hit in L2 (best)</button>
+    </div>
+  </div>
+  <div class="fx-row">
+    <span class="label">Query block</span>
+    <div class="fx-btns" data-group="br">
+      <button class="btn" type="button" data-v="64">64 rows</button>
+      <button class="btn" type="button" data-v="128" aria-pressed="true">128 rows</button>
+    </div>
+  </div>
+  <div class="ctl">
+    <label>sequence length N <input type="range" min="0" max="8" step="1" value="4" data-in="n" /> <output data-out="n">8K</output></label>
+  </div>
+
+  <div class="fx-bars">
+    <div class="fx-bar"><span class="label">Naive · HBM traffic</span><div class="fx-track"><span class="fx-fill naive" data-bar="naive"></span></div><b class="readout" data-out="nb">-</b></div>
+    <div class="fx-bar"><span class="label">Flash · HBM traffic</span><div class="fx-track"><span class="fx-fill flash" data-bar="flash"></span></div><b class="readout" data-out="fb">-</b></div>
+  </div>
+
+  <svg viewBox="0 0 560 240" class="fx-plot" role="img" aria-label="Log-log plot of bytes moved against sequence length for naive and flash attention">
+    <g data-layer="grid"></g>
+    <g data-layer="lines"></g>
+    <g data-layer="dots"></g>
+    <text x="300" y="234" text-anchor="middle">SEQUENCE LENGTH N (LOG)</text>
+    <text x="12" y="112" text-anchor="middle" transform="rotate(-90 12 112)">BYTES MOVED (LOG)</text>
+  </svg>
+
+  <dl class="fx-out">
+    <div><dt class="label">Traffic ratio</dt><dd><span class="readout big" data-out="ratio">-</span></dd></div>
+    <div><dt class="label">Naive extra memory (S + P)</dt><dd><span class="readout" data-out="nmem">-</span></dd></div>
+    <div><dt class="label">Flash extra memory (m, l)</dt><dd><span class="readout" data-out="fmem">-</span></dd></div>
+    <div><dt class="label">FLOPs (same for both)</dt><dd><span class="readout" data-out="flops">-</span></dd></div>
+    <div><dt class="label">Naive time floor (Spark)</dt><dd><span class="readout" data-out="nt">-</span></dd></div>
+    <div><dt class="label">Flash time floor (Spark)</dt><dd><span class="readout" data-out="ft">-</span></dd></div>
+    <div><dt class="label">FLOPs per byte: naive / flash</dt><dd><span class="readout" data-out="ai">-</span></dd></div>
+  </dl>
+  <p class="fx-note" data-out="note"></p>
+</div>
+
+<style>
+  .fx-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+  .fx-row > .label { width: 96px; flex: none; font-size: 10.5px; }
+  .fx-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .fx-btns .btn { padding: 5px 9px; font-size: 10.5px; }
+  .fx-bars { margin-top: 16px; display: grid; gap: 8px; }
+  .fx-bar { display: grid; grid-template-columns: 150px minmax(0, 1fr) 76px; gap: 10px; align-items: center; }
+  .fx-bar .label { font-size: 10px; }
+  .fx-bar .readout { font-size: 12px; text-align: right; }
+  .fx-track { height: 14px; border: 1px solid var(--ink); background: var(--paper); }
+  .fx-fill { display: block; height: 100%; transition: width 0.25s; }
+  .fx-fill.naive { background: var(--ink-3); }
+  .fx-fill.flash { background: var(--blue); }
+  .fx-plot { width: 100%; margin-top: 14px; }
+  .fx-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 18px; margin: 14px 0 0; }
+  .fx-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .fx-out dt { font-size: 10px; }
+  .fx-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); }
+  .fx-out .big { font-size: 20px; }
+  .fx-note { margin: 14px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+  @media (max-width: 520px) {
+    .fx-bar { grid-template-columns: minmax(0, 1fr) 70px; }
+    .fx-bar .label { grid-column: 1 / -1; }
+  }
+  @media (prefers-reduced-motion: reduce) { .fx-fill { transition: none; } }
+</style>
+
+<script>
+  const H = 32; // heads, one layer, batch 1
+  const BYTES = 2; // fp16
+  const BW = 273e9; // DGX Spark spec-sheet bandwidth
+  const PEAK = 125e12; // rough upper bound for dense BF16 on the Spark (see the bandwidth lesson)
+  const CAP = 128e9;
+  const NS_ = [512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const nLabel = (n: number) => (n >= 1024 ? `${n / 1024}K` : `${n}`);
+  const sz = (b: number) =>
+    b >= 1e12 ? `${(b / 1e12).toFixed(b >= 1e13 ? 0 : 1)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(b >= 1e10 ? 0 : 1)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(b >= 1e7 ? 0 : 1)} MB` : `${(b / 1e3).toFixed(0)} KB`;
+  const tm = (s: number) => (s >= 1 ? `${s.toFixed(1)} s` : s >= 1e-3 ? `${(s * 1e3).toFixed(s >= 0.01 ? 0 : 1)} ms` : `${(s * 1e6).toFixed(0)} µs`);
+
+  type St = { d: number; naive: number; kv: string; br: number; n: number };
+  function model(s: St, N: number) {
+    const { d, naive, kv, br } = s;
+    // naive: read Q, K, V, write O (4Nd) plus `naive` full passes over an N x N matrix
+    const nElems = 4 * N * d + naive * N * N;
+    // flash: read Q once, read K and V once per query block (or once total if L2 holds them), write O, write logsumexp (fp32)
+    const kvReads = kv === 'l2' ? 2 * N * d : (N / br) * 2 * N * d;
+    const fElems = 2 * N * d + kvReads;
+    const nb = H * nElems * BYTES;
+    const fb = H * (fElems * BYTES + N * 4);
+    const flops = H * 4 * N * N * d;
+    return { nb, fb, flops };
+  }
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const el = (tag: string, attrs: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  const X0 = 64, X1 = 548, Y0 = 210, Y1 = 12;
+  const YMIN = 1e6, YMAX = 1e13;
+  const px = (n: number) => X0 + (Math.log2(n / 512) / Math.log2(131072 / 512)) * (X1 - X0);
+  const py = (b: number) => Y0 - ((Math.log10(Math.max(YMIN, Math.min(YMAX, b))) - 6) / 7) * (Y0 - Y1);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="flash-traffic"]').forEach((root) => {
+    const state: St = { d: 128, naive: 4, kv: 'hbm', br: 128, n: 4 };
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+
+    const g = q<SVGGElement>('[data-layer="grid"]');
+    g.appendChild(el('rect', { x: X0, y: Y1, width: X1 - X0, height: Y0 - Y1, class: 'ink', 'stroke-width': 1 }));
+    NS_.forEach((n, i) => {
+      g.appendChild(el('line', { x1: px(n), x2: px(n), y1: Y1, y2: Y0, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      if (i % 2 === 0) g.appendChild(el('text', { x: px(n), y: Y0 + 14, 'text-anchor': i === NS_.length - 1 ? 'end' : i === 0 ? 'start' : 'middle' }, nLabel(n)));
+    });
+    [[1e6, '1 MB'], [1e9, '1 GB'], [1e12, '1 TB']].forEach(([v, t]) => {
+      g.appendChild(el('line', { x1: X0, x2: X1, y1: py(v as number), y2: py(v as number), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      g.appendChild(el('text', { x: X0 - 6, y: py(v as number) + 4, 'text-anchor': 'end' }, t as string));
+    });
+
+    const render = () => {
+      const N = NS_[state.n];
+      const r = model(state, N);
+      const lines = q<SVGGElement>('[data-layer="lines"]');
+      lines.replaceChildren();
+      const pts = (key: 'nb' | 'fb') => NS_.map((n) => `${px(n)},${py(model(state, n)[key])}`).join(' ');
+      lines.appendChild(el('polyline', { points: pts('nb'), class: 'ink', 'stroke-width': 1.5 }));
+      lines.appendChild(el('polyline', { points: pts('fb'), class: 'blue', 'stroke-width': 2 }));
+      const lx = px(1024);
+      const at = model(state, 1024);
+      lines.appendChild(el('text', { x: lx, y: py(at.nb) - 10, 'text-anchor': 'middle', class: 'strong' }, 'NAIVE'));
+      lines.appendChild(el('text', { x: lx, y: py(at.fb) + 20, 'text-anchor': 'middle', class: 'blue-t' }, 'FLASH'));
+      const dots = q<SVGGElement>('[data-layer="dots"]');
+      dots.replaceChildren();
+      dots.appendChild(el('line', { x1: px(N), x2: px(N), y1: Y1, y2: Y0, class: 'blue dash', 'stroke-width': 1 }));
+      dots.appendChild(el('circle', { cx: px(N), cy: py(r.nb), r: 5, style: 'fill:var(--ink)' }));
+      dots.appendChild(el('circle', { cx: px(N), cy: py(r.fb), r: 5, class: 'fill-blue' }));
+
+      q<HTMLElement>('[data-bar="naive"]').style.width = '100%';
+      q<HTMLElement>('[data-bar="flash"]').style.width = `${Math.max(0.5, (100 * r.fb) / r.nb)}%`;
+      out('nb').textContent = sz(r.nb);
+      out('fb').textContent = sz(r.fb);
+      out('n').textContent = nLabel(N);
+      const ratio = r.nb / r.fb;
+      out('ratio').textContent = `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}×`;
+      const nmem = 2 * H * N * N * BYTES;
+      out('nmem').textContent = sz(nmem) + (nmem > CAP ? ' · DOES NOT FIT' : '');
+      out('nmem').style.color = nmem > CAP ? 'var(--warn)' : '';
+      out('fmem').textContent = sz(2 * H * N * 4);
+      out('flops').textContent = `${(r.flops / 1e12).toFixed(r.flops >= 1e13 ? 0 : 2)} TFLOP`;
+      const tn = Math.max(r.nb / BW, r.flops / PEAK);
+      const tf = Math.max(r.fb / BW, r.flops / PEAK);
+      out('nt').textContent = `${tm(tn)} · ${r.nb / BW > r.flops / PEAK ? 'memory' : 'math'}`;
+      out('ft').textContent = `${tm(tf)} · ${r.fb / BW > r.flops / PEAK ? 'memory' : 'math'}`;
+      const ain = r.flops / r.nb, aif = r.flops / r.fb;
+      out('ai').textContent = `${Math.round(ain)} / ${Math.round(aif).toLocaleString('en-US')} (ridge ≈ 460)`;
+      let note: string;
+      if (nmem > CAP) note = `Naive needs ${sz(nmem)} just for S and P in one layer. The Spark has 128 GB. Naive attention is not slow here, it is impossible. Flash keeps ${sz(2 * H * N * 4)} of running statistics.`;
+      else if (state.kv === 'hbm') note = `Worst case: both curves grow as N², so the ratio stays about ${ratio.toFixed(1)}× however long N gets (it is about 2 × block rows / d for the fused naive). The win here is the constant, plus never storing N × N. Flip "K, V re-reads" to see the typical case.`;
+      else note = `When K and V for a head stay in L2 across query blocks, flash moves only Q, K, V and O: linear in N. Naive still moves N² bytes, so the gap grows with N. Real kernels sit between the two modes; measure yours with Nsight Compute.`;
+      out('note').textContent = note;
+    };
+
+    root.querySelectorAll<HTMLElement>('[data-group]').forEach((grp) => {
+      const key = grp.dataset.group as 'd' | 'naive' | 'kv' | 'br';
+      grp.querySelectorAll<HTMLButtonElement>('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          grp.querySelectorAll('button').forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+          const v = btn.dataset.v!;
+          if (key === 'kv') state.kv = v; else state[key] = Number(v);
+          render();
+        });
+      });
+    });
+    q<HTMLInputElement>('[data-in="n"]').addEventListener('input', (e) => { state.n = Number((e.target as HTMLInputElement).value); render(); });
+    render();
+  });
+</script>

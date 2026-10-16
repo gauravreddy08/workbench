@@ -1,0 +1,196 @@
+---
+// Interactive: one request's trace as a waterfall of nested spans
+// (gateway -> server -> tokenizer / cache / queue / prefill / decode).
+// Pick a planted fault and see which span grows, and what that does to total time and TTFT.
+---
+<div class="ow" data-fig="obs-waterfall">
+  <div class="ow-read">
+    <div><span class="label">Request total</span><span class="readout" data-o="total"></span></div>
+    <div><span class="label">TTFT</span><span class="readout" data-o="ttft"></span></div>
+    <div><span class="label">Span that grew</span><span class="readout" data-o="grew"></span></div>
+  </div>
+  <div class="ow-axis" aria-hidden="true"><span></span><span class="ow-ticks"></span></div>
+  <div class="ow-rows" role="img" aria-label="Trace waterfall of one request, one row per span"></div>
+  <div class="ctl ow-ctl">
+    <span class="label">Planted fault</span>
+    <span class="ow-group">
+      <button class="btn" type="button" data-f="none" aria-pressed="true">None</button>
+      <button class="btn" type="button" data-f="db" aria-pressed="false">Slow DB</button>
+      <button class="btn" type="button" data-f="lock" aria-pressed="false">Cache lock</button>
+      <button class="btn" type="button" data-f="tok" aria-pressed="false">Tokenizer</button>
+      <button class="btn" type="button" data-f="queue" aria-pressed="false">GPU queue</button>
+      <button class="btn" type="button" data-f="decode" aria-pressed="false">Slow decode</button>
+    </span>
+  </div>
+  <p class="ow-note" data-o="note"></p>
+</div>
+
+<style is:global>
+  .ow-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 16px; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 12px; }
+  .ow-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .ow-read .label { font-size: 10px; }
+  .ow-read .readout { font-size: 17px; }
+  .ow-axis, .ow-row { display: grid; grid-template-columns: minmax(112px, 32%) 1fr; gap: 8px; align-items: center; }
+  .ow-ticks { position: relative; height: 16px; border-bottom: 1px solid var(--ink); }
+  .ow-ticks span { position: absolute; bottom: 2px; transform: translateX(-50%); font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); white-space: nowrap; }
+  .ow-ticks span.end { transform: translateX(-100%); }
+  .ow-rows { display: flex; flex-direction: column; gap: 3px; margin-top: 6px; }
+  .ow-name { font-family: var(--mono); font-size: 11px; color: var(--ink-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: flex; justify-content: space-between; gap: 6px; }
+  .ow-name b { font-weight: 400; color: var(--ink-3); }
+  .ow-row.hot .ow-name { color: var(--blue); font-weight: 600; }
+  .ow-row.hot .ow-name b { color: var(--blue); }
+  .ow-track { position: relative; height: 18px; background-image: linear-gradient(90deg, var(--rule) 1px, transparent 1px); background-size: 25% 100%; }
+  .ow-bar { position: absolute; top: 3px; height: 12px; min-width: 2px; background: var(--blue-fill); border: 1px solid var(--blue); transition: left 0.35s, width 0.35s; }
+  .ow-row.hot .ow-bar { background: var(--blue); }
+  .ow-row.svc .ow-bar { background: var(--paper-2); border-color: var(--ink); }
+  .ow-mark { position: absolute; top: -2px; bottom: -2px; width: 0; border-left: 1px dashed var(--ink); transition: left 0.35s; }
+  .ow-hop { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.06em; color: var(--ink-3); padding: 2px 0 1px; border-top: 1px dashed var(--rule); margin-top: 2px; }
+  .ow-group { display: flex; flex-wrap: wrap; gap: 6px; }
+  .ow-ctl { margin-top: 14px; }
+  .ow-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.55; color: var(--ink-2); margin: 12px 0 0; min-height: 3.2em; }
+  @media (max-width: 520px) { .ow-ticks span.odd { display: none; } .ow-axis, .ow-row { grid-template-columns: 128px 1fr; } .ow-name { font-size: 10px; } }
+  @media (prefers-reduced-motion: reduce) { .ow-bar, .ow-mark { transition: none; } }
+</style>
+
+<script>
+  type Fault = 'none' | 'db' | 'lock' | 'tok' | 'queue' | 'decode';
+  // Durations in ms for one streaming request, 32 output tokens. Illustrative numbers.
+  const BASE = { gw_in: 2, quota: 3, hop: 1, tok: 2, cache: 1, queue: 15, prefill: 90, itl: 20, ntok: 32, gw_out: 1 };
+  const EXTRA: Record<Fault, Partial<typeof BASE>> = {
+    none: {},
+    db: { quota: 403 },
+    lock: { cache: 301 },
+    tok: { tok: 252 },
+    queue: { queue: 900 },
+    decode: { itl: 34 },
+  };
+  const GREW: Record<Fault, string> = {
+    none: '—', db: 'quota_check', lock: 'cache_lookup', tok: 'tokenize', queue: 'queue_wait', decode: 'decode',
+  };
+  const NOTE: Record<Fault, string> = {
+    none: 'A healthy request. Decode dominates: 32 tokens at 20 ms each. Everything before the dashed line is TTFT.',
+    db: 'The quota lookup in the gateway took 400 ms longer. The model never saw it: the server span starts late but is itself normal. Server-side metrics look perfect.',
+    lock: 'cache_lookup grew by 300 ms. Its own work is microseconds; the time is spent waiting for a lock someone else holds. Self-time in the span, not CPU, is the clue.',
+    tok: 'tokenize grew by 250 ms on this request only. Look at the span attributes of slow traces: they all share something about the prompt.',
+    queue: 'queue_wait grew, on every request at once. Nothing is broken; the server is overloaded. In-flight gauge and queue depth climb with it.',
+    decode: 'Every decode step got slower (20 → 34 ms), so the decode span stretches. TTFT is fine. Only an ITL or tokens/s metric shows this clearly.',
+  };
+
+  function layout(f: Fault) {
+    const p = { ...BASE, ...EXTRA[f] };
+    const decode = p.itl * p.ntok;
+    let t = 0;
+    const quotaS = (t += p.gw_in); const quotaE = (t += p.quota);
+    const srvS = (t += p.hop);
+    const tokS = (t += 0.5); const tokE = (t += p.tok);
+    const cacheS = tokE; const cacheE = (t += p.cache);
+    const qS = cacheE; const qE = (t += p.queue);
+    const preS = qE; const preE = (t += p.prefill);
+    const decS = preE; const decE = (t += decode);
+    const srvE = (t += 0.5);
+    const total = (t += p.hop + p.gw_out);
+    return {
+      total, ttft: preE,
+      rows: [
+        { name: 'gateway', s: 0, e: total, d: 0, svc: true, key: '' },
+        { name: 'quota_check', s: quotaS, e: quotaE, d: 1, key: 'quota_check' },
+        { hop: true },
+        { name: 'server', s: srvS, e: srvE, d: 1, svc: true, key: '' },
+        { name: 'tokenize', s: tokS, e: tokE, d: 2, key: 'tokenize' },
+        { name: 'cache_lookup', s: cacheS, e: cacheE, d: 2, key: 'cache_lookup' },
+        { name: 'queue_wait', s: qS, e: qE, d: 2, key: 'queue_wait' },
+        { name: 'prefill', s: preS, e: preE, d: 2, key: 'prefill' },
+        { name: 'decode ×' + p.ntok, s: decS, e: decE, d: 2, key: 'decode' },
+      ] as any[],
+    };
+  }
+
+  const fmt = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(ms)} ms`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="obs-waterfall"]').forEach((root) => {
+    const rowsEl = root.querySelector<HTMLElement>('.ow-rows')!;
+    const ticks = root.querySelector<HTMLElement>('.ow-ticks')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-f]')];
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const SCALE = 1800; // fixed axis, so bars visibly grow
+    const pct = (ms: number) => `${Math.min(100, (ms / SCALE) * 100)}%`;
+
+    ticks.replaceChildren();
+    [0, 450, 900, 1350, 1800].forEach((v, i, a) => {
+      const s = document.createElement('span');
+      s.textContent = v === 0 ? '0' : `${v} ms`;
+      s.style.left = pct(v);
+      if (i === a.length - 1) s.className = 'end';
+      if (i === 0) s.style.transform = 'none';
+      if (i % 2 === 1) s.classList.add('odd');
+      ticks.appendChild(s);
+    });
+
+    // build rows once, then only move bars (so CSS transitions animate)
+    const base = layout('none');
+    const bars: HTMLElement[] = [];
+    const marks: HTMLElement[] = [];
+    const names: HTMLElement[] = [];
+    const rowEls: HTMLElement[] = [];
+    base.rows.forEach((r) => {
+      if (r.hop) {
+        const h = document.createElement('div');
+        h.className = 'ow-hop';
+        h.textContent = '↓ HTTP CALL · HEADER traceparent: 00-<trace id>-<parent span>-01';
+        rowsEl.appendChild(h);
+        return;
+      }
+      const row = document.createElement('div');
+      row.className = 'ow-row' + (r.svc ? ' svc' : '');
+      const nm = document.createElement('div');
+      nm.className = 'ow-name';
+      nm.style.paddingLeft = `${r.d * 10}px`;
+      const tr = document.createElement('div');
+      tr.className = 'ow-track';
+      const bar = document.createElement('div');
+      bar.className = 'ow-bar';
+      tr.appendChild(bar);
+      if (r.d === 0) {
+        const m = document.createElement('div');
+        m.className = 'ow-mark';
+        m.title = 'first token';
+        tr.appendChild(m);
+        marks.push(m);
+      }
+      row.append(nm, tr);
+      rowsEl.appendChild(row);
+      bars.push(bar); names.push(nm); rowEls.push(row);
+    });
+
+    function render(f: Fault) {
+      const L = layout(f);
+      let i = 0;
+      L.rows.forEach((r) => {
+        if (r.hop) return;
+        bars[i].style.left = pct(r.s);
+        bars[i].style.width = `max(2px, ${pct(r.e - r.s)})`;
+        names[i].innerHTML = '';
+        names[i].append(document.createTextNode(r.name));
+        const b = document.createElement('b');
+        b.textContent = fmt(r.e - r.s);
+        names[i].appendChild(b);
+        rowEls[i].classList.toggle('hot', r.key !== '' && r.key === GREW[f]);
+        i++;
+      });
+      marks.forEach((m) => (m.style.left = pct(L.ttft)));
+      out('total').textContent = fmt(L.total);
+      out('ttft').textContent = fmt(L.ttft);
+      const d = L.total - base.total;
+      out('grew').textContent = f === 'none' ? '—' : `${GREW[f]} +${fmt(d)}`;
+      out('note').textContent = NOTE[f];
+    }
+
+    btns.forEach((b) =>
+      b.addEventListener('click', () => {
+        btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render(b.dataset.f as Fault);
+      }),
+    );
+    render('none');
+  });
+</script>

@@ -1,0 +1,201 @@
+---
+// Interactive: a single-server queue. Requests arrive at random (Poisson); each takes 10 ms of
+// service on average. Slide the arrival rate and watch the latency distribution and p50/p99.
+// Simulated with the Lindley recursion: wait[i] = max(0, wait[i-1] + service[i-1] - gap[i]).
+---
+<div class="tq" data-fig="tail-queue">
+  <div class="tq-read">
+    <div><span class="label">Utilization</span><span class="readout" data-o="rho"></span></div>
+    <div><span class="label">Mean</span><span class="readout" data-o="mean"></span></div>
+    <div><span class="label">p50</span><span class="readout" data-o="p50"></span></div>
+    <div><span class="label">p99</span><span class="readout" data-o="p99"></span></div>
+    <div><span class="label">p99.9</span><span class="readout" data-o="p999"></span></div>
+  </div>
+  <svg class="tq-hist" viewBox="0 0 480 170" role="img" aria-label="Histogram of request latency on a log scale, with p50 and p99 marked"></svg>
+  <svg class="tq-curve" viewBox="0 0 480 170" role="img" aria-label="p50 and p99 latency against utilization"></svg>
+  <div class="ctl">
+    <label>Arrivals / s <input type="range" min="5" max="99" step="1" value="50" data-k="lam" /><output></output></label>
+    <span class="tq-group">
+      <button class="btn" type="button" data-dist="const" aria-pressed="false">Service: constant</button>
+      <button class="btn" type="button" data-dist="exp" aria-pressed="true">Exponential</button>
+      <button class="btn" type="button" data-dist="heavy" aria-pressed="false">Rare 100 ms</button>
+    </span>
+  </div>
+  <p class="tq-note">One server, 10 ms of work per request on average, so it can do at most 100 requests per second. 20,000 simulated requests per setting. Top: where latencies fall (log scale). Bottom: p50 and p99 across every arrival rate, for the chosen service times; the dot is you.</p>
+</div>
+
+<style>
+  .tq-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 10px 14px; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 10px; }
+  .tq-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .tq-read .label { font-size: 10px; }
+  .tq-read .readout { font-size: 17px; }
+  .tq svg { width: 100%; }
+  .tq-curve { margin-top: 6px !important; }
+  .tq-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tq-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const S = 10; // mean service time, ms
+  const N = 20000;
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  // small seeded PRNG so the picture is stable while you drag
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const expo = (r: () => number, mean: number) => -Math.log(1 - r()) * mean;
+
+  function service(dist: string, r: () => number) {
+    if (dist === 'const') return S;
+    if (dist === 'exp') return expo(r, S);
+    // 98% quick (exponential, mean 8 ms), 2% stragglers of 108 ms: overall mean still 10 ms
+    return r() < 0.02 ? 108 : expo(r, 8);
+  }
+
+  function simulate(lam: number, dist: string): Float64Array {
+    const r = rng(12345);
+    const meanGap = 1000 / lam;
+    const out = new Float64Array(N);
+    let w = 0, sPrev = 0;
+    for (let i = 0; i < N; i++) {
+      const gap = expo(r, meanGap);
+      w = i === 0 ? 0 : Math.max(0, w + sPrev - gap);
+      const s = service(dist, r);
+      out[i] = w + s;
+      sPrev = s;
+    }
+    return out;
+  }
+
+  function stats(lat: Float64Array) {
+    const a = Float64Array.from(lat).sort();
+    const q = (p: number) => a[Math.min(a.length - 1, Math.floor(p * a.length))];
+    let sum = 0;
+    for (const v of a) sum += v;
+    return { mean: sum / a.length, p50: q(0.5), p99: q(0.99), p999: q(0.999), sorted: a };
+  }
+
+  const fmt = (ms: number) => (ms < 100 ? `${ms.toFixed(1)} ms` : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(2)} s`);
+
+  const curveCache = new Map<string, { lam: number; p50: number; p99: number }[]>();
+  function curve(dist: string) {
+    if (!curveCache.has(dist)) {
+      const pts = [];
+      for (let lam = 5; lam <= 97; lam += 4) {
+        const s = stats(simulate(lam, dist));
+        pts.push({ lam, p50: s.p50, p99: s.p99 });
+      }
+      curveCache.set(dist, pts);
+    }
+    return curveCache.get(dist)!;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="tail-queue"]').forEach((root) => {
+    const hist = root.querySelector<SVGSVGElement>('.tq-hist')!;
+    const cur = root.querySelector<SVGSVGElement>('.tq-curve')!;
+    const slider = root.querySelector<HTMLInputElement>('[data-k="lam"]')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-dist]')];
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    let dist = 'exp';
+
+    function drawHist(st: ReturnType<typeof stats>) {
+      hist.replaceChildren();
+      const x0 = 30, x1 = 470, yTop = 38, yBot = 140;
+      const lo = Math.log10(1), hi = Math.log10(10000); // 1 ms .. 10 s
+      const X = (ms: number) => x0 + ((Math.log10(Math.max(1, Math.min(10000, ms))) - lo) / (hi - lo)) * (x1 - x0);
+      const B = 72;
+      const counts = new Array(B).fill(0);
+      for (const v of st.sorted) {
+        const b = Math.min(B - 1, Math.max(0, Math.floor(((Math.log10(Math.max(1, v)) - lo) / (hi - lo)) * B)));
+        counts[b]++;
+      }
+      const max = Math.max(...counts);
+      const bw = (x1 - x0) / B;
+      counts.forEach((c, i) => {
+        if (!c) return;
+        const h = Math.max(1, (c / max) * (yBot - yTop));
+        hist.appendChild(el('rect', { x: x0 + i * bw + 0.5, y: yBot - h, width: Math.max(1, bw - 1), height: h, style: 'fill:var(--blue-fill);stroke:var(--blue);stroke-width:0.6' }));
+      });
+      hist.appendChild(el('line', { x1: x0, y1: yBot, x2: x1, y2: yBot, style: 'stroke:var(--ink);stroke-width:1' }));
+      for (const [ms, lab] of [[1, '1ms'], [10, '10ms'], [100, '100ms'], [1000, '1s'], [10000, '10s']] as [number, string][]) {
+        hist.appendChild(el('line', { x1: X(ms), y1: yBot, x2: X(ms), y2: yBot + 4, style: 'stroke:var(--ink);stroke-width:1' }));
+        hist.appendChild(el('text', { x: X(ms), y: yBot + 16, 'text-anchor': 'middle' }, lab));
+      }
+      const marks: [number, string, string][] = [
+        [st.p50, 'P50', 'stroke:var(--ink);stroke-width:1.2'],
+        [st.mean, 'MEAN', 'stroke:var(--ink-3);stroke-width:1;stroke-dasharray:3 3'],
+        [st.p99, 'P99', 'stroke:var(--blue);stroke-width:1.5'],
+      ];
+      // stagger label heights so close markers don't collide
+      marks.forEach(([v, lab, style], i) => {
+        const x = X(v);
+        hist.appendChild(el('line', { x1: x, y1: 14 + i * 11, x2: x, y2: yBot, style }));
+        const right = x > 430;
+        const t = el('text', { x: right ? x - 3 : x + 3, y: 11 + i * 11, 'text-anchor': right ? 'end' : 'start', class: lab === 'P99' ? 'blue-t' : lab === 'P50' ? 'strong' : '' }, lab);
+        hist.appendChild(t);
+      });
+      hist.appendChild(el('text', { x: x1, y: 166, 'text-anchor': 'end' }, 'LATENCY, LOG SCALE'));
+    }
+
+    function drawCurve(lam: number, st: ReturnType<typeof stats>) {
+      cur.replaceChildren();
+      const pts = curve(dist);
+      const x0 = 46, x1 = 470, yTop = 12, yBot = 140, yMax = 1000;
+      const X = (l: number) => x0 + (l / 100) * (x1 - x0);
+      const Y = (ms: number) => yBot - (Math.min(ms, yMax) / yMax) * (yBot - yTop);
+      cur.appendChild(el('line', { x1: x0, y1: yBot, x2: x1, y2: yBot, style: 'stroke:var(--ink);stroke-width:1' }));
+      cur.appendChild(el('line', { x1: x0, y1: yTop, x2: x0, y2: yBot, style: 'stroke:var(--ink);stroke-width:1' }));
+      for (const ms of [0, 500, 1000]) cur.appendChild(el('text', { x: x0 - 6, y: Y(ms) + 4, 'text-anchor': 'end' }, ms === 1000 ? '1 s' : `${ms}`));
+      for (const u of [0, 50, 100]) cur.appendChild(el('text', { x: X(u), y: yBot + 16, 'text-anchor': 'middle' }, `${u}%`));
+      cur.appendChild(el('line', { x1: X(100), y1: yTop, x2: X(100), y2: yBot, style: 'stroke:var(--ink-3);stroke-width:1;stroke-dasharray:3 3' }));
+      const path = (k: 'p50' | 'p99') => pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.lam).toFixed(1)},${Y(p[k]).toFixed(1)}`).join(' ');
+      cur.appendChild(el('path', { d: path('p50'), style: 'fill:none;stroke:var(--ink);stroke-width:1.2' }));
+      cur.appendChild(el('path', { d: path('p99'), style: 'fill:none;stroke:var(--blue);stroke-width:1.5' }));
+      let last = pts[0];
+      for (const p of pts) if (p.p99 < yMax) last = p;
+      cur.appendChild(el('text', { x: X(last.lam) - 6, y: Y(last.p99) - 4, 'text-anchor': 'end', class: 'blue-t' }, 'P99'));
+      cur.appendChild(el('text', { x: X(70), y: Y(pts.find((p) => p.lam >= 70)!.p50) - 6, 'text-anchor': 'end', class: 'strong' }, 'P50'));
+      cur.appendChild(el('circle', { cx: X(lam), cy: Y(st.p99), r: 3.5, style: 'fill:var(--blue)' }));
+      cur.appendChild(el('circle', { cx: X(lam), cy: Y(st.p50), r: 3, style: 'fill:var(--ink)' }));
+      cur.appendChild(el('text', { x: x1, y: 166, 'text-anchor': 'end' }, 'UTILIZATION'));
+    }
+
+    function render() {
+      const lam = +slider.value;
+      const st = stats(simulate(lam, dist));
+      slider.nextElementSibling!.textContent = String(lam);
+      out('rho').textContent = `${lam}%`;
+      out('mean').textContent = fmt(st.mean);
+      out('p50').textContent = fmt(st.p50);
+      out('p99').textContent = fmt(st.p99);
+      out('p999').textContent = fmt(st.p999);
+      drawHist(st);
+      drawCurve(lam, st);
+    }
+
+    slider.addEventListener('input', render);
+    btns.forEach((b) =>
+      b.addEventListener('click', () => {
+        dist = b.dataset.dist!;
+        btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

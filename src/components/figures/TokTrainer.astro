@@ -1,0 +1,130 @@
+---
+// Step through BPE training by hand on a tiny corpus: count adjacent pairs, merge the most frequent, repeat.
+// Uses characters (not bytes) so every symbol is readable. Ties go to the pair seen first.
+---
+<div class="toktr" data-fig="tok-trainer">
+  <label class="label" for="toktr-corpus">Corpus (edit me)</label>
+  <textarea id="toktr-corpus" class="toktr-in" rows="2" spellcheck="false">low low low low low lower lower newest newest newest newest newest newest widest widest widest</textarea>
+  <div class="toktr-grid">
+    <div>
+      <div class="label">Words, split into symbols</div>
+      <ul class="toktr-words" data-words></ul>
+    </div>
+    <div>
+      <div class="label">Adjacent pair counts</div>
+      <table class="toktr-pairs"><tbody data-pairs></tbody></table>
+    </div>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-merge>Merge top pair</button>
+    <button class="btn" type="button" data-reset>Reset</button>
+    <span>symbols in corpus <span class="readout" data-total>0</span></span>
+  </div>
+  <p class="toktr-msg" data-msg></p>
+  <ol class="toktr-merges" data-merges></ol>
+</div>
+
+<style>
+  .toktr-in {
+    display: block; width: 100%; margin-top: 6px; font-family: var(--mono); font-size: 13px; line-height: 1.5;
+    background: var(--paper); color: var(--ink); border: 1px solid var(--rule); padding: 8px 10px; resize: vertical;
+  }
+  .toktr-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 18px; margin-top: 14px; }
+  .toktr-words { list-style: none; margin: 8px 0 0; padding: 0; font-family: var(--mono); font-size: 13px; }
+  .toktr-words li { display: flex; flex-wrap: wrap; gap: 3px; align-items: center; padding: 3px 0; }
+  .toktr-words .s { padding: 2px 5px; border: 1px solid var(--rule); background: var(--paper-2); color: var(--ink); }
+  .toktr-words .s.hit { background: var(--blue-fill); border-color: var(--blue); }
+  .toktr-words .n { color: var(--ink-3); font-size: 11px; margin-left: 4px; }
+  .toktr-pairs { border-collapse: collapse; margin-top: 8px; font-family: var(--mono); font-size: 12.5px; width: 100%; }
+  .toktr-pairs td { padding: 3px 8px 3px 0; border-bottom: 1px solid var(--rule); color: var(--ink-2); }
+  .toktr-pairs tr.top td { color: var(--blue); font-weight: 600; }
+  .toktr-pairs td.c { text-align: right; }
+  .toktr-msg { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 12px 0 0; line-height: 1.6; }
+  .toktr-merges { margin: 8px 0 0; padding-left: 2.2em; font-family: var(--mono); font-size: 12px; color: var(--ink-2); columns: 2; }
+  @media (max-width: 520px) { .toktr-grid { grid-template-columns: 1fr; } .toktr-merges { columns: 1; } }
+</style>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-fig="tok-trainer"]').forEach((root) => {
+    const ta = root.querySelector<HTMLTextAreaElement>('textarea')!;
+    const wordsEl = root.querySelector<HTMLElement>('[data-words]')!;
+    const pairsEl = root.querySelector<HTMLElement>('[data-pairs]')!;
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const mergesEl = root.querySelector<HTMLElement>('[data-merges]')!;
+    const totalEl = root.querySelector<HTMLElement>('[data-total]')!;
+    const mergeBtn = root.querySelector<HTMLButtonElement>('[data-merge]')!;
+    let words: { syms: string[]; n: number }[] = [];
+    let merges: string[] = [];
+    let lastNew = '';
+
+    function reset() {
+      const counts = new Map<string, number>();
+      for (const w of ta.value.split(/\s+/).filter(Boolean)) counts.set(w, (counts.get(w) ?? 0) + 1);
+      words = [...counts].map(([w, n]) => ({ syms: [...w], n }));
+      merges = []; lastNew = '';
+      msg.textContent = 'Start: every character is its own symbol. Count every adjacent pair, weighted by how often the word appears.';
+      render();
+    }
+
+    function stats() {
+      const st = new Map<string, number>();
+      for (const { syms, n } of words)
+        for (let i = 0; i < syms.length - 1; i++) {
+          const k = syms[i] + '\u0000' + syms[i + 1];
+          st.set(k, (st.get(k) ?? 0) + n);
+        }
+      return [...st].sort((x, y) => y[1] - x[1]); // stable sort keeps first-seen order on ties
+    }
+
+    function render() {
+      const st = stats();
+      wordsEl.replaceChildren(...words.map(({ syms, n }) => {
+        const li = document.createElement('li');
+        syms.forEach((s) => {
+          const e = document.createElement('span');
+          e.className = 's' + (s === lastNew ? ' hit' : '');
+          e.textContent = s;
+          li.appendChild(e);
+        });
+        const c = document.createElement('span'); c.className = 'n'; c.textContent = '×' + n; li.appendChild(c);
+        return li;
+      }));
+      pairsEl.replaceChildren(...st.slice(0, 6).map(([k, c], i) => {
+        const tr = document.createElement('tr');
+        if (i === 0) tr.className = 'top';
+        const [a, b] = k.split('\u0000');
+        tr.innerHTML = `<td></td><td class="c"></td>`;
+        tr.children[0].textContent = `${a} + ${b}`;
+        tr.children[1].textContent = String(c);
+        return tr;
+      }));
+      mergesEl.replaceChildren(...merges.map((m) => { const li = document.createElement('li'); li.textContent = m; return li; }));
+      totalEl.textContent = String(words.reduce((s, w) => s + w.syms.length * w.n, 0));
+      mergeBtn.disabled = st.length === 0;
+      if (st.length === 0 && words.length) msg.textContent = 'Every word is now a single symbol. Nothing left to merge.';
+    }
+
+    mergeBtn.addEventListener('click', () => {
+      const st = stats();
+      if (!st.length) return;
+      const [k, c] = st[0];
+      const [a, b] = k.split('\u0000');
+      const ab = a + b;
+      for (const w of words) {
+        const out: string[] = [];
+        for (let i = 0; i < w.syms.length; i++) {
+          if (i < w.syms.length - 1 && w.syms[i] === a && w.syms[i + 1] === b) { out.push(ab); i++; }
+          else out.push(w.syms[i]);
+        }
+        w.syms = out;
+      }
+      merges.push(`${a} + ${b} → ${ab}`);
+      lastNew = ab;
+      msg.textContent = `Merge ${merges.length}: "${a}" + "${b}" appeared ${c} times, so "${ab}" becomes a new symbol in the vocabulary. Counts are recomputed.`;
+      render();
+    });
+    root.querySelector('[data-reset]')!.addEventListener('click', reset);
+    ta.addEventListener('change', reset);
+    reset();
+  });
+</script>

@@ -1,0 +1,62 @@
+---
+layout: ../layouts/Page.astro
+title: How this works.
+---
+
+import Term from '../components/Term.astro';
+
+This is a workbook, not a textbook. Each lesson makes a problem happen on your laptop or your DGX Spark, explains why it happens in plain words, and has you build the fix. Reading about async and doing async are different skills. You only get the second one by building.
+
+## The Loop
+
+Every lesson follows the same four steps.
+
+1. **Predict.** Before you touch any code, write down a guess, with a number if you can. "The SSD read will be about 1,000x slower than RAM." The guess goes in a box on the page and is saved in your browser. A wrong prediction is the most useful thing in the lesson, because it shows you exactly which part of your mental model is off.
+2. **Build.** The smallest real thing that makes the concept show up. Not a toy CRUD app. Something a strong engineer would find interesting, usually connected to your inference server, your ranker, or your agents.
+3. **Measure.** Run it, fill in the results table, and check your prediction. Numbers you measured yourself stick in a way that numbers you read never do.
+4. **Explain it back.** Answer a few questions out loud in plain words, as if someone asked you in an interview. If you can't explain it simply, you don't own it yet. Go back one step.
+
+Then each lesson has you break the thing on purpose, because seeing how something fails teaches you how it works.
+
+## Reading A Lesson
+
+Lessons are split into fixed sections so you always know where you are: **Today**, **The Problem**, **The Idea**, **Build It**, **Measure**, **Break It**, **Explain It Back**, **Go Deeper**.
+
+Words with a dotted blue underline are <Term w="jargon">A specialized word that people in a field use as shorthand. Useful once you know it, a wall when you don't. On this site every one gets a plain definition here in the margin (or under the word if you tap it on a phone).</Term>. The definition sits in the margin so you never have to leave the sentence to look it up.
+
+Boxes marked **Origin** tell you the problem that forced someone to invent the thing. That's the history of computing, told as a list of "why". Knowing why something exists is most of the intuition.
+
+## The Agent Badge
+
+Every build task has a badge that says how much help a coding agent should give you. You're self-aware about this, so treat it as a default, not a rule.
+
+| Badge | Meaning |
+|---|---|
+| Hands only | You write it. This is the part that teaches. Get stuck, stay stuck a while, then read the docs. |
+| Agent: explain only | An agent can explain a concept or an error message to you. It doesn't write the code. |
+| Agent: review after | You write it, then ask an agent to review it and explain what it would change and why. |
+| Agent: fine | Setup or boilerplate that teaches nothing. Let the agent do it. |
+
+A good test: if you couldn't rewrite it from memory tomorrow, you didn't learn it, you watched it.
+
+## The Map
+
+The [table of contents](/) is the whole map: eight tracks, from how memory works to training models with RL. Every lesson on it is written. New ones you add start as stubs: a page showing what the lesson covers and what you'll build, plus a prompt you can copy to have Claude write it.
+
+There's no timeline. Go at your own pace, in any order, and follow your curiosity across tracks. When a lesson's numbers don't match what you measure on your machine, trust your machine, and have Claude revise the lesson with what you found.
+
+**Start with Chapter 0, "Waiting vs Working".** It goes from the latency numbers you need for every estimate, through memory, threads and async, to a baseline model server on your Spark that you benchmark against Fireworks. That baseline is the scoreboard for the whole inference track. Every later lesson moves one number on it.
+
+## Adding What You Find
+
+You'll keep running into words you don't know: in job posts, interviews, docs, Slack. Drop each one in the [gap inbox](/inbox/). Then sort it:
+
+- **It blocks something you're building now.** It becomes the next lesson.
+- **It shows up in job postings, interviews, or your work.** It becomes a stub on the map, in the right track.
+- **Neither.** Leave it in the inbox. If it keeps coming back, it gets promoted.
+
+The inbox can copy your items as a prompt for Claude, which adds the stubs or writes the lesson for you, following the house style in `CLAUDE.md`.
+
+## Why Bother
+
+Coding agents removed the typing bottleneck. They didn't remove the understanding bottleneck. They made it more valuable. The engineers who stand out now are the ones who can say "that won't scale, here's the arithmetic", or "this is slow because it's bandwidth-bound, not compute-bound", and be right. That's what this site is for.

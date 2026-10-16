@@ -1,0 +1,943 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import CacheSim from '../components/figures/CacheSim.astro';
+
+## Today
+
+- Explain why caches work at all (repetition, and the lopsided popularity called Zipf), and recognise the same idea at every layer from the CPU to your browser.
+- Do the hit-rate arithmetic in your head, and say why a cache transforms your p50 but barely touches your p99.
+- Pick a TTL on purpose, name the four ways to wire a cache into code, and explain why invalidation is the hard part.
+- Build an LRU cache with a TTL from a hash map and a doubly linked list, with tests.
+- Put Redis in front of your inference server, measure hit rate and latency under a Zipf workload, cause a cache stampede and fix it, and catch a semantic cache returning a wrong answer.
+
+Prerequisites: your server and harness from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), and the async load generator from [Waiting vs working](/lessons/waiting-vs-working/). [Paged attention and prefix caching](/lessons/prefix-caching/) is the GPU-memory cousin of this lesson; you don't need it first, but the two make each other clearer. Rough time: one evening for the idea and the LRU class, one for Redis, the workload and the stampede.
+
+## The Problem
+
+Your eval harness runs 500 prompts through the server on the Spark every time someone changes the ranking code. Temperature 0, the same model, the same prompts. Every run, the GPU spends about 40 minutes re-deriving 500 answers it already gave yesterday, word for word.
+
+So you put a dictionary in front of it. Key: the prompt. Value: the answer. The second run takes 4 seconds. You feel like a genius for about a week.
+
+Then the bugs arrive, one at a time.
+
+You swap in a fine-tuned checkpoint and the eval scores don't move at all. Of course not: the cache is still serving the old model's answers, because the model wasn't part of the key. You fix that, and a teammate's sampling experiment at temperature 0.8 produces exactly one answer per prompt no matter how many times it runs, because temperature wasn't part of the key either. You move the cache to Redis so the three replicas share it, set every entry to expire after an hour, and at 10:00 every morning, an hour after the 9:00 warm-up job, the GPU queue spikes to hundreds of requests for the same handful of prompts, all at once.
+
+Each of these is a classic, with a name and a known fix. A cache is the cheapest speedup in computing and also the most reliable way to serve something wrong with total confidence. This lesson is about both halves.
+
+<Origin year="1965" title="Slave memory, then memcached, then Redis">
+
+In 1965 Maurice Wilkes wrote a two-page paper, "Slave Memories and Dynamic Storage Allocation", proposing a small fast memory that would automatically hold copies of whatever the processor had used recently from the big slow one. IBM shipped the first commercial version in the System/360 Model 85 in 1968 and called it a cache. Every CPU since has one.
+
+The same trick moved up the stack whenever something got slow. In 2003 Brad Fitzpatrick's blogging site LiveJournal was drowning its databases in repeated reads, so he wrote memcached: a big hash table in RAM, spread across spare machines, that any web server could ask before bothering the database. Facebook later ran it at enormous scale and wrote up what broke. In 2009 Salvatore Sanfilippo, building a real-time analytics product called LLOOGG that was too slow on MySQL, wrote Redis: like memcached, but storing lists, sets and other data structures instead of only strings, and able to save itself to disk.
+
+The line everyone quotes is usually credited to Phil Karlton at Netscape: "There are only two hard things in Computer Science: cache invalidation and naming things." Keep it in mind. Making a cache fast is easy. Knowing when its answers stop being true is not.
+
+</Origin>
+
+## The Idea
+
+### A cache is a bet
+
+A <Term w="cache">A small, fast store that keeps copies of results from a bigger, slower source, so repeated requests skip the slow part.</Term> is a bet that you'll ask for the same thing again soon. When you win, a <Term w="hit">A request the cache can answer from its copy. The slow source is never touched.</Term>, you skip the slow work entirely. When you lose, a <Term w="miss">A request the cache can't answer. You pay the full slow cost, plus the small cost of having checked the cache first.</Term>, you do the slow work, and usually store the result in case it's asked again.
+
+Why is that bet usually a good one? You met the CPU version in [How slow is slow?](/lessons/latency-numbers/): programs reuse what they used recently, called <Term w="temporal locality">The tendency to ask for something again soon after asking for it once. The reason "keep what was used recently" is a good rule.</Term>. People do the same. The prompt someone sent a second ago is far more likely to come again than one from last month.
+
+The second reason is stronger, and it's about popularity, not time. Rank every distinct request by how often it's asked. In real traffic (web pages, search queries, words in text, songs, API calls, prompts) the counts are wildly lopsided. The most popular item gets asked twice as often as the second, three times as often as the third, and so on. That shape is a <Term w="Zipf distribution">A popularity curve where the k-th most popular item is requested about 1/k^s as often as the most popular one. With s near 1, a few items get a big share of all traffic and a long tail of items is rarely asked.</Term>, and the exponent `s` (the <Term w="skew">How lopsided popularity is. s = 0 means every item is equally popular; bigger s means the top items take more of the traffic.</Term>) says how lopsided.
+
+Zipf is why small caches work. Here is what I measured on this Mac with a 15-line Python simulation: 10,000 distinct items, 200,000 requests drawn from a Zipf distribution, and an LRU cache (defined properly later) of a given size starting empty.
+
+| Cache holds | s = 0 (uniform) | s = 0.8 | s = 1.0 | s = 1.2 |
+| --- | --- | --- | --- | --- |
+| 10 items (0.1%) | 0.1% | 3% | 13% | 34% |
+| 100 items (1%) | 1% | 16% | 39% | 66% |
+| 1,000 items (10%) | 10% | 44% | 67% | 86% |
+| 5,000 items (50%) | 49% | 78% | 89% | 95% |
+
+Read the s = 1.0 column. A cache holding 1% of the items answers 39% of requests. One holding 10% answers two thirds. Then read the uniform column: with no skew, a cache holding 10% of items answers 10% of requests, and caching is almost pointless. **The workload decides whether a cache helps, not the cache.** Before you build one, look at how often your requests actually repeat.
+
+### One idea, many layers
+
+You have already met caches several times in this curriculum without the word always being in the title. They are the same idea at different sizes and distances.
+
+<Figure n="001" title="ONE IDEA, MANY LAYERS" caption="Top row: the path a web or API request takes, with a cache at almost every stop. Bottom row: inside one machine. Every box keeps copies of something slower to its right. Latencies are rough orders of magnitude; your hardware and network will differ." wide>
+<svg viewBox="0 0 760 300" role="img" aria-label="Caches on the path of a request and inside one machine">
+  <text x="10" y="20" class="strong">ACROSS THE NETWORK</text>
+  <rect x="10" y="32" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="66" y="54" text-anchor="middle" class="strong">BROWSER</text>
+  <text x="66" y="72" text-anchor="middle">HTTP cache</text>
+  <text x="66" y="92" text-anchor="middle" class="blue-t">~0 ms</text>
+  <rect x="142" y="32" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="198" y="54" text-anchor="middle" class="strong">CDN EDGE</text>
+  <text x="198" y="72" text-anchor="middle">near the user</text>
+  <text x="198" y="92" text-anchor="middle" class="blue-t">~5-30 ms</text>
+  <rect x="274" y="32" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="330" y="54" text-anchor="middle" class="strong">APP MEMORY</text>
+  <text x="330" y="72" text-anchor="middle">dict, lru_cache</text>
+  <text x="330" y="92" text-anchor="middle" class="blue-t">~0.1 µs</text>
+  <rect x="406" y="32" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="462" y="54" text-anchor="middle" class="strong">REDIS</text>
+  <text x="462" y="72" text-anchor="middle">shared, in RAM</text>
+  <text x="462" y="92" text-anchor="middle" class="blue-t">~0.1-1 ms</text>
+  <rect x="538" y="32" width="212" height="74" class="fill-paper" stroke-width="1.2" />
+  <text x="644" y="54" text-anchor="middle" class="strong">THE SLOW THING</text>
+  <text x="644" y="72" text-anchor="middle">database · other API · LLM</text>
+  <text x="644" y="92" text-anchor="middle">10 ms ... 20 s</text>
+  <line x1="122" y1="69" x2="142" y2="69" class="ink" stroke-width="1.2" />
+  <line x1="254" y1="69" x2="274" y2="69" class="ink" stroke-width="1.2" />
+  <line x1="386" y1="69" x2="406" y2="69" class="ink" stroke-width="1.2" />
+  <line x1="518" y1="69" x2="538" y2="69" class="ink" stroke-width="1.2" />
+  <text x="10" y="128">EACH STOP: "DO I ALREADY HAVE A COPY?" IF NOT, ASK THE NEXT ONE TO THE RIGHT.</text>
+  <text x="10" y="172" class="strong">INSIDE ONE MACHINE</text>
+  <rect x="10" y="184" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="66" y="206" text-anchor="middle" class="strong">L1 / L2</text>
+  <text x="66" y="224" text-anchor="middle">KB to MB</text>
+  <text x="66" y="244" text-anchor="middle" class="blue-t">~1-4 ns</text>
+  <rect x="142" y="184" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="198" y="206" text-anchor="middle" class="strong">L3 / SLC</text>
+  <text x="198" y="224" text-anchor="middle">tens of MB</text>
+  <text x="198" y="244" text-anchor="middle" class="blue-t">~10-20 ns</text>
+  <rect x="274" y="184" width="112" height="74" class="fill-paper" stroke-width="1.2" />
+  <text x="330" y="206" text-anchor="middle" class="strong">RAM</text>
+  <text x="330" y="224" text-anchor="middle">GB</text>
+  <text x="330" y="244" text-anchor="middle">~100 ns</text>
+  <rect x="406" y="184" width="112" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="462" y="206" text-anchor="middle" class="strong">PAGE CACHE</text>
+  <text x="462" y="224" text-anchor="middle">file data in RAM</text>
+  <text x="462" y="244" text-anchor="middle" class="blue-t">~µs</text>
+  <rect x="538" y="184" width="212" height="74" class="fill-paper" stroke-width="1.2" />
+  <text x="644" y="206" text-anchor="middle" class="strong">SSD</text>
+  <text x="644" y="224" text-anchor="middle">TB</text>
+  <text x="644" y="244" text-anchor="middle">~50-100 µs</text>
+  <line x1="122" y1="221" x2="142" y2="221" class="ink" stroke-width="1.2" />
+  <line x1="254" y1="221" x2="274" y2="221" class="ink" stroke-width="1.2" />
+  <line x1="386" y1="221" x2="406" y2="221" class="ink" stroke-width="1.2" />
+  <line x1="518" y1="221" x2="538" y2="221" class="ink" stroke-width="1.2" />
+  <rect x="10" y="276" width="14" height="10" class="fill-wash" stroke-width="1" />
+  <text x="30" y="285">A CACHE</text>
+  <rect x="110" y="276" width="14" height="10" class="fill-paper" stroke-width="1" />
+  <text x="130" y="285">THE SOURCE IT COPIES</text>
+</svg>
+</Figure>
+
+The CPU caches from [Why is NumPy 100x faster?](/lessons/cpu-caches/) copy RAM. The kernel's page cache from [What happens when you save a file?](/lessons/files-and-disks/) copies the SSD. A Python `dict` or `functools.lru_cache` copies the result of a function. Redis copies the result of a database query or a model call, and is shared by every server process. A <Term w="CDN">Content delivery network. Thousands of servers spread around the world that keep copies of your files (and sometimes API responses) close to users, so most requests never cross an ocean.</Term> copies your web server's responses, near the user. The browser copies them on the user's own disk. And on the GPU, the [KV cache](/lessons/kv-cache/) and [prefix cache](/lessons/prefix-caching/) copy attention keys and values that would otherwise be recomputed.
+
+Every layer faces the same four questions, and the rest of this lesson is about them:
+
+1. **What is the key?** What exactly must match for a stored answer to count as the answer to this request?
+2. **How long is a copy allowed to be trusted?** (TTL, invalidation.)
+3. **When it's full, what leaves?** (Eviction.)
+4. **What happens on a miss, especially many misses at once?** (Stampedes.)
+
+What changes between layers is who answers them. The CPU answers them in silicon, the kernel in C, the CDN with HTTP headers you send. At the application layer, which is today's layer, you answer them, in code, and you get them wrong in the ways from the Problem.
+
+### The arithmetic
+
+Every request either hits or misses. If a fraction `h` of requests hit (the <Term w="hit rate">The fraction of requests answered from the cache. 1 minus the hit rate is the miss rate.</Term>), the average cost is:
+
+```text
+effective latency = h · t_hit + (1 − h) · t_miss
+```
+
+Plug in your server. A hit through Redis costs about 1 ms. A miss costs about 2,000 ms of GPU time for a short answer.
+
+| Hit rate | Average latency | Speedup vs no cache |
+| --- | --- | --- |
+| 0% | 2,000 ms | 1× |
+| 50% | 1,000 ms | 2× |
+| 90% | 201 ms | 10× |
+| 99% | 21 ms | 95× |
+
+Look at the jump from 90% to 99%. Nine more points of hit rate, ten times faster. That's because the misses dominate the sum: `t_miss` is 2,000 times `t_hit`, so the average is basically the miss rate times the miss cost. **Think in miss rate, not hit rate.** Going from 10% misses to 1% misses is a 10x improvement; going from 90% hits to 99% hits sounds like a rounding error.
+
+Two more consequences of the same formula. A cache whose hit costs almost as much as a miss is useless at any hit rate (caching a 2 ms database query behind a 1 ms Redis round trip saves you at most half). And a cache with a terrible hit rate makes things slower, because every miss also pays the lookup.
+
+<Predict id="p50-p99">
+
+Your server gets traffic with a 70% hit rate. Hits take 1 ms, misses take 2,000 ms. What are the p50 and the p99 latencies, with the cache and without it?
+
+<Fragment slot="answer">
+
+Without the cache, both are about 2,000 ms.
+
+With it, sort all latencies from fastest to slowest. The fastest 70% are hits, all about 1 ms. The median request (the 50th percentile) falls inside that 70%, so **p50 is about 1 ms**, a 2,000× improvement. The 99th percentile falls in the slowest 30%, which are misses, so **p99 is still about 2,000 ms**: no improvement at all.
+
+p99 only drops to hit speed once the miss rate is below 1%. This is the honest summary of most caches: they make the typical request magical and leave the worst requests exactly as bad. If your users suffer from p99 (from [p99 and load testing](/lessons/tail-latency/): with fan-out, they usually do), a cache isn't the fix by itself. There is one indirect win: on your one-at-a-time GPU server, every hit is a request that isn't standing in the queue, so the misses that remain wait less. You'll see that in Measure.
+
+</Fragment>
+
+</Predict>
+
+### Four ways to wire it in
+
+Where does the cache sit relative to your code and the slow source? There are four standard answers, and the names come up in every system-design conversation.
+
+<Figure n="002" title="FOUR WAYS TO WIRE A CACHE" caption="Numbers are the order of steps. Cache-aside: your code does everything. Read-through: the cache fetches on a miss. Write-through: every write goes to the cache and the source before it's acknowledged. Write-behind: the cache acknowledges at once and writes to the source later." wide>
+<svg viewBox="0 0 760 330" role="img" aria-label="Cache-aside, read-through, write-through and write-behind diagrams">
+  <defs>
+    <marker id="ca-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" class="fill-blue" /></marker>
+    <marker id="ca-ark" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" style="fill:var(--ink)" /></marker>
+  </defs>
+  <g>
+    <text x="10" y="18" class="strong">CACHE-ASIDE (LAZY)</text>
+    <rect x="10" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+    <text x="50" y="64" text-anchor="middle" class="strong">APP</text>
+    <rect x="250" y="34" width="110" height="34" class="fill-wash" stroke-width="1.2" />
+    <text x="305" y="56" text-anchor="middle" class="strong">CACHE</text>
+    <rect x="250" y="100" width="110" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="305" y="122" text-anchor="middle" class="strong">SOURCE</text>
+    <line x1="90" y1="48" x2="248" y2="44" class="blue" stroke-width="1.2" marker-end="url(#ca-arr)" />
+    <text x="110" y="40" class="blue-t">1 GET (MISS)</text>
+    <line x1="90" y1="76" x2="248" y2="112" class="ink" stroke-width="1.2" marker-end="url(#ca-ark)" />
+    <text x="104" y="104">2 QUERY</text>
+    <line x1="90" y1="62" x2="248" y2="60" class="blue dash" stroke-width="1.2" marker-end="url(#ca-arr)" />
+    <text x="150" y="76" class="blue-t">3 SET</text>
+  </g>
+  <g>
+    <text x="400" y="18" class="strong">READ-THROUGH</text>
+    <rect x="400" y="40" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+    <text x="440" y="64" text-anchor="middle" class="strong">APP</text>
+    <rect x="530" y="40" width="110" height="40" class="fill-wash" stroke-width="1.2" />
+    <text x="585" y="64" text-anchor="middle" class="strong">CACHE</text>
+    <rect x="530" y="110" width="110" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="585" y="132" text-anchor="middle" class="strong">SOURCE</text>
+    <line x1="480" y1="60" x2="528" y2="60" class="blue" stroke-width="1.2" marker-end="url(#ca-arr)" />
+    <text x="484" y="54" class="blue-t">1 GET</text>
+    <line x1="585" y1="80" x2="585" y2="108" class="ink" stroke-width="1.2" marker-end="url(#ca-ark)" />
+    <text x="594" y="99">2 LOAD ON MISS</text>
+    <text x="660" y="56">cache owns</text>
+    <text x="660" y="70">the loader</text>
+  </g>
+  <line x1="10" y1="165" x2="750" y2="165" style="stroke:var(--rule)" stroke-width="1" />
+  <g>
+    <text x="10" y="190" class="strong">WRITE-THROUGH</text>
+    <rect x="10" y="212" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+    <text x="50" y="236" text-anchor="middle" class="strong">APP</text>
+    <rect x="140" y="212" width="110" height="40" class="fill-wash" stroke-width="1.2" />
+    <text x="195" y="236" text-anchor="middle" class="strong">CACHE</text>
+    <rect x="140" y="282" width="110" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="195" y="304" text-anchor="middle" class="strong">SOURCE</text>
+    <line x1="90" y1="232" x2="138" y2="232" class="blue" stroke-width="1.2" marker-end="url(#ca-arr)" />
+    <text x="92" y="226" class="blue-t">1 PUT</text>
+    <line x1="195" y1="252" x2="195" y2="280" class="ink" stroke-width="1.2" marker-end="url(#ca-ark)" />
+    <text x="204" y="271">2 WRITE NOW</text>
+    <text x="270" y="228">3 OK only after</text>
+    <text x="270" y="242">both have it</text>
+  </g>
+  <g>
+    <text x="400" y="190" class="strong">WRITE-BEHIND (WRITE-BACK)</text>
+    <rect x="400" y="212" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+    <text x="440" y="236" text-anchor="middle" class="strong">APP</text>
+    <rect x="530" y="212" width="110" height="40" class="fill-wash" stroke-width="1.2" />
+    <text x="585" y="236" text-anchor="middle" class="strong">CACHE</text>
+    <rect x="530" y="282" width="110" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="585" y="304" text-anchor="middle" class="strong">SOURCE</text>
+    <line x1="480" y1="232" x2="528" y2="232" class="blue" stroke-width="1.2" marker-end="url(#ca-arr)" />
+    <text x="482" y="226" class="blue-t">1 PUT</text>
+    <line x1="585" y1="252" x2="585" y2="280" class="ink dash" stroke-width="1.2" marker-end="url(#ca-ark)" />
+    <text x="594" y="271">3 FLUSH LATER</text>
+    <text x="660" y="228">2 OK at once</text>
+    <text x="660" y="242">(lost if cache</text>
+    <text x="660" y="256">dies first)</text>
+  </g>
+</svg>
+</Figure>
+
+**<Term w="cache-aside">The application checks the cache, and on a miss reads the source itself and stores the result. The cache is a passive key-value store. The most common pattern.</Term>** is what you'll build today, and what most code using Redis does: `get`, and if nothing came back, compute and `set`. The cache knows nothing about where values come from. Pros: simple, the cache can be any key-value store, and if the cache dies your code still works (slowly). Cons: every caller has to remember the dance, and a miss costs three steps.
+
+**<Term w="read-through">The cache itself knows how to load a missing value (you give it a loader function). Callers only ever ask the cache.</Term>** moves the loader into the cache. `functools.lru_cache` is read-through: you call the function, the decorator checks its table and calls the real function on a miss. CDNs are read-through: on a miss the edge fetches from your origin. The win is that loading logic lives in one place, which is also the natural place to make sure only one caller loads a given key at a time (more on that soon).
+
+Those two are about reads. Writes raise a sharper question: when the data changes, who updates the cache?
+
+**<Term w="write-through">Every write updates the cache and the source together, and only then reports success. Reads after a write see the new value.</Term>** keeps them in step: slower writes, fresh reads. **<Term w="write-behind">The cache accepts the write and reports success immediately, then writes to the source later, often in batches. Also called write-back.</Term>** makes writes fast and lumps them together, at the price that a crash can lose writes the caller already thought were saved. Your CPU's caches are write-back, and so is the page cache: in [What happens when you save a file?](/lessons/files-and-disks/) you saw that `write()` returns long before the bytes reach the SSD, which is exactly why `fsync` exists.
+
+For LLM responses there are no "writes" in the usual sense: the source (the model) never changes an answer behind your back; only *you* change the model. So cache-aside with a careful key is the right shape. The write patterns matter the moment you cache something users can edit.
+
+### How long to trust a copy: TTLs
+
+A copy is a snapshot. The source may change after you took it, and the cache has no way of noticing. The bluntest, most reliable answer is to give every entry an expiry date: a <Term w="TTL">Time to live. How long a cache entry may be served after it was stored. After that it counts as missing, and the next request refetches it.</Term>. In Redis, `SET key value EX 3600` stores a value that disappears an hour later.
+
+A TTL is a promise about **staleness**: "this answer is at most an hour out of date." Choosing it is a business question wearing a technical costume. Ask three things:
+
+1. **How wrong can the answer be, and for how long, before someone is hurt?** A stock price: seconds. A product description: an hour. A user's permissions after being fired: zero, which means TTL alone is the wrong tool.
+2. **How often does the source actually change?** Data that changes once a day gains nothing from a 10-second TTL except more misses.
+3. **What does a miss cost?** If a miss is a 2 ms query, short TTLs are cheap. If it's 2 seconds of GPU, every expiry is expensive, and you want long TTLs plus some other way to handle changes.
+
+For your LLM cache, the answer to (2) is "never, until you change the model or the prompt template". So the right TTL is long (days), and the thing that actually keeps answers correct is the key, not the clock. The TTL is there to bound memory and to clean up keys no one will ever ask for again.
+
+Two refinements you'll use. **Jitter**: instead of exactly 3,600 seconds, use 3,600 plus or minus a random 10%. Otherwise everything you stored in one burst (a warm-up job, a deploy) expires in one burst, which is the 10:00 spike from the Problem. **Negative caching**: also cache "not found" answers, briefly. If a missing user ID is requested 1,000 times a second, without a negative entry every one of those is a miss that hits the database.
+
+### Invalidation, the hard part
+
+The alternative to waiting for a TTL is to remove or update the copy the moment the source changes: <Term w="invalidation">Removing or updating a cached copy because the source data changed. The hard part is doing it at the right moment, everywhere the copy lives, without races.</Term>. With cache-aside, the usual recipe is: write to the database, then delete the cache key. The next read misses and fetches the fresh value. It sounds airtight. It isn't.
+
+<Predict id="invalidate-race">
+
+Two requests, one cache-aside cache, using "write the database, then delete the key". Request R reads key `user:7`, misses, and queries the database. Meanwhile request W updates user 7 in the database and deletes `user:7` from the cache. Describe an ordering of these steps that leaves the cache holding stale data. How long does it stay stale?
+
+<Fragment slot="answer">
+
+1. R misses in the cache and reads user 7 from the database: the **old** value.
+2. W writes the new value to the database.
+3. W deletes `user:7` from the cache (there's nothing there yet).
+4. R, which was slow (a GC pause, a busy thread), now does its `SET user:7 <old value>`.
+
+The cache now holds the old value, and nothing will ever remove it, because the invalidation already happened. It stays wrong until the TTL expires, or forever if there is no TTL. That's why people say "always set a TTL, even if you invalidate": the TTL is the backstop that bounds how long any bug in your invalidation can last.
+
+Real fixes include: have the reader only set if no invalidation happened in between (Facebook's memcache uses short-lived "leases" for this), use versioned keys (below), or delete the key a second time a little later. The point is that once a copy exists in two places, keeping them in agreement is a distributed-systems problem, with races, and not a line of code.
+
+</Fragment>
+
+</Predict>
+
+Invalidation is also hard because you have to know every key a change affects. A user renames themselves: which cached pages, search results and recommendation lists contain the old name? The usual escape is to not invalidate at all. Make the version part of the key instead: `answer:v3:<hash>`. When the data or the code changes, bump to `v4`. Old keys are simply never asked for again, and the TTL (or LRU) quietly clears them out. You trade memory for correctness, which is almost always the right trade. **For your LLM cache this is the whole strategy: the model, its weights revision and the prompt template version go into the key, so changing any of them changes every key.**
+
+### When it's full: eviction
+
+RAM is finite. When the cache is full and a new entry arrives, something has to leave. Choosing what is <Term w="eviction">Removing an entry to make room for a new one, because the cache is full. Not the same as expiry: an evicted entry may still have been valid.</Term>, and the rule is the <Term w="eviction policy">The rule that picks which entry to evict. LRU, LFU, FIFO and random are the common ones.</Term>. The ideal rule would evict the entry that will be needed furthest in the future (Bélády's optimal algorithm, 1966), which you can't know. Every real policy is a guess about the future from the past.
+
+- **<Term w="LRU">Least recently used. When full, evict the entry whose last use is oldest. Bets that what was used recently will be used again soon.</Term>** bets on recency. Cheap, adapts quickly when popularity shifts, and the default nearly everywhere. Its classic weakness: one big scan (a batch job reading 100,000 keys once each) pushes out every hot entry, because each scanned key is "recently used" for a moment.
+- **<Term w="LFU">Least frequently used. When full, evict the entry that has been used the fewest times. Bets on popularity rather than recency.</Term>** bets on frequency. Resists scans (a key used once never outranks a key used a thousand times), but is slow to forget: yesterday's viral prompt keeps its huge count. Practical LFUs let counts decay over time.
+- **<Term w="ARC">Adaptive Replacement Cache (Megiddo and Modha, IBM, 2003). Keeps a recency list and a frequency list, plus "ghost" lists of recently evicted keys, and shifts space between the two lists depending on which ghosts get asked for again.</Term>** keeps both kinds of evidence and tunes the balance by watching its own mistakes. Used in ZFS. Modern designs in the same spirit (W-TinyLFU in Java's Caffeine library) admit a new entry only if it looks more popular than the one it would push out.
+- **FIFO and random** sound naive and are often within a few points of LRU on real traffic, with less bookkeeping. Redis itself doesn't run exact LRU: it samples a handful of keys and evicts the oldest among them.
+
+Try all of this before reading on. The figure runs an LRU cache over 200 keys whose popularity follows Zipf (key 1 is the most popular). Watch the stream, then move the sliders. The bottom chart re-runs 3,000 requests at every cache size and draws the hit-rate curve, next to the "ideal" dashed line of a cache that magically holds exactly the most popular keys.
+
+<Figure n="003" title="AN LRU CACHE UNDER ZIPF TRAFFIC" caption="Filled marks are hits, outlined marks misses, crossed marks entries that had expired. Try: skew 0 (caching is pointless); skew 1.5 with size 5 (tiny cache, big win); then set a TTL of 100 and watch even key 1 get thrown away and refetched. TTL counts from when the entry was written, as in Redis." wide>
+
+<CacheSim />
+
+</Figure>
+
+Things to notice:
+
+- **The curve bends early.** At skew 1.0 the first 20 slots give you most of the win. Doubling a cache that's already on the flat part buys little, which is why cache sizing is a question for the curve, not for your gut.
+- **LRU sits below the ideal line**, for two reasons. Every distinct key costs one <Term w="compulsory miss">The first request for a key always misses, no matter how big the cache. Also called a cold miss.</Term> on a cold start. And LRU keeps some unpopular keys that happened to be asked for recently, wasting slots. That gap is what LFU and ARC fight over.
+- **A TTL lowers the whole curve.** Even key 1, asked for constantly, gets thrown out every TTL and costs a miss. That's the price of the staleness bound, and the reason hot keys deserve special care when they expire.
+
+### Building LRU: a hash map and a doubly linked list
+
+You need two operations, `get` and `set`, both in constant time, and the ability to find the least recently used entry instantly. No single data structure does all three.
+
+A hash map (a Python `dict`) finds any key in O(1) but has no idea of order. A list knows order, but finding a key in it is O(n). The trick is to use both and make them point at each other.
+
+<Figure n="004" title="LRU = HASH MAP + DOUBLY LINKED LIST" caption="The map finds a node in one step. The list keeps nodes in recency order. A hit unlinks its node and relinks it at the front (four pointer updates). Eviction removes the node just before TAIL. HEAD and TAIL are empty sentinel nodes so no operation needs an 'is the list empty?' special case.">
+<svg viewBox="0 0 640 250" role="img" aria-label="A hash map whose entries point at nodes of a doubly linked list ordered from most to least recently used">
+  <defs>
+    <marker id="cl-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" class="fill-blue" /></marker>
+    <marker id="cl-ark" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7 z" style="fill:var(--ink)" /></marker>
+  </defs>
+  <text x="10" y="18" class="strong">MAP (DICT)</text>
+  <rect x="10" y="28" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="47">"b"</text>
+  <rect x="10" y="56" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="75">"a"</text>
+  <rect x="10" y="84" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="103">"d"</text>
+  <rect x="10" y="112" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="131">"c"</text>
+  <circle cx="86" cy="42" r="3" class="fill-blue" />
+  <circle cx="86" cy="70" r="3" class="fill-blue" />
+  <circle cx="86" cy="98" r="3" class="fill-blue" />
+  <circle cx="86" cy="126" r="3" class="fill-blue" />
+  <text x="150" y="170" class="strong">LIST, MOST RECENT → LEAST RECENT</text>
+  <rect x="150" y="186" width="60" height="44" class="fill-paper dash" stroke-width="1" />
+  <text x="180" y="212" text-anchor="middle">HEAD</text>
+  <rect x="234" y="186" width="66" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="267" y="204" text-anchor="middle" class="strong">a</text>
+  <text x="267" y="220" text-anchor="middle">exp 12:05</text>
+  <rect x="324" y="186" width="66" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="357" y="204" text-anchor="middle" class="strong">c</text>
+  <text x="357" y="220" text-anchor="middle">exp 12:01</text>
+  <rect x="414" y="186" width="66" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="447" y="204" text-anchor="middle" class="strong">d</text>
+  <text x="447" y="220" text-anchor="middle">no ttl</text>
+  <rect x="504" y="186" width="66" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="537" y="204" text-anchor="middle" class="strong">b</text>
+  <text x="537" y="220" text-anchor="middle">exp 12:09</text>
+  <rect x="582" y="186" width="54" height="44" class="fill-paper dash" stroke-width="1" />
+  <text x="609" y="212" text-anchor="middle">TAIL</text>
+  <line x1="210" y1="200" x2="232" y2="200" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="234" y1="216" x2="212" y2="216" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="300" y1="200" x2="322" y2="200" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="324" y1="216" x2="302" y2="216" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="390" y1="200" x2="412" y2="200" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="414" y1="216" x2="392" y2="216" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="480" y1="200" x2="502" y2="200" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="504" y1="216" x2="482" y2="216" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="570" y1="200" x2="580" y2="200" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <line x1="582" y1="216" x2="572" y2="216" class="ink" stroke-width="1" marker-end="url(#cl-ark)" />
+  <path d="M89 42 C 300 40, 520 80, 535 184" class="blue" stroke-width="1" marker-end="url(#cl-arr)" />
+  <path d="M89 70 C 200 80, 260 120, 265 184" class="blue" stroke-width="1" marker-end="url(#cl-arr)" />
+  <path d="M89 98 C 300 110, 440 130, 446 184" class="blue" stroke-width="1" marker-end="url(#cl-arr)" />
+  <path d="M89 126 C 220 130, 350 140, 356 184" class="blue" stroke-width="1" marker-end="url(#cl-arr)" />
+  <text x="537" y="246" text-anchor="middle" class="blue-t">EVICT NEXT</text>
+  <text x="267" y="246" text-anchor="middle" class="blue-t">JUST USED</text>
+</svg>
+</Figure>
+
+Each node stores its key, its value, its expiry time, and two pointers: `prev` and `next`. The map stores key → node. Then:
+
+- **get(k)**: look up the node in the map. Missing: miss. Expired: unlink it, delete it from the map, miss. Otherwise unlink it from where it is and relink it right after HEAD. Return the value.
+- **set(k, v)**: if the key exists, update the node and move it to the front. Otherwise create a node, put it at the front, add it to the map, and if the map is now over capacity, take the node just before TAIL, unlink it, and delete its key from the map.
+
+Why *doubly* linked? To unlink a node from the middle of the list you need to change its predecessor's `next`, and with only forward pointers, finding the predecessor is a walk from HEAD. The `prev` pointer makes unlinking O(1). And why does each node store its own key? Because at eviction time you start from the node (just before TAIL) and need to delete the matching map entry.
+
+Notice how TTL fits in: it's checked **lazily**, at `get` time. An expired entry that nobody asks for just sits there until LRU pushes it out. That's exactly what Redis does too, plus a background sweep. `collections.OrderedDict` is this same structure, written in C, with `move_to_end` and `popitem(last=False)`; it's what the [prefix cache](/lessons/prefix-caching/) used. Today you build it by hand once, so it's never magic again. Expect your version to be a few times slower than a plain `dict` lookup: on this Mac a hand-written Python `get` took about 0.15 µs against 0.03 µs for `dict.get`. Both are a rounding error next to a 1 ms network round trip.
+
+### Many misses at once: the stampede
+
+Here's the 10:00 spike. A hot key, say the answer to the prompt your whole team's dashboard sends, is being read 200 times a second. All of those are hits. Its TTL runs out. For the next two seconds, while the first miss is being recomputed on the GPU, *every* request for that key misses too, because the value isn't back yet. Each of them sends its own copy of the same request to the model.
+
+<Figure n="005" title="A STAMPEDE, AND COALESCING" caption="Top: a hot key expires and every request arriving during the 2-second recompute misses and goes to the backend, which is now flooded with identical work. Bottom: with request coalescing, the first miss starts the recompute and later ones wait for that same result. One backend call instead of hundreds." wide>
+<svg viewBox="0 0 760 270" role="img" aria-label="Timeline of a cache stampede compared with coalesced requests">
+  <defs>
+    <marker id="cs-ark" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7 z" style="fill:var(--ink)" /></marker>
+    <marker id="cs-arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="10" y="18" class="strong">NO PROTECTION</text>
+  <line x1="120" y1="60" x2="740" y2="60" class="ink" stroke-width="1" />
+  <text x="10" y="64">REQUESTS</text>
+  <line x1="120" y1="104" x2="740" y2="104" class="ink" stroke-width="1" />
+  <text x="10" y="108">BACKEND</text>
+  <rect x="120" y="50" width="160" height="20" class="fill-blue" opacity="0.85" />
+  <text x="200" y="44" text-anchor="middle" class="blue-t">HITS</text>
+  <line x1="280" y1="30" x2="280" y2="120" class="ink dash" stroke-width="1" />
+  <text x="284" y="34">TTL EXPIRES</text>
+  <rect x="282" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="296" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="310" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="324" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="338" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="352" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="366" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="380" y="52" width="6" height="16" class="ink" stroke-width="1" />
+  <text x="400" y="64">... ALL MISS</text>
+  <line x1="285" y1="70" x2="285" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="299" y1="70" x2="299" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="313" y1="70" x2="313" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="327" y1="70" x2="327" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="341" y1="70" x2="341" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="355" y1="70" x2="355" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="369" y1="70" x2="369" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <line x1="383" y1="70" x2="383" y2="96" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <rect x="282" y="110" width="440" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="502" y="125" text-anchor="middle">N IDENTICAL CALLS, QUEUED BEHIND ONE GPU</text>
+  <line x1="10" y1="150" x2="750" y2="150" style="stroke:var(--rule)" stroke-width="1" />
+  <text x="10" y="172" class="strong">COALESCED</text>
+  <line x1="120" y1="210" x2="740" y2="210" class="ink" stroke-width="1" />
+  <text x="10" y="214">REQUESTS</text>
+  <line x1="120" y1="254" x2="740" y2="254" class="ink" stroke-width="1" />
+  <text x="10" y="258">BACKEND</text>
+  <rect x="120" y="200" width="160" height="20" class="fill-blue" opacity="0.85" />
+  <line x1="280" y1="180" x2="280" y2="262" class="ink dash" stroke-width="1" />
+  <rect x="282" y="202" width="6" height="16" class="ink" stroke-width="1" />
+  <rect x="296" y="202" width="6" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="310" y="202" width="6" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="324" y="202" width="6" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="338" y="202" width="6" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="352" y="202" width="6" height="16" class="fill-wash" stroke-width="1" />
+  <text x="370" y="196" class="blue-t">LATER MISSES WAIT ON THE FIRST ONE'S RESULT</text>
+  <line x1="285" y1="220" x2="285" y2="240" class="ink" stroke-width="1" marker-end="url(#cs-ark)" />
+  <rect x="282" y="242" width="150" height="20" class="fill-paper" stroke-width="1.2" />
+  <text x="357" y="256" text-anchor="middle">ONE CALL</text>
+  <line x1="432" y1="252" x2="450" y2="222" class="blue" stroke-width="1" marker-end="url(#cs-arr)" />
+  <rect x="452" y="200" width="288" height="20" class="fill-blue" opacity="0.85" />
+  <text x="596" y="214" text-anchor="middle" style="fill:var(--paper)">ALL ANSWERED · CACHE REFILLED · HITS</text>
+</svg>
+</Figure>
+
+This is a <Term w="cache stampede">Many requests miss on the same key at the same moment (usually right after it expires) and all recompute it at once, flooding the backend with identical work. Also called a thundering herd or dog-piling.</Term>. On a web stack it can knock over a database. On your server it's worse in a specific way: the GPU lock serialises requests, so 400 identical misses means the 400th waits for 400 full generations, even though the answer was ready after the first.
+
+The fixes, from simplest to most thorough:
+
+- **<Term w="request coalescing">When several requests for the same key miss at once, only the first one does the work; the rest wait for its result and share it. Go's standard library calls this singleflight.</Term>.** Keep a table of "in-flight" keys. A miss first checks it: if someone's already computing this key, wait for their result instead of starting another. In one asyncio process this is a dict from key to `asyncio.Future`, about ten lines. It only works within one process, though; three replicas still make three calls.
+- **A lock in the shared cache.** Across processes or machines, the first miss takes a lock with `SET lock:<key> <id> NX PX 10000` (set only if it doesn't exist, expire in 10 seconds, so a crashed holder can't block everyone forever). Whoever wins recomputes. Losers wait briefly and re-check the cache. More moving parts, but it works across the whole fleet.
+- **Jittered TTLs.** Doesn't stop one hot key's stampede, but stops many keys from expiring together, which is what turns small stampedes into one big one.
+- **<Term w="stale-while-revalidate">When an entry expires, keep serving the old copy for a while and refresh it in the background. Users get a slightly stale answer instantly instead of all waiting for a fresh one. Named after an HTTP Cache-Control extension (RFC 5861).</Term>.** Store a "soft" expiry earlier than the real one. After the soft expiry, the first reader triggers one background refresh and everyone, including that reader, keeps getting the old value until the new one lands. Nobody waits. The cost is serving answers a bit past their TTL, which you've already decided is acceptable if you're caching at all.
+- **Probabilistic early refresh.** Each reader, as an entry nears expiry, recomputes early with a small probability that grows as the deadline approaches, so one reader almost always refreshes before the cliff. The "XFetch" paper below shows how to pick the probability.
+
+You'll build coalescing and the lock, and see each one's limit.
+
+### Redis, in one sitting
+
+<Term w="Redis">An in-memory data structure server: a separate program that holds keys mapped to strings, hashes, lists, sets, sorted sets and more, in RAM, and answers commands over a TCP connection. Used as a cache, a queue, a rate limiter, a session store.</Term> is a program you run next to your servers. You connect over TCP and send short text commands: `SET k v EX 60`, `GET k`, `INCR counter`, `ZADD leaderboard 42 alice`. It keeps everything in RAM, so a command is usually a few microseconds of work, and the round trip over the network or loopback dominates (roughly 0.1 ms on one machine; measure it in the Build).
+
+Four things make it what it is.
+
+**It's single-threaded where it matters.** Redis executes commands one at a time on one thread, with an <Term w="event loop">A single loop that runs ready work one piece at a time and, when nothing is ready, sleeps until the OS reports that some socket or timer is ready.</Term> just like the one you built in [Waiting vs working](/lessons/waiting-vs-working/): it asks the kernel (epoll on Linux) which client sockets have commands waiting, runs each command to completion, writes the reply, repeat. Since Redis 6, extra threads can help read and write sockets, but command execution stays on one thread. Two big consequences. Every command is <Term w="atomic">Happens all at once or not at all, with nothing else interleaved. No other client can see a half-done INCR.</Term> for free: `INCR` can't race with another `INCR`, because nothing runs at the same time. And one slow command (`KEYS *` on ten million keys, a huge `SORT`) blocks every other client, exactly like a blocking call in an `async def`. Redis is fast because each command is tiny, not because it does many at once.
+
+**It stores data structures, not just strings.** <Term w="hash" label="Redis hash">A Redis value that is itself a small map of field → value, like a Python dict stored under one key.</Term>es, lists (queues), sets, <Term w="sorted set">A set where each member has a score, kept ordered by score. Leaderboards, priority queues, sliding-window rate limiters.</Term>s, streams (append-only logs), plus counters, bitmaps and HyperLogLog (approximate counting of distinct items). That's why it's used for far more than caching: the [rate limiter](/lessons/rate-limits/) you built could live in Redis and be shared by every replica.
+
+**It expires and evicts.** Any key can carry a TTL. Expired keys are removed lazily (when someone touches one) and by a background job that samples keys with TTLs several times a second. When memory hits the `maxmemory` limit, `maxmemory-policy` decides what happens. The default, `noeviction`, refuses new writes with an error, which is right for a database and wrong for a cache. For a cache you set `allkeys-lru` or `allkeys-lfu`. Redis's LRU is approximate: it samples a few keys (5 by default) and evicts the best candidate among them, which in practice is close to true LRU and saves two pointers per key.
+
+**It can survive a restart, if you ask.** Two <Term w="persistence">Saving in-memory data to disk so it survives a restart. Redis offers snapshots (RDB), an append-only log (AOF), both, or neither.</Term> options, both built on things you've seen. **RDB snapshots**: Redis calls `fork()`; the child process writes the whole dataset to a file while the parent keeps serving, and the kernel's copy-on-write from [Virtual memory](/lessons/virtual-memory/) means they share memory pages until the parent modifies one. A crash loses everything since the last snapshot. **AOF**: every write command is appended to a log, and `appendfsync` (`always`, `everysec`, or `no`) decides how often it's `fsync`ed, the same durability-for-speed trade from [What happens when you save a file?](/lessons/files-and-disks/). For a pure cache, you can turn persistence off: losing a cache costs time, not data. That's the property to protect. **A cache must be safe to lose.** If deleting your Redis loses something that exists nowhere else, it's a database, and should be treated as one.
+
+A note on the name: in 2024 Redis changed to a more restrictive license, and the Linux Foundation forked the last open-source version as Valkey, which major clouds now offer; Redis later added an AGPL option. For your purposes they speak the same protocol and the same commands. Check the current state if it matters for work.
+
+### Caching LLM responses
+
+Now the case you actually care about. Two very different caches go by the name "prompt caching", so first, a separation.
+
+The [prefix cache](/lessons/prefix-caching/) reuses the **KV cache** for the shared beginning of prompts, inside the GPU. The model still runs and still generates every output token; it just skips recomputing attention for tokens it has seen. It's exact by construction and works for partially matching prompts.
+
+A **response cache** sits in front of the server and skips the model entirely. It returns the stored text of a previous answer. That's thousands of times cheaper on a hit, and it only works when the whole request matches. The question that decides whether it's correct is the one from the top of the lesson: **what is the key?**
+
+**Exact-match caching.** The key is a hash of everything that can change the output. Not the prompt. Everything:
+
+- the model ID **and its revision** (weights hash, checkpoint path, or a version you bump),
+- the chat template or prompt-template version, and any system prompt your server adds,
+- all of `messages`, in order, and any tools or response format,
+- every sampling parameter: `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`, penalties.
+
+Turn that into a canonical string (JSON with sorted keys and no whitespace, so the same request always gives the same bytes) and hash it with SHA-256: `llm:v1:` plus 64 hex characters. On this Mac, hashing a request with a 2,000-character prompt took about 5 µs. Free.
+
+Why so paranoid? Every field you leave out is a bug from the Problem. Leave out `max_tokens`, and a request for 16 tokens gets served a stored 512-token answer (or worse, the reverse: a truncated answer for someone who wanted the whole thing). Leave out the model revision, and you evaluate the old model forever.
+
+<Predict id="temperature-key">
+
+Your cache key includes temperature. A user sends the same prompt five times at temperature 0.8, hoping for five different brainstorm ideas. What do they get from an exact-match cache? Is that a bug?
+
+<Fragment slot="answer">
+
+They get the same answer five times: the first sample, stored and replayed. Including temperature in the key keeps them from getting a temperature-0 answer, but it can't give them fresh randomness, because the cache's whole job is to return the stored result.
+
+Whether that's a bug depends on what the request means. At temperature 0, the request asks for "the most likely answer", and replaying it is correct (it's even *more* consistent than the GPU, where greedy decoding can differ slightly between runs because batching changes the order of floating-point additions). At temperature 0.8, the request asks for "a sample from the distribution". A cache turns a distribution into a single point. Five calls are no longer five independent samples, and anything that relies on that (best-of-n, self-consistency voting, pass@k evals, brainstorming) silently breaks.
+
+The usual policies: only cache when temperature is 0 (or a `seed` is set, so the request is really asking for one specific sample, and put the seed in the key); or let callers opt out with a header; or store several samples per key and hand them out in turn. Pick one on purpose.
+
+</Fragment>
+
+</Predict>
+
+A few more rules for the response cache:
+
+- **Only store complete, successful answers.** Not errors, not timeouts, not a stream that broke because the client hung up halfway. Check `finish_reason`.
+- **Streaming still works.** On a hit, replay the stored text as SSE events, so clients don't need to know. Time to first token on a hit becomes a millisecond, which will look wonderful on your [scoreboard](/lessons/baseline-vs-fireworks/) and mean nothing about the model. Label cached runs separately.
+- **Mind privacy.** If one user's conversation contains their own data, a shared cache keyed only on the text can only return that answer to someone who sent exactly the same text, which is fine. The danger comes with the next idea.
+
+**Semantic caching.** Exact match misses "What's the capital of France?" when the cached prompt was "what is the capital of france". A <Term w="semantic cache">A cache that matches requests by meaning instead of exact bytes: embed the prompt, find the most similar cached prompt, and if the similarity is above a threshold, return its answer.</Term> embeds each prompt into a vector (an <Term w="embedding">A list of numbers (a vector) produced by a model so that texts with similar meaning land close together. Closeness is usually measured by cosine similarity.</Term>, the same machinery as your bi-encoder retrieval work), searches the cached prompts for the nearest one (with the tools from [Nearest neighbors at scale](/lessons/vector-search/)), and returns its answer if the <Term w="cosine similarity">A score from -1 to 1 for how closely two vectors point the same way. 1 means identical direction. Most sentence embeddings of real text score between about 0 and 1.</Term> is above a threshold like 0.9.
+
+It raises hit rate on paraphrases. It also returns wrong answers, confidently, and you can see why from your ranking work: an embedding model is trained so that texts *about the same thing* land close together. I checked a few pairs with `all-MiniLM-L6-v2`, a popular small embedding model. "Is ibuprofen safe during pregnancy?" vs "Is ibuprofen unsafe during pregnancy?": 0.979. "Convert 5 miles to km" vs "Convert 5 km to miles": 0.987. "What is 2+2?" vs "What is 2+3?": 0.887. Meanwhile real paraphrases like "What is the capital of France?" vs "France's capital city?" scored 0.918, and "How many kilometers is 5 miles?" only 0.825 against the miles-to-km prompt. Topic similarity is not answer equivalence. Your cross-encoder exists precisely because bi-encoder similarity is a rough signal.
+
+<Figure n="006" title="WHERE A SEMANTIC CACHE GOES WRONG" caption="Real cosine similarities from all-MiniLM-L6-v2, measured on this Mac, against the cached prompt 'Convert 5 miles to km'. The question with the opposite answer scores 0.987. Two honest paraphrases score 0.81-0.83. Any threshold that lets the paraphrases hit also lets the impostor hit, and the impostor is closer than either.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Similarity scale showing a wrong question scoring higher than paraphrases">
+  <text x="10" y="20" class="strong">CACHED: "Convert 5 miles to km" → "8.05 km"</text>
+  <line x1="40" y1="130" x2="620" y2="130" class="ink" stroke-width="1.2" />
+  <line x1="40" y1="124" x2="40" y2="136" class="ink" stroke-width="1" />
+  <text x="40" y="152" text-anchor="middle">0.70</text>
+  <line x1="185" y1="124" x2="185" y2="136" class="ink" stroke-width="1" />
+  <text x="185" y="152" text-anchor="middle">0.80</text>
+  <line x1="330" y1="124" x2="330" y2="136" class="ink" stroke-width="1" />
+  <text x="330" y="152" text-anchor="middle">0.90</text>
+  <line x1="475" y1="124" x2="475" y2="136" class="ink" stroke-width="1" />
+  <text x="475" y="152" text-anchor="middle">0.95</text>
+  <line x1="620" y1="124" x2="620" y2="136" class="ink" stroke-width="1" />
+  <text x="620" y="152" text-anchor="middle">1.00</text>
+  <text x="620" y="170" text-anchor="end">COSINE SIMILARITY →</text>
+  <circle cx="202" cy="130" r="5" class="fill-paper" stroke-width="1.4" />
+  <circle cx="221" cy="130" r="5" class="fill-paper" stroke-width="1.4" />
+  <line x1="211" y1="122" x2="160" y2="70" class="ink" stroke-width="1" />
+  <text x="40" y="44">"5 miles in kilometers?" 0.812</text>
+  <text x="40" y="60">"How many km is 5 miles?" 0.825</text>
+  <text x="40" y="76" class="blue-t">SAME ANSWER: SHOULD HIT</text>
+  <circle cx="601" cy="130" r="6" class="fill-blue" />
+  <line x1="601" y1="122" x2="560" y2="70" class="ink" stroke-width="1" />
+  <text x="620" y="44" text-anchor="end" class="strong">"Convert 5 km to miles" 0.987</text>
+  <text x="620" y="60" text-anchor="end" class="strong">WRONG ANSWER: MUST MISS</text>
+  <rect x="185" y="190" width="435" height="18" class="fill-wash" stroke-width="1" />
+  <text x="192" y="203">THRESHOLD 0.80: BOTH PARAPHRASES HIT, AND SO DOES THE IMPOSTOR</text>
+  <rect x="475" y="218" width="145" height="18" class="fill-wash" stroke-width="1" />
+  <text x="470" y="231" text-anchor="end">THRESHOLD 0.95: ONLY THE IMPOSTOR HITS</text>
+</svg>
+</Figure>
+
+Use semantic caching only where a near-miss answer is harmless (FAQ bots with fixed answers, say), keep the threshold high, scope it per user or per tenant (otherwise a near match can hand one customer's answer to another), and measure the false-hit rate on real traffic before trusting it. Exact match is boring and correct. You'll find a failure yourself in the Build.
+
+## Build It
+
+All of this goes in a new folder next to your inference project:
+
+```text
+inference/
+  server_naive.py        # from the baseline lesson, unchanged
+  bench.py               # from the baseline lesson
+  cache/
+    lru.py               # Task 1: LRU + TTL, by hand
+    test_lru.py
+    keys.py              # Task 2: the cache key
+    proxy.py             # Task 2: cache-aside proxy in front of the server
+    make_zipf.py         # Task 3: workload generator
+    stampede.py          # Task 4
+    semantic.py          # Task 5
+```
+
+<Task id="t0" title="Get Redis running" agent="ok">
+
+On the Spark (ARM64; the official image is multi-arch), or on your Mac with Docker Desktop:
+
+```bash
+docker run -d --name redis -p 6379:6379 redis:7 \
+  redis-server --save "" --appendonly no --maxmemory 512mb --maxmemory-policy allkeys-lru
+pip install redis httpx fastapi uvicorn pytest
+docker exec -it redis redis-cli ping                     # PONG
+docker exec -it redis redis-cli SET hello world EX 10
+docker exec -it redis redis-cli TTL hello                # counts down from 10
+docker exec -it redis redis-benchmark -q -t get,set -n 100000
+```
+
+The flags make it a pure cache: no snapshots, no AOF, 512 MB cap, evict least recently used. `apt install redis-server` works too if you'd rather not use Docker; set the same options in `/etc/redis/redis.conf`.
+
+Write down the `redis-benchmark` numbers (requests per second for GET and SET). Then run it again with `-P 16` (pipelining: 16 commands sent before waiting for replies) and compare. The difference is the round trip, which is the real cost of a Redis call.
+
+</Task>
+
+<Task id="t1" title="An LRU cache with TTL, by hand, with tests" agent="hands">
+
+No `OrderedDict`, no `functools`. A dict and your own doubly linked list, as in Figure 004. The clock is injectable so tests can move time without sleeping.
+
+```python
+# cache/lru.py
+import time
+from typing import Any, Callable, Hashable
+
+class _Node:
+    __slots__ = ("key", "value", "expires_at", "prev", "next")
+    ...
+
+class LRUCache:
+    def __init__(self, capacity: int, default_ttl: float | None = None,
+                 clock: Callable[[], float] = time.monotonic):
+        """capacity >= 1. default_ttl in seconds, None = never expires.
+        Set up the map and two sentinel nodes (head, tail) linked to each other.
+        Counters: hits, misses, evictions, expirations."""
+        ...
+
+    def _unlink(self, node: _Node) -> None: ...
+    def _push_front(self, node: _Node) -> None: ...
+
+    def get(self, key: Hashable, default: Any = None) -> Any:
+        """Miss -> default. Expired -> remove, count, default. Hit -> move to front."""
+        ...
+
+    def set(self, key: Hashable, value: Any, ttl: float | None = None) -> None:
+        """Insert or overwrite at the front. ttl overrides default_ttl.
+        Over capacity -> evict the node just before tail."""
+        ...
+
+    def __len__(self) -> int: ...
+```
+
+Then the tests. Two to get you started; the rest are yours.
+
+```python
+# cache/test_lru.py
+from lru import LRUCache
+
+class FakeClock:
+    def __init__(self): self.t = 0.0
+    def __call__(self): return self.t
+
+def test_evicts_least_recently_used():
+    c = LRUCache(2)
+    c.set("a", 1); c.set("b", 2)
+    assert c.get("a") == 1          # a is now most recent
+    c.set("c", 3)                   # so b is evicted, not a
+    assert c.get("b") is None and c.get("a") == 1 and c.get("c") == 3
+
+def test_ttl_expires():
+    clk = FakeClock()
+    c = LRUCache(10, default_ttl=5, clock=clk)
+    c.set("a", 1)
+    clk.t = 4.9; assert c.get("a") == 1
+    clk.t = 5.0; assert c.get("a") is None
+    assert len(c) == 0              # expired entries are actually removed
+```
+
+Write at least these: overwriting an existing key moves it to the front (and doesn't grow the cache); a per-key `ttl` overrides the default; storing `None` as a value is distinguishable from a miss (use a sentinel `default`); capacity 1 works; the counters are right after a known sequence. Then the one that catches real bugs: a **randomized test** that runs 20,000 random `get`/`set` operations on keys 0-19 against your cache and against a reference `OrderedDict` implementation (10 lines), asserting they agree after every step.
+
+Hints: with sentinels, `_unlink` is two lines and `_push_front` is four. The most common bug is forgetting to delete from the map when you evict or expire, which the randomized test finds within a few hundred operations. Run with `pytest -q`.
+
+</Task>
+
+<Task id="t2" title="Redis in front of your server: exact-match prompt caching" agent="hands">
+
+Write the key function first. It's ten lines and it's where all the correctness lives.
+
+```python
+# cache/keys.py
+import hashlib, json
+
+KEY_VERSION = "v1"          # bump when the response format or template changes
+
+def cache_key(body: dict, model_revision: str) -> str:
+    """Return 'llm:{KEY_VERSION}:<sha256 hex>' for a chat request body.
+    Include everything that changes the output: model + revision, messages,
+    every sampling parameter (fill in defaults so a missing field and its
+    default value give the same key), max_tokens, stop, seed, tools.
+    Exclude things that don't: stream, request ids, user agent.
+    Canonicalise with json.dumps(..., sort_keys=True, separators=(",", ":"))."""
+    ...
+
+def cacheable(body: dict) -> bool:
+    """Your policy from the temperature Predict. Start with: temperature == 0
+    or a seed is given."""
+    ...
+```
+
+Test it: same request with keys in a different order gives the same key; changing `temperature`, `max_tokens`, one character of a message, or the model revision gives a different key; adding `"stream": true` does not.
+
+Now the proxy. It listens on 8001, forwards to your server on 8000, and does cache-aside. The plumbing (forwarding a stream and replaying one) is boilerplate:
+
+```python
+# cache/proxy.py (scaffolding)
+import json, os
+import httpx, redis.asyncio as aioredis
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
+from keys import cache_key, cacheable
+
+UPSTREAM = os.environ.get("UPSTREAM", "http://127.0.0.1:8000")
+MODEL_REVISION = os.environ.get("MODEL_REVISION", "base")
+TTL = int(os.environ.get("CACHE_TTL", str(3 * 24 * 3600)))
+
+app = FastAPI()
+r = aioredis.Redis(host=os.environ.get("REDIS_HOST", "127.0.0.1"), port=6379)
+client = httpx.AsyncClient(timeout=None)
+
+async def replay(lines: list[str]):
+    """Yield stored SSE lines exactly as the server sent them."""
+    for line in lines:
+        yield line + "\n\n"
+
+async def forward(body: dict, collected: list[str]):
+    """Stream from upstream to the client, appending each 'data: ...' line to collected."""
+    async with client.stream("POST", f"{UPSTREAM}/v1/chat/completions", json=body) as resp:
+        async for line in resp.aiter_lines():
+            if line.startswith("data:"):
+                collected.append(line)
+                yield line + "\n\n"
+```
+
+The endpoint is yours:
+
+```python
+@app.post("/v1/chat/completions")
+async def chat(req: Request):
+    body = await req.json()
+    # 1. not cacheable -> just forward (header x-cache: bypass)
+    # 2. key = cache_key(...); stored = await r.get(key)
+    #    hit  -> StreamingResponse(replay(json.loads(stored)), headers={"x-cache": "hit"})
+    # 3. miss -> stream forward(...) to the client; when the stream ends, if the last
+    #    chunk had a finish_reason and you saw "data: [DONE]", store the lines with
+    #    await r.set(key, json.dumps(lines), ex=TTL)   (add jitter!)
+    #    headers={"x-cache": "miss"}
+    # 4. if Redis is down or slow (wrap calls in a short timeout), treat it as a miss
+    #    and serve from upstream anyway. A cache outage must not be a site outage.
+    ...
+```
+
+Hints: the "store after the stream ends" step belongs at the end of a wrapper async generator around `forward`, so it runs only if the client stayed to the end. Use `asyncio.wait_for(r.get(key), 0.05)` for the Redis timeout. Run with `uvicorn proxy:app --port 8001`, send the same curl twice, and check the `x-cache` header and the timing (`curl -w "%{time_total}\n"`). Then `redis-cli --scan --pattern 'llm:*'` and `redis-cli TTL <key>`.
+
+</Task>
+
+<Task id="t3" title="A Zipf workload: hit rate vs cache size, p50 and p99" agent="review">
+
+The generator is boilerplate:
+
+```python
+# cache/make_zipf.py: N distinct prompts, R requests, popularity ~ 1/rank^s
+import json, random, sys
+N, R, S, SEED = 500, 1000, 1.0, 0
+rng = random.Random(SEED)
+topics = ["sorting", "TCP", "Redis", "the GIL", "B-trees", "attention", "LoRA", "DNS",
+          "mmap", "consistent hashing"]
+prompts = [f"In two sentences, explain {topics[i % 10]} to a new engineer. (variant {i})"
+           for i in range(N)]
+weights = [1 / (k + 1) ** S for k in range(N)]
+with open(sys.argv[1] if len(sys.argv) > 1 else "zipf.jsonl", "w") as f:
+    for idx in rng.choices(range(N), weights=weights, k=R):
+        f.write(json.dumps({"id": idx, "messages": [{"role": "user", "content": prompts[idx]}],
+                            "max_tokens": 32, "temperature": 0}) + "\n")
+```
+
+Then yours, in three parts.
+
+1. **Simulate.** Feed the same request sequence (just the `id`s) through your `LRUCache` at capacities 10, 25, 50, 100, 250, 500 and print the hit rate for each. This takes milliseconds and is your prediction.
+2. **Run it for real.** Add an in-process tier to the proxy (env `LOCAL_CAPACITY`: if set, use your `LRUCache` with that capacity instead of Redis) so capacity is measured in entries, not bytes. Point your harness from the baseline lesson at port 8001, concurrency 4, and record per-request latency and the `x-cache` header. Do capacity 50 and 250, plus a no-cache baseline on the first 200 requests. Each miss is about 2-3 seconds of GPU with `max_tokens` 32, so a run is tens of minutes; if you want the whole curve fast, point `UPSTREAM` at the fake slow LLM from [Waiting vs working](/lessons/waiting-vs-working/) instead and keep the real GPU for two points.
+3. **Then Redis.** One run through Redis (no `LOCAL_CAPACITY`), and check `redis-cli INFO stats` for `keyspace_hits` and `keyspace_misses`.
+
+Have an agent review your harness changes for the classic mistakes: measuring latency from when the request was *sent* rather than when it was *meant* to be sent ([coordinated omission](/lessons/tail-latency/)), and counting the first request for each prompt as anything other than a compulsory miss.
+
+</Task>
+
+<Task id="t4" title="Cause a stampede, then coalesce it" agent="hands">
+
+Use a fake upstream so you can count calls: a tiny FastAPI app that sleeps 2 seconds per request, increments a counter, and serves the counter at `/stats`. Point the proxy's `UPSTREAM` at it. Then:
+
+```python
+# cache/stampede.py
+# 1. send one request for the hot prompt (fills the cache), with CACHE_TTL=5 on the proxy
+# 2. sleep 5.5 s so it expires
+# 3. fire 200 concurrent identical requests with asyncio.gather + httpx
+# 4. print: upstream calls during the burst (from /stats), p50 and max latency
+```
+
+Without protection, expect about 200 upstream calls. Now add coalescing to the proxy: a module-level `inflight: dict[str, asyncio.Future]`. On a miss, if the key is in `inflight`, await that future and replay its result; otherwise create the future, do the upstream call, store in Redis, set the future's result, and remove the key from `inflight` in a `finally`. (Waiters need the full response, not the live stream; the simplest version buffers the first caller's stream into the future.)
+
+Rerun: one upstream call. Then run the proxy with `uvicorn proxy:app --port 8001 --workers 4` and rerun. Predict the count before you look. Then fix it across processes with a Redis lock: `await r.set(f"lock:{key}", token, nx=True, px=10_000)`. The winner computes; the others poll the cache every 50 ms until the value appears (or the lock expires and they try to take it themselves). Rerun with 4 workers.
+
+Finally, latency: with coalescing, all 200 requests wait on the one call, so each takes about 2 seconds. Against the real one-at-a-time GPU server without coalescing, the last of them would wait about 200 × 2 s = 400 s.
+
+</Task>
+
+<Task id="t5" title="A semantic cache, and a wrong answer" agent="explain">
+
+`pip install sentence-transformers` and use a small embedding model (`all-MiniLM-L6-v2` is the usual starting point, or your own bi-encoder from work). Build the simplest semantic cache: a list of (normalized embedding, prompt, answer); `lookup(prompt, threshold)` embeds the prompt, takes the dot product with every stored embedding, and returns the best answer if it's above the threshold.
+
+Then build a small test set of about 30 pairs, half of each kind:
+
+- **Paraphrases** (should hit): "what's the capital of France" / "France's capital city?".
+- **Traps** (must not hit): swap one entity (Austria/Australia, Java the island/Java the language), flip a negation ("safe"/"not safe"), swap units or direction ("5 miles in km"/"5 km in miles"), change a number ("2+2"/"2+3").
+
+For thresholds 0.80, 0.85, 0.90, 0.95, report the fraction of paraphrases that hit and the fraction of traps that hit. Find at least one trap that hits at a threshold where most paraphrases still miss. An agent can explain the embedding library or cosine math; the test set and the conclusions are yours.
+
+</Task>
+
+<DoneWhen>
+
+- `pytest -q` passes for `test_lru.py`, including the randomized comparison against `OrderedDict`.
+- A repeated temperature-0 request through the proxy returns `x-cache: hit` in a few milliseconds, and changing `temperature`, `max_tokens` or `MODEL_REVISION` produces a miss.
+- Stopping Redis (`docker stop redis`) makes the proxy slower, not broken.
+- The results tables below are filled in, and the simulated and measured hit rates agree within a couple of points.
+- The stampede test shows ~200 upstream calls before, 1 with coalescing in one process, and 1 with the Redis lock across 4 workers.
+- You have a semantic-cache trap pair, with its similarity score, that returns a wrong answer.
+
+</DoneWhen>
+
+## Measure
+
+**Redis itself.** From Task 0:
+
+| Measurement | Your number |
+| --- | --- |
+| `redis-benchmark` GET, requests/s, no pipelining | |
+| Same with `-P 16` | |
+| One `GET` round trip from Python (`time.perf_counter` around `await r.get`) | |
+
+Expect tens of thousands to a couple hundred thousand requests per second without pipelining, several times more with it, and a single Python round trip on the order of 0.1-0.3 ms. The gap between the first two rows is the round trip: Redis does far more commands per second than one connection can feed it one at a time. That's the [latency vs bandwidth](/lessons/latency-numbers/) distinction again.
+
+**Hit rate vs cache size.** 500 distinct prompts, 1,000 requests, s = 1.0:
+
+| Capacity | Simulated (your LRU) | Measured through proxy | Ideal (top-k share) |
+| --- | --- | --- | --- |
+| 10 | | | 0.43 |
+| 25 | | | 0.56 |
+| 50 | | | 0.66 |
+| 100 | | | 0.76 |
+| 250 | | | 0.90 |
+| 500 | | | 1.00 |
+
+For reference, my simulation of this exact setup, but with 2,000 requests instead of 1,000 (seed 0), gave LRU hit rates of 0.24, 0.39, 0.52, 0.64, 0.78 and 0.81. With 1,000 requests, yours will be a bit lower, because compulsory misses are a bigger share of a shorter run. Look at the last row: even a cache big enough for every prompt can't beat 1 minus (distinct prompts seen / requests). In my 2,000-request run 373 distinct prompts appeared, so the ceiling was 1 − 373/2,000 = 0.81. Your measured hit rate should match the simulation within a couple of points; at concurrency 4 the order of arrivals shifts slightly. If it doesn't match, your key function is wrong (two requests that should share a key don't).
+
+**Latency.**
+
+| Config | Hit rate | p50 | p99 | Mean | Prediction (from h · t_hit + (1 − h) · t_miss) |
+| --- | --- | --- | --- | --- | --- |
+| No cache (first 200 requests) | 0 | | | | |
+| Local LRU, capacity 50 | | | | | |
+| Local LRU, capacity 250 | | | | | |
+| Redis | | | | | |
+
+What you should see: p50 collapses to milliseconds once the hit rate passes 50%, and p99 stays at miss latency, as the p50/p99 Predict said. Two things to check in your numbers. First, the mean should roughly match the formula, but **misses with the cache on are faster than without it**: at concurrency 4 behind the GPU lock, a miss waits behind other misses, and with half the requests answered from cache, the queue is shorter. Caching helps the misses indirectly by taking load off the bottleneck. Second, the Redis hit p50 should be a millisecond or two higher than the local LRU's, which is the network round trip plus the Python client, and almost always worth it for a cache shared by every replica.
+
+**Stampede.**
+
+| Setup | Upstream calls | p50 latency | Max latency |
+| --- | --- | --- | --- |
+| No protection, 1 worker | | | |
+| Coalescing, 1 worker | | | |
+| Coalescing, 4 workers | | | |
+| Redis lock, 4 workers | | | |
+
+I ran a stripped-down version of this on my Mac (1,000 concurrent asyncio tasks, a 200 ms fake backend): 1,000 backend calls without coalescing, exactly 1 with it, and the same wall time for both, because the fake backend had unlimited parallelism. Your fake upstream doesn't serialise either, so the latency difference will be small; the call count is the point. Against the real GPU server, which runs one request at a time, those 200 calls would mean the last request waits about 200 × 2 s, nearly 7 minutes, for an answer that was ready after 2 seconds. With 4 workers and in-process coalescing you'll see 4 calls (one per process), which is the limit of the in-process fix.
+
+**Semantic cache.**
+
+| Threshold | Paraphrases that hit | Traps that hit (wrong answers) |
+| --- | --- | --- |
+| 0.80 | | |
+| 0.85 | | |
+| 0.90 | | |
+| 0.95 | | |
+
+You should find that the two columns fall together as the threshold rises, and that some trap pairs score higher than some paraphrase pairs. When that happens no threshold separates them, and that's the finding: similarity measures topic, not whether the answer is the same.
+
+## Break It
+
+**1. Drop a field from the key.** Remove `max_tokens` from `cache_key`. Send a prompt with `max_tokens: 8`, then the same prompt with `max_tokens: 256`. The second user gets the 8-token answer, from cache, in a millisecond. Now make `cache_key` ignore `model_revision`, run a few eval prompts, then restart the server with a different model (any other small instruct model will do) and run them again. Every answer comes back from the old model, and the scores don't move. This is the most common cache bug in ML infrastructure, and the fix is the version-in-the-key discipline, not a better TTL.
+
+**2. Make every key expire at once.** Warm the cache with 200 prompts in a burst with a fixed TTL of 60 seconds and no jitter, then send steady traffic over those prompts. At the 60-second mark the hit rate falls off a cliff and the upstream sees a wall of misses. Add ±10% jitter and rerun: the misses spread out over 12 seconds instead of arriving together.
+
+**3. Fill Redis with `noeviction`.** Restart Redis with `--maxmemory 2mb --maxmemory-policy noeviction` and run the workload. Writes start failing with an error like `OOM command not allowed when used memory > 'maxmemory'`. Does your proxy still serve the request (it should: a failed cache write is not a failed request), or does it return 500? Then switch to `allkeys-lru` and watch `evicted_keys` climb in `INFO stats` instead.
+
+**4. Scan through a small LRU.** Run a cyclic workload: prompts 1, 2, ..., 60, 1, 2, ..., 60, with a local LRU capacity of 50. The hit rate is zero. Not low: zero. Each prompt is evicted just before it comes back, because the 50 most recently used are always the 50 you won't need next. Increase capacity to 60 and it jumps to nearly 100%. It's the same failure the prefix cache lesson found with round-robin system prompts, and it's why databases and LFU/ARC-style caches treat one-time scans specially.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Why do caches work at all, and when don't they?</summary>
+
+Because requests repeat, and unevenly. Recently used things tend to be used again soon (temporal locality), and popularity is lopsided (Zipf): a few items get a large share of all requests, so a cache holding a small fraction of items can answer a large fraction of requests. They don't work when requests rarely repeat (unique prompts, uniform popularity: hit rate is just cache size over the number of items), when a hit isn't much cheaper than a miss, or when the data changes faster than you can tolerate stale copies. First check how often your requests actually repeat.
+
+</details>
+
+<details>
+<summary>2. Your cache has a 90% hit rate. Your boss wants it faster. Is 95% a small improvement?</summary>
+
+No, it's about 2x. With hits nearly free and misses expensive, the average latency is about miss rate times miss cost. Going from 10% misses to 5% halves it. Going to 1% cuts it 10x. Think in miss rate. And separately: p50 is already at hit speed with 90% hits, and p99 is at miss speed until the miss rate goes below 1%. So if the complaint is about the tail, the hit rate has to go to 99%+, or the misses themselves have to get faster.
+
+</details>
+
+<details>
+<summary>3. How would you cache LLM responses, and what has to be in the key?</summary>
+
+Cache-aside in front of the model server: hash a canonical serialization of the whole request, check Redis, on a miss call the model and store the complete answer with a long, jittered TTL. The key contains everything that changes the output: model and weights revision, prompt template version, the full messages and tools, and every sampling parameter (temperature, top_p, max_tokens, stop, seed). Only cache temperature-0 or seeded requests, because caching a sampled answer turns a distribution into one fixed sample. Only store complete successful responses. Make it fail open if Redis is down. Use coalescing so a popular prompt isn't computed many times at once. And keep it separate from prefix caching, which reuses KV inside the GPU and still runs the model; the response cache skips the model entirely but needs an exact match.
+
+</details>
+
+<details>
+<summary>4. What is a cache stampede and how do you prevent it?</summary>
+
+A hot key expires and every request that arrives before it's recomputed misses too, so the backend gets many identical expensive requests at once. On an inference server behind one GPU, that means hundreds of queued copies of the same generation. Fixes: request coalescing (singleflight), so only the first miss computes and others wait on its result; across processes, a short-lived lock in Redis with SET NX PX; jittered TTLs so keys don't expire together; stale-while-revalidate, which keeps serving the old value while one background refresh runs; or probabilistic early refresh before the TTL.
+
+</details>
+
+<details>
+<summary>5. You go from one inference server to 50 replicas and 10,000 requests a second. How does your cache design change?</summary>
+
+A per-process cache now has 50 separate copies with 1/50th the reuse each, so you want a shared tier: Redis (or Redis Cluster, which splits keys across nodes using 16,384 hash slots, so capacity and throughput grow with nodes). Then do the numbers. 10,000 requests a second is fine for a small Redis cluster, since one node does on the order of 100k simple operations a second. Memory: if responses average 2 KB and you want to keep 10 million of them, that's 20 GB plus overhead, a few nodes. Watch for hot keys: one popular prompt maps to one node, and a single key can saturate it; the fix is a small in-process cache on each replica in front of Redis (a two-tier cache) with a short TTL. Coalescing must work across machines (a lock in Redis), or one expiring hot key sends 50 copies to the GPUs. Make the whole thing fail open with tight timeouts, since a Redis outage must degrade to slower, not down. And route similar prompts to the same replicas anyway, for the prefix cache inside the GPU.
+
+</details>
+
+## Go Deeper
+
+- **Rajesh Nishtala et al., "Scaling Memcache at Facebook"**, NSDI 2013. The best real-world account of every problem in this lesson at enormous scale: invalidation across regions, leases to stop stale sets and stampedes, cold clusters, hot keys.
+- **Redis docs: "Key eviction" and "Redis persistence"** (on redis.io). How `maxmemory-policy`, the sampled LRU and LFU actually work, and the honest trade-offs between RDB and AOF. Short and precise.
+- **Nimrod Megiddo and Dharmendra S. Modha, "ARC: A Self-Tuning, Low Overhead Replacement Cache"**, FAST 2003. A beautiful paper: how to get the benefits of both LRU and LFU, and adapt between them, in constant time per request.
+- **Lee Breslau, Pei Cao, Li Fan, Graham Phillips, Scott Shenker, "Web Caching and Zipf-like Distributions: Evidence and Implications"**, INFOCOM 1999. The measurement that showed web traffic follows Zipf and derived what that means for hit rate vs cache size.
+- **Andrea Vattani, Flavio Chierichetti, Keegan Lowenstein, "Optimal Probabilistic Cache Stampede Prevention"**, VLDB 2015. The XFetch algorithm: refresh early with a probability that makes the stampede vanish, with a one-line formula.
+- **Mark Nottingham, [RFC 5861: HTTP Cache-Control Extensions for Stale Content](https://www.rfc-editor.org/rfc/rfc5861)**, and **[RFC 9111: HTTP Caching](https://www.rfc-editor.org/rfc/rfc9111)**. Where `stale-while-revalidate` comes from, and the standard every browser and CDN cache follows.
+- **Go's [singleflight package](https://pkg.go.dev/golang.org/x/sync/singleflight)** and Brad Fitzpatrick's **groupcache**. About a hundred lines that are the canonical implementation of request coalescing. Read the source.
+- **GPTCache** (zilliztech/GPTCache on GitHub). A popular open-source semantic cache for LLMs. Read how it configures similarity thresholds and evaluation, with your Task 5 results in mind.
+
+## Connections
+
+This lesson is the application-level version of ideas you've met lower down: [How slow is slow?](/lessons/latency-numbers/) and [Why is NumPy 100x faster?](/lessons/cpu-caches/) (locality, the hardware caches), [What happens when you save a file?](/lessons/files-and-disks/) (the page cache, write-back, fsync, which reappear as Redis AOF), and [Virtual memory](/lessons/virtual-memory/) (the fork and copy-on-write behind Redis snapshots). Redis's single thread is the event loop from [Waiting vs working](/lessons/waiting-vs-working/), and a slow Redis command is the same mistake as a blocking call in an `async def`.
+
+On the inference side, it sits in front of the [prefix cache](/lessons/prefix-caching/): one skips the model, the other skips part of the prompt, and both live or die by their key. [p99 and load testing](/lessons/tail-latency/) explains why the cache barely moves your tail. [Load balancers and state](/lessons/load-balancing/) is why a shared Redis beats 50 private dicts, and [Rate limits and backpressure](/lessons/rate-limits/) is the other half of protecting a GPU from a flood: a stampede is a flood you caused yourself. Next in the Data track, [Nearest neighbors at scale](/lessons/vector-search/) is the machinery a semantic cache runs on, and [Queues and logs](/lessons/queues/) is where write-behind's "do it later" becomes a design of its own.

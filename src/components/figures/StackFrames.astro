@@ -1,0 +1,201 @@
+---
+// Step through a recursive C function call by call, watching frames push and pop.
+// Usage: <StackFrames />
+---
+<div class="sf" data-fig="stack-frames">
+  <div class="sf-cols">
+    <div class="sf-code-wrap">
+      <span class="label">Code</span>
+      <pre class="sf-code" aria-label="C source"></pre>
+    </div>
+    <div class="sf-stack-wrap">
+      <span class="label sf-hi">High addresses</span>
+      <div class="sf-stack" aria-live="polite"></div>
+      <span class="label sf-lo">Low addresses · stack grows down ↓</span>
+    </div>
+  </div>
+  <p class="sf-note"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="back">← Back</button>
+    <button class="btn" type="button" data-act="step">Step →</button>
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <label>n <input type="range" min="1" max="6" step="1" value="3" data-act="n" /> <output>3</output></label>
+  </div>
+  <div class="ctl">
+    <span>step <span class="readout" data-out="step">0</span></span>
+    <span>frames <span class="readout" data-out="depth">1</span></span>
+    <span>SP <span class="readout" data-out="sp">-</span></span>
+    <span>stack used <span class="readout" data-out="used">-</span></span>
+  </div>
+</div>
+
+<style>
+  .sf-cols { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+  .sf-code-wrap { flex: 1 1 260px; min-width: 0; }
+  .sf-stack-wrap { flex: 1 1 220px; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+  .sf-code {
+    margin: 6px 0 0; padding: 10px 0; font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+    background: var(--paper); border: 1px solid var(--rule); overflow-x: auto; color: var(--ink);
+  }
+  .sf-code :global(.ln) { display: block; padding: 0 12px; white-space: pre; border-left: 2px solid transparent; }
+  .sf-code :global(.ln.on) { background: var(--blue-wash); border-left-color: var(--blue); color: var(--blue); }
+  .sf-code :global(.ln i) { font-style: normal; color: var(--ink-3); display: inline-block; width: 1.6em; }
+  .sf-stack { display: flex; flex-direction: column; gap: 0; min-height: 120px; }
+  .sf-stack :global(.fr) {
+    border: 1px solid var(--ink); background: var(--paper); padding: 6px 10px; margin-top: -1px;
+    font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); line-height: 1.5;
+  }
+  .sf-stack :global(.fr b) { color: var(--ink); font-weight: 600; letter-spacing: 0.04em; }
+  .sf-stack :global(.fr.top) { border-color: var(--blue); background: var(--blue-fill); color: var(--ink); position: relative; }
+  .sf-stack :global(.fr.top b) { color: var(--blue); }
+  .sf-stack :global(.fr .row) { display: flex; justify-content: space-between; gap: 10px; }
+  .sf-stack :global(.fr .addr) { color: var(--ink-3); }
+  .sf-stack :global(.sp) { font-family: var(--mono); font-size: 11px; color: var(--blue); padding: 4px 0 0; letter-spacing: 0.06em; }
+  .sf-stack :global(.free) { border: 1px dashed var(--rule); padding: 6px 10px; margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+  .sf-hi, .sf-lo { font-size: 10px; }
+  .sf-note { margin: 14px 0 0; font-size: 15.5px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  type Frame = { fn: string; n?: number; rest?: number | null; s?: number | null; ret: string };
+  type Snap = { line: number; frames: Frame[]; note: string };
+
+  const CODE = [
+    'int sum(int n) {',
+    '  if (n == 0) return 0;',
+    '  int rest = sum(n - 1);',
+    '  return n + rest;',
+    '}',
+    '',
+    'int main(void) {',
+    '  int s = sum(N);',
+    '  printf("%d\\n", s);',
+    '}',
+  ];
+  const FRAME_BYTES = 32; // illustrative: n, rest, saved frame pointer, return address
+  const BASE = 0x7ffd5000; // illustrative starting address for the main frame
+
+  function build(N: number): Snap[] {
+    const out: Snap[] = [];
+    const st: Frame[] = [{ fn: 'main', s: null, ret: 'C runtime' }];
+    const snap = (line: number, note: string) => out.push({ line, frames: st.map((f) => ({ ...f })), note });
+    snap(8, 'main() is running. Its frame holds the local s (not set yet). Every running function has exactly one frame.');
+    const call = (n: number, from: string): number => {
+      st.push({ fn: 'sum', n, rest: null, ret: from });
+      snap(2, `Call sum(${n}): PUSH a new frame. The CPU saves where to come back to (${from}) and moves the stack pointer down by one frame.`);
+      if (n === 0) {
+        snap(2, 'n is 0, so this call can answer right away: return 0. No more calls. This is the deepest the stack gets.');
+        st.pop();
+        return 0;
+      }
+      snap(3, `sum(${n}) needs sum(${n - 1}) before it can finish, so it calls it. Its own frame waits, frozen, with n = ${n}.`);
+      const r = call(n - 1, `sum(${n}) line 3`);
+      st[st.length - 1].rest = r;
+      snap(4, `sum(${n - 1}) returned ${r}: its frame was POPPED (the stack pointer just moved back up). sum(${n}) resumes with rest = ${r}.`);
+      const v = n + r;
+      snap(4, `sum(${n}) returns ${n} + ${r} = ${v}. Its frame is about to be popped. Last in, first out.`);
+      st.pop();
+      return v;
+    };
+    const s = call(N, 'main line 8');
+    st[0].s = s;
+    snap(9, `Back in main with s = ${s}. Every sum frame is gone. Nobody "freed" anything: popping is just moving one pointer.`);
+    return out;
+  }
+
+  const hex = (x: number) => '0x' + x.toString(16);
+  const reduce = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="stack-frames"]').forEach((root) => {
+    const codeEl = root.querySelector<HTMLElement>('.sf-code')!;
+    const stackEl = root.querySelector<HTMLElement>('.sf-stack')!;
+    const noteEl = root.querySelector<HTMLElement>('.sf-note')!;
+    const nInput = root.querySelector<HTMLInputElement>('input[data-act="n"]')!;
+    const nOut = nInput.parentElement!.querySelector('output')!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-act="play"]')!;
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-out="${k}"]`)!;
+    let N = 3;
+    let snaps = build(N);
+    let i = 0;
+    let timer: number | undefined;
+
+    function renderCode(line: number) {
+      codeEl.innerHTML = '';
+      CODE.forEach((src, k) => {
+        const s = document.createElement('span');
+        s.className = 'ln' + (k + 1 === line ? ' on' : '');
+        const num = document.createElement('i');
+        num.textContent = String(k + 1);
+        s.appendChild(num);
+        s.appendChild(document.createTextNode(src.replace('N', String(N))));
+        codeEl.appendChild(s);
+      });
+    }
+
+    function render() {
+      const sn = snaps[i];
+      renderCode(sn.line);
+      stackEl.innerHTML = '';
+      sn.frames.forEach((f, k) => {
+        const d = document.createElement('div');
+        d.className = 'fr' + (k === sn.frames.length - 1 ? ' top' : '');
+        const addr = BASE - (k + 1) * FRAME_BYTES; // lowest address of this frame
+        const title = f.fn === 'main' ? 'main()' : `sum(${f.n})`;
+        const locals = f.fn === 'main'
+          ? `s = ${f.s ?? '?'}`
+          : `n = ${f.n}   rest = ${f.rest ?? '?'}`;
+        d.innerHTML = `<div class="row"><b>${title}</b><span class="addr">${hex(addr)}</span></div>` +
+          `<div>${locals}</div><div class="addr">return to: ${f.ret}</div>`;
+        stackEl.appendChild(d);
+      });
+      const sp = BASE - sn.frames.length * FRAME_BYTES;
+      const spEl = document.createElement('div');
+      spEl.className = 'sp';
+      spEl.textContent = '▲ stack pointer (SP) = ' + hex(sp);
+      stackEl.appendChild(spEl);
+      const free = document.createElement('div');
+      free.className = 'free';
+      free.textContent = 'unused stack (still reserved, up to ~8 MB)';
+      stackEl.appendChild(free);
+      noteEl.textContent = sn.note;
+      out('step').textContent = `${i} / ${snaps.length - 1}`;
+      out('depth').textContent = String(sn.frames.length);
+      out('sp').textContent = hex(sp);
+      out('used').textContent = `${sn.frames.length * FRAME_BYTES} B`;
+    }
+
+    function stop() {
+      if (timer !== undefined) clearInterval(timer);
+      timer = undefined;
+      playBtn.setAttribute('aria-pressed', 'false');
+      playBtn.textContent = 'Play';
+    }
+
+    root.querySelector('[data-act="step"]')!.addEventListener('click', () => { stop(); if (i < snaps.length - 1) i++; render(); });
+    root.querySelector('[data-act="back"]')!.addEventListener('click', () => { stop(); if (i > 0) i--; render(); });
+    root.querySelector('[data-act="reset"]')!.addEventListener('click', () => { stop(); i = 0; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer !== undefined) { stop(); return; }
+      if (reduce) { i = snaps.length - 1; render(); return; }
+      if (i >= snaps.length - 1) i = 0;
+      playBtn.setAttribute('aria-pressed', 'true');
+      playBtn.textContent = 'Pause';
+      render();
+      timer = window.setInterval(() => {
+        if (i >= snaps.length - 1) { stop(); return; }
+        i++;
+        render();
+      }, 1100);
+    });
+    nInput.addEventListener('input', () => {
+      stop();
+      N = Number(nInput.value);
+      nOut.textContent = String(N);
+      snaps = build(N);
+      i = 0;
+      render();
+    });
+    render();
+  });
+</script>

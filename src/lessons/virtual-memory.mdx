@@ -1,0 +1,698 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import VirtMemMapper from '../components/figures/VirtMemMapper.astro';
+
+## Today
+
+- Explain what a virtual address is, how the CPU turns it into a real RAM location (pages, page tables, the TLB), and why every process gets to believe it owns the whole machine.
+- Make `malloc` hand you 100 GB on a 48 GB laptop, then watch real memory (RSS) climb only as you touch it, one page fault at a time.
+- Read a process's memory like a doctor: VSZ vs RSS, anonymous vs file-backed, minor vs major faults, swap, `free`'s "available" column.
+- Trigger the Linux OOM killer on purpose, safely, inside a memory-limited container, and read its confession in the kernel log.
+- Explain copy-on-write after `fork`, why simply *reading* a Python list in a DataLoader worker makes memory grow, and what unified memory on the Spark means for loading a 70B model.
+
+Prerequisites: [Where do my variables live?](/lessons/stack-and-heap/) (the address space strip) and [Processes, threads, and the GIL](/lessons/processes-threads-gil/) (each process has its own address space; `fork` and DataLoader workers). Rough time: one evening on the Mac, one session on the Spark.
+
+## The Problem
+
+You want to try a 70B model on the Spark. Full bf16 weights are about 140 GB, which is more than the box's 128 GB, so you grab an 8-bit checkpoint: about 70 GB. Plenty of room. `free -h` says around 115 GB available. You write the obvious script:
+
+```python
+state = torch.load("llama-70b-int8.pt")   # read weights into memory
+model = build_model()
+model.load_state_dict(state)
+model.to("cuda")                           # move to the GPU
+```
+
+It runs for a few minutes. The disk light blinks. The desktop gets sluggish. Then the terminal prints one word and your prompt comes back:
+
+```text
+Killed
+```
+
+No Python traceback. No `MemoryError`. No `CUDA out of memory`. `echo $?` says `137`. Nothing in your code caught anything, because nothing in your code was ever told. Something outside your process decided it should stop existing.
+
+Three things here should bother you.
+
+1. Python never raised `MemoryError`. Every allocation it asked for *succeeded*. So who said no, and when?
+2. You had 115 GB available and needed 70 GB. Where did the rest go?
+3. `.to("cuda")` is supposed to put things on the GPU. Why would that use up memory the CPU needs?
+
+All three answers live in one idea: the addresses your program uses are not real. They're a story the kernel and the CPU tell each process, and the story has fine print. This lesson reads the fine print.
+
+<Origin year="1962" title="The Atlas computer and the one-level store">
+
+In the 1950s, programmers had a small, fast main memory and a big, slow drum. If your program didn't fit in main memory, you split it into pieces yourself and wrote code to swap the pieces in and out by hand, called "overlays". Some estimates had programmers spending half their time on this plumbing.
+
+The Atlas team at Manchester (Tom Kilburn and colleagues) had a radical idea: let the *machine* do it. Every program would see one big, uniform memory. Hardware would chop that memory into fixed-size pages, keep a table saying which pages were actually in core memory and which were on the drum, and when a program touched a page that wasn't in core, the hardware would stop, fetch it, and carry on. They called it the "one-level store". We call it virtual memory, and every phone, laptop and GPU server you've used since works this way.
+
+The OOM killer is the other end of the story. Unix systems made `fork` cheap by not copying memory until it was written, and Linux went further: it lets programs reserve more memory than exists, betting most of it will never be used. When the bet loses, something has to give. Since the late 1990s, the Linux answer has been a kernel routine that picks a process and kills it.
+
+</Origin>
+
+## The Idea
+
+### A hotel with fake room numbers
+
+Picture a hotel where every guest is told: "Your rooms are numbered 0 to 1,000,000. Use whichever you like." That's absurd, the hotel only has 500 rooms. But it works, because the front desk keeps a private book for each guest: "Guest A's room 7 is really room 212. Guest A's room 900,000 is really room 31." The guest never sees the book. They just walk to "room 7" and the desk silently sends them to 212. Most guests only ever use a handful of rooms, so 500 real rooms go a long way.
+
+And if a guest *reserves* rooms 1 through 50,000 and never visits them? The desk writes "reserved" in the book and assigns nothing. A real room is handed over only the first time the guest actually opens the door.
+
+That's virtual memory. The guest is your process, the fake room numbers are <Term w="virtual addresses">The addresses a program sees and uses. Every pointer in your program is one. They are translated into real RAM locations on every memory access, by hardware, using tables the kernel maintains.</Term>, the real rooms are <Term w="physical memory">The actual RAM chips. A physical address names a real location on a real memory chip.</Term>, the front desk is the CPU's <Term w="MMU">Memory management unit. Hardware in each CPU core that translates every virtual address into a physical one, using the current process's page table.</Term> plus the kernel, and the book is the page table.
+
+In [Where do my variables live?](/lessons/stack-and-heap/) you drew one process's memory as a long strip: code at the bottom, heap growing up, stack growing down, with a huge empty gap in the middle. That strip is the guest's view: room numbers. The gap costs nothing, because nobody's assigned a real room to it. In [Processes, threads, and the GIL](/lessons/processes-threads-gil/) you saw that address `0x10a3f2c0` in one process and the same address in another point at different RAM. That's just two guests, two books.
+
+### Pages: translating in chunks, not bytes
+
+Keeping a book entry for every single byte would be insane: the book would be bigger than the memory. So memory is translated in fixed-size chunks called <Term w="pages">Fixed-size, aligned chunks of virtual memory, the unit the OS and MMU translate, protect and move around. Typically 4 KB on x86 Linux.</Term>. Physical RAM is chopped into chunks of the same size called <Term w="frames" label="page frames">Page-sized slots of physical RAM. A virtual page is mapped onto exactly one frame (or onto none, if it isn't in RAM).</Term>. The book only needs one entry per page.
+
+Page size depends on the machine:
+
+| Machine | Page size | Offset bits |
+| --- | --- | --- |
+| x86-64 Linux (most servers) | 4 KB | 12 |
+| Apple Silicon macOS (your Mac) | 16 KB | 14 |
+| ARM64 Linux | 4 KB, 16 KB or 64 KB, chosen when the kernel is built | 12, 14 or 16 |
+
+The Spark is ARM64 Linux, so its page size depends on how NVIDIA built DGX OS's kernel. Some NVIDIA ARM server kernels use 64 KB pages; I'm not sure which the Spark ships. Don't trust me, ask the machine: `getconf PAGESIZE`. On the Mac it prints `16384`. Write the Spark's number down, every calculation below depends on it.
+
+A virtual address splits cleanly in two. The low bits are the <Term w="offset">Which byte inside the page. With 4 KB pages, the low 12 bits (2^12 = 4096). This part is never translated.</Term>, the high bits are the <Term w="virtual page number">The address with the offset bits chopped off. It's the key looked up in the page table.</Term>. Translation swaps the page number for a frame number and keeps the offset as is.
+
+<Figure n="001" title="ONE ADDRESS, TRANSLATED" caption="A virtual address is a page number plus an offset. The TLB (a tiny cache of recent translations) answers in about a cycle. On a miss, the hardware walks the page table, four levels deep on x86-64, to find the frame. The offset is copied straight across. If the walk finds no valid entry, the CPU stops and asks the kernel: a page fault." wide>
+<svg viewBox="0 0 820 300" role="img" aria-label="Virtual address split into page number and offset, looked up in the TLB, then in a four level page table, producing a physical frame number plus the same offset">
+  <defs>
+    <marker id="vm-a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="24" class="strong">VIRTUAL ADDRESS (48 BITS USED, 4 KB PAGES)</text>
+  <rect x="20" y="34" width="300" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="170" y="56" text-anchor="middle" class="strong">PAGE NUMBER · 36 BITS</text>
+  <rect x="320" y="34" width="110" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="375" y="56" text-anchor="middle" class="strong">OFFSET · 12</text>
+  <line x1="95" y1="68" x2="95" y2="84" class="ink" stroke-width="1" />
+  <line x1="170" y1="68" x2="170" y2="84" class="ink" stroke-width="1" />
+  <line x1="245" y1="68" x2="245" y2="84" class="ink" stroke-width="1" />
+  <text x="57" y="98" text-anchor="middle">L4 · 9</text>
+  <text x="132" y="98" text-anchor="middle">L3 · 9</text>
+  <text x="207" y="98" text-anchor="middle">L2 · 9</text>
+  <text x="282" y="98" text-anchor="middle">L1 · 9</text>
+  <rect x="520" y="34" width="160" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="600" y="56" text-anchor="middle" class="strong">TLB</text>
+  <text x="600" y="74" text-anchor="middle">~1-3K recent pages</text>
+  <line x1="432" y1="44" x2="516" y2="44" class="blue" stroke-width="1.2" marker-end="url(#vm-a1)" />
+  <text x="470" y="38" text-anchor="middle" class="blue-t">LOOK UP</text>
+  <text x="700" y="56" class="blue-t">HIT: ~1 CYCLE</text>
+  <line x1="600" y1="90" x2="600" y2="250" class="blue" stroke-width="1.2" marker-end="url(#vm-a1)" />
+  <text x="610" y="124" class="blue-t">MISS: WALK</text>
+  <rect x="20" y="130" width="100" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="154" text-anchor="middle" class="strong">L4 TABLE</text>
+  <text x="70" y="172" text-anchor="middle">512 entries</text>
+  <rect x="150" y="130" width="100" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="200" y="154" text-anchor="middle" class="strong">L3 TABLE</text>
+  <text x="200" y="172" text-anchor="middle">512 entries</text>
+  <rect x="280" y="130" width="100" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="330" y="154" text-anchor="middle" class="strong">L2 TABLE</text>
+  <text x="330" y="172" text-anchor="middle">512 entries</text>
+  <rect x="410" y="130" width="100" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="460" y="154" text-anchor="middle" class="strong">L1 (PTE)</text>
+  <text x="460" y="172" text-anchor="middle">frame + bits</text>
+  <line x1="120" y1="158" x2="146" y2="158" class="ink" stroke-width="1.2" marker-end="url(#vm-a1)" />
+  <line x1="250" y1="158" x2="276" y2="158" class="ink" stroke-width="1.2" marker-end="url(#vm-a1)" />
+  <line x1="380" y1="158" x2="406" y2="158" class="ink" stroke-width="1.2" marker-end="url(#vm-a1)" />
+  <text x="20" y="208">START: THIS PROCESS'S TOP TABLE (CR3 / TTBR0)</text>
+  <text x="410" y="208">bits: present,</text>
+  <text x="410" y="222">writable, dirty …</text>
+  <line x1="460" y1="186" x2="460" y2="194" class="ink" stroke-width="1" />
+  <rect x="20" y="254" width="300" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="170" y="276" text-anchor="middle" class="strong">FRAME NUMBER</text>
+  <rect x="320" y="254" width="110" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="375" y="276" text-anchor="middle" class="strong">OFFSET · 12</text>
+  <text x="440" y="276" class="strong">= PHYSICAL ADDRESS</text>
+  <line x1="460" y1="226" x2="300" y2="250" class="blue" stroke-width="1.2" marker-end="url(#vm-a1)" />
+  <line x1="430" y1="51" x2="452" y2="51" class="ink dash" stroke-width="1" />
+  <line x1="452" y1="51" x2="452" y2="120" class="ink dash" stroke-width="1" />
+  <line x1="452" y1="120" x2="395" y2="120" class="ink dash" stroke-width="1" />
+  <line x1="395" y1="120" x2="395" y2="250" class="ink dash" stroke-width="1" marker-end="url(#vm-a1)" />
+  <text x="400" y="114">COPIED</text>
+  <text x="610" y="270" class="blue-t">NO VALID ENTRY?</text>
+  <text x="610" y="286" class="blue-t">→ PAGE FAULT</text>
+</svg>
+</Figure>
+
+### The page table, and why it's a tree
+
+The book is called the <Term w="page table">The per-process data structure, kept by the kernel in RAM, that maps each virtual page number to a physical frame number plus permission bits. The MMU reads it directly.</Term>. Each entry, a <Term w="PTE">Page table entry. 8 bytes holding a frame number plus flags: present, writable, user-accessible, accessed, dirty, and so on.</Term>, holds a frame number and a few flag bits. The important ones: *present* (is this page in RAM at all?), *writable* (can you store to it?), *dirty* (has anyone written it since it was loaded?).
+
+Why a tree and not one big array? Do the math. A 48-bit address space with 4 KB pages has 2<sup>36</sup> pages, about 69 billion. At 8 bytes per entry, a flat table would be 512 GB *per process*. Instead, x86-64 uses a four-level tree: the page number is cut into four 9-bit pieces, each indexing a 512-entry table that points to the next. The trick is that a whole subtree can be missing. The huge empty gap between your heap and stack has no tables at all, so a typical process's page tables are a few hundred KB to a few MB.
+
+They're not free, though. Touch 100 GB with 4 KB pages and you need 26 million PTEs, about 200 MB of page tables just to describe where your memory is. That's one reason big-memory workloads use bigger pages.
+
+Each process has its own tree; threads in one process share one tree, which is what "threads share an address space" means in hardware.
+
+### The TLB: a tiny cache that makes it all affordable
+
+If every memory access needed four extra memory reads to walk the tree, programs would run several times slower. So each core keeps a <Term w="TLB">Translation lookaside buffer. A small, very fast cache inside each core of recently used virtual-page-to-frame translations. A hit costs about a cycle; a miss triggers a page table walk.</Term>, a tiny cache of recent translations. A modern core has a first level of a few dozen entries and a second level of one to a few thousand (spec-sheet figures vary by core; treat these as order-of-magnitude).
+
+Here's a number worth having in your head, the TLB's *reach*: entries times page size. Around 1,500 entries times 4 KB pages covers about 6 MB. Your model weights are 70 GB. Every time a decode step streams through the weights, it blows through the TLB thousands of times over. That's why the GPU's MMU and serious CPU workloads use <Term w="huge pages">Pages much larger than the base size, typically 2 MB (or 1 GB) on x86 and on ARM64 with 4 KB base pages. One TLB entry then covers 512 times more memory. Linux can create them automatically (Transparent Huge Pages).</Term>: one 2 MB page covers what 512 small pages would, so the same TLB reaches 3 GB.
+
+With 64 KB base pages (if the Spark has them), reach is 16 times bigger for free.
+
+### Lazy allocation: malloc is a promise
+
+Now the part that explains "Python never raised MemoryError".
+
+When your program calls `malloc(100 GB)` (or `np.zeros`, or `torch.empty`), the C library asks the kernel for address space with a system call named <Term w="mmap">The system call that adds a new region to a process's address space. It can be anonymous (plain memory, starts as zeros) or backed by a file (the region shows the file's contents).</Term>. The kernel does almost nothing. It writes down one note, "addresses X to X+100 GB belong to this process, readable and writable, start as zeros", and returns. No frames assigned. No page table entries filled in. Your process's <Term w="VSZ">Virtual size: the total of all address ranges the process has reserved, touched or not. Also called VIRT in top or VmSize in /proc. Mostly meaningless as a measure of memory use.</Term> jumps by 100 GB. Its <Term w="RSS">Resident set size: how much of the process's memory is actually in physical RAM right now. The number that matters for running out of memory.</Term> doesn't move at all.
+
+The real work happens later, one page at a time, the first time you touch each page.
+
+<Predict id="malloc-100g">
+
+Your Mac has 48 GB of RAM. You run `np.zeros(100 * 2**30, dtype=np.uint8)`, a 100 GB array. Does it succeed? How long does it take? What happens to RSS? Then you write a 1 into every element. What happens?
+
+<Fragment slot="answer">
+
+It succeeds, in about a tenth of a millisecond. I measured 0.11 ms on an M-series Mac with 48 GB. RSS stayed at 28 MB. `np.zeros` asks for zero-filled memory, and fresh anonymous pages from the kernel *are* zero, so NumPy doesn't even have to write anything.
+
+Writing every element is a different story. Each first touch of a 16 KB page faults, the kernel finds a frame, zeroes it and maps it, and RSS climbs. Past 48 GB of real RAM, macOS starts compressing pages and swapping, everything slows to a crawl, and eventually the system steps in. Don't actually do this on the bare host. You'll do a safe version below.
+
+</Fragment>
+
+</Predict>
+
+### Page faults: the CPU asks the kernel for help
+
+When the MMU walks the tree and finds no valid entry, or finds one that doesn't allow what you're trying to do (writing a read-only page), it can't finish the instruction. It raises a <Term w="page fault">A hardware exception raised when a memory access can't be translated, or isn't allowed. The CPU stops the instruction and jumps into the kernel, which either fixes things up and retries, or kills the process.</Term>: the instruction stops, the CPU jumps into the kernel, and the kernel looks up the faulting address in its notes.
+
+Not every fault is an error. Most are the lazy plan working as designed. The kernel sorts them into three cases:
+
+- **Address not in any region you reserved.** You really did touch memory that isn't yours. The kernel sends `SIGSEGV`: a segfault, exactly what you saw with the stack's guard page in the stack-and-heap lesson.
+- **Reserved, and the data is already in RAM somewhere (or it's just zeros).** First touch of fresh memory, a file page already in the cache, or a copy-on-write (coming up). The kernel grabs or points to a frame, fills in the PTE, and returns. Your instruction runs again and succeeds. This is a <Term w="minor fault">A page fault the kernel resolves without any disk I/O: zero-fill a fresh page, map a page that's already in the page cache, or copy a page. Costs well under a microsecond to a few microseconds.</Term>.
+- **Reserved, but the data is on disk.** A page of a memory-mapped file that isn't cached yet, or a page that was pushed out to swap. The kernel issues a read, puts your thread to sleep until it arrives, maps it, and resumes. This is a <Term w="major fault">A page fault that needs disk I/O to resolve: reading a file page or swapping a page back in. Costs tens of microseconds on fast NVMe, milliseconds on spinning disks.</Term>.
+
+Measured on my Mac: filling a fresh 4 GB NumPy array the first time took 0.21 s (19 GB/s) and took 262,149 faults, almost exactly 4 GB / 16 KB = 262,144. Filling it again, with every page already mapped, took 0.086 s (46 GB/s). The difference, spread over the faults, is about 0.5 µs per minor fault, including zeroing a 16 KB page. Put that on the [latency ladder](/lessons/latency-numbers/): a minor fault costs about as much as five trips to RAM (~100 ns each), cheap one at a time but it adds up over millions of pages. A major fault from NVMe (tens of microseconds or more) is roughly a hundred times worse again.
+
+Here is all of it at once. Play with it: malloc, touch, fork, touch in the child, run out of frames, turn swap on and off.
+
+<Figure n="002" title="PAGES, FRAMES, FAULTS" caption="Two processes' virtual pages on the outside, six physical frames in the middle. malloc only grows VSZ. Each first touch is a minor fault that grabs a frame. fork shares every frame read-only (dashed links), and the first write to a shared page copies it. When frames run out, swap evicts the coldest private page, or, with swap off, the OOM killer kills whichever process has the most RSS." wide>
+
+<VirtMemMapper />
+
+</Figure>
+
+Things to try. Malloc twice and notice VSZ is 4 and RSS is 0. Touch until A has 4 pages, fork, and notice B's RSS is 4 while free frames didn't change: RSS double-counts shared pages. Touch B until frames run out with swap off. Then reset, turn swap on, and do the same thing: the kernel buys time by pushing pages to disk, and touching them again costs a major fault.
+
+### Overcommit: the kernel's bet
+
+So `malloc` is a promise, and the kernel makes the promise before checking whether it can keep it. On Linux this is a policy called <Term w="overcommit">Letting processes reserve more memory than RAM plus swap can actually back, on the bet that most of it will never be touched. Linux does this by default.</Term>, controlled by `/proc/sys/vm/overcommit_memory`:
+
+| Value | Name | What it does |
+| --- | --- | --- |
+| 0 | heuristic (default) | Refuses only obviously absurd requests, roughly a single allocation bigger than RAM plus swap. Everything else is granted. |
+| 1 | always | Never refuses. `malloc(1 TB)` succeeds on a laptop. |
+| 2 | never (strict) | Keeps a running total of promised memory and refuses once it passes `swap + RAM × overcommit_ratio / 100` (ratio defaults to 50). |
+
+Why bet at all? Because programs reserve far more than they use. Every thread reserves an 8 MB stack and touches a few KB. And above all, `fork`: when a 20 GB process forks to run a tiny shell command, strict accounting would need another 20 GB "just in case" the child writes every page, even though it's about to throw them away with `exec`. With overcommit, that fork just works.
+
+The cost: the kernel has written more cheques than it can cash. If enough processes touch their memory at once, there's no frame for the next faulting page, and the fault can't fail politely. Your program isn't calling a function, it's executing a store instruction; there's no return value to put `NULL` in. The kernel has to make room, right now.
+
+### When frames run out: reclaim, swap, then the killer
+
+<Figure n="003" title="WHAT HAPPENS ON A FAULT" caption="The kernel's decision path when a page fault needs a free frame. Clean file pages are cheap to drop (they can be re-read from disk). Dirty anonymous pages can only go to swap. If neither frees enough, the OOM killer picks a victim and sends SIGKILL, which the victim can't catch.">
+<svg viewBox="0 0 640 450" role="img" aria-label="Flowchart from page fault to minor fault, major fault, segfault, reclaim, swap and OOM kill">
+  <defs>
+    <marker id="vm-a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="230" y="10" width="180" height="32" class="fill-wash" stroke-width="1.2" />
+  <text x="320" y="31" text-anchor="middle" class="strong">TOUCH ADDRESS</text>
+  <line x1="320" y1="42" x2="320" y2="62" class="blue" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <rect x="210" y="66" width="220" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="87" text-anchor="middle">TLB / PAGE TABLE: VALID?</text>
+  <line x1="430" y1="82" x2="500" y2="82" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="465" y="76" text-anchor="middle">YES</text>
+  <rect x="504" y="66" width="126" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="567" y="87" text-anchor="middle">JUST RUNS</text>
+  <line x1="320" y1="98" x2="320" y2="118" class="blue" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="330" y="112" class="blue-t">NO: PAGE FAULT</text>
+  <rect x="210" y="122" width="220" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="143" text-anchor="middle">IN A REGION YOU OWN?</text>
+  <line x1="210" y1="138" x2="130" y2="138" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="170" y="132" text-anchor="middle">NO</text>
+  <rect x="10" y="122" width="116" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="68" y="143" text-anchor="middle" class="strong">SIGSEGV</text>
+  <line x1="320" y1="154" x2="320" y2="174" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <rect x="210" y="178" width="220" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="199" text-anchor="middle">NEED A NEW FRAME?</text>
+  <line x1="430" y1="194" x2="500" y2="194" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="465" y="188" text-anchor="middle">NO</text>
+  <rect x="504" y="178" width="126" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="567" y="193" text-anchor="middle">MAP CACHED PAGE</text>
+  <text x="567" y="205" text-anchor="middle">minor fault</text>
+  <line x1="320" y1="210" x2="320" y2="230" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <rect x="210" y="234" width="220" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="255" text-anchor="middle">A FREE FRAME?</text>
+  <line x1="430" y1="250" x2="500" y2="250" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="465" y="244" text-anchor="middle">YES</text>
+  <rect x="504" y="234" width="126" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="567" y="250" text-anchor="middle">ZERO/COPY: MINOR</text>
+  <text x="567" y="264" text-anchor="middle">DISK READ: MAJOR</text>
+  <line x1="320" y1="266" x2="320" y2="286" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="330" y="280">NO</text>
+  <rect x="190" y="290" width="260" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="308" text-anchor="middle" class="strong">RECLAIM</text>
+  <text x="320" y="324" text-anchor="middle">drop clean file pages</text>
+  <line x1="450" y1="312" x2="500" y2="270" class="ink dash" stroke-width="1" marker-end="url(#vm-a3)" />
+  <text x="490" y="306">FREED</text>
+  <line x1="320" y1="334" x2="320" y2="354" class="ink" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <rect x="190" y="358" width="260" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="379" text-anchor="middle">WRITE ANON PAGES TO SWAP</text>
+  <line x1="450" y1="374" x2="520" y2="280" class="ink dash" stroke-width="1" marker-end="url(#vm-a3)" />
+  <line x1="320" y1="390" x2="320" y2="410" class="blue" stroke-width="1.2" marker-end="url(#vm-a3)" />
+  <text x="330" y="404" class="blue-t">STILL NOTHING</text>
+  <rect x="190" y="414" width="260" height="32" class="fill-blue" />
+  <text x="320" y="435" text-anchor="middle" style="fill:var(--paper)" class="strong">OOM KILLER: SIGKILL A VICTIM</text>
+</svg>
+</Figure>
+
+Before killing anyone, the kernel tries to free frames. Not all memory is equal here, and the difference is the key to the "where did my 115 GB go" mystery.
+
+**File-backed pages** hold a copy of something that's on disk: the code of `python3` itself, a shared library, a file you read, or a file you `mmap`'d. Linux keeps recently read file data in RAM in the <Term w="page cache">The kernel's in-RAM copy of recently read or written file data, shared by every process. It grows into free RAM and shrinks when programs need memory.</Term>. If a file page is *clean* (unchanged since it was read), the kernel can just drop it: if anyone needs it again, it reads it from disk again. Cheap to reclaim.
+
+**Anonymous pages** are memory with no file behind them: your heap, your stack, NumPy arrays, every PyTorch CPU tensor you built with `torch.load`. There's no copy anywhere else. The only way to free one is to write it somewhere first, and that somewhere is <Term w="swap">Disk space (a partition, a file, or compressed RAM like zram) where the kernel parks anonymous pages it needs to evict. Touching a swapped page later is a major fault.</Term>. If there's no swap, or it's full, anonymous memory can't be reclaimed at all. It stays until the process frees it or dies.
+
+That's why `free -h` has a "free" column and an "available" column. "Free" is RAM nobody is using, often small because the page cache happily fills idle RAM. "Available" is the kernel's estimate of what it could hand you without swapping: free plus most of the reclaimable cache. "Available" is the number to believe.
+
+When reclaim can't keep up and swap is out, the kernel runs the <Term w="OOM killer">The Linux kernel routine that, when memory is exhausted and can't be reclaimed, picks one process and kills it with SIGKILL to free its memory. OOM = out of memory.</Term>. It scores every process and kills the highest. You can read the score yourself in `/proc/<pid>/oom_score`, from 0 to 1000. In modern kernels it's roughly "what fraction of memory this process is using" (RSS plus swap plus page tables) scaled to 1000, plus an adjustment you can set in `/proc/<pid>/oom_score_adj`, from -1000 (never kill me) to +1000 (kill me first). The logic is blunt on purpose: killing the biggest process frees the most memory with the fewest deaths.
+
+The victim gets <Term w="SIGKILL">Signal 9. The one signal a process can't catch, block or clean up after. The kernel just stops it and frees its memory. A shell reports it as exit code 137 = 128 + 9.</Term>. That's why your script printed "Killed" and nothing else. Python never got a chance to raise anything. The confession is in the kernel log, which you read with `sudo dmesg` or `journalctl -k`:
+
+```text
+Out of memory: Killed process 48213 (python3) total-vm:142336704kB, anon-rss:117440512kB, file-rss:2048kB, shmem-rss:0kB, UID:1000 pgtables:230400kB oom_score_adj:0
+```
+
+That line (real shape, illustrative numbers) says who died, its address space (`total-vm`, the VSZ), and the real anonymous memory it held (`anon-rss`).
+
+One more killer to know about on Ubuntu-based systems: `systemd-oomd`, a userspace daemon that watches memory *pressure* and may kill a whole group of processes (a terminal session, a service) before the kernel's killer ever runs. If something dies and `dmesg` is silent, check `journalctl -u systemd-oomd`. Whether DGX OS enables it, check yourself: `systemctl status systemd-oomd`.
+
+### cgroups: a smaller box with its own killer
+
+The global OOM killer protects the whole machine. A <Term w="cgroup">Control group. A Linux kernel feature that puts a set of processes in a group and limits or measures what they use together: memory, CPU, I/O. Docker and systemd are built on it.</Term> lets you draw a smaller box around a set of processes and give it its own memory limit. In cgroup v2 (what modern Ubuntu uses), the limit lives in a file called `memory.max`, current usage in `memory.current`, and a counter of kills in `memory.events`.
+
+Over its limit, the group first reclaims its own pages, and if that fails, the OOM killer runs on *only that group*. The log line says `Memory cgroup out of memory`.
+
+Docker's `--memory=512m` is exactly this: it puts the container in a cgroup with `memory.max` set to 512 MB. That's how you'll trigger the OOM killer below without risking the Spark: the explosion happens inside a 512 MB box. Two things that trip people up. Page cache from files read inside the container counts against its limit too (but it's reclaimable, so it usually just gets squeezed). And the kernel only charges what's *resident*: a container with a 512 MB limit can still `malloc` 100 GB. Lazy allocation works inside the box too.
+
+### fork and copy-on-write
+
+Now `fork`. In the threads lesson you saw that a forked worker is a new process with its own address space, a copy of the parent's. Copying 20 GB on every fork would make `fork` take seconds. So it doesn't copy. It copies the *page table*, and then marks every writable page as read-only in both parent and child.
+
+Now both processes point at the same frames. Reads are free: no faults, no copies. The first time *either* process writes to one of those pages, the MMU sees a write to a read-only page and faults. The kernel notices this is a <Term w="copy-on-write">COW. Sharing a page between processes read-only, and copying it only when one of them writes to it. Makes fork nearly free, and means memory is only duplicated where the copies actually differ.</Term> page, copies that one page to a fresh frame, gives the writer the copy with write permission, and resumes. Only the pages that actually differ get duplicated.
+
+For C programs this is beautiful. For Python it has a nasty edge.
+
+<Predict id="cow-read">
+
+The parent builds a list of 5 million Python ints (about 200 MB of objects) and forks a child. The child only *reads* the list: `for x in L: pass`. It never assigns anything. How much memory gets copied?
+
+<Fragment slot="answer">
+
+Nearly all of it. In [Where do my variables live?](/lessons/stack-and-heap/) you saw that every Python object starts with a reference count. Binding `x` to an element increments that element's refcount, and moving on decrements it. Each increment is a *write* to the page holding that object's header. Five million objects, packed densely on the heap, means every page holding them gets written, so every page gets copied. Reading a Python object is a write to memory.
+
+A NumPy array is different: its 5 million numbers sit in one raw buffer with one header. `A.sum()` reads the buffer and writes nothing, so the buffer stays shared.
+
+On my Mac (16 KB pages), the child iterating the list took 22,076 page faults (about 345 MB worth of pages; macOS takes a fault to map a page and often another to copy it, so this overcounts the copy). The NumPy sum took about 2,500 faults on macOS, which lazily maps pages into the child even for reads, and should take close to zero copies on Linux. On the Spark you'll measure the copies directly.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="004" title="COPY-ON-WRITE MEETS REFCOUNTS" caption="After fork, parent and child share every frame read-only. A NumPy buffer is raw numbers: reading it writes nothing, so it stays shared forever. A Python list is millions of small objects, each with a refcount in its header. Touching an element writes its refcount, which faults and copies the whole page it lives on. Do that in every DataLoader worker and each one slowly gets its own copy of your dataset.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Parent and child processes sharing frames; numpy buffer frames stay shared while Python object frames get copied after refcount writes">
+  <text x="20" y="22" class="strong">PARENT (MAIN PROCESS)</text>
+  <text x="620" y="22" text-anchor="end" class="strong">CHILD (DATALOADER WORKER)</text>
+  <text x="320" y="22" text-anchor="middle" class="strong">PHYSICAL FRAMES</text>
+  <rect x="20" y="40" width="140" height="28" class="fill-wash" stroke-width="1" /><text x="30" y="59">numpy buffer p1</text>
+  <rect x="20" y="72" width="140" height="28" class="fill-wash" stroke-width="1" /><text x="30" y="91">numpy buffer p2</text>
+  <rect x="480" y="40" width="140" height="28" class="fill-wash" stroke-width="1" /><text x="490" y="59">numpy buffer p1</text>
+  <rect x="480" y="72" width="140" height="28" class="fill-wash" stroke-width="1" /><text x="490" y="91">numpy buffer p2</text>
+  <rect x="250" y="40" width="140" height="28" class="fill-wash" stroke-width="1" /><text x="320" y="59" text-anchor="middle">F10 SHARED</text>
+  <rect x="250" y="72" width="140" height="28" class="fill-wash" stroke-width="1" /><text x="320" y="91" text-anchor="middle">F11 SHARED</text>
+  <line x1="160" y1="54" x2="250" y2="54" class="blue dash" stroke-width="1.2" />
+  <line x1="160" y1="86" x2="250" y2="86" class="blue dash" stroke-width="1.2" />
+  <line x1="390" y1="54" x2="480" y2="54" class="blue dash" stroke-width="1.2" />
+  <line x1="390" y1="86" x2="480" y2="86" class="blue dash" stroke-width="1.2" />
+  <text x="320" y="120" text-anchor="middle" class="blue-t">A.sum(): ONLY READS. STAYS SHARED.</text>
+  <rect x="20" y="150" width="140" height="44" class="fill-paper" stroke-width="1" />
+  <text x="30" y="168">py ints, page q</text>
+  <text x="30" y="184">refcnt|type|val</text>
+  <rect x="480" y="150" width="140" height="44" class="fill-paper" stroke-width="1" />
+  <text x="490" y="168">py ints, page q</text>
+  <text x="490" y="184" class="blue-t">refcnt += 1 !</text>
+  <rect x="250" y="150" width="140" height="44" class="fill-paper" stroke-width="1" />
+  <text x="320" y="168" text-anchor="middle">F20 · PARENT'S</text>
+  <text x="320" y="184" text-anchor="middle">now private</text>
+  <rect x="250" y="214" width="140" height="44" class="fill-wash" stroke-width="2" />
+  <text x="320" y="232" text-anchor="middle" class="strong">F31 · COPY</text>
+  <text x="320" y="248" text-anchor="middle">4-16 KB for 8 B</text>
+  <line x1="160" y1="172" x2="250" y2="172" class="blue" stroke-width="1.2" />
+  <line x1="480" y1="172" x2="390" y2="236" class="blue" stroke-width="1.2" />
+  <line x1="480" y1="160" x2="390" y2="162" class="ink dash" stroke-width="1" />
+  <text x="436" y="152" text-anchor="middle">WAS</text>
+  <text x="320" y="286" text-anchor="middle" class="blue-t">for x in L: A READ IN PYTHON IS A WRITE IN MEMORY. PAGE COPIED.</text>
+</svg>
+</Figure>
+
+This is the famous "DataLoader memory leak" that isn't a leak. You build a dataset as a Python list of a million dicts of strings, start 8 workers with `num_workers=8`, and over the first epoch memory climbs to roughly 9 times the dataset size. Each worker, just by indexing into the list, slowly copies the pages it touches. `top` shows every worker with a large RSS and you panic. Two things to keep straight:
+
+- RSS counts shared pages in *every* process that maps them, so summing RSS across workers overcounts, especially right after fork. A fairer per-process number is <Term w="PSS">Proportional set size. Like RSS, but each shared page is divided by the number of processes sharing it. Summing PSS across processes gives the true total. Linux shows it in /proc/PID/smaps_rollup.</Term>, and the honest "how much did this process cost me" number is its private dirty memory.
+- But the growth over the epoch is real: the copies really happen.
+
+The fix is to keep your data out of millions of Python objects: store it in NumPy arrays, Arrow tables, or a memory-mapped file, and index into those. Raw buffers stay shared. One more twist: this only applies when workers are created with `fork`. With `spawn` or `forkserver`, the dataset is pickled and *fully* copied into each worker up front. Python 3.14 changed the default start method on Linux from `fork` to `forkserver`, so check what your DataLoader actually uses (`multiprocessing_context`, and `mp.get_start_method()`). Don't assume.
+
+### mmap: borrowing a file as memory
+
+The last tool. `mmap` with a file instead of anonymous memory creates a region whose pages *are* the file's pages in the page cache. Touch byte 4,000,000 of the region and you get byte 4,000,000 of the file: the first time via a major fault (read from disk) or a minor one (already cached), every time after just a normal load.
+
+For model weights this changes everything about memory accounting. A safetensors file loaded with `mmap` costs no anonymous memory at all. Its pages are clean file pages: they count in RSS (as `file-rss`), they're shared with every other process that maps the same file, and under pressure the kernel can drop them instead of killing you, because it can always re-read them. Contrast `torch.load` without `mmap`, which reads the file into freshly allocated anonymous memory: now the same 70 GB exists twice, once in the page cache and once in your heap, and only the page cache copy is reclaimable.
+
+### Unified memory: one pool for CPU and GPU
+
+Back to the Spark. On a normal workstation, the GPU has its own memory (VRAM) on its own board, and `.to("cuda")` copies bytes across PCIe into that separate pool. Running out of VRAM gives you `CUDA out of memory`, a Python exception you can catch. System RAM is a different pool with a different killer.
+
+The Spark's GB10 is built differently. Its CPU and GPU share one pool: 128 GB of LPDDR5x, at about 273 GB/s (spec-sheet numbers). There is no separate VRAM. A `cudaMalloc` for the GPU and a `malloc` for Python come out of the same physical frames. Linux sees all of it as system RAM, and the GPU driver allocates its memory from that RAM too. (Expect a bit under 128 GB to show up in `free`, since firmware and the kernel reserve some. Check yours.)
+
+<Figure n="005" title="THE 70B LOAD ON 128 GB" caption="The naive load holds the weights three times: in the page cache from reading the file, in anonymous CPU memory from torch.load, and again in GPU allocations, which on the Spark come from the same pool. The page cache gets squeezed out, but two 70 GB anonymous copies can't fit. The mmap path keeps one reclaimable file-backed copy plus one GPU copy at the peak. Sizes are approximate.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Two horizontal bars showing a 128 GB memory pool overflowing with a naive load and fitting with an mmap load">
+  <text x="20" y="22" class="strong">ONE 128 GB POOL · CPU AND GPU</text>
+  <text x="20" y="54">NAIVE</text>
+  <rect x="90" y="38" width="500" height="28" class="fill-paper" stroke-width="1" />
+  <rect x="90" y="38" width="31" height="28" class="fill-paper" stroke-width="1" />
+  <text x="105" y="57" text-anchor="middle">OS</text>
+  <rect x="121" y="38" width="273" height="28" class="fill-wash" stroke-width="1" />
+  <text x="257" y="57" text-anchor="middle" class="strong">torch.load · 70 GB ANON</text>
+  <rect x="394" y="38" width="196" height="28" class="fill-blue" />
+  <text x="492" y="57" text-anchor="middle" class="strong" style="fill:var(--paper)">.to(cuda) · 70 GB …</text>
+  <rect x="590" y="38" width="40" height="28" class="fill-blue dash" opacity="0.4" />
+  <line x1="590" y1="30" x2="590" y2="76" class="ink" stroke-width="2" />
+  <text x="590" y="90" text-anchor="middle" class="strong">128 GB</text>
+  <text x="90" y="90">PEAK ≈ 8 + 70 + 70 = 148 GB → OOM KILL</text>
+  <text x="20" y="150">MMAP</text>
+  <rect x="90" y="134" width="500" height="28" class="fill-paper" stroke-width="1" />
+  <rect x="90" y="134" width="31" height="28" class="fill-paper" stroke-width="1" />
+  <text x="105" y="153" text-anchor="middle">OS</text>
+  <rect x="121" y="134" width="273" height="28" class="fill-paper dash" stroke-width="1" />
+  <text x="257" y="153" text-anchor="middle">FILE PAGES · RECLAIMABLE</text>
+  <rect x="121" y="168" width="273" height="20" class="fill-blue" />
+  <text x="257" y="182" text-anchor="middle" class="strong" style="fill:var(--paper)">GPU WEIGHTS · 70 GB</text>
+  <line x1="590" y1="126" x2="590" y2="196" class="ink" stroke-width="2" />
+  <text x="90" y="212">AS EACH TENSOR MOVES TO GPU, ITS FILE PAGES CAN BE DROPPED</text>
+</svg>
+</Figure>
+
+Now the opening scene makes sense. `torch.load` read the 70 GB file, which filled the page cache, and copied it into 70 GB of anonymous memory. Fine so far: "available" covered it, because the kernel quietly dropped page cache. Then `.to("cuda")` started allocating GPU memory, from the same pool, while the CPU copy still existed. Somewhere past 115 GB of anonymous plus GPU memory, reclaim had nothing left to drop, there was little or no swap, and the kernel's OOM killer picked the process with the biggest score. That was you. `cudaMalloc` didn't fail politely, because on unified memory the pressure lands on the whole system, not on a separate GPU pool. (Exactly when the CUDA driver gives a clean `out of memory` versus when the kernel kills the process depends on how the driver allocates and pins memory on GB10. Watch for both.)
+
+The fixes follow from the model: never hold two full copies. Load with `mmap` (safetensors, or `torch.load(..., mmap=True)`) and move tensors to the GPU one at a time so file pages can be dropped as you go, or load straight onto the device (`device_map`, `safetensors` with `device="cuda"`). Or use 4-bit weights, which at about 35-40 GB give you room for a KV cache too, a story for [How much memory does a model need?](/lessons/memory-math/).
+
+## Build It
+
+Do this in `~/workbench/vm/`, first on the Mac, then on the Spark. The Mac shows you lazy allocation and page faults with 16 KB pages; the Spark shows you Linux's accounting (`/proc`), overcommit, cgroups and the OOM killer.
+
+<Task id="t0" title="Set up: page size and a memory probe" agent="ok">
+
+Make a venv with NumPy (`python3 -m venv .venv && .venv/bin/pip install numpy`). Then write a small probe module you'll import everywhere. It reports RSS, VSZ and fault counts, using `/proc` on Linux and `ps` on macOS.
+
+```python
+# probe.py
+import os, sys, resource, subprocess
+
+PAGE = os.sysconf("SC_PAGE_SIZE")
+
+def faults() -> tuple[int, int]:
+    """(minor, major) page faults so far in this process."""
+    r = resource.getrusage(resource.RUSAGE_SELF)
+    return r.ru_minflt, r.ru_majflt
+
+def mem() -> dict:
+    """RSS and VSZ in MB. On Linux, also anonymous vs file-backed RSS."""
+    if sys.platform == "linux":
+        out = {}
+        with open("/proc/self/status") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("VmRSS", "VmSize", "RssAnon", "RssFile", "RssShmem", "VmPTE"):
+                    out[k] = int(v.split()[0]) / 1024  # kB -> MB
+        return out
+    rss, vsz = subprocess.run(["ps", "-o", "rss=,vsz=", "-p", str(os.getpid())],
+                              capture_output=True, text=True).stdout.split()
+    return {"VmRSS": int(rss) / 1024, "VmSize": int(vsz) / 1024}
+
+def show(label: str) -> None:
+    m = mem()
+    mi, ma = faults()
+    parts = " ".join(f"{k}={v:,.0f}MB" for k, v in m.items())
+    print(f"{label:<18} {parts}  minflt={mi:,} majflt={ma:,}")
+```
+
+Then, on each machine, record:
+
+```bash
+getconf PAGESIZE                          # Mac: 16384. Spark: write it down.
+cat /proc/sys/vm/overcommit_memory        # Spark only. Expect 0.
+free -h; swapon --show                    # Spark only. How much swap is there?
+```
+
+On macOS, VSZ starts absurdly large (about 466 GB for a bare Python on my Mac) because the system reserves a big shared region in every process. Ignore its absolute value and watch changes.
+
+</Task>
+
+<Task id="t1" title="Allocate 100 GB, then touch it" agent="hands">
+
+Write `lazy.py`. Before running, fill in your predictions in the Measure table.
+
+```python
+# lazy.py
+import mmap, time
+from probe import show, faults, PAGE
+
+GB = 1 << 30
+
+def reserve(nbytes: int) -> mmap.mmap:
+    """Anonymous, private mapping of nbytes. Returns without touching it."""
+    ...
+
+def touch(m: mmap.mmap, nbytes: int) -> tuple[float, int]:
+    """Write one byte into every page of the first nbytes.
+    Return (seconds, minor faults taken)."""
+    ...
+
+if __name__ == "__main__":
+    show("start")
+    m = reserve(100 * GB)
+    show("reserved 100GB")
+    # touch 2 GB, show; touch the same 2 GB again, show and compare times
+    ...
+```
+
+Hints:
+
+- `mmap.mmap(-1, n, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)`. Pass the flags: Python's default for `-1` is a *shared* mapping, which Linux backs with shared memory and accounts differently (you'd see it under `RssShmem`).
+- Step by `PAGE`, not by 4096. On the Mac, stepping by 4096 touches each 16 KB page four times but only faults once.
+- Faults taken should be almost exactly `nbytes / PAGE`. If it's much more or less, you're stepping wrong.
+- Also try the NumPy version, which is faster to touch: `a = np.empty(4 * GB, dtype=np.uint8)`, time `a[:] = 1` twice, and work out microseconds per fault from the difference.
+
+On the Spark, also try `reserve(200 * GB)` with `overcommit_memory` at 0. One 200 GB request on a 128 GB machine with little swap should be refused (`OSError: [Errno 12] Cannot allocate memory`), while 100 GB is fine. That's the heuristic: refuse only the obviously absurd.
+
+</Task>
+
+<Task id="t2" title="Fork, copy-on-write, and the refcount trap" agent="hands">
+
+Write `cow.py`. The parent builds two things of the same length, a list of Python ints and a NumPy array, then forks children that each do one thing and report what it cost.
+
+```python
+# cow.py
+import os, time
+import numpy as np
+from probe import faults
+
+N = 5_000_000
+L = [i for i in range(10**9, 10**9 + N)]   # big ints: real objects, not cached small ints
+A = np.arange(N, dtype=np.int64)
+
+def private_dirty_mb() -> float | None:
+    """Linux only: Private_Dirty from /proc/self/smaps_rollup, in MB. None elsewhere."""
+    ...
+
+def in_child(name: str, fn) -> None:
+    """fork; in the child, measure faults (and private dirty MB on Linux)
+    before and after fn(), print one line, then os._exit(0). Parent waits."""
+    ...
+
+if __name__ == "__main__":
+    in_child("nothing", lambda: None)
+    in_child("A.sum()", lambda: A.sum())
+    in_child("for x in L", lambda: [None for x in L])
+    in_child("A.copy()", lambda: A.copy())   # a real write: control case
+```
+
+Hints:
+
+- In the child, use `os._exit(0)`, not `sys.exit`. `sys.exit` runs cleanup that can write to memory and muddy the numbers.
+- `smaps_rollup` has lines like `Private_Dirty:   123456 kB`. Measure the delta across `fn()`.
+- On the Spark, expect `A.sum()` near 0 MB copied and `for x in L` close to the size of the int objects plus the list's pointer array (5 M × (32 + 8) bytes ≈ 200 MB). Work out the expected number before you run.
+- Bonus: call `gc.freeze()` before forking and rerun. Does it help here? (It stops the garbage collector from writing to tracked objects' headers, but ints aren't tracked and refcounts still change. Predict first.)
+
+</Task>
+
+<Task id="t3" title="Trigger the OOM killer inside a 512 MB box" agent="review">
+
+**On the Spark, inside a container. Never on the bare host**: the global OOM killer might pick your SSH session, your desktop, or a training job instead of the hog.
+
+Write `hog.py`: allocate 50 MB at a time *and touch it* (a `bytearray(50 * 2**20)` is zero-filled, so it's touched as it's created), keep every chunk in a list, and after each one print how much you hold plus the cgroup's own view: `/sys/fs/cgroup/memory.current` and `/sys/fs/cgroup/memory.max`. Flush every print.
+
+Then run it in a memory-limited container (check that Docker works first with `docker run --rm hello-world`; DGX OS should have it):
+
+```bash
+docker run --name hog -m 512m --memory-swap 512m \
+  -v "$PWD":/w -w /w python:3.12-slim python -u hog.py
+echo "exit: $?"
+docker inspect hog --format '{{.State.OOMKilled}} {{.State.ExitCode}}'
+sudo dmesg | grep -i -A2 "memory cgroup out of memory" | tail -5
+docker rm hog
+```
+
+`--memory-swap` equal to `-m` means no swap inside the box, so the kill comes fast. Then, while a second copy runs slowly (add a `time.sleep(0.5)` per chunk), watch it from the host: find its PID with `docker top hog` and `cat /proc/<pid>/oom_score` every second. Watch the score climb as RSS grows.
+
+If you'd rather not use Docker, systemd can make the same cgroup: `systemd-run --user --scope -p MemoryMax=512M -p MemorySwapMax=0 python3 hog.py` (needs user cgroup delegation, which recent Ubuntu has by default; if it errors, use Docker).
+
+When it works, have an agent review `hog.py` for anything that could escape the box (e.g. writing big files to the mounted host folder) and check your reading of the `dmesg` line.
+
+</Task>
+
+<Task id="t4" title="Where does a model load's memory go?" agent="explain">
+
+Don't load a real 70B model; fake one at a safe size. Make a ~16 GB safetensors file of random bf16 tensors (say 64 tensors of 128 MB; ask an agent to explain the safetensors API if needed, but write the loop yourself). Then, in separate runs, load it two ways and print `show()` after loading:
+
+1. `torch.load`-style: read the whole file into anonymous memory (`safetensors.torch.load(open(p, "rb").read())`, or save a `.pt` and `torch.load` it without `mmap`).
+2. `mmap`-style: `safetensors.torch.load_file(p)` or `safe_open(p, "pt")` and fetch each tensor, which maps the file instead of copying it (check the safetensors docs for current behaviour; libraries change).
+
+Compare `RssAnon` and `RssFile` between the two. In a second terminal, run `vmstat 1` and watch the `cache` column and the `si`/`so` (swap in/out) columns while each load happens. Then run each load once more right after the first: is the second one faster? Why? (You're seeing the page cache, which [What happens when you save a file?](/lessons/files-and-disks/) digs into.)
+
+For the GPU half: move tensors to `cuda` one at a time and watch `free -h`. On unified memory the GPU's share shows up as system memory used. (`nvidia-smi` may not report a normal memory-used figure on the Spark; check.)
+
+</Task>
+
+<DoneWhen>
+
+- `lazy.py` reserves 100 GB instantly on both machines, and you can point at the VSZ jump with no RSS change, then RSS climbing with faults ≈ bytes / page size.
+- You have a microseconds-per-minor-fault number for each machine.
+- `cow.py` shows the NumPy sum staying shared and the list iteration copying, with the copied size within about 25% of your prediction on the Spark.
+- You've seen exit code 137, `OOMKilled: true`, and the `Memory cgroup out of memory` line, and watched `oom_score` climb.
+- You can say, for your fake model load, how much of RSS was anonymous vs file-backed and why that matters.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Predictions first.
+
+| Measurement | Mac | Spark | Prediction |
+| --- | --- | --- | --- |
+| `getconf PAGESIZE` | 16384 | | |
+| VSZ change after reserving 100 GB | | | |
+| RSS change after reserving 100 GB | | | |
+| Faults to touch 2 GB | | | |
+| Time to touch 2 GB, first vs second pass | | | |
+| µs per minor fault (NumPy 4 GB fill) | | | |
+| `reserve(200 GB)` succeeds? | | | |
+| COW: copied by `A.sum()` | | | |
+| COW: copied by `for x in L` | | | |
+| `hog.py` last line printed before death | — | | |
+| Fake model: RssAnon / RssFile, load vs mmap | | | |
+
+For reference, my numbers on an M-series MacBook (48 GB, macOS, 16 KB pages, Python 3.14):
+
+| Measurement | Result |
+| --- | --- |
+| `mmap` 100 GB | instant; RSS 16 MB before and after; VSZ +100 GB |
+| `np.zeros(100 GB)` | 0.11 ms, RSS 28 MB |
+| Touch 2 GB in a Python loop, one byte per 16 KB page | 131,074 minor faults (2 GB / 16 KB = 131,072), RSS → 2,064 MB, 0.15 s |
+| Same 2 GB again | 0 new faults to speak of, 0.11 s (the loop itself dominates) |
+| NumPy 4 GB fill, first vs second | 0.21 s (19 GB/s) vs 0.086 s (46 GB/s); 262,149 faults; ≈ 0.5 µs per fault |
+| Forked child: nothing / `A.sum()` / `for x in L` | 26 / 2,553 / 22,076 faults |
+
+What the numbers should tell you:
+
+**Reserving is free; touching costs.** The VSZ jump with no RSS change is lazy allocation, in one line of output. Faults ≈ bytes / page size is the proof that memory arrives one page at a time, on first touch.
+
+**A minor fault costs around half a microsecond to a microsecond.** That's cheap per page and expensive in bulk. Touching 70 GB of fresh memory with 4 KB pages is about 18 million faults; at roughly 0.5 µs each, around 9 seconds of pure fault handling, before you've done anything useful. With 64 KB pages it's 1.1 million faults. Page size matters when the numbers get big, which is why your Spark measurement is the one to compare.
+
+**COW is about writes, and Python reads are writes.** On Linux, `A.sum()` should copy essentially nothing; `for x in L` should copy roughly the full ~200 MB of objects; `A.copy()` allocates 40 MB of new memory (that's new anonymous memory, not a copy-on-write, so check which counter it shows up in).
+
+**The hog dies near 512 MB, not at 512 MB exactly.** Python itself, the interpreter's own pages and any page cache charged to the container all count. The last printed `memory.current` should be within one chunk of `memory.max`.
+
+## Break It
+
+**1. Ask for zeros vs ones.** In the 512 MB container, run `np.zeros(10 * 2**30, dtype=np.uint8)` and then `np.ones(...)` with the same size. The first survives and holds almost nothing. The second dies. Same size, same allocation call underneath, but `ones` has to write every byte, and every written page is charged to the cgroup. Lesson: "how big is my array" is the wrong question; "how much of it have I touched" is the right one.
+
+**2. Make yourself the preferred victim.** Run two hogs in one container (`-m 1g`), one of them after `echo 1000 > /proc/self/oom_score_adj` (raising your own score needs no privileges; lowering it does). Let them grow at the same rate. The adjusted one dies first, even when it's smaller. This is how systemd and Kubernetes steer the killer away from important processes and toward expendable ones.
+
+**3. Thrash.** Run the hog in a container with `-m 512m --memory-swap 2g` (512 MB of RAM, 1.5 GB of swap), and change it to cycle through all its chunks, reading one byte per page, after each new allocation. It no longer dies quickly. It just gets slower and slower, and `vmstat 1` on the host shows swap traffic (`si`, `so`) pegged. This is <Term w="thrashing">When the pages a program needs keep being pushed to swap and pulled back, so the machine spends nearly all its time moving pages instead of computing. Usually worse than being killed outright.</Term>, and it's why many ML boxes run with little or no swap: a fast, clean OOM kill is better than a training job crawling at 1% speed for hours. (Needs swap on the host; if `swapon --show` is empty, read this one rather than run it.)
+
+**4. The fake leak.** Fork 8 children that each iterate the list and then sleep. Sum their RSS, then sum their `Pss` from `smaps_rollup`, and compare both with `free`'s change. RSS overcounts the shared pages; PSS and `free` agree. Swap the list for the NumPy array and the per-child growth vanishes.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What is virtual memory, and why do we bother with it?</summary>
+
+Every process uses fake addresses. The CPU's MMU translates each one into a real RAM location, page by page (4 KB or 16 KB or 64 KB chunks), using a per-process page table the kernel maintains, with a small cache (the TLB) so translation is nearly free. That buys three things: isolation (a process can only reach frames its table points to, so one can't scribble on another), the illusion of a huge contiguous memory regardless of where the frames really are, and laziness (memory can be promised now and backed later, shared between processes, or pushed to disk, all invisibly to the program).
+
+</details>
+
+<details>
+<summary>2. My process has a VSZ of 300 GB and an RSS of 4 GB on a 128 GB machine. Is that a problem?</summary>
+
+No. VSZ is address space reserved: thread stacks, a big `mmap`, an allocator's arenas, CUDA's reservations. None of it costs RAM until touched. RSS is what's actually in RAM, and 4 GB is fine. What I'd actually watch: RSS (better, PSS or private memory if many processes share pages), the anonymous part of it, since file-backed pages are reclaimable, and how it grows over time. VSZ matters only under strict overcommit (mode 2), where reservations themselves count against a limit.
+
+</details>
+
+<details>
+<summary>3. Python got "Killed" with no traceback while loading a model. Walk me through what happened and how you'd fix it.</summary>
+
+Allocations succeeded because Linux overcommits: `malloc` only reserves address space. Memory was actually consumed as pages were touched, one minor fault at a time. Once anonymous memory (plus, on the Spark, GPU allocations from the same unified pool) used up what reclaim could free, and there was no swap left, a fault had no frame to get, and the kernel's OOM killer picked the process with the highest oom_score (roughly, the biggest share of memory) and sent SIGKILL. That can't be caught, so: no traceback, exit code 137. I'd confirm with `dmesg` (the "Out of memory: Killed process" line with anon-rss). Fix: don't hold two copies: load with mmap (safetensors) so weights are reclaimable file pages, move them to the GPU tensor by tensor or load straight to the device, or use smaller weights. And test risky loads inside a cgroup limit so the failure is contained.
+
+</details>
+
+<details>
+<summary>4. DataLoader workers' memory grows during the epoch even though they only read the dataset. Why, and what do you do?</summary>
+
+Workers are forked, so they start out sharing the parent's pages copy-on-write. But reading a Python object changes its refcount, which is a write to the page that holds it, so each touched page gets copied into the worker. With a dataset stored as millions of Python objects, each worker slowly builds its own full copy. Also, RSS overcounts shared pages, so summed RSS looks worse than reality; PSS is the fair measure. Fix: store the data in a few big buffers (NumPy, Arrow, an mmap'd file) so reads don't write, or keep only file paths and offsets in Python. And check the start method: with spawn or forkserver (Python 3.14's Linux default), the dataset is pickled and copied into each worker up front.
+
+</details>
+
+<details>
+<summary>5. How does memory use scale as you touch 1 GB, 10 GB, 100 GB with 4 KB vs 64 KB pages? What else scales?</summary>
+
+RSS scales linearly with what's touched, whatever the page size. What changes is the bookkeeping. Faults: bytes / page size, so 100 GB is ~26 million faults at 4 KB, ~1.6 million at 64 KB; at around half a microsecond each that's about 13 seconds vs under one. Page tables: ~8 bytes per page, so ~200 MB at 4 KB vs ~13 MB at 64 KB. TLB reach: ~1,500 entries cover ~6 MB at 4 KB vs ~96 MB at 64 KB, so fewer misses when streaming big tensors. The costs of big pages: more waste for small allocations (a 1-byte touch costs a whole page) and more copying per copy-on-write fault. That trade is why big-memory systems lean toward huge pages.
+
+</details>
+
+## Go Deeper
+
+- **Remzi H. and Andrea C. Arpaci-Dusseau, _Operating Systems: Three Easy Pieces_**, free at [pages.cs.wisc.edu/~remzi/OSTEP](https://pages.cs.wisc.edu/~remzi/OSTEP/). Chapters "Address Translation", "Paging: Introduction", "Paging: Faster Translations (TLBs)", "Paging: Smaller Tables" and the two "Beyond Physical Memory" chapters. The whole lesson, slower and with exercises.
+- **Ulrich Drepper, "What Every Programmer Should Know About Memory"** (2007). Section 4 is virtual memory and TLBs from the hardware up, with measurements. Long, dense, still the reference.
+- **Linux kernel docs, "Overcommit Accounting"** ([docs.kernel.org/mm/overcommit-accounting.html](https://docs.kernel.org/mm/overcommit-accounting.html)) and **"Control Group v2"**, memory controller section ([docs.kernel.org/admin-guide/cgroup-v2.html](https://docs.kernel.org/admin-guide/cgroup-v2.html)). The primary source for the three overcommit modes and for `memory.max`, `memory.current` and `memory.events`.
+- **`man 5 proc`**, sections on `/proc/pid/status`, `/proc/pid/smaps`, `oom_score` and `oom_score_adj`. Every field you printed in this lesson, defined precisely. Also `man 2 mmap` and `man 2 fork`.
+- **Mel Gorman, _Understanding the Linux Virtual Memory Manager_** (2004, free from the author/publisher). Older kernel, but the clearest tour of page tables, the page cache, reclaim and the OOM killer as real code.
+- **Instagram Engineering, "Dismissing Python Garbage Collection at Instagram"** (2017). A production war story of Python forked workers losing copy-on-write sharing, and how they got it back. The same bug as your DataLoader.
+- **PyTorch docs, `torch.utils.data`, "Multi-process data loading"** ([pytorch.org/docs/stable/data.html](https://pytorch.org/docs/stable/data.html)), including the note on copy-on-access with Python objects, and GitHub issue pytorch/pytorch #13246, the long thread where many people hit exactly this.
+- **Peter J. Denning, "Virtual Memory"**, _ACM Computing Surveys_ (1970). The survey that made virtual memory a science: working sets, thrashing, and why it works at all.
+
+## Connections
+
+This lesson finishes the picture started in [Where do my variables live?](/lessons/stack-and-heap/): the address-space strip is virtual, and the empty gap costs nothing. It gives a hardware meaning to "each process has its own address space" from [Processes, threads, and the GIL](/lessons/processes-threads-gil/), and explains why forking DataLoader workers is cheap at first and expensive later. The fault costs belong on the ladder from [How slow is slow?](/lessons/latency-numbers/).
+
+Next, [What happens when you save a file?](/lessons/files-and-disks/) picks up the page cache and `mmap` from the other side: why the second model load is faster, and what it takes for bytes to be safe on disk. [How much memory does a model need?](/lessons/memory-math/) turns "will it fit in 128 GB" into arithmetic, and [Containers](/lessons/containers/) shows that the 512 MB box you built today is most of what a container is.

@@ -1,0 +1,118 @@
+---
+// CIDR explorer: pick an address and a prefix length, see which of the 32 bits are the
+// "network" part, how many addresses the block holds, and whether a second address is on
+// the same network (deliver directly) or not (send to the router).
+---
+<div class="psub" data-fig="packet-subnet">
+  <div class="ctl">
+    <span>Address</span>
+    <button class="btn" type="button" data-ip="192.168.86.87" aria-pressed="true">192.168.86.87</button>
+    <button class="btn" type="button" data-ip="10.20.30.6" aria-pressed="false">10.20.30.6</button>
+    <button class="btn" type="button" data-ip="100.101.102.103" aria-pressed="false">100.101.102.103</button>
+    <button class="btn" type="button" data-ip="1.1.1.1" aria-pressed="false">1.1.1.1</button>
+  </div>
+  <div class="psub-bits" data-bits></div>
+  <div class="ctl">
+    <label>Prefix length / <input type="range" min="0" max="32" value="24" data-len /> <output data-o-len>24</output></label>
+  </div>
+  <dl class="psub-dl">
+    <dt>In CIDR</dt><dd class="readout" data-r="cidr"></dd>
+    <dt>Subnet mask</dt><dd class="readout" data-r="mask"></dd>
+    <dt>Block</dt><dd class="readout" data-r="range"></dd>
+    <dt>Addresses</dt><dd class="readout" data-r="count"></dd>
+    <dt>Kind</dt><dd class="readout" data-r="kind"></dd>
+    <dt>Router 192.168.86.1</dt><dd class="readout" data-r="same"></dd>
+  </dl>
+</div>
+
+<style>
+  .psub-bits { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+  .psub-oct { min-width: 0; }
+  .psub-oct .label { display: block; text-align: center; font-size: 11px; color: var(--ink); margin-bottom: 4px; }
+  .psub-row { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)); gap: 2px; }
+  .psub-row span {
+    display: block; text-align: center; font-family: var(--mono); font-size: 11px; line-height: 20px;
+    border: 1px solid var(--ink-3); background: var(--paper); color: var(--ink-2);
+  }
+  .psub-row span.net { background: var(--blue); border-color: var(--blue); color: var(--paper); }
+  .psub-dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 16px; margin: 14px 0 0; font-family: var(--mono); font-size: 12px; }
+  .psub-dl dt { color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; font-size: 11px; }
+  .psub-dl dd { margin: 0; overflow-wrap: anywhere; }
+  @media (max-width: 420px) { .psub-row span { font-size: 9px; line-height: 16px; } .psub-bits { gap: 4px; } }
+</style>
+
+<script>
+  const toInt = (s: string) => s.split('.').reduce((a, o) => (a * 256) + Number(o), 0);
+  const toStr = (n: number) => [24, 16, 8, 0].map((sh) => Math.floor(n / 2 ** sh) % 256).join('.');
+  const maskOf = (len: number) => (len === 0 ? 0 : (2 ** 32 - 2 ** (32 - len)));
+  // bitwise AND without 32-bit sign trouble: work per octet
+  const and = (a: number, b: number) => {
+    let r = 0;
+    for (const sh of [24, 16, 8, 0]) r += ((Math.floor(a / 2 ** sh) % 256) & (Math.floor(b / 2 ** sh) % 256)) * 2 ** sh;
+    return r;
+  };
+  const inBlock = (ip: number, net: string, len: number) => and(ip, maskOf(len)) === and(toInt(net), maskOf(len));
+
+  function kind(ip: number) {
+    if (inBlock(ip, '10.0.0.0', 8) || inBlock(ip, '172.16.0.0', 12) || inBlock(ip, '192.168.0.0', 16)) return 'private (RFC 1918): not routable on the internet';
+    if (inBlock(ip, '100.64.0.0', 10)) return 'shared 100.64.0.0/10 (carrier NAT; Tailscale uses it)';
+    if (inBlock(ip, '127.0.0.0', 8)) return 'loopback';
+    return 'public: routable anywhere on the internet';
+  }
+
+  function fmtCount(n: number) {
+    if (n >= 1e9) return `${(n / 1e9).toFixed(2)} billion`;
+    if (n >= 1e6) return `${(n / 1e6).toFixed(1)} million`;
+    return n.toLocaleString('en-US');
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="packet-subnet"]').forEach((root) => {
+    const bitsEl = root.querySelector<HTMLElement>('[data-bits]')!;
+    const len = root.querySelector<HTMLInputElement>('[data-len]')!;
+    const out = root.querySelector<HTMLOutputElement>('[data-o-len]')!;
+    const ipBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-ip]')];
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    let addr = '192.168.86.87';
+
+    function render() {
+      const L = Number(len.value);
+      out.textContent = String(L);
+      const ip = toInt(addr);
+      const m = maskOf(L);
+      const net = and(ip, m);
+      const size = 2 ** (32 - L);
+      bitsEl.replaceChildren(...addr.split('.').map((o, k) => {
+        const d = document.createElement('div');
+        d.className = 'psub-oct';
+        const lab = document.createElement('span');
+        lab.className = 'label';
+        lab.textContent = o;
+        const row = document.createElement('div');
+        row.className = 'psub-row';
+        Number(o).toString(2).padStart(8, '0').split('').forEach((b, j) => {
+          const s = document.createElement('span');
+          s.textContent = b;
+          if (k * 8 + j < L) s.className = 'net';
+          row.appendChild(s);
+        });
+        d.append(lab, row);
+        return d;
+      }));
+      r('cidr').textContent = `${toStr(net)}/${L}`;
+      r('mask').textContent = toStr(m);
+      r('range').textContent = `${toStr(net)} – ${toStr(net + size - 1)}`;
+      r('count').textContent = `2^${32 - L} = ${fmtCount(size)}`;
+      r('kind').textContent = kind(ip);
+      const same = and(toInt('192.168.86.1'), m) === net;
+      r('same').textContent = same ? 'same network: send to it directly (ARP for its MAC)' : 'different network: hand the packet to the default gateway';
+    }
+
+    len.addEventListener('input', render);
+    ipBtns.forEach((b) => b.addEventListener('click', () => {
+      addr = b.dataset.ip!;
+      ipBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    render();
+  });
+</script>

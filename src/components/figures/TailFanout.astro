@@ -1,0 +1,121 @@
+---
+// Interactive: one user request fans out to N backends and must wait for all of them.
+// If each backend is "slow" with probability p (p = 1% means "slower than its own p99"),
+// the user request is slow with probability 1 - (1 - p)^N.
+---
+<div class="tf" data-fig="tail-fanout">
+  <div class="tf-read">
+    <div><span class="label">User requests that hit a slow backend</span><span class="readout" data-o="pslow"></span></div>
+    <div><span class="label">A typical (median) user waits for the backends'</span><span class="readout" data-o="pmed"></span></div>
+  </div>
+  <svg class="tf-grid" viewBox="0 0 480 116" role="img" aria-label="100 user requests, with the ones that hit at least one slow backend filled in"></svg>
+  <svg class="tf-curve" viewBox="0 0 480 130" role="img" aria-label="Chance a user request is slow against the number of backends it needs"></svg>
+  <div class="ctl">
+    <label>Backends per request <input type="range" min="0" max="12" step="1" value="6" data-k="n" /><output></output></label>
+    <span class="tf-group">
+      <button class="btn" type="button" data-p="0.1" aria-pressed="false">Slow = past p90</button>
+      <button class="btn" type="button" data-p="0.01" aria-pressed="true">Past p99</button>
+      <button class="btn" type="button" data-p="0.001" aria-pressed="false">Past p99.9</button>
+    </span>
+  </div>
+  <p class="tf-note">Each square is one user request out of 100. Filled = at least one of its backends was slower than the chosen percentile, so the whole page was slow. Assumes backends are slow independently of each other.</p>
+</div>
+
+<style>
+  .tf-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px 16px; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 10px; }
+  .tf-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .tf-read .label { font-size: 10px; line-height: 1.4; }
+  .tf-read .readout { font-size: 18px; }
+  .tf svg { width: 100%; }
+  .tf-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .tf-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const NS_LIST = [1, 2, 5, 10, 20, 50, 100, 200, 300, 500, 1000, 2000, 5000];
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  // a fixed shuffled order, so filled squares look scattered but don't flicker
+  const order = Array.from({ length: 100 }, (_, i) => i);
+  let seed = 7;
+  for (let i = 99; i > 0; i--) {
+    seed = (seed * 1103515245 + 12345) % 2147483648;
+    const j = seed % (i + 1);
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+
+  const pct = (x: number) => (x >= 0.9995 ? '>99.9%' : x < 0.001 ? `${(x * 100).toFixed(2)}%` : `${(x * 100).toFixed(1)}%`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="tail-fanout"]').forEach((root) => {
+    const grid = root.querySelector<SVGSVGElement>('.tf-grid')!;
+    const cur = root.querySelector<SVGSVGElement>('.tf-curve')!;
+    const slider = root.querySelector<HTMLInputElement>('[data-k="n"]')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-p]')];
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    let p = 0.01;
+
+    function render() {
+      const n = NS_LIST[+slider.value];
+      const slow = 1 - Math.pow(1 - p, n);
+      // the user's median is the backend latency that all n backends beat half the time:
+      // q^n = 0.5, so q = 0.5^(1/n)
+      const q = Math.pow(0.5, 1 / n) * 100;
+      slider.nextElementSibling!.textContent = String(n);
+      out('pslow').textContent = pct(slow);
+      out('pmed').textContent = q >= 99.995 ? 'p99.99+' : `p${q < 99 ? q.toFixed(1) : q.toFixed(2)}`;
+
+      grid.replaceChildren();
+      const filled = new Set(order.slice(0, Math.round(slow * 100)));
+      const cell = 13, gap = 3, cols = 25, w = cols * (cell + gap) - gap;
+      const ox = (480 - w) / 2;
+      for (let i = 0; i < 100; i++) {
+        const x = ox + (i % cols) * (cell + gap), y = 8 + Math.floor(i / cols) * (cell + gap);
+        grid.appendChild(
+          el('rect', {
+            x, y, width: cell, height: cell,
+            style: filled.has(i) ? 'fill:var(--blue);stroke:var(--blue);stroke-width:1' : 'fill:var(--paper);stroke:var(--ink-3);stroke-width:1',
+          }),
+        );
+      }
+      const ty = 8 + 4 * (cell + gap) + 18;
+      grid.appendChild(el('text', { x: ox, y: ty, class: 'blue-t' }, `■ SLOW: ${filled.size} / 100`));
+      grid.appendChild(el('text', { x: ox + w, y: ty, 'text-anchor': 'end' }, `EACH WAITS FOR ${n} BACKEND${n > 1 ? 'S' : ''}`));
+      grid.appendChild(el('text', { x: ox, y: ty + 18 }, `1 − (1 − ${p})^${n} = ${slow.toFixed(3)}`));
+
+      cur.replaceChildren();
+      const x0 = 36, x1 = 470, yTop = 10, yBot = 100;
+      const X = (v: number) => x0 + (Math.log10(v) / Math.log10(5000)) * (x1 - x0);
+      const Y = (f: number) => yBot - f * (yBot - yTop);
+      cur.appendChild(el('line', { x1: x0, y1: yBot, x2: x1, y2: yBot, style: 'stroke:var(--ink);stroke-width:1' }));
+      cur.appendChild(el('line', { x1: x0, y1: yTop, x2: x0, y2: yBot, style: 'stroke:var(--ink);stroke-width:1' }));
+      cur.appendChild(el('text', { x: x0 - 6, y: Y(1) + 4, 'text-anchor': 'end' }, '100%'));
+      cur.appendChild(el('text', { x: x0 - 6, y: Y(0) + 4, 'text-anchor': 'end' }, '0'));
+      for (const v of [1, 10, 100, 1000]) cur.appendChild(el('text', { x: X(v), y: yBot + 15, 'text-anchor': 'middle' }, String(v)));
+      cur.appendChild(el('text', { x: x1, y: 128, 'text-anchor': 'end' }, 'BACKENDS PER REQUEST, LOG SCALE'));
+      let d = '';
+      for (let i = 0; i <= 120; i++) {
+        const v = Math.pow(5000, i / 120);
+        d += `${i ? 'L' : 'M'}${X(v).toFixed(1)},${Y(1 - Math.pow(1 - p, v)).toFixed(1)} `;
+      }
+      cur.appendChild(el('path', { d, style: 'fill:none;stroke:var(--blue);stroke-width:1.5' }));
+      cur.appendChild(el('circle', { cx: X(n), cy: Y(slow), r: 4, style: 'fill:var(--blue)' }));
+    }
+
+    slider.addEventListener('input', render);
+    btns.forEach((b) =>
+      b.addEventListener('click', () => {
+        p = +b.dataset.p!;
+        btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

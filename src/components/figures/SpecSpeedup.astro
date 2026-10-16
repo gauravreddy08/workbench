@@ -1,0 +1,109 @@
+---
+// Speculative decoding speedup calculator (Leviathan et al. 2023, Theorem 3.8 / Corollary).
+// alpha = per-token acceptance rate, K = draft length, c = cost of one draft step / one target step.
+// Assumes acceptances are independent and verifying K+1 tokens costs one target step.
+// Usage: <SpecSpeedup />
+---
+<div class="ssu" data-fig="spec-speedup">
+  <div class="ctl">
+    <label>α acceptance <input type="range" min="0.05" max="0.95" step="0.05" value="0.7" data-in="a" /> <output data-out="a">0.70</output></label>
+    <label>K draft length <input type="range" min="1" max="16" step="1" value="4" data-in="k" /> <output data-out="k">4</output></label>
+    <label>c draft cost <input type="range" min="0" max="1" step="0.01" value="0.1" data-in="c" /> <output data-out="c">0.10</output></label>
+  </div>
+
+  <svg viewBox="0 0 560 250" role="img" aria-label="Speedup over plain decoding as a function of draft length K, with the current K highlighted">
+    <g data-layer="plot"></g>
+  </svg>
+
+  <dl class="ssu-out">
+    <div><dt class="label">Tokens per target pass</dt><dd><span class="readout big" data-out="e">-</span></dd></div>
+    <div><dt class="label">Cost per round</dt><dd><span class="readout" data-out="cost">-</span></dd></div>
+    <div><dt class="label">Speedup</dt><dd><span class="readout big" data-out="s">-</span></dd></div>
+    <div><dt class="label">Best K here</dt><dd><span class="readout" data-out="best">-</span></dd></div>
+    <div><dt class="label">Verified, thrown away</dt><dd><span class="readout" data-out="waste">-</span></dd></div>
+  </dl>
+  <p class="ssu-note" aria-live="polite"></p>
+</div>
+
+<style>
+  .ssu svg { width: 100%; margin-top: 12px; }
+  .ssu-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 18px; margin: 12px 0 0; }
+  .ssu-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .ssu-out dt { font-size: 10.5px; }
+  .ssu-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 13px; color: var(--ink-2); }
+  .ssu-out .big { font-size: 20px; }
+  .ssu-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  // expected tokens per target pass: 1 + a + a^2 + ... + a^K
+  const E = (a: number, K: number) => (1 - a ** (K + 1)) / (1 - a);
+  const S = (a: number, K: number, c: number) => E(a, K) / (1 + K * c);
+  const KMAX = 16;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="spec-speedup"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const inp = (k: string) => q<HTMLInputElement>(`[data-in="${k}"]`);
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const G = q<SVGGElement>('[data-layer="plot"]');
+    const note = q<HTMLElement>('.ssu-note');
+
+    const render = () => {
+      const a = Number(inp('a').value), K = Number(inp('k').value), c = Number(inp('c').value);
+      out('a').textContent = a.toFixed(2);
+      out('k').textContent = String(K);
+      out('c').textContent = c.toFixed(2);
+
+      const ss = Array.from({ length: KMAX }, (_, i) => S(a, i + 1, c));
+      const bestK = ss.indexOf(Math.max(...ss)) + 1;
+      const yMax = Math.max(2, Math.ceil(Math.max(...ss) + 0.25));
+      const x0 = 46, x1 = 540, y0 = 20, y1 = 210;
+      const X = (k: number) => x0 + ((k - 1) / (KMAX - 1)) * (x1 - x0);
+      const Y = (s: number) => y1 - (s / yMax) * (y1 - y0);
+
+      G.replaceChildren();
+      G.appendChild(mk('line', { x1: x0, y1: y1, x2: x1, y2: y1, class: 'ink', 'stroke-width': 1 }));
+      G.appendChild(mk('line', { x1: x0, y1: y0, x2: x0, y2: y1, class: 'ink', 'stroke-width': 1 }));
+      for (let s = 0; s <= yMax; s++) {
+        G.appendChild(mk('text', { x: x0 - 8, y: Y(s) + 4, 'text-anchor': 'end' }, `${s}×`));
+        if (s > 0) G.appendChild(mk('line', { x1: x0, y1: Y(s), x2: x1, y2: Y(s), class: s === 1 ? 'ink dash' : 'blue dash', 'stroke-width': s === 1 ? 1 : 0.4 }));
+      }
+      G.appendChild(mk('text', { x: x1, y: Y(1) - 5, 'text-anchor': 'end' }, 'PLAIN DECODING = 1×'));
+      for (let k = 1; k <= KMAX; k++) {
+        if (k === 1 || k % 3 === 0 || k === KMAX) G.appendChild(mk('text', { x: X(k), y: y1 + 16, 'text-anchor': 'middle' }, String(k)));
+      }
+      G.appendChild(mk('text', { x: (x0 + x1) / 2, y: y1 + 34, 'text-anchor': 'middle' }, 'K · TOKENS DRAFTED PER ROUND'));
+      const pts = ss.map((s, i) => `${X(i + 1).toFixed(1)},${Y(s).toFixed(1)}`).join(' ');
+      G.appendChild(mk('polyline', { points: pts, class: 'blue', 'stroke-width': 1.5 }));
+      ss.forEach((s, i) => {
+        const k = i + 1;
+        G.appendChild(mk('circle', { cx: X(k), cy: Y(s), r: k === K ? 5.5 : 2.5, class: k === K ? 'fill-blue' : 'fill-paper', 'stroke-width': 1 }));
+      });
+      const sK = ss[K - 1];
+      G.appendChild(mk('text', { x: Math.min(X(K) + 9, x1 - 60), y: Y(sK) - 10, class: 'strong' }, `${sK.toFixed(2)}×`));
+      G.appendChild(mk('line', { x1: X(bestK), y1: Y(ss[bestK - 1]) - 8, x2: X(bestK), y2: Y(ss[bestK - 1]) - 22, class: 'ink', 'stroke-width': 1 }));
+      G.appendChild(mk('text', { x: X(bestK), y: Y(ss[bestK - 1]) - 26, 'text-anchor': 'middle', class: 'blue-t' }, 'BEST'));
+
+      const e = E(a, K);
+      out('e').textContent = e.toFixed(2);
+      out('cost').textContent = `${(1 + K * c).toFixed(2)} target passes`;
+      out('s').textContent = `${sK.toFixed(2)}×`;
+      out('best').textContent = `K = ${bestK} · ${ss[bestK - 1].toFixed(2)}×`;
+      out('waste').textContent = `${((100 * (K + 1 - e)) / (K + 1)).toFixed(0)}% of ${K + 1} slots`;
+
+      if (sK < 1) note.textContent = `Slower than not speculating. Each round spends ${(K * c).toFixed(2)} target-passes of time drafting, and the drafts are not kept often enough to pay for it. Lower K, or find a cheaper or better draft.`;
+      else if (K > bestK) note.textContent = `Past the best K. The chance all ${K} drafts survive is α^K = ${(a ** K).toFixed(3)}, so the extra drafts at the end are rarely used, but you pay c for each one every round.`;
+      else if (K < bestK) note.textContent = `Below the best K. Drafts are cheap and good enough here that guessing further ahead still pays.`;
+      else note.textContent = `This is the best K for this α and c. Try c = 0 (prompt lookup, nearly free drafts): the best K grows. Try c = 0.3 (a slow Python draft loop): it shrinks fast.`;
+    };
+    root.querySelectorAll('input').forEach((i) => i.addEventListener('input', render));
+    render();
+  });
+</script>

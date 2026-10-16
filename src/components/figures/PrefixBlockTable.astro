@@ -1,0 +1,53 @@
+---
+// Static: parallel sampling (n=2) with PagedAttention.
+// Each sample has logical blocks; a per-sequence block table maps them to physical blocks.
+// Prompt blocks are shared (ref 2). The last, partly filled block was copied on first write.
+const pool = [
+  { id: 'P0', text: 'free', free: true },
+  { id: 'P1', text: 'PROMPT 16-31 · REF 2', shared: true },
+  { id: 'P2', text: 'free', free: true },
+  { id: 'P3', text: '32-39 + S1 OUT · REF 1' },
+  { id: 'P4', text: 'free', free: true },
+  { id: 'P5', text: '32-39 + S2 OUT · REF 1', copy: true },
+  { id: 'P6', text: 'free', free: true },
+  { id: 'P7', text: 'PROMPT 0-15 · REF 2', shared: true },
+];
+const py = (i: number) => 34 + i * 30;
+const seqs = [
+  { name: 'SAMPLE 1', y: 34, rows: [['L0', 'TOK 0-15', 7], ['L1', 'TOK 16-31', 1], ['L2', 'TOK 32-47', 3]] },
+  { name: 'SAMPLE 2', y: 164, rows: [['L0', 'TOK 0-15', 7], ['L1', 'TOK 16-31', 1], ['L2', 'TOK 32-47', 5]] },
+] as const;
+---
+<svg viewBox="0 0 640 290" role="img" aria-label="Two samples of one prompt share physical KV blocks through their block tables; the last block was copied on write">
+  <text x="20" y="20" class="strong">LOGICAL BLOCKS</text>
+  <text x="196" y="20" class="strong">BLOCK TABLES</text>
+  <text x="420" y="20" class="strong">PHYSICAL KV POOL</text>
+  {seqs.map((s) => (
+    <g>
+      <text x="20" y={s.y + 6} class="blue-t">{s.name}</text>
+      {s.rows.map((r, j) => {
+        const y = s.y + 14 + j * 30;
+        const target = py(r[2]) + 12;
+        return (
+          <g>
+            <rect x="20" y={y} width="140" height="24" class="fill-paper" stroke-width="1" />
+            <text x="28" y={y + 16} class="strong">{r[0]}</text>
+            <text x="152" y={y + 16} text-anchor="end">{r[1]}</text>
+            <rect x="196" y={y} width="80" height="24" class="fill-paper" stroke-width="1" />
+            <text x="204" y={y + 16}>{`${j} → P${r[2]}`}</text>
+            <line x1="160" y1={y + 12} x2="196" y2={y + 12} class="ink" stroke-width="1" />
+            <line x1="276" y1={y + 12} x2="420" y2={target} class={r[2] === 7 || r[2] === 1 ? 'blue' : 'ink'} stroke-width="1.2" />
+          </g>
+        );
+      })}
+    </g>
+  ))}
+  {pool.map((p, i) => (
+    <g>
+      <rect x="420" y={py(i)} width="200" height="24" class={p.free ? 'fill-paper dash' : p.shared ? 'fill-wash' : 'fill-paper'} stroke-width={p.copy ? 2 : 1} />
+      <text x="428" y={py(i) + 16} class={p.free ? '' : 'strong'}>{p.id}</text>
+      <text x="612" y={py(i) + 16} text-anchor="end" class={p.shared ? 'blue-t' : ''}>{p.text}</text>
+    </g>
+  ))}
+  <text x="420" y="284" class="blue-t">P5 = COPY OF P3, MADE ON S2'S FIRST WRITE</text>
+</svg>

@@ -1,0 +1,192 @@
+---
+// The event loop as a ring of tasks. Step through: the loop runs one ready task until it
+// hits await, parks it, picks the next; when nothing is ready it asks the OS to wake it.
+---
+<div class="wl" data-fig="waiting-loop">
+  <svg class="wl-svg" viewBox="0 0 560 330" role="img" aria-label="Event loop with five tasks">
+    <defs>
+      <marker id="wl-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+        <path d="M0,0 L10,5 L0,10 z" style="fill:var(--blue)" />
+      </marker>
+    </defs>
+    <circle cx="200" cy="165" r="118" class="blue dash" stroke-width="1" />
+    <line class="wl-hand" x1="200" y1="165" x2="200" y2="70" stroke-width="1.5" marker-end="url(#wl-arrow)" style="stroke:var(--blue)" />
+    <rect x="148" y="140" width="104" height="50" class="fill-paper" stroke-width="1.5" />
+    <text x="200" y="160" text-anchor="middle" class="strong">EVENT LOOP</text>
+    <text x="200" y="178" text-anchor="middle" class="blue-t wl-clock">t = 0 ms</text>
+    <g class="wl-nodes"></g>
+    <rect x="390" y="40" width="160" height="250" class="fill-paper" stroke-width="1" />
+    <text x="470" y="60" text-anchor="middle" class="strong">OS · KQUEUE/EPOLL</text>
+    <text x="470" y="76" text-anchor="middle">PARKED, WAKE AT</text>
+    <g class="wl-parked"></g>
+    <line x1="318" y1="165" x2="388" y2="165" class="ink dash" stroke-width="1" />
+    <text x="353" y="157" text-anchor="middle">select()</text>
+  </svg>
+  <p class="wl-log readout" aria-live="polite"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-a="step">Step</button>
+    <button class="btn" type="button" data-a="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-a="reset">Reset</button>
+    <span>READY QUEUE <span class="readout wl-q"></span></span>
+  </div>
+</div>
+
+<style>
+  .wl-svg { width: 100%; }
+  .wl-log { min-height: 3.2em; margin: 10px 0 0; font-size: 13px; line-height: 1.5; font-weight: 400; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  type T = { name: string; waits: number[]; idx: number; status: 'ready' | 'running' | 'waiting' | 'done'; wakeAt: number };
+  const SCRIPT: [string, number[]][] = [
+    ['T1', [400, 200]],
+    ['T2', [300]],
+    ['T3', [600, 100]],
+    ['T4', [200, 200, 200]],
+    ['T5', [500]],
+  ];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="waiting-loop"]').forEach((root) => {
+    const nodesG = root.querySelector('.wl-nodes')!;
+    const parkedG = root.querySelector('.wl-parked')!;
+    const hand = root.querySelector<SVGLineElement>('.wl-hand')!;
+    const clock = root.querySelector('.wl-clock')!;
+    const log = root.querySelector('.wl-log')!;
+    const qOut = root.querySelector('.wl-q')!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-a="play"]')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const cx = 200, cy = 165, R = 118;
+    const pos = SCRIPT.map((_, i) => {
+      const a = -Math.PI / 2 + (i * 2 * Math.PI) / SCRIPT.length;
+      return { x: cx + R * Math.cos(a), y: cy + R * Math.sin(a) };
+    });
+
+    let tasks: T[] = [], ready: T[] = [], running: T | null = null, now = 0, timer: number | undefined, finished = false;
+    const sequential = SCRIPT.reduce((s, [, w]) => s + w.reduce((a, b) => a + b, 0), 0);
+
+    function reset() {
+      tasks = SCRIPT.map(([name, waits]) => ({ name, waits, idx: 0, status: 'ready', wakeAt: 0 }));
+      ready = [...tasks];
+      running = null;
+      now = 0;
+      finished = false;
+      log.textContent = 'All five tasks start ready. Press Step. The loop runs one task at a time.';
+      draw();
+    }
+
+    function step() {
+      if (finished) return;
+      if (running) {
+        const t = running;
+        running = null;
+        if (t.idx < t.waits.length) {
+          const w = t.waits[t.idx++];
+          t.status = 'waiting';
+          t.wakeAt = now + w;
+          log.textContent = `${t.name} sends its request and hits await. Parked until the OS says its socket has data (in ${w} ms). The loop moves on.`;
+        } else {
+          t.status = 'done';
+          log.textContent = `${t.name} gets its last reply, finishes, and leaves the ring.`;
+        }
+      } else if (ready.length) {
+        running = ready.shift()!;
+        running.status = 'running';
+        log.textContent = `Loop takes ${running.name} from the ready queue and runs it. It runs for well under a millisecond of real work.`;
+      } else {
+        const waiting = tasks.filter((t) => t.status === 'waiting');
+        if (!waiting.length) {
+          finished = true;
+          log.textContent = `All done at t = ${now} ms on one thread. Run one after another, the same waits take ${sequential} ms.`;
+          stop();
+        } else {
+          now = Math.min(...waiting.map((t) => t.wakeAt));
+          const woke = waiting.filter((t) => t.wakeAt <= now);
+          woke.forEach((t) => { t.status = 'ready'; ready.push(t); });
+          log.textContent = `Nothing is ready, so the loop calls select() and sleeps. At t = ${now} ms the OS wakes it: ${woke.map((t) => t.name).join(', ')} ready again.`;
+        }
+      }
+      draw();
+    }
+
+    function draw() {
+      nodesG.replaceChildren();
+      tasks.forEach((t, i) => {
+        const p = pos[i];
+        const g = document.createElementNS(NS, 'g');
+        const c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', String(p.x));
+        c.setAttribute('cy', String(p.y));
+        c.setAttribute('r', '24');
+        c.setAttribute('stroke-width', '1.5');
+        const style: Record<T['status'], string> = {
+          running: 'fill:var(--blue);stroke:var(--blue)',
+          ready: 'fill:var(--blue-fill);stroke:var(--blue)',
+          waiting: 'fill:var(--paper);stroke:var(--ink-3);stroke-dasharray:3 3',
+          done: 'fill:var(--paper-2);stroke:var(--rule)',
+        };
+        c.setAttribute('style', style[t.status]);
+        const tx = document.createElementNS(NS, 'text');
+        tx.setAttribute('x', String(p.x));
+        tx.setAttribute('y', String(p.y + 4));
+        tx.setAttribute('text-anchor', 'middle');
+        tx.setAttribute('style', t.status === 'running' ? 'fill:var(--paper);font-weight:600' : t.status === 'done' ? 'fill:var(--ink-3)' : 'fill:var(--ink);font-weight:600');
+        tx.textContent = t.name;
+        const st = document.createElementNS(NS, 'text');
+        st.setAttribute('x', String(p.x));
+        st.setAttribute('y', String(p.y + (p.y < cy - 10 ? -32 : 40)));
+        st.setAttribute('text-anchor', 'middle');
+        st.setAttribute('style', 'font-size:10px');
+        st.textContent = t.status.toUpperCase();
+        g.append(c, tx, st);
+        nodesG.appendChild(g);
+      });
+      parkedG.replaceChildren();
+      tasks
+        .filter((t) => t.status === 'waiting')
+        .sort((a, b) => a.wakeAt - b.wakeAt)
+        .forEach((t, j) => {
+          const tx = document.createElementNS(NS, 'text');
+          tx.setAttribute('x', '470');
+          tx.setAttribute('y', String(104 + j * 22));
+          tx.setAttribute('text-anchor', 'middle');
+          tx.textContent = `${t.name} · ${t.wakeAt} ms`;
+          parkedG.appendChild(tx);
+        });
+      const target = running ? pos[tasks.indexOf(running)] : null;
+      if (target) {
+        const dx = target.x - cx, dy = target.y - cy, d = Math.hypot(dx, dy);
+        hand.setAttribute('x2', String(cx + (dx * (d - 28)) / d));
+        hand.setAttribute('y2', String(cy + (dy * (d - 28)) / d));
+        hand.style.display = '';
+      } else {
+        hand.style.display = 'none';
+      }
+      clock.textContent = `t = ${now} ms`;
+      qOut.textContent = ready.length ? ready.map((t) => t.name).join(' → ') : 'empty';
+    }
+
+    function stop() {
+      if (timer !== undefined) window.clearInterval(timer);
+      timer = undefined;
+      playBtn.setAttribute('aria-pressed', 'false');
+      playBtn.textContent = 'Play';
+    }
+
+    root.querySelector('[data-a="step"]')!.addEventListener('click', () => { stop(); step(); });
+    root.querySelector('[data-a="reset"]')!.addEventListener('click', () => { stop(); reset(); });
+    playBtn.addEventListener('click', () => {
+      if (timer !== undefined) return stop();
+      if (finished) reset();
+      if (reduce) {
+        // no animation: run to the end in one go
+        while (!finished) step();
+        return;
+      }
+      playBtn.setAttribute('aria-pressed', 'true');
+      playBtn.textContent = 'Pause';
+      timer = window.setInterval(step, 900);
+    });
+    reset();
+  });
+</script>

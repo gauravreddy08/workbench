@@ -1,0 +1,181 @@
+---
+// Step through UDP hole punching between a laptop behind a cafe NAT and a server behind a home NAT.
+// Each router keeps a table of "conversations I started"; a packet gets in only if it matches one.
+// Toggle the home router to a "hard" (symmetric) NAT and watch the punch fail, which is when DERP takes over.
+---
+<div class="hp" data-fig="ssh-hole-punch">
+  <svg viewBox="0 0 640 290" role="img" aria-label="Two devices behind two NAT routers opening a direct UDP path">
+    <rect x="200" y="14" width="100" height="36" class="fill-paper" stroke-width="1" />
+    <text x="250" y="36" text-anchor="middle" class="strong">STUN</text>
+    <rect x="340" y="14" width="100" height="36" class="fill-paper" stroke-width="1" />
+    <text x="390" y="36" text-anchor="middle" class="strong">CONTROL</text>
+
+    <rect x="14" y="146" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+    <text x="59" y="164" text-anchor="middle" class="strong">LAPTOP</text>
+    <text x="59" y="180" text-anchor="middle">10.0.0.23</text>
+    <rect x="150" y="136" width="70" height="64" class="fill-wash" stroke-width="1.2" />
+    <text x="185" y="160" text-anchor="middle" class="strong">CAFE</text>
+    <text x="185" y="174" text-anchor="middle">NAT</text>
+    <text x="185" y="190" text-anchor="middle" data-cafe-kind>EASY</text>
+    <rect x="420" y="136" width="70" height="64" class="fill-wash" stroke-width="1.2" />
+    <text x="455" y="160" text-anchor="middle" class="strong">HOME</text>
+    <text x="455" y="174" text-anchor="middle">NAT</text>
+    <text x="455" y="190" text-anchor="middle" data-home-kind>EASY</text>
+    <rect x="536" y="146" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+    <text x="581" y="164" text-anchor="middle" class="strong">SERVER</text>
+    <text x="581" y="180" text-anchor="middle">192.168.1.50</text>
+
+    <text x="14" y="222" class="blue-t">CAFE NAT REMEMBERS</text>
+    <text x="626" y="222" text-anchor="end" class="blue-t">HOME NAT REMEMBERS</text>
+    <g data-tab-a></g>
+    <g data-tab-b></g>
+    <g data-arrows></g>
+  </svg>
+  <p class="hp-msg" data-msg></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-prev>Back</button>
+    <button class="btn" type="button" data-next>Next</button>
+    <span>Step <span class="readout" data-step></span></span>
+    <button class="btn" type="button" data-hard aria-pressed="false">Home NAT: easy</button>
+  </div>
+</div>
+
+<style>
+  .hp svg { width: 100%; }
+  .hp-msg { font-family: var(--mono); font-size: 12px; line-height: 1.6; color: var(--ink-2); margin: 10px 0 0; min-height: 5.2em; }
+  .hp .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+</style>
+
+<script>
+  type Pt = [number, number];
+  type Arrow = { pts: Pt[]; dashed?: boolean; drop?: boolean };
+  type Step = { msg: string; arrows: Arrow[]; a: string[]; b: string[] };
+
+  const UP = 160, DN = 178; // y lanes for laptop->server and server->laptop
+  const toB = (y: number, drop: boolean): Arrow => drop
+    ? { pts: [[104, y], [420, y]], drop: true }
+    : { pts: [[104, y], [536, y]] };
+  const toA = (y: number, drop: boolean): Arrow => drop
+    ? { pts: [[536, y], [220, y]], drop: true }
+    : { pts: [[536, y], [104, y]] };
+
+  function steps(hard: boolean): Step[] {
+    const aStun = '10.0.0.23:41641 ⇄ :51000 (to STUN)';
+    const bStun = '192.168.1.50:41641 ⇄ :62000 (to STUN)';
+    const s: Step[] = [
+      {
+        msg: 'Two devices behind two NATs. Neither has a public address, and each router drops any packet it was not expecting. Neither side can simply "call" the other.',
+        arrows: [], a: [], b: [],
+      },
+      {
+        msg: 'Each device sends one UDP packet to a STUN server. The reply says "you look like 198.51.100.7:51000 to me" (laptop) and "203.0.113.9:62000" (server). Each router wrote down the mapping it made.',
+        arrows: [
+          { pts: [[80, 146], [185, 136], [230, 50]] },
+          { pts: [[560, 146], [455, 136], [270, 50]] },
+        ],
+        a: [aStun], b: [bStun],
+      },
+      {
+        msg: 'Both send their public address and WireGuard public key to the control server, which passes them to the other side. That is all the control server does. It never carries the traffic.',
+        arrows: [
+          { pts: [[40, 146], [175, 136], [360, 50]], dashed: true },
+          { pts: [[600, 146], [465, 136], [420, 50]], dashed: true },
+        ],
+        a: [aStun], b: [bStun],
+      },
+      {
+        msg: 'The laptop sends UDP to 203.0.113.9:62000. Its own router notes "I sent to 203.0.113.9:62000, replies from there are OK". The home router has no matching note and drops it. That is fine: this packet’s real job was to open the cafe side.',
+        arrows: [toB(UP, true)],
+        a: [aStun, 'let in: 203.0.113.9:62000'], b: [bStun],
+      },
+    ];
+    if (!hard) {
+      s.push(
+        {
+          msg: 'The server sends UDP to 198.51.100.7:51000 (in reality both fire at about the same time). The home router reuses its :62000 mapping and notes the cafe address. The cafe router sees a packet from 203.0.113.9:62000, which matches its note: let in.',
+          arrows: [toA(DN, false)],
+          a: [aStun, 'let in: 203.0.113.9:62000'], b: [bStun, 'let in: 198.51.100.7:51000'],
+        },
+        {
+          msg: 'Both routers now hold a matching note, so packets flow both ways with no relay and no port forward. WireGuard does its handshake over this path. Small keepalive packets stop the notes from expiring (UDP mappings often time out in 30 s to a few minutes).',
+          arrows: [toB(UP, false), toA(DN, false)],
+          a: [aStun, 'let in: 203.0.113.9:62000'], b: [bStun, 'let in: 198.51.100.7:51000'],
+        },
+      );
+    } else {
+      s.push(
+        {
+          msg: 'Hard NAT: the home router picks a NEW public port for every new destination. The server’s packet leaves as 203.0.113.9:62417, not :62000. The cafe router only expects :62000, so it drops it.',
+          arrows: [toA(DN, true)],
+          a: [aStun, 'let in: 203.0.113.9:62000'], b: [bStun, '192.168.1.50 ⇄ :62417 (to cafe)'],
+        },
+        {
+          msg: 'The laptop keeps aiming at :62000, but on a hard NAT that mapping only accepts replies from the STUN server. Dropped again. Neither side can predict the other’s port, so Tailscale sends the traffic through a DERP relay instead, and keeps trying for a direct path in the background.',
+          arrows: [toB(UP, true), toA(DN, true)],
+          a: [aStun, 'let in: 203.0.113.9:62000'], b: [bStun, '192.168.1.50 ⇄ :62417 (to cafe)'],
+        },
+      );
+    }
+    return s;
+  }
+
+  const NS = 'http://www.w3.org/2000/svg';
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="ssh-hole-punch"]').forEach((root) => {
+    const arrowsG = root.querySelector('[data-arrows]')!;
+    const tabA = root.querySelector('[data-tab-a]')!;
+    const tabB = root.querySelector('[data-tab-b]')!;
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const stepEl = root.querySelector<HTMLElement>('[data-step]')!;
+    const prev = root.querySelector<HTMLButtonElement>('[data-prev]')!;
+    const next = root.querySelector<HTMLButtonElement>('[data-next]')!;
+    const hardBtn = root.querySelector<HTMLButtonElement>('[data-hard]')!;
+    const homeKind = root.querySelector<SVGTextElement>('[data-home-kind]')!;
+    let hard = false;
+    let i = 0;
+
+    function render() {
+      const all = steps(hard);
+      i = Math.max(0, Math.min(i, all.length - 1));
+      const s = all[i];
+      msg.textContent = s.msg;
+      stepEl.textContent = `${i + 1} / ${all.length}`;
+      prev.disabled = i === 0;
+      next.disabled = i === all.length - 1;
+      homeKind.textContent = hard ? 'HARD' : 'EASY';
+      arrowsG.replaceChildren();
+      s.arrows.forEach((a) => {
+        const d = 'M ' + a.pts.map((p) => p.join(' ')).join(' L ');
+        arrowsG.append(el('path', {
+          d, fill: 'none', 'stroke-width': 2,
+          class: a.dashed ? 'ink dash' : 'blue',
+        }));
+        const [x, y] = a.pts[a.pts.length - 1];
+        if (a.drop) {
+          arrowsG.append(el('line', { x1: x - 7, y1: y - 7, x2: x + 7, y2: y + 7, class: 'ink', 'stroke-width': 2.5 }));
+          arrowsG.append(el('line', { x1: x + 7, y1: y - 7, x2: x - 7, y2: y + 7, class: 'ink', 'stroke-width': 2.5 }));
+        } else {
+          arrowsG.append(el('circle', { cx: x, cy: y, r: 4, class: a.dashed ? 'fill-paper' : 'fill-blue' }));
+        }
+      });
+      tabA.replaceChildren(...s.a.map((t, k) => el('text', { x: 14, y: 240 + k * 17 }, t)));
+      tabB.replaceChildren(...s.b.map((t, k) => el('text', { x: 626, y: 240 + k * 17, 'text-anchor': 'end' }, t)));
+    }
+
+    prev.addEventListener('click', () => { i--; render(); });
+    next.addEventListener('click', () => { i++; render(); });
+    hardBtn.addEventListener('click', () => {
+      hard = !hard;
+      hardBtn.setAttribute('aria-pressed', String(hard));
+      hardBtn.textContent = hard ? 'Home NAT: hard' : 'Home NAT: easy';
+      render();
+    });
+    render();
+  });
+</script>

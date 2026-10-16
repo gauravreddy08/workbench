@@ -1,0 +1,188 @@
+---
+// Interactive: the life of one API version (v1) and the clients on it.
+// v1 goes design -> beta -> GA -> deprecated -> sunset. v2 ships at the deprecation date.
+// A toy migration model (illustrative, not data): new clients join over time; after the
+// deprecation date new clients pick v2, and existing v1 clients migrate at a monthly rate that
+// depends on how loudly you tell them. A share of v1 clients is "unreachable" (nobody reads the
+// emails or the headers: abandoned scripts, ex-employees' cron jobs). Brownouts flush most of them
+// out. Whoever is still on v1 at sunset breaks.
+---
+<div class="atl" data-fig="api-timeline">
+  <svg viewBox="0 0 640 330" role="img" aria-label="Timeline of an API version's stages with client adoption curves for v1 and v2"></svg>
+  <div class="atl-read">
+    <div><span class="label">v1 clients at deprecation</span><span class="readout" data-r="atD">-</span></div>
+    <div><span class="label">Still on v1 at sunset</span><span class="readout" data-r="broken">-</span></div>
+    <div><span class="label">Share broken</span><span class="readout" data-r="pct">-</span></div>
+  </div>
+  <div class="ctl">
+    <label>Deprecate at month <input type="range" min="12" max="24" value="18" data-k="dep" /> <output data-o="dep">18</output></label>
+    <label>Migration window <input type="range" min="2" max="18" value="6" data-k="win" /> <output data-o="win">6</output> mo</label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-t="nudge" aria-pressed="false">Deprecation headers + emails</button>
+    <button class="btn" type="button" data-t="brown" aria-pressed="false">Brownouts before sunset</button>
+  </div>
+  <p class="atl-note" data-r="why"></p>
+  <p class="atl-note">Toy model, not data: 200 clients, migration rates made up to show the shape. Real curves have the same long tail.</p>
+</div>
+
+<style>
+  .atl svg { width: 100%; }
+  .atl-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px 14px; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 6px; }
+  .atl-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .atl-read .label { font-size: 10px; }
+  .atl-read .readout { font-size: 17px; }
+  .atl-note { font-family: var(--mono); font-size: 11px; line-height: 1.55; color: var(--ink-2); margin: 12px 0 0; }
+  .atl-note + .atl-note { color: var(--ink-3); font-size: 10.5px; margin-top: 6px; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const MONTHS = 36, TOTAL = 200, DT = 0.25;
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  // cumulative clients that have ever integrated, by month t
+  const joined = (t: number) => (t < 3 ? 0 : TOTAL / (1 + Math.exp(-(t - 11) / 2.2)));
+
+  function simulate(dep: number, win: number, nudge: boolean, brown: boolean) {
+    const sunset = Math.min(MONTHS, dep + win);
+    let v1 = 0, v2 = 0, stuck = 0, atD = 0, broken = 0;
+    const pts1: [number, number][] = [], pts2: [number, number][] = [];
+    for (let t = 0; t <= MONTHS + 1e-9; t += DT) {
+      const add = joined(t + DT) - joined(t);
+      if (t < dep) v1 += add; else v2 += add;
+      if (Math.abs(t - dep) < DT / 2) {
+        atD = v1;
+        stuck = v1 * (nudge ? 0.12 : 0.2); // never read the notice
+      }
+      if (t >= dep && t < sunset) {
+        const late = t > sunset - win / 3;
+        let rate = nudge ? 0.14 : 0.04; // per month, of reachable v1 clients
+        if (late) rate *= 2; // deadline effect
+        const reachable = Math.max(0, v1 - stuck);
+        const mv = reachable * (1 - Math.exp(-rate * DT));
+        v1 -= mv; v2 += mv;
+        if (brown && t > sunset - 1.5) {
+          // brownouts: scheduled short outages make silent clients' owners notice
+          const found = stuck * (1 - Math.exp(-1.6 * DT));
+          stuck -= found; v1 -= found; v2 += found;
+        }
+      }
+      if (Math.abs(t - sunset) < DT / 2 && sunset < MONTHS) {
+        broken = v1;
+        pts1.push([t, v1]);
+        v1 = 0;
+      }
+      pts1.push([t, v1]); pts2.push([t, v2]);
+    }
+    if (sunset >= MONTHS) broken = NaN;
+    return { pts1, pts2, atD, broken, sunset };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="api-timeline"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const s = { dep: 18, win: 6, nudge: false, brown: false };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+
+    const X0 = 46, X1 = 628, TOP = 96, BOT = 290;
+    const xt = (t: number) => X0 + (t / MONTHS) * (X1 - X0);
+    const yv = (v: number) => BOT - (v / TOTAL) * (BOT - TOP);
+
+    function band(y: number, label: string, stages: [string, number, number, string][]) {
+      svg.append(el('text', { x: X0 - 8, y: y + 15, 'text-anchor': 'end', class: 'strong' }, label));
+      for (const [name, a, b, cls] of stages) {
+        if (b <= a) continue;
+        svg.append(el('rect', { x: xt(a), y, width: xt(b) - xt(a), height: 22, class: cls, 'stroke-width': 1 }));
+        if (xt(b) - xt(a) > 34) svg.append(el('text', { x: (xt(a) + xt(b)) / 2, y: y + 15, 'text-anchor': 'middle', 'font-size': 10 }, name));
+      }
+    }
+
+    function draw() {
+      const res = simulate(s.dep, s.win, s.nudge, s.brown);
+      svg.replaceChildren();
+      const sun = res.sunset;
+      band(14, 'v1', [
+        ['DESIGN', 0, 3, 'fill-paper dash'],
+        ['BETA', 3, 6, 'fill-paper'],
+        ['GA', 6, s.dep, 'fill-wash'],
+        ['DEPRECATED', s.dep, sun, 'fill-paper dash'],
+        ['GONE', sun, MONTHS, 'fill-paper'],
+      ]);
+      band(44, 'v2', [
+        ['DESIGN', Math.max(0, s.dep - 7), s.dep - 3, 'fill-paper dash'],
+        ['BETA', s.dep - 3, s.dep, 'fill-paper'],
+        ['GA', s.dep, MONTHS, 'fill-wash'],
+      ]);
+
+      // axes
+      svg.append(el('line', { x1: X0, y1: BOT, x2: X1, y2: BOT, class: 'ink', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: X0, y1: TOP, x2: X0, y2: BOT, class: 'ink', 'stroke-width': 1 }));
+      for (const v of [0, 100, 200]) svg.append(el('text', { x: X0 - 6, y: yv(v) + 4, 'text-anchor': 'end' }, String(v)));
+      svg.append(el('text', { x: X0 + 4, y: TOP - 6 }, 'CLIENTS'));
+      for (let t = 0; t <= MONTHS; t += 6) svg.append(el('text', { x: xt(t), y: BOT + 16, 'text-anchor': 'middle' }, `${t}`));
+      svg.append(el('text', { x: X1, y: BOT + 32, 'text-anchor': 'end' }, 'MONTH →'));
+
+      // event lines
+      svg.append(el('line', { x1: xt(s.dep), y1: 10, x2: xt(s.dep), y2: BOT, class: 'blue dash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: xt(s.dep) + 4, y: TOP + 10, class: 'blue-t' }, 'DEPRECATE'));
+      if (sun < MONTHS) {
+        svg.append(el('line', { x1: xt(sun), y1: 10, x2: xt(sun), y2: BOT, class: 'ink dash', 'stroke-width': 1 }));
+        svg.append(el('text', { x: xt(sun) + 4, y: TOP + 24, class: 'strong' }, 'SUNSET'));
+        if (s.brown) svg.append(el('rect', { x: xt(sun - 1.5), y: BOT - 6, width: xt(sun) - xt(sun - 1.5), height: 6, class: 'fill-blue' }));
+      }
+
+      const path = (pts: [number, number][]) => pts.map(([t, v], i) => `${i ? 'L' : 'M'}${xt(t).toFixed(1)} ${yv(v).toFixed(1)}`).join(' ');
+      svg.append(el('path', { d: path(res.pts2), class: 'blue', 'stroke-width': 1.8 }));
+      svg.append(el('path', { d: path(res.pts1), class: 'ink', 'stroke-width': 1.5 }));
+      svg.append(el('text', { x: X1 - 4, y: yv(res.pts2[res.pts2.length - 1][1]) - 6, 'text-anchor': 'end', class: 'blue-t' }, 'ON v2'));
+      const peak = res.pts1.reduce((a, b) => (b[1] > a[1] ? b : a));
+      svg.append(el('text', { x: xt(peak[0]) - 6, y: yv(peak[1]) - 8, 'text-anchor': 'end', class: 'strong' }, 'ON v1'));
+
+      if (!isNaN(res.broken) && res.broken > 0.5) {
+        const x = xt(sun), y = yv(res.broken);
+        svg.append(el('line', { x1: x - 5, y1: y - 5, x2: x + 5, y2: y + 5, class: 'ink', 'stroke-width': 1.5 }));
+        svg.append(el('line', { x1: x - 5, y1: y + 5, x2: x + 5, y2: y - 5, class: 'ink', 'stroke-width': 1.5 }));
+        svg.append(el('text', { x: x + 8, y: y - 6, class: 'strong' }, `${Math.round(res.broken)} BREAK`));
+      }
+
+      r('atD').textContent = String(Math.round(res.atD));
+      if (isNaN(res.broken)) {
+        r('broken').textContent = 'past chart';
+        r('pct').textContent = '-';
+      } else {
+        r('broken').textContent = String(Math.round(res.broken));
+        r('pct').textContent = `${((100 * res.broken) / Math.max(1, res.atD)).toFixed(0)}%`;
+      }
+      let why = '';
+      if (isNaN(res.broken)) why = 'Sunset is at or past month 36: no one has broken yet, and you are still running two versions.';
+      else if (!s.nudge && !s.brown) why = 'Nobody is told, so migration is slow and a big group breaks on sunset day. Try the headers and a longer window.';
+      else if (s.nudge && !s.brown) why = 'Telling people helps, but a stubborn tail never reads the notice. Only breaking them (briefly, on purpose) finds them.';
+      else if (!s.nudge && s.brown) why = 'Brownouts find the silent clients, but without notice the reachable ones were slow too.';
+      else why = 'Loud notice plus brownouts: the tail is small. A longer window shrinks it further, at the cost of running v1 longer.';
+      r('why').textContent = why;
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        (s as any)[inp.dataset.k!] = +inp.value;
+        root.querySelector<HTMLElement>(`[data-o="${inp.dataset.k}"]`)!.textContent = inp.value;
+        draw();
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-t]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const k = b.dataset.t as 'nudge' | 'brown';
+        s[k] = !s[k];
+        b.setAttribute('aria-pressed', String(s[k]));
+        draw();
+      });
+    });
+    draw();
+  });
+</script>

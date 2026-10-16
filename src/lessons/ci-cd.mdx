@@ -1,0 +1,722 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import PipelineIntegration from '../components/figures/PipelineIntegration.astro';
+
+## Today
+
+- Say what git actually stores: not diffs, but a pile of snapshots named by their own hash, with branches as tiny files pointing into the pile. You'll prove it by reading `.git/objects` by hand.
+- Explain, with arithmetic, why ten small merges hurt less than one big one, and why a bug found in two minutes is cheaper than the same bug found in two weeks.
+- Define continuous integration, continuous delivery and continuous deployment precisely, plus the words around them: artifact, environment, rollback, feature flag, trunk-based development, branch protection.
+- Build a real pipeline for this site: on every push, a clean machine installs, builds, runs a link checker and a "every lesson renders" test, and deploys to GitHub Pages. Then break production on purpose and time your rollback.
+- Map all of it onto ML: what "the build is green" should mean for a model, and where your validation harness fits.
+
+Prerequisites: you've used git and GitHub Actions. That's it. Rough time: one evening for the reading and the `.git` spelunking, one for the pipeline and the drill.
+
+## The Problem
+
+You've been on a branch for three weeks. It adds hard-negative mining to the cross-encoder's training data: a new sampler, a change to the feature pipeline, a tweak to the loss. Locally everything passes and NDCG@10 is up two points. Meanwhile a teammate has refactored the feature pipeline you touched, renamed the function your sampler calls, and moved the tokenizer config.
+
+Merge day. Git reports 14 conflicting files. You resolve them over an afternoon, mostly by guessing what the other person meant. The code now merges, but doesn't run: your sampler calls a function that no longer exists under that name. You fix that. Now it runs, but NDCG is down a point and nobody knows whose change did it, because there are 140 commits between the last known-good state and now. And when your teammate tries it on their machine, it fails outright: your code reads a cached tokenizer file that exists only on your laptop.
+
+None of these problems are about git commands. You know the commands. They're about *time*: how long work stays apart before it's combined, and how long a mistake lives before anyone sees it. Source control and CI/CD are, at heart, tools for shrinking both.
+
+<Origin year="1990s" title="Integration hell, and the people who refused to live there">
+
+In the 1980s and early 90s, big projects ran like this: teams built their parts separately for months, then held an "integration phase" to put them together. It routinely took longer than building the parts, and nobody could predict how long. Programmers called it integration hell. The pieces each worked; the whole didn't, and the reasons were buried under months of unrelated change.
+
+The first fix was brute force: build everything, every day. Microsoft famously ran a daily build of Windows NT with a "smoke test", and Steve McConnell wrote the practice up in 1996 ("Daily Build and Smoke Test", IEEE Software). If you broke the build, you fixed it before anything else, and in some teams you wore a silly hat until someone else broke it. Grady Booch had used the phrase "continuous integration" in 1991; Kent Beck's Extreme Programming, later in the 90s, turned it into a rule: integrate many times a day, and run all the tests every time.
+
+Martin Fowler wrote the description everyone still links to, "Continuous Integration" (2000, heavily revised in 2006). His colleagues at ThoughtWorks built CruiseControl (2001), the first popular CI server: a machine that watched the repository and built every change. Hudson (2005), renamed Jenkins (2011), made it ubiquitous; Travis CI (2011) put it in the cloud for free; GitHub Actions (2019) put it in the same place as the code.
+
+Then the question moved downstream. If every change is built and tested, why is shipping it still a scary, manual, quarterly event? Jez Humble and David Farley's book *Continuous Delivery* (2010) answered: make every green build releasable, automate the release, and do it so often it becomes boring. The cost of not doing that got a famous price tag on 1 August 2012, when Knight Capital deployed new trading code by hand to eight servers, missed one, and an old feature flag woke up dormant code on it. In about 45 minutes the firm lost roughly $460 million. The code wasn't the root problem. The deploy process was.
+
+</Origin>
+
+## The Idea
+
+### Source control is a history of snapshots
+
+Strip away the commands and source control answers three questions: *what does the project look like right now, what did it look like at any point in the past, and how do several people change it at once without trampling each other?*
+
+The oldest tools (SCCS at Bell Labs in 1972, then RCS and CVS) tracked one file at a time, storing each file's changes as a chain of edits. Subversion (2000) tracked whole-project versions but kept one central server that everyone had to talk to. Git took a different and much simpler idea, and that idea is the thing worth understanding.
+
+<Origin year="2005" title="Two weeks to replace BitKeeper">
+
+The Linux kernel had been using a proprietary version control system, BitKeeper, under a free license. In April 2005 the license was withdrawn after a dispute. Linus Torvalds needed a replacement that could handle thousands of contributors and patches flowing in constantly, and nothing free was fast enough. He wrote the first version of git in about two weeks. It was fast and robust because its core is tiny: a key-value store where every key is the hash of its value.
+
+</Origin>
+
+The core idea is <Term w="content addressing">Naming a piece of data by a fingerprint computed from the data itself, instead of by a location or a made-up ID. Same content, same name, always.</Term>. Git takes your file's bytes, computes a <Term w="hash">A function that turns any amount of data into a fixed-size fingerprint (here 40 hex characters, SHA-1). Change one bit of input and the fingerprint changes completely. Two different inputs having the same hash is practically impossible.</Term> of them, and stores the bytes under that hash. The hash *is* the name. Git keeps exactly three kinds of objects (plus a fourth, tags, which we'll skip):
+
+- A <Term w="blob">Git's name for the raw contents of one file. No filename, no permissions, just bytes.</Term> is one file's contents. Just bytes. Not even the filename.
+- A <Term w="tree">A git object listing one directory: for each entry, its mode, its name, and the hash of the blob (file) or tree (subfolder) it points to.</Term> is one directory: a list of (name, hash) pairs, pointing at blobs and other trees.
+- A <Term w="commit">A git object that points at one root tree (the full snapshot of the project), the commit(s) before it, an author, a time, and a message.</Term> points at one root tree, which is a full snapshot of the project, plus the commit (or commits) that came before it, and who, when, why.
+
+That's the whole data model. A commit doesn't store "what changed". It stores *the entire project*, by pointing at a tree. It looks expensive, but content addressing makes it nearly free: if a file didn't change, its blob has the same hash, so the new tree just points at the old blob. Only the things that changed get new objects.
+
+<Predict id="same-content">
+
+You make a repo, add `a.txt` containing `hello`, and commit. Then you add `sub/b.txt`, also containing exactly `hello`, and commit again. How many new objects does the second commit create in `.git/objects`?
+
+<Fragment slot="answer">
+
+Three, not four. A new tree for `sub/`, a new root tree (because the root directory now has a new entry), and the new commit. The file `sub/b.txt` gets *no* new blob, because its bytes are identical to `a.txt`'s, so they hash to the same name, `ce013625...`, which already exists. I ran exactly this on this Mac: 3 objects after the first commit, 6 after the second. You'll repeat it in the Build.
+
+</Fragment>
+</Predict>
+
+And now the part that makes git feel like magic once you see it: a <Term w="branch">In git, a file containing one commit hash. That's all. "Being on a branch" means new commits will move that pointer forward.</Term> is a 41-byte text file. `.git/refs/heads/main` holds a commit hash and a newline. Making a branch writes one more such file. `HEAD` is a file that says which branch you're on (`ref: refs/heads/main`). Committing creates objects and then moves the pointer. Nothing else.
+
+<Figure n="001" title="WHAT A REPO ACTUALLY IS" caption="Commits point at trees, trees point at blobs and other trees, and each commit points at its parent. Branches are just named pointers to a commit; HEAD names the branch you're on. Commit C2 reuses the unchanged blob for a.txt, and sub/b.txt points at that same blob because its bytes are identical." wide>
+<svg viewBox="0 0 760 330" role="img" aria-label="Git object graph: two commits, their trees, shared blobs, and branch pointers">
+  <rect x="20" y="20" width="70" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="38" text-anchor="middle" class="strong">HEAD</text>
+  <line x1="90" y1="34" x2="140" y2="34" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <rect x="142" y="20" width="110" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="197" y="38" text-anchor="middle" class="strong">main</text>
+  <rect x="142" y="60" width="110" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="197" y="78" text-anchor="middle" class="strong">exp</text>
+  <text x="270" y="38">refs/heads/main</text>
+  <text x="270" y="78">refs/heads/exp</text>
+  <text x="270" y="52" class="blue-t">41 BYTES: A HASH</text>
+  <line x1="197" y1="48" x2="470" y2="120" class="blue" stroke-width="1.2" marker-end="url(#pi-arrb)" />
+  <line x1="252" y1="80" x2="470" y2="130" class="blue dash" stroke-width="1.2" marker-end="url(#pi-arrb)" />
+  <rect x="472" y="108" width="120" height="46" class="fill-paper" stroke-width="1.4" />
+  <text x="532" y="126" text-anchor="middle" class="strong">COMMIT C2</text>
+  <text x="532" y="143" text-anchor="middle">78e635…</text>
+  <rect x="160" y="160" width="120" height="46" class="fill-paper" stroke-width="1.4" />
+  <text x="220" y="178" text-anchor="middle" class="strong">COMMIT C1</text>
+  <text x="220" y="195" text-anchor="middle">3f486e…</text>
+  <line x1="472" y1="140" x2="282" y2="176" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <text x="370" y="150" text-anchor="middle">PARENT</text>
+  <rect x="472" y="200" width="120" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="532" y="217" text-anchor="middle" class="strong">TREE /</text>
+  <text x="532" y="232" text-anchor="middle">a.txt  sub/</text>
+  <line x1="532" y1="154" x2="532" y2="198" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <rect x="160" y="236" width="120" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="220" y="253" text-anchor="middle" class="strong">TREE /</text>
+  <text x="220" y="268" text-anchor="middle">a.txt</text>
+  <line x1="220" y1="206" x2="220" y2="234" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <rect x="640" y="236" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="690" y="253" text-anchor="middle" class="strong">TREE sub/</text>
+  <text x="690" y="268" text-anchor="middle">b.txt</text>
+  <line x1="592" y1="226" x2="660" y2="236" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <rect x="380" y="282" width="150" height="40" class="fill-wash" stroke-width="1.4" />
+  <text x="455" y="299" text-anchor="middle" class="strong">BLOB "hello\n"</text>
+  <text x="455" y="314" text-anchor="middle">ce0136…</text>
+  <line x1="280" y1="266" x2="378" y2="296" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <line x1="510" y1="240" x2="480" y2="280" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <line x1="660" y1="276" x2="532" y2="300" class="ink" stroke-width="1.2" marker-end="url(#pi-arr)" />
+  <text x="600" y="312" class="blue-t">ONE BLOB, THREE POINTERS</text>
+  <text x="20" y="130" class="strong">EVERY BOX IS A FILE</text>
+  <text x="20" y="146">.git/objects/ce/0136…</text>
+  <text x="20" y="162">NAMED BY ITS OWN HASH</text>
+  <defs>
+    <marker id="pi-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--ink)" /></marker>
+    <marker id="pi-arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--blue)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+Three consequences you already rely on without knowing why:
+
+1. **History can't be quietly edited.** A commit's hash covers its tree and its parent's hash, which covers *its* parent, all the way down. Change one byte in an old file and every hash above it changes. This is the same chain-of-hashes trick as a blockchain, used fifteen years earlier for something useful. It's why `git rebase` gives your commits new hashes: they are genuinely new commits.
+2. **Branches are free.** Creating one writes 41 bytes. That's why git encouraged a branching style that would have been unthinkable in CVS, where a branch meant copying history around on a server.
+3. **Every clone is a full backup.** The object store is the whole history. GitHub holds one more copy; it's not special to git, only to your team.
+
+A note on "git doesn't store diffs": as an optimisation, `git gc` later packs objects into <Term w="packfile">A single compressed file holding many git objects, where similar objects are stored as deltas against each other to save space. A storage trick only; the model is still snapshots.</Term>s and delta-compresses similar ones. But that's a storage detail underneath. The *model* is snapshots, and `git diff` computes differences on demand by comparing two trees.
+
+### Merging, and why small merges win
+
+Now the part that bit you on merge day. When you merge branch B into main, git finds the <Term w="merge base">The most recent commit that both branches have in their history: the point where they split.</Term>, the last commit both sides share, and does a <Term w="three-way merge">Combining two versions of a file by comparing each to their common ancestor. A change made on only one side is taken automatically. Different changes to the same lines on both sides is a conflict.</Term>: for each file, compare base to main and base to B. If only one side changed a region, take that change. If both sides changed the same region differently, that's a <Term w="merge conflict">When both branches changed the same part of the same file since they split, and git can't know which version (or which combination) is right. A human has to decide.</Term>, and a human must decide. The result is a commit with two parents.
+
+Conflicts aren't random bad luck. They have arithmetic.
+
+Say the repo has 1,000 files and each developer touches about 10 different files a week, spread at random. Two developers on week-long branches: what's the chance their branches touch at least one common file? Each of my 10 files has a 1% chance of being in your 10, so the chance of no overlap is about 0.99^10 ≈ 0.90, so roughly a **10%** chance of a conflict.
+
+<Predict id="four-weeks">
+
+Same two developers, same pace, but now the branches live for four weeks before merging (40 files each). The work is four times bigger. How much likelier is a conflict: 4x? 16x? Something else? And with 8 developers instead of 2?
+
+<Fragment slot="answer">
+
+About **80%**, eight times likelier, not four: 0.96^40 ≈ 0.20. The overlap chance grows roughly with the *square* of branch size when it's small (each of my k files can hit any of your k files: about k × k / 1000), then saturates near certainty. I checked both numbers with a quick simulation on this Mac (9.4% and 81%).
+
+With 8 developers there are 8 × 7 / 2 = 28 pairs of branches that can collide. At one week that's about 28 × 0.10 ≈ 3 colliding pairs per merge round; at four weeks, 28 × 0.80 ≈ 22. Pairs grow with the square of team size, overlap grows with the square of branch size, and the two multiply.
+
+</Fragment>
+</Predict>
+
+So integration pain scales like *(people)² × (branch lifetime)²* per merge. Merging four times as often divides the pain of each merge by about sixteen and multiplies the number of merges by four, so the total still drops by about four. And each conflict you do hit is smaller and fresher: you wrote the code this morning, so you remember what it was for.
+
+There's a worse kind of conflict that git can't even see. A <Term w="semantic conflict">Two changes that merge cleanly line-by-line but break when combined, e.g. one branch renames a function while another adds a new call to the old name.</Term> merges with no complaint and is broken anyway. Your sampler called `build_features()`; your teammate renamed it `featurize()`. Different files, no textual overlap, a clean merge, and a crash. Only *building and running the combined code* catches this. Hold that thought; it's the whole argument for CI.
+
+Play with it. Same edits, same bugs, two schedules: merge every 20 days, or every day.
+
+<Figure n="002" title="BIG BANG VS CONTINUOUS" caption="Each row is a developer, each pale block a stretch of work that hasn't been merged yet. Orange circles on main are merges with conflicts, sized by how many edits have to be reconciled. Orange lines are bugs: written at the dot, unseen until the next merge runs the tests. Add developers or make changes bigger and watch the big-bang row explode while the continuous row barely moves." wide>
+<PipelineIntegration />
+</Figure>
+
+The model is a toy (600 files, a few hot ones that everybody touches, 2% of edits carry a bug, tests catch a bug at the next merge), but the shape is honest. Three things to try:
+
+- One developer: no conflicts at any schedule. Integration hell is a *team* problem. Bugs still hide until a merge runs the tests, which is the part that's about feedback, not people.
+- Drag developers from 2 to 12 with big-bang on. Conflict work grows much faster than linearly, the N² pairs.
+- Drag the big-bang interval down. Somewhere around every 2 to 5 days most of the pain is gone. The win isn't "daily" as a magic number. It's "short enough that branches can't drift far".
+
+### The feedback loop: the cost of a bug is mostly time
+
+The orange lines in that figure are the second half of the story. A bug is cheap at the moment you write it: you're looking at the code, it's in your head, and the only suspect is the last thing you typed. Every hour it survives makes it more expensive, for mechanical reasons, not mystical ones:
+
+- **More suspects.** Found right after one commit, there's one place to look. Found after 140 commits, you're bisecting.
+- **Lost context.** In two weeks you've forgotten why you wrote it, and the person who wrote the code next to it may be on vacation.
+- **Things built on top.** Other code, other people's branches, a trained checkpoint, a report to your manager, all assumed the bug wasn't there.
+- **Blast radius.** In your editor it hurts you. In production it hurts users, and maybe their data.
+
+You will often see a chart claiming a bug costs 100x more to fix in production than in design, attributed to Barry Boehm's 1981 book. Be careful with that number: the original data came from big 1970s projects, and later people (Laurent Bossavit's *The Leprechauns of Software Engineering* is the fun takedown) showed how thin and mangled the evidence behind the famous curve is. The *direction* is not in dispute; the exact multiplier is. Argue from the mechanism above, not from the chart.
+
+<Figure n="003" title="WHERE BUGS GET CAUGHT" caption="Each rung is a place a mistake can be noticed. Moving down, the time until you find out grows, and so does the number of changes you have to suspect. CI's job is to pull detection up the ladder: catch on a clean machine in minutes what would otherwise surface in staging or production days later. Times are rough orders of magnitude.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Ladder of detection points from editor to production with time to detection and number of suspects">
+  <text x="10" y="18" class="strong">CAUGHT IN</text>
+  <text x="250" y="18" class="strong">TIME TO KNOW</text>
+  <text x="420" y="18" class="strong">SUSPECT CHANGES</text>
+  <g>
+    <rect x="10" y="30" width="200" height="34" class="fill-wash" stroke-width="1.2" />
+    <text x="20" y="51" class="strong">EDITOR / TYPE CHECK</text>
+    <text x="250" y="51">seconds</text>
+    <rect x="420" y="40" width="6" height="14" class="fill-blue" />
+    <text x="436" y="51">1 line</text>
+  </g>
+  <g>
+    <rect x="10" y="74" width="200" height="34" class="fill-wash" stroke-width="1.2" />
+    <text x="20" y="95" class="strong">LOCAL TESTS</text>
+    <text x="250" y="95">a minute</text>
+    <rect x="420" y="84" width="14" height="14" class="fill-blue" />
+    <text x="444" y="95">your last edit</text>
+  </g>
+  <g>
+    <rect x="10" y="118" width="200" height="34" class="fill-wash" stroke-width="2" />
+    <text x="20" y="139" class="strong">CI ON A CLEAN MACHINE</text>
+    <text x="250" y="139" class="blue-t">~5-15 minutes</text>
+    <rect x="420" y="128" width="26" height="14" class="fill-blue" />
+    <text x="456" y="139">one commit / PR</text>
+  </g>
+  <g>
+    <rect x="10" y="162" width="200" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="20" y="183" class="strong">CODE REVIEW</text>
+    <text x="250" y="183">hours</text>
+    <rect x="420" y="172" width="40" height="14" class="fill-blue" />
+    <text x="470" y="183">one PR, by eye</text>
+  </g>
+  <g>
+    <rect x="10" y="206" width="200" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="20" y="227" class="strong">STAGING / BIG MERGE</text>
+    <text x="250" y="227">days</text>
+    <rect x="420" y="216" width="90" height="14" class="fill-blue" />
+    <text x="520" y="227">dozens of PRs</text>
+  </g>
+  <g>
+    <rect x="10" y="250" width="200" height="34" class="fill-paper" stroke-width="1.2" />
+    <text x="20" y="271" class="strong">PRODUCTION (USERS)</text>
+    <text x="250" y="271">days to weeks</text>
+    <rect x="420" y="260" width="140" height="14" class="fill-blue" />
+    <text x="570" y="271">everything</text>
+  </g>
+  <line x1="224" y1="40" x2="224" y2="276" class="blue" stroke-width="1.2" marker-end="url(#pi-arrb2)" />
+  <defs>
+    <marker id="pi-arrb2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--blue)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+### Continuous integration, precisely
+
+Now the definition will sound obvious, which is the point.
+
+<Term w="Continuous integration">The practice of everyone merging their work into the shared main line at least daily, with every merge automatically built and tested on a clean machine, and a broken build fixed before anything else. Often shortened to CI.</Term> is a *practice*, not a tool: everyone merges into the shared main line at least once a day, and every merge is automatically built and tested, and if it breaks, fixing it is the team's top priority. Fowler's article lists the habits that make it work. The core ones:
+
+- **One shared main line**, and everybody merges into it often. If people keep branches for weeks and "use CI" on them, they've bought the tool and skipped the practice.
+- **The build is automated** and the build is **self-testing**: one command gets you from source to a checked, runnable thing.
+- **Every change builds on a separate, clean machine**, not just on the author's laptop.
+- **Keep it fast.** Fowler's rule of thumb is about ten minutes. A slow build gets skipped, batched, or ignored, and then you're back to big merges.
+- **A red build is fixed immediately**, usually by reverting the change, not by debugging on top of it.
+
+The tool side has a handful of words. A <Term w="pipeline">The automated sequence of steps a change goes through: install, build, test, package, deploy. Each step must pass for the next to run.</Term> is the sequence of steps. In GitHub Actions a <Term w="workflow">A YAML file in .github/workflows/ that says when to run (on push, on pull request, on a schedule, by hand) and what jobs to run.</Term> defines one, made of jobs, each made of steps, each running on a <Term w="runner">The machine (usually a fresh virtual machine) that executes a CI job, then gets thrown away.</Term>. The result gets reported back to the pull request as a <Term w="status check">A pass/fail mark that CI attaches to a commit. GitHub can be told to block merging until certain checks pass.</Term>.
+
+Why insist on a *clean* machine? Because your laptop lies. It has the cached tokenizer from the opening scene. It has a package you `pip install`ed by hand six months ago. It has a case-insensitive filesystem (macOS does by default), so `import "./Figure.astro"` finds a file called `figure.astro`, and the Linux server won't. "Works on my machine" isn't a joke about careless people; it's the default state of every machine that's been used for a while. A fresh runner starts from nothing but what's written down in the repo: the code, the <Term w="lockfile">A file (package-lock.json, uv.lock, poetry.lock) recording the exact version of every dependency, including dependencies of dependencies, so every install gets the same bytes.</Term>, and the workflow. If the build passes there, it'll pass anywhere that starts from the same things. That's also why CI uses `npm ci` rather than `npm install`: `ci` installs exactly what the lockfile says, and fails if `package.json` and the lockfile disagree, instead of quietly updating the lockfile.
+
+### Continuous delivery, and the things that make it safe
+
+CI answers "does the combined code work?". The next question is "how does it reach users?", and here the two "CD"s split:
+
+- <Term w="Continuous delivery">Every change that passes the pipeline is releasable at the push of a button, and the release is automated. A human still decides when.</Term>: every green build *could* go to production, with one button and no heroics. A human chooses when.
+- <Term w="Continuous deployment">Every change that passes the pipeline goes to production automatically, with no human step.</Term>: every green build *does* go out, automatically. Your site will work this way.
+
+Either way, a few ideas carry the weight.
+
+**Build once, promote the artifact.** An <Term w="artifact">The packaged output of a build: a folder of static files, a container image, a wheel, a model checkpoint. Identified by a version or hash, stored, and deployed as-is.</Term> is the thing the build produced: for this site, the `dist/` folder; for a service, a container image; for you, often a model checkpoint. The rule is to build it *once*, test it, and deploy those exact bytes, rather than rebuilding for each stage and hoping the rebuild matches. It's the same idea as git's content addressing: if you can name exactly what you tested, you can deploy exactly what you tested.
+
+**Environments.** An <Term w="environment">A place the software runs, with its own configuration and data: e.g. preview, staging, production. Same artifact, different settings.</Term> is somewhere the artifact runs. Typically a preview per pull request, a staging copy that mimics production, and production itself. The artifact moves through them unchanged; only configuration differs.
+
+<Figure n="004" title="A PIPELINE, END TO END" caption="A push starts a fresh runner. Each stage gates the next: if tests fail, nothing is packaged or deployed. The artifact is built once and the same bytes are promoted through environments. A rollback is just pointing production back at an artifact you already have." wide>
+<svg viewBox="0 0 760 250" role="img" aria-label="Pipeline stages from push to production with gates and a rollback path">
+  <rect x="10" y="60" width="80" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="50" y="80" text-anchor="middle" class="strong">PUSH / PR</text>
+  <text x="50" y="96" text-anchor="middle">commit SHA</text>
+  <line x1="90" y1="82" x2="112" y2="82" class="ink" stroke-width="1.2" marker-end="url(#pi-arr3)" />
+  <rect x="114" y="40" width="380" height="84" class="fill-wash dash" stroke-width="1" />
+  <text x="124" y="56" class="blue-t">FRESH RUNNER (THROWN AWAY AFTER)</text>
+  <rect x="124" y="64" width="80" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="164" y="84" text-anchor="middle" class="strong">INSTALL</text>
+  <text x="164" y="100" text-anchor="middle">npm ci</text>
+  <rect x="216" y="64" width="80" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="256" y="84" text-anchor="middle" class="strong">BUILD</text>
+  <text x="256" y="100" text-anchor="middle">astro build</text>
+  <rect x="308" y="64" width="80" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="348" y="84" text-anchor="middle" class="strong">TEST</text>
+  <text x="348" y="100" text-anchor="middle">links, slugs</text>
+  <rect x="400" y="64" width="84" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="442" y="84" text-anchor="middle" class="strong">PACKAGE</text>
+  <text x="442" y="100" text-anchor="middle">dist/ → artifact</text>
+  <line x1="204" y1="86" x2="214" y2="86" class="ink" stroke-width="1.2" />
+  <line x1="296" y1="86" x2="306" y2="86" class="ink" stroke-width="1.2" />
+  <line x1="388" y1="86" x2="398" y2="86" class="ink" stroke-width="1.2" />
+  <line x1="348" y1="108" x2="348" y2="150" class="ink dash" stroke-width="1" />
+  <text x="356" y="146">RED: STOP, NOTHING SHIPS</text>
+  <line x1="494" y1="82" x2="520" y2="82" class="ink" stroke-width="1.2" marker-end="url(#pi-arr3)" />
+  <rect x="522" y="30" width="110" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="577" y="48" text-anchor="middle" class="strong">PREVIEW</text>
+  <text x="577" y="62" text-anchor="middle">per PR</text>
+  <rect x="522" y="96" width="110" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="577" y="114" text-anchor="middle" class="strong">STAGING</text>
+  <text x="577" y="128" text-anchor="middle">same bytes</text>
+  <line x1="632" y1="116" x2="652" y2="116" class="ink" stroke-width="1.2" marker-end="url(#pi-arr3)" />
+  <rect x="654" y="96" width="96" height="40" class="fill-wash" stroke-width="1.4" />
+  <text x="702" y="114" text-anchor="middle" class="strong">PRODUCTION</text>
+  <text x="702" y="128" text-anchor="middle">→ artifact v42</text>
+  <rect x="522" y="180" width="228" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="532" y="198" class="strong">ARTIFACT STORE</text>
+  <text x="532" y="214">v40   v41   v42 (live)</text>
+  <text x="532" y="228" class="blue-t">ROLLBACK = POINT PROD AT v41</text>
+  <line x1="702" y1="136" x2="702" y2="178" class="blue" stroke-width="1.2" marker-end="url(#pi-arrb3)" />
+  <line x1="442" y1="108" x2="520" y2="200" class="ink dash" stroke-width="1" marker-end="url(#pi-arr3)" />
+  <defs>
+    <marker id="pi-arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--ink)" /></marker>
+    <marker id="pi-arrb3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--blue)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+**Rollbacks.** A <Term w="rollback">Returning production to a previous known-good version, ideally by redeploying an artifact that already exists rather than building a fix under pressure.</Term> is going back to the last version that worked. Notice how much this looks like a git branch: if production is "a pointer to artifact v42", rolling back is moving the pointer to v41. That takes seconds and needs no new code, which is exactly what you want at 3am. The alternative, "roll forward" (write a fix, push it through the pipeline), is fine when the fix is obvious and the pipeline is fast, and a disaster when neither is true. One honest caveat: a rollback only undoes what the pipeline controls. If version 42 changed a database schema or wrote bad data, putting v41's code back doesn't un-write it. That's why teams change databases in backward-compatible steps (add the new column, deploy code that writes both, then later drop the old one).
+
+<Predict id="rollback-git">
+
+The site is deployed from `main`. A bad commit just went live. You have two ways back: `git revert` the commit and push (the pipeline rebuilds and redeploys), or redeploy the artifact from the previous successful run. Which is faster, and which one leaves `main` correct?
+
+<Fragment slot="answer">
+
+Redeploying the old artifact is faster: it skips install, build and test (for this tiny site the difference is small, maybe a minute; for a service with a 20-minute build it's the whole game). But afterwards `main` still contains the bad commit, so the *next* push redeploys it. `git revert` is slower but leaves main and production agreeing. Real teams usually do both: redeploy the old artifact to stop the bleeding, then revert on main so the next deploy is also good. You'll time both in the drill.
+
+</Fragment>
+</Predict>
+
+**Feature flags.** A <Term w="feature flag">A switch, read at run time from config, that turns a piece of code on or off without deploying again. Lets code ship "dark" and be released later, or to a few users first.</Term> separates *deploying* code from *releasing* it. Your hard-negative sampler can be merged to main on day two, behind `if flags.hard_negatives:`, defaulting to off. It's integrated (it builds, it's tested, nobody's branch drifts from it), but nothing changes for users until you flip it, and flipping it back is instant. That's the trick that makes daily merging possible for work that takes three weeks. The Knight Capital story is the warning label: flags are code too. They reused an old flag's name for new behaviour, a server still had the old code that read it, and nobody removed dead flags. Delete flags when they've done their job.
+
+**Trunk-based development.** Put those together and you get <Term w="trunk-based development">A way of working where everyone merges small changes into one main branch (the trunk) at least daily, using short-lived branches (hours to a couple of days) and feature flags for unfinished work, rather than long-lived feature or release branches.</Term>: one main branch, short-lived branches that live hours or a day or two, flags for unfinished work. Google famously runs most of its code in one huge repository on a single trunk with tens of thousands of engineers committing to it, and the CACM paper about it (Potvin and Levenberg, 2016) is worth reading for the scale alone. The Accelerate research (Forsgren, Humble and Kim, from the State of DevOps surveys) found trunk-based habits and frequent deploys go together with *both* faster delivery *and* fewer failures, which kills the intuition that moving fast and being careful are a trade-off.
+
+**Branch protection.** The last piece makes the rules enforceable. <Term w="branch protection">Repository settings (on GitHub, "rulesets" or "branch protection rules") that stop anyone pushing to main directly, and require a pull request with passing status checks before merging.</Term> tells GitHub: nobody pushes to `main` directly; changes come through a pull request; the PR can't merge until the CI check is green. Without it, CI is advice. With it, a red build physically can't reach production.
+
+### What changes for ML
+
+In ordinary software, the behaviour lives in the code, so testing the code tests the behaviour. In ML, the behaviour lives in three things: the code, the *data*, and the *weights*. A pipeline that only tests code will happily ship a model trained on a broken dataset. Google's "Hidden Technical Debt in Machine Learning Systems" (Sculley et al., 2015) made this point memorably: the model code is a small box in the middle of a big diagram of data collection, feature extraction, configuration and monitoring, and most of the failures live in the big diagram.
+
+So "the build is green" needs more checks, and each catches a different class of bug:
+
+- **Unit tests on the code**: the tokenizer pads correctly, the loss is zero for a perfect prediction, the sampler never returns the positive as a negative. Fast, run on every push, exactly like normal CI.
+- **Data validation**: the new training set has the expected columns and types, null rates and label balance haven't jumped, no query in the eval set appears in the training set (leakage, the classic way to get a beautiful number that means nothing). Run when data changes, not just code.
+- **An eval gate**: train or fine-tune (or for a big model, load the candidate checkpoint), run it on a frozen eval set, and fail the pipeline if the metric drops past a threshold versus the current production model. For your cross-encoder that's NDCG@10 or MRR on a fixed query set. This is where your validation harness lives. A harness you run by hand is a test suite you run sometimes; wired into the pipeline as a required check, it becomes a gate nothing can skip.
+- **The model as an artifact**: the checkpoint is stored with its hash, the commit that produced it, and the dataset version it saw. Deploying means pointing the server at a checkpoint ID; rollback means pointing it back. Same pointer trick, again.
+- **Gradual release**: shadow traffic (the new model scores real queries, results logged but not shown) or a canary (1% of traffic), watched with metrics before going to 100%. A feature flag for models.
+
+One ML-specific trap: an eval metric is noisy. If NDCG@10 on 500 queries wobbles by ±0.01 between two runs of the *same* model with different seeds, a gate at "fail if it drops 0.005" is a coin flip, and a flaky gate trains the team to click "re-run" until it's green. Measure the noise first, then set the threshold above it. [Is that improvement real?](/lessons/statistics-for-evals/) is the lesson on doing that properly.
+
+<Figure n="005" title="CI FOR A RANKING MODEL" caption="Code, data and weights each get their own gate. Cheap checks run on every push; expensive ones run when their inputs change. Only a candidate that passes the eval gate against the current production model becomes a deployable artifact, and release is gradual, with a way back.">
+<svg viewBox="0 0 640 300" role="img" aria-label="ML pipeline: code tests, data validation, training, eval gate, model registry, canary">
+  <text x="10" y="18" class="strong">INPUTS</text>
+  <rect x="10" y="28" width="110" height="36" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="50" text-anchor="middle" class="strong">CODE</text>
+  <rect x="10" y="78" width="110" height="36" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="100" text-anchor="middle" class="strong">DATA</text>
+  <rect x="10" y="128" width="110" height="36" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="150" text-anchor="middle" class="strong">CONFIG</text>
+  <rect x="150" y="28" width="140" height="36" class="fill-wash" stroke-width="1.2" />
+  <text x="220" y="44" text-anchor="middle" class="strong">UNIT TESTS</text>
+  <text x="220" y="58" text-anchor="middle">every push, ~min</text>
+  <rect x="150" y="78" width="140" height="36" class="fill-wash" stroke-width="1.2" />
+  <text x="220" y="94" text-anchor="middle" class="strong">DATA VALIDATION</text>
+  <text x="220" y="108" text-anchor="middle">schema, nulls, leaks</text>
+  <line x1="120" y1="46" x2="148" y2="46" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <line x1="120" y1="96" x2="148" y2="96" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <rect x="320" y="70" width="110" height="52" class="fill-paper" stroke-width="1.2" />
+  <text x="375" y="92" text-anchor="middle" class="strong">TRAIN /</text>
+  <text x="375" y="108" text-anchor="middle" class="strong">FINE-TUNE</text>
+  <line x1="290" y1="46" x2="318" y2="80" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <line x1="290" y1="96" x2="318" y2="96" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <line x1="120" y1="146" x2="318" y2="114" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <rect x="460" y="62" width="170" height="68" class="fill-wash" stroke-width="2" />
+  <text x="545" y="82" text-anchor="middle" class="strong">EVAL GATE</text>
+  <text x="545" y="98" text-anchor="middle">NDCG@10 on frozen set</text>
+  <text x="545" y="114" text-anchor="middle">vs prod, above noise</text>
+  <line x1="430" y1="96" x2="458" y2="96" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <line x1="545" y1="130" x2="545" y2="176" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <text x="553" y="158">PASS</text>
+  <rect x="440" y="178" width="190" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="535" y="196" text-anchor="middle" class="strong">MODEL REGISTRY</text>
+  <text x="535" y="212" text-anchor="middle">ckpt hash + commit + data ver</text>
+  <line x1="440" y1="200" x2="300" y2="246" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <rect x="150" y="236" width="150" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="225" y="256" text-anchor="middle" class="strong">SHADOW → CANARY</text>
+  <text x="225" y="272" text-anchor="middle">1% → 100%, watched</text>
+  <rect x="10" y="236" width="110" height="48" class="fill-wash" stroke-width="1.2" />
+  <text x="65" y="256" text-anchor="middle" class="strong">PRODUCTION</text>
+  <text x="65" y="272" text-anchor="middle">→ ckpt id</text>
+  <line x1="150" y1="260" x2="122" y2="260" class="ink" stroke-width="1.2" marker-end="url(#pi-arr5)" />
+  <text x="460" y="250" class="blue-t">FAIL ANY GATE:</text>
+  <text x="460" y="266" class="blue-t">NOTHING SHIPS</text>
+  <defs>
+    <marker id="pi-arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" style="fill:var(--ink)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+## Build It
+
+Two parts. First you take git apart by hand, so "a commit is a pointer to a snapshot" is something you've seen rather than been told. Then you give this site the pipeline it deserves: you're reading a lesson that, by the end, will have been tested and deployed by the pipeline it describes.
+
+<Task id="t1" title="Read .git/objects by hand" agent="hands">
+
+Make a throwaway repo and watch the object store as you go. Run each line and look before you move on.
+
+```bash
+mkdir -p ~/scratch/gitguts && cd ~/scratch/gitguts && git init -b main
+find .git/objects -type f            # empty
+echo hello > a.txt && git add a.txt
+find .git/objects -type f            # one file appeared. Just from `add`, before any commit.
+git cat-file -t ce013625030ba8dba906f756967f9e9ca394464a
+git commit -m first
+find .git/objects -type f | sort     # how many now? which is which?
+git cat-file -p HEAD                 # the commit: a tree, an author, a message
+git cat-file -p 'HEAD^{tree}'        # the tree: mode, type, hash, name
+cat .git/HEAD .git/refs/heads/main   # HEAD names a branch; the branch names a commit
+```
+
+Now check your prediction from earlier: add `sub/b.txt` containing `hello`, commit, and count objects again. Then `git branch exp` and `ls -la .git/refs/heads`. How big is the file that *is* the branch?
+
+Then write `objcat.py`, your own 15-line `git cat-file`. Shape:
+
+```python
+import sys, zlib, hashlib, pathlib
+
+def read_object(repo: pathlib.Path, sha: str) -> tuple[str, bytes]:
+    """Return (type, body) for an object, e.g. ('blob', b'hello\n')."""
+    # objects live at .git/objects/<first 2 hex chars>/<remaining 38>
+    # the file is zlib-compressed:  b"<type> <size>\x00<body>"
+    ...
+
+def hash_blob(data: bytes) -> str:
+    """What git would name a file with these bytes."""
+    # sha1 over the header + body, NOT over the body alone
+    ...
+```
+
+Hints: `zlib.decompress`, then split once on `b"\x00"`. Check `hash_blob(b"hello\n")` against `echo hello | git hash-object --stdin`. A tree's body is binary (names followed by 20 raw hash bytes), so for trees just print the raw bytes and pick out the filenames; parsing them properly is a nice extra.
+
+Last: in this Workbench repo, run `git count-objects -v`, then `git log --oneline | wc -l`. That's the entire history of the site, on your disk, no GitHub needed.
+
+</Task>
+
+<Task id="t2" title="Put the site on GitHub, with the right base path" agent="ok">
+
+Create a GitHub repo and push. Then decide where the site will live, because it changes one line of config.
+
+A GitHub Pages **project site** is served from a sub-path: `https://<you>.github.io/workbench/`. Every URL the site generates must start with `/workbench/`, or the browser asks for `https://<you>.github.io/lessons/...`, which doesn't exist. Astro handles this with the `base` option. The layouts in this repo already build their links from `import.meta.env.BASE_URL` (look at `src/layouts/Base.astro`), so setting `base` fixes them:
+
+```js
+// astro.config.mjs
+export default defineConfig({
+  site: 'https://<you>.github.io',
+  base: '/workbench',
+  integrations: [mdx()],
+  // ...markdown config unchanged
+});
+```
+
+Two alternatives that keep `base` at `/`: name the repo `<you>.github.io` (a **user site**, served from the root), or attach a custom domain. Your home server over Tailscale also serves from `/`. Pick one, but don't change any lesson links yet. Your link checker is about to tell you something.
+
+Then in the repo's Settings → Pages, set **Source: GitHub Actions**. One plan note to check yourself: Pages and branch protection on a *private* repo need a paid GitHub plan; on a public repo both are free.
+
+</Task>
+
+<Task id="t3" title="Write the tests: every lesson renders, every link resolves" agent="review">
+
+CI is only as good as what it checks. `astro build` passing proves the MDX compiled; it doesn't prove the site works. Write `scripts/check_site.py`, standard library only, that takes the build folder and the base path and exits non-zero on failure:
+
+```python
+# usage: python3 scripts/check_site.py dist /workbench
+import sys, re, pathlib
+from html.parser import HTMLParser
+from urllib.parse import urlsplit, unquote
+
+class LinkCollector(HTMLParser):
+    """Collect every href/src on a page, and every id (for #fragment links)."""
+    def handle_starttag(self, tag, attrs): ...
+
+def resolve(page: pathlib.Path, url: str, dist: pathlib.Path, base: str) -> pathlib.Path | None:
+    """Map a link to the file it should hit in dist/, or None for external links."""
+    # skip http(s)://, mailto:, and pure '#...' links
+    # '/workbench/lessons/x/' -> dist/lessons/x/index.html
+    # a root-relative link that does NOT start with base is broken by definition
+    # relative links ('../x/') resolve against the page's own folder
+    ...
+
+def main():
+    # 1. every slug in src/data/curriculum.ts has dist/lessons/<slug>/index.html
+    # 2. every internal link and #fragment on every page points at something that exists
+    # print each failure as: BROKEN <page> <link>, then a one-line summary, exit 1 if any
+    ...
+```
+
+Hints: slugs are easy to pull out of `curriculum.ts` with `re.findall(r"slug: '([^']+)'", text)`. A link ending in `/` means "that folder's `index.html`". Keep a set of every page's ids so `#measure` can be checked too.
+
+<Predict id="broken-links">
+
+Build with the base set to `/workbench` and run your checker. How many broken links do you expect: zero, a handful, or dozens? Where will they be?
+
+<Fragment slot="answer">
+
+Dozens. When I built this repo with `npx astro build --base /workbench` and ran a reference checker, it found 55 broken links out of 808 internal ones (the count will have changed as lessons get added). With base `/` it found 0. The layouts were fine; every broken link was written by hand in lesson MDX or `method.mdx`, like `[Where do my variables live?](/lessons/stack-and-heap/)`. A root-relative path in Markdown is passed through as-is, so it skips the base. In dev, base is effectively `/` and it all works, which is exactly how "works on my machine" sneaks in.
+
+The fix is your call: relative links (`../stack-and-heap/` from one lesson page reaches the other, under any base), a tiny remark plugin that prefixes `/lessons/` links with the base, or deploy to a root (user site, custom domain, home server). What matters is that the checker now runs on every push, so the next hard-coded link can't reach production.
+
+</Fragment>
+</Predict>
+
+After you've written it, ask an agent to review it for missed cases: links with query strings, `src` on images and scripts, percent-encoded paths.
+
+</Task>
+
+<Task id="t4" title="The workflow: build, test, deploy" agent="ok">
+
+Create `.github/workflows/site.yml`. This is boilerplate; read every line anyway, since each one is a decision from The Idea.
+
+```yaml
+name: site
+
+on:
+  push:
+    branches: [main]
+  pull_request:          # build and test PRs, but never deploy them
+  workflow_dispatch:     # a "Run workflow" button, used for rollbacks
+    inputs:
+      ref:
+        description: 'Commit SHA to deploy (blank = latest main)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  pages: write           # allowed to publish to Pages
+  id-token: write        # proves to Pages that this run is who it says it is
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}          # empty on push/PR, so it uses the pushed commit
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22                # astro 7 needs >= 22.22; match your local major if you can
+          cache: npm
+      - run: npm ci
+      - run: npx astro build
+      - run: python3 scripts/check_site.py dist /workbench
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build                          # no green build, no deploy
+    runs-on: ubuntu-latest
+    concurrency:                          # one deploy at a time; let a running one finish
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+Check the current major versions of the four `actions/*` steps in their READMEs before you push; they get bumped every year or so, and the shape stays the same. Astro also publishes its own `withastro/action` that wraps install and build, which is fine too. Writing the steps out is better for learning.
+
+Push. Open the Actions tab and watch the run. Note how long each step took, then open the deployed URL.
+
+</Task>
+
+<Task id="t5" title="Make the rules enforceable" agent="explain">
+
+Settings → Rules → Rulesets → New branch ruleset, targeting the default branch. Turn on: require a pull request before merging, require status checks to pass (add the `build` job; it only appears in the list after it has run once), and block force pushes. Leave yourself the bypass for emergencies if you want, but notice that it exists.
+
+Then prove it works: on a branch, add a lesson link to `/lessons/does-not-exist/`, open a PR, and watch the check go red and the merge button refuse. Fix it on the same branch and watch it go green. Ask an agent to explain anything in the ruleset screen you don't understand, but click the buttons yourself.
+
+</Task>
+
+<Task id="t6" title="The rollback drill" agent="hands">
+
+Break production on purpose, and time everything. Use a phone stopwatch, or the timestamps in the Actions UI.
+
+1. Make a change that passes CI but is wrong: edit the title of one lesson in `curriculum.ts` to `BROKEN`. Push to main (or merge a PR). Write down **T0** when you push, **T1** when the deploy finishes, and **T2** when the bad title actually shows in your browser (Pages has a CDN in front, so T2 may lag T1; hard-refresh).
+2. **Rollback by redeploy.** Find the SHA of the last good commit (`git log --oneline`). Actions tab → the `site` workflow → Run workflow, paste the SHA into `ref`. Time from click to the good title being back.
+3. Push any small unrelated change to main. What does production show now? (Think about the Predict earlier before you look.)
+4. **Rollback by revert.** `git revert <bad sha>` and push. Time from push to fixed.
+
+Write down which rollback you'd use at 3am, and why. Then write one sentence on what this pipeline *cannot* roll back. (Hint: anything that doesn't live in the repo.)
+
+</Task>
+
+<Task id="t7" title="Optional: deploy to your home server over Tailscale" agent="review">
+
+If you'd rather serve the site from your own box (base `/`, no project-site sub-path), add a second deploy job that joins your tailnet and copies the artifact over. The shape:
+
+```yaml
+  deploy-home:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4   # or rebuild; better: upload dist/ as a normal artifact in build
+      - uses: tailscale/github-action@v3     # check its README: it uses an OAuth client + a tag like tag:ci
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+      - run: |
+          # copy into a new folder named by commit, then flip a symlink
+          # releases/<sha>/  and  current -> releases/<sha>
+          ...
+```
+
+The idea to get right is the release layout: each deploy goes into `releases/<sha>/`, and your web server serves `current`, a symlink. Deploying is "copy, then repoint `current`"; rolling back is "repoint `current` at the previous folder", which takes milliseconds and needs no build. To make the flip atomic, create the new symlink under a temp name and `mv` it over the old one (on Linux, `mv -T`), since `ln -sfn` deletes then creates. Keep the last five releases. Put the SSH key and Tailscale secrets in repo secrets, never in the YAML. Have an agent review the job for leaked secrets and for what happens if the copy dies halfway.
+
+</Task>
+
+<DoneWhen>
+
+- You can point at the blob, tree and commit files in `.git/objects` for your scratch repo, and your `objcat.py` agrees with `git cat-file` and `git hash-object`.
+- Every push to main builds on a clean runner, runs `check_site.py`, and deploys. Every PR builds and tests but doesn't deploy.
+- A PR with a broken link shows a red check and can't be merged.
+- The site loads at its real URL with working CSS, working lesson links, and working figures.
+- You've done the rollback drill both ways and have the times written down.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in from the Actions UI and your stopwatch.
+
+| What | Your number | Rough expectation |
+| --- | --- | --- |
+| Local `npx astro build` (whole site) | | ~1 s on an M-series Mac (I measured under 1 s for 65 pages) |
+| CI: checkout + setup-node | | ~5-20 s |
+| CI: `npm ci` | | ~10-40 s, less with the npm cache warm |
+| CI: build + `check_site.py` | | a few seconds |
+| CI: deploy job | | ~10-60 s |
+| Push → new version visible (T0 → T2) | | ~1-3 min |
+| Broken-link PR: push → red check | | ~1 min |
+| Rollback by redeploy: click → fixed | | ~1-2 min |
+| Rollback by revert: push → fixed | | ~1-3 min |
+| Internal links checked / broken (base `/workbench`, before your fix) | | ~800 / ~55 when I ran it |
+| Objects in scratch repo after commit 1 / commit 2 | | 3 / 6 |
+
+The CI rows are rough expectations from GitHub-hosted runners, not measurements; they vary by day and queue. What the numbers should tell you:
+
+**Most of your pipeline's time isn't your build.** Starting a runner, checking out, installing Node and dependencies will dwarf a one-second Astro build. That's normal, and it's why caching dependencies matters far more than optimising the build itself for small projects. For a big service the build and tests dominate, and Fowler's ten-minute rule starts to bite.
+
+**Feedback in about a minute is the whole point.** Compare the broken-link row to the opening scene: three weeks to find out a link-shaped mistake (a renamed function, a missing file) versus one minute, on a machine that isn't yours, before anyone else sees it. That ratio is the case for CI in one number.
+
+**The two rollbacks are close here, and that's misleading.** On this site both take a minute or two, because the build is trivial. Multiply the build by twenty (a service with real tests, or a model with an eval gate that takes 20 minutes) and redeploying an existing artifact becomes the only rollback fast enough to use under pressure. Notice what was fast in both cases: no human had to build anything by hand. That's what Knight Capital didn't have.
+
+**The 55 broken links should be the most interesting row.** They were invisible in dev, invisible in `astro build` (which passed), and only visible to a test that checked the site the way it will actually be served. "The build passes" and "the thing works" are different claims; good pipelines test the second.
+
+## Break It
+
+**1. Make it work on your machine only.** In a lesson, import a figure with the wrong case: `figures/pipelineintegration.astro` instead of `PipelineIntegration.astro`. Build locally. On this Mac it built without a warning (I checked: macOS's default filesystem ignores case). Push it. The Linux runner's filesystem is case-sensitive, so the build should fail there (check it yourself). This is the cleanest demonstration of why the clean machine exists: your laptop isn't wrong, it's just not the machine your users get.
+
+**2. Delete the lockfile.** Remove `package-lock.json` and push. `npm ci` refuses to run without one. Now imagine CI used `npm install` instead: it would happily resolve the newest versions that match `^7.4.0`, and one day a new minor release of a dependency changes the build output, with no commit in your repo to blame. Lockfiles turn "same code" into "same bytes". Restore it.
+
+**3. Add a flaky test.** Add a check to `check_site.py` that fails at random 20% of the time (`random.random() < 0.2`). Push a few times. Notice how quickly you stop reading red builds and start clicking "Re-run". That's the real cost of flakiness: a check that is sometimes wrong for no reason trains everyone to ignore it, and then it misses the real failure. In ML this is the eval gate with a threshold inside the noise. Remove it, and promise yourself to quarantine flaky tests rather than live with them.
+
+**4. Roll back something the pipeline doesn't own.** Change a Pages setting by hand (or, in a real service, run a database migration that drops a column) and then "roll back" by redeploying the previous commit. Nothing changes, because that state was never in the repo. Rollback is only as complete as the part of your system that's described in version control, which is the whole argument for config-as-code and backward-compatible migrations.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What does git actually store when you commit? What's a branch?</summary>
+
+Git is a key-value store where each key is the SHA-1 hash of the value. A file's contents are stored as a blob; each directory is a tree listing names and the hashes of the blobs and trees inside it; a commit points to one root tree (a full snapshot of the project), its parent commit(s), an author, a time and a message. Unchanged files are reused for free because identical content has an identical hash. A branch is just a small file containing one commit hash, and HEAD says which branch you're on; committing writes new objects and moves the branch pointer forward. Because each commit's hash covers its tree and its parent's hash, history can't be changed without changing every hash after it.
+
+</details>
+
+<details>
+<summary>2. Why are many small merges better than one big one? Give the reasoning, not just the slogan.</summary>
+
+A conflict happens when two branches changed the same part of a file since they split. The chance two branches overlap grows roughly with the square of how much each one changed (each of my edits can collide with each of yours), and the number of pairs of branches grows with the square of the team size. So one merge after four weeks is far worse than four weekly merges: each weekly merge has about a sixteenth of the overlap, and there are only four of them. Small merges are also easier to resolve because the code is fresh in your head, and they catch semantic conflicts (clean merges that break, like a rename on one side and a new call on the other) early, since CI builds and tests the combined code within minutes.
+
+</details>
+
+<details>
+<summary>3. What's the difference between CI, continuous delivery and continuous deployment? Why "build once, deploy the artifact"?</summary>
+
+CI: everyone merges to the main line at least daily, and every merge is automatically built and tested on a clean machine; a red build is fixed first. Continuous delivery: every green build is releasable with one automated, push-button step, and a human chooses when. Continuous deployment: every green build is released automatically. You build the artifact once and promote those exact bytes through staging to production so that what you tested is exactly what you ship; rebuilding per stage risks a different dependency version or environment sneaking in, and keeping old artifacts makes rollback a pointer change instead of a rebuild.
+
+</details>
+
+<details>
+<summary>4. How does this scale? The team goes from 5 engineers to 50 on one repo. What breaks, and what do you change?</summary>
+
+Integration pain grows with the square of the number of people (5 people is 10 pairs, 50 is 1,225), so long-lived branches become hopeless: you need trunk-based development, small PRs and feature flags. The test suite grows too, so the pipeline slows past the ten-minute budget; you parallelise and shard tests, cache builds, and run only tests affected by a change (Google and others use build systems like Bazel that know the dependency graph). With many merges per hour, two PRs that each pass alone can break main together, so you add a merge queue that tests each PR on top of the latest main before merging. Flaky tests become a constant tax at this scale, so you track and quarantine them. And deploys need to be gradual (canaries, flags) because more changes per day means more chances to break production, so rollback must be fast and automatic.
+
+</details>
+
+<details>
+<summary>5. You're asked to set up CI/CD for the cross-encoder. What goes in the pipeline?</summary>
+
+Unit tests on the code on every push (tokenization, padding, loss, sampler invariants such as never using the positive as a negative). Data validation whenever the data changes: schema, null rates, label distribution, and a leakage check that no eval query appears in training data. An eval gate: score the candidate on a frozen eval set with NDCG@10 or MRR and compare to the current production model, with a threshold set above the measured run-to-run noise so the gate isn't flaky. The checkpoint is stored as an artifact with its hash, the commit and the dataset version. Release goes through shadow traffic or a canary while watching online metrics, and rollback means pointing the server back at the previous checkpoint ID. Cheap checks run on every push; expensive training and evals run when their inputs change or on a schedule.
+
+</details>
+
+## Go Deeper
+
+- **Martin Fowler, ["Continuous Integration"](https://martinfowler.com/articles/continuousIntegration.html)** (2000, revised 2006 and again since). The definition everyone means, with the reasoning behind each practice. Read it once now and once after a bad merge.
+- **Jez Humble and David Farley, _Continuous Delivery_ (Addison-Wesley, 2010).** The book that named the deployment pipeline. Chapters on the pipeline, artifact promotion and environments are the ones to read.
+- **Scott Chacon and Ben Straub, _Pro Git_, chapter 10 "Git Internals"** (free at [git-scm.com/book](https://git-scm.com/book/en/v2)). Builds blobs, trees and commits by hand with plumbing commands. The perfect companion to Task 1.
+- **Nicole Forsgren, Jez Humble and Gene Kim, _Accelerate_ (IT Revolution, 2018).** The research behind "deploying more often goes with fewer failures", from years of State of DevOps survey data. Where the four DORA metrics come from.
+- **Rachel Potvin and Josh Levenberg, "Why Google Stores Billions of Lines of Code in a Single Repository"**, Communications of the ACM, 2016. Trunk-based development at a scale that should be impossible, and what tooling it took.
+- **D. Sculley et al., "Hidden Technical Debt in Machine Learning Systems"**, NeurIPS 2015, and **Eric Breck et al., "The ML Test Score: A Rubric for ML Production Readiness and Technical Debt Reduction"** (Google, 2017). The first explains why ML systems rot in ways code tests miss; the second is a concrete checklist of tests for data, models and infrastructure.
+- **Steve McConnell, "Daily Build and Smoke Test"**, IEEE Software, 1996. Short, and a time capsule: CI before it had a name.
+- **Astro docs, ["Deploy your Astro Site to GitHub Pages"](https://docs.astro.build/en/guides/deploy/github/)**, and **GitHub docs on Pages with custom workflows**. Check here for the current action versions and the `site`/`base` details.
+
+## Connections
+
+This builds on [Containers vs VMs](/lessons/containers/): a CI runner is a clean machine, and a container image is the way to make "clean and identical" cheap, both for CI and for the artifact you deploy. The rollback drill and the "what changed?" question lead straight into [Logs, metrics and traces](/lessons/observability/), because a pipeline tells you a change is safe to ship and observability tells you whether it actually was.
+
+On the ML side, the eval gate is only as good as its threshold, which is [Is that improvement real?](/lessons/statistics-for-evals/), and [Why is the eval separate?](/lessons/why-evals-are-separate/) explains why the frozen eval set has to stay frozen. The tunnel for the optional home-server deploy is in [Your home server, explained](/lessons/ssh-and-tailscale/).

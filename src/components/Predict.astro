@@ -1,0 +1,31 @@
+---
+// Write a prediction before building. The textarea is saved in this browser.
+// Usage:
+// <Predict id="ram-vs-ssd">
+//   How many times slower is a random SSD read than a RAM read?
+//   <Fragment slot="answer">About 1,000x ...</Fragment>
+// </Predict>
+interface Props { id: string }
+const { id } = Astro.props;
+const lesson = Astro.url.pathname.replace(/\/$/, '').split('/').pop();
+const key = `wb:predict:${lesson}:${id}`;
+---
+<div class="predict" data-key={key}>
+  <div class="predict-head"><span class="label">Predict first</span><span class="label">write it down</span></div>
+  <div class="predict-q"><slot /></div>
+  <textarea placeholder="Your guess, with a number if you can. No looking it up." aria-label="Your prediction"></textarea>
+  <details><summary>Reveal</summary><div class="answer"><slot name="answer" /></div></details>
+</div>
+<script>
+  import { saveProgress } from '../lib/db';
+  const wire = () => document.querySelectorAll<HTMLElement>('.predict[data-key]').forEach((el) => {
+    const key = el.dataset.key!;
+    const ta = el.querySelector('textarea')!;
+    if (document.activeElement !== ta) { try { ta.value = localStorage.getItem(key) ?? ''; } catch {} }
+    if (el.dataset.wired) return;
+    el.dataset.wired = '1';
+    ta.addEventListener('input', () => saveProgress(key, ta.value));
+  });
+  wire();
+  window.addEventListener('wb:synced', wire);
+</script>

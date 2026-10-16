@@ -1,0 +1,151 @@
+---
+import Base from '../layouts/Base.astro';
+import { tracks, startHere, findLesson, allLessons } from '../data/curriculum';
+
+const raw = import.meta.glob<string>('../lessons/*.mdx', { eager: true, query: '?raw', import: 'default' });
+const taskCount: Record<string, number> = {};
+for (const [p, src] of Object.entries(raw)) {
+  taskCount[p.split('/').pop()!.replace('.mdx', '')] = (src.match(/<Task\s/g) ?? []).length;
+}
+const written = (slug: string) => slug in taskCount;
+const nWritten = allLessons.filter((l) => written(l.slug)).length;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const href = (slug: string) => `${base}/lessons/${slug}`;
+---
+<Base title="Workbench">
+  <main class="wrap">
+    <section class="cover">
+      <div>
+        <h1>WORK<br />BENCH</h1>
+        <p class="lede">A build-it-yourself manual for the gap between using software and understanding it.</p>
+        <p class="lede sub">Every lesson makes a problem happen on your own machine, explains it in plain words, and then has you build the fix. You predict a number first, then measure it. Jargon gets defined in the margin, every time.</p>
+        <div class="meta">
+          <span class="label">{tracks.length} tracks</span>
+          <span class="label">{allLessons.length} lessons on the map</span>
+          <span class="label" style="color:var(--blue)">{nWritten} written</span>
+        </div>
+      </div>
+
+      <figure class="fig" style="margin:0">
+        <div class="fig-head"><span class="label">FIG_000</span><span class="label">[ THE LOOP ]</span></div>
+        <div class="fig-body">
+          <svg viewBox="0 0 420 300" role="img" aria-label="The lesson loop: predict, build, measure, explain, repeat">
+            <defs>
+              <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+                <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+              </marker>
+            </defs>
+            <circle cx="210" cy="150" r="92" class="blue dash" stroke-width="1" />
+            <g>
+              <rect x="150" y="22" width="120" height="48" class="fill-wash" stroke-width="1.25" />
+              <text x="210" y="43" text-anchor="middle" class="strong">01 PREDICT</text>
+              <text x="210" y="59" text-anchor="middle">guess a number</text>
+            </g>
+            <g>
+              <rect x="290" y="126" width="120" height="48" class="fill-paper" stroke-width="1.25" />
+              <text x="350" y="147" text-anchor="middle" class="strong">02 BUILD</text>
+              <text x="350" y="163" text-anchor="middle">make it happen</text>
+            </g>
+            <g>
+              <rect x="150" y="230" width="120" height="48" class="fill-paper" stroke-width="1.25" />
+              <text x="210" y="251" text-anchor="middle" class="strong">03 MEASURE</text>
+              <text x="210" y="267" text-anchor="middle">were you right?</text>
+            </g>
+            <g>
+              <rect x="10" y="126" width="120" height="48" class="fill-paper" stroke-width="1.25" />
+              <text x="70" y="147" text-anchor="middle" class="strong">04 EXPLAIN</text>
+              <text x="70" y="163" text-anchor="middle">in plain words</text>
+            </g>
+            <path d="M272 58 Q 330 70 345 122" class="blue" stroke-width="1.25" marker-end="url(#arr)" />
+            <path d="M345 178 Q 330 232 274 246" class="blue" stroke-width="1.25" marker-end="url(#arr)" />
+            <path d="M148 246 Q 90 232 75 178" class="blue" stroke-width="1.25" marker-end="url(#arr)" />
+            <path d="M75 122 Q 90 70 148 58" class="blue" stroke-width="1.25" marker-end="url(#arr)" />
+            <text x="210" y="146" text-anchor="middle" class="blue-t">BREAK IT,</text>
+            <text x="210" y="162" text-anchor="middle" class="blue-t">THEN AGAIN</text>
+          </svg>
+        </div>
+      </figure>
+    </section>
+
+    <section style="display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:40px" class="start-grid">
+      <div class="start">
+        <div class="start-head"><span class="label">Start here · Chapter 0: Waiting vs Working</span><span class="label">6 lessons</span></div>
+        <ol>
+          {startHere.map((s) => {
+            const l = findLesson(s)!;
+            return (
+              <li><a href={href(s)} data-slug={s}>
+                <span><span class="tt">{l.title}</span><span class="q">{l.question}</span></span>
+                <span class="trk">{l.track.title}</span>
+              </a></li>
+            );
+          })}
+        </ol>
+      </div>
+      <div class="progress" style="align-self:start" id="progress" data-total={allLessons.length} data-written={nWritten}>
+        <span>Current progress</span>
+        <div class="bar" id="bar">&nbsp;</div>
+        <dl>
+          <dt>Lessons done</dt><dd id="p-done">0</dd>
+          <dt>Lessons started</dt><dd id="p-started">0</dd>
+          <dt>Tasks checked</dt><dd id="p-tasks">0</dd>
+          <dt>Written / on map</dt><dd>{nWritten} / {allLessons.length}</dd>
+        </dl>
+        <p style="margin:14px 0 0;text-transform:none;letter-spacing:0;font-family:var(--serif);font-size:14px;color:var(--ink-3)">█ done &nbsp;▓ started &nbsp;▒ ready &nbsp;░ not written yet</p>
+      </div>
+    </section>
+
+    <div class="toc-head"><h2>Table of Contents.</h2><span class="line"></span><span class="label">Status</span></div>
+    <section class="toc">
+      {tracks.map((t) => (
+        <div class="toc-track" id={`track-${t.id}`}>
+          <h3><span class="n">{t.n}.</span>{t.title.toUpperCase()}</h3>
+          <p class="blurb">{t.blurb}</p>
+          <ul>
+            {t.lessons.map((l) => (
+              <li>
+                <a href={href(l.slug)} class:list={{ stub: !written(l.slug) }} data-slug={l.slug} data-tasks={taskCount[l.slug] ?? -1}>
+                  <span class="tt">{l.title}</span><span class="dots"></span>
+                  <span class:list={['st', { ready: written(l.slug) }]}>{written(l.slug) ? 'Ready' : 'Stub'}</span>
+                </a>
+              </li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </section>
+  </main>
+
+  <style>
+    @media (max-width: 960px) { .start-grid { grid-template-columns: 1fr !important; } }
+  </style>
+
+  <script>
+    const render = () => {
+    const get = (k: string) => { try { return localStorage.getItem(k); } catch { return null; } };
+    let keys: string[] = [];
+    try { keys = Object.keys(localStorage); } catch {}
+    const checked = (slug: string) => keys.filter((k) => k.startsWith(`wb:task:${slug}:`) && get(k) === '1').length;
+    const links = [...document.querySelectorAll<HTMLAnchorElement>('.toc a[data-slug]')];
+    let done = 0, started = 0;
+    const cells: string[] = [];
+    links.forEach((a) => {
+      const slug = a.dataset.slug!;
+      const total = Number(a.dataset.tasks);
+      const st = a.querySelector('.st')!;
+      if (total < 0) { cells.push('░'); return; }
+      const c = checked(slug);
+      const visited = get(`wb:visited:${slug}`) === '1';
+      if (total > 0 && c >= total) { st.textContent = 'Done'; st.className = 'st done'; done++; cells.push('█'); }
+      else if (visited || c > 0) { st.textContent = total ? `${c}/${total}` : 'Started'; st.className = 'st ready'; started++; cells.push('▓'); }
+      else cells.push('▒');
+    });
+    document.getElementById('bar')!.textContent = cells.join('');
+    document.getElementById('p-done')!.textContent = String(done);
+    document.getElementById('p-started')!.textContent = String(started);
+    document.getElementById('p-tasks')!.textContent = String(keys.filter((k) => k.startsWith('wb:task:') && get(k) === '1').length);
+    };
+    render();
+    window.addEventListener('wb:synced', render);
+  </script>
+</Base>

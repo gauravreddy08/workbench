@@ -1,0 +1,807 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import URLWaterfall from '../components/figures/URLWaterfall.astro';
+
+## Today
+
+- Walk through every step between pressing enter and seeing pixels, in order, and say roughly how long each one takes.
+- Explain DNS properly: who asks whom, what gets cached where and for how long, and why it doesn't melt under billions of queries a day.
+- Count the round trips a fresh HTTPS page load needs before the first byte arrives, and say which tricks (warm caches, reused connections, CDNs) remove which ones.
+- Build a DNS query by hand out of raw bytes, send it to `8.8.8.8` over UDP, and parse the answer.
+- Fetch a page with raw sockets while timing each phase, and line your numbers up against `curl`, `dig +trace` and the Chrome DevTools waterfall.
+
+Prerequisites: [How does data travel?](/lessons/packets-and-ip/) (IP addresses and routes) and [TCP and UDP](/lessons/tcp-vs-udp/) help, but this lesson stands on its own. Rough time: one evening to read, one to build.
+
+## The Problem
+
+In the diagnostic you answered this question like this: "it goes towards a DNS server I guess... then it will have an IP address, which will point to an actual backend server... pages fetched in parts (code, assets) and then rendered."
+
+That's a good skeleton. Every bone is in the right place. What's missing is everything between the bones, and that's where both the interview points and the real-world bugs live.
+
+Here's a scene from your actual job. TinyFish fetches web pages for agents. One of your agents loads a page and it takes 1.4 seconds. You open the page in your own browser and it takes 300 ms. Same page. Where did the other 1.1 seconds go? Was it DNS? A slow handshake to a far-away server? The server thinking? Twenty images fetched one after another? A lost packet and a one-second retry timer? Each of those has a different fix, and if you can't split a page load into its phases, you can't tell which one you're looking at.
+
+So this lesson takes the skeleton and fills every gap, then has you time each phase on your own machine.
+
+<Origin year="1983" title="One text file for the whole internet">
+
+In the 1970s the ARPANET had a few hundred machines, and the mapping from names to addresses lived in a single file called `HOSTS.TXT`, maintained by hand at the Stanford Research Institute. If you wanted your machine to have a name, you emailed SRI. Every site periodically downloaded the whole file.
+
+That broke as the network grew: the file got big, the downloads became heavy traffic on their own, names collided, and one office was a bottleneck for every change. In 1983 Paul Mockapetris published the design for the Domain Name System (RFCs 882 and 883, refined in 1987 as RFCs 1034 and 1035). Its two big ideas, still running today: split the name space into a tree where each owner runs their own branch, and let everyone cache answers for a stated time. The `HOSTS.TXT` idea survives too: it's `/etc/hosts` on your Mac, checked before DNS.
+
+</Origin>
+
+## The Idea
+
+### The whole trip on one page
+
+Let's get the map first, then walk it stop by stop. You type `https://en.wikipedia.org/wiki/Cat` and press enter.
+
+<Figure n="001" title="THE WHOLE TRIP" caption="Fourteen stops from enter to pixels. The top row happens before a single byte of the page is requested. The middle row is the request travelling to the machine that answers it. The bottom row is your browser turning bytes into a picture. Costs are typical, not guarantees." wide>
+<svg viewBox="0 0 640 330" role="img" aria-label="Fourteen steps of a page load in three rows: find and connect, ask and answer, draw">
+  <text x="8" y="16" class="strong">FIND AND CONNECT</text>
+  <g>
+    <rect x="8" y="26" width="112" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="16" y="44" class="blue-t">01</text>
+    <text x="16" y="60" class="strong">PARSE URL</text>
+    <text x="16" y="78">~µs</text>
+    <rect x="136" y="26" width="112" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="144" y="44" class="blue-t">02</text>
+    <text x="144" y="60" class="strong">CACHE, HSTS</text>
+    <text x="144" y="78">~µs-ms</text>
+    <rect x="264" y="26" width="112" height="62" class="fill-wash" stroke-width="1.2" />
+    <text x="272" y="44" class="blue-t">03</text>
+    <text x="272" y="60" class="strong">DNS</text>
+    <text x="272" y="78">0-100+ ms</text>
+    <rect x="392" y="26" width="112" height="62" class="fill-wash" stroke-width="1.2" />
+    <text x="400" y="44" class="blue-t">04</text>
+    <text x="400" y="60" class="strong">TCP CONNECT</text>
+    <text x="400" y="78">1 RTT</text>
+    <rect x="520" y="26" width="112" height="62" class="fill-wash" stroke-width="1.2" />
+    <text x="528" y="44" class="blue-t">05</text>
+    <text x="528" y="60" class="strong">TLS</text>
+    <text x="528" y="78">1 RTT (TLS 1.3)</text>
+  </g>
+  <line x1="120" y1="57" x2="136" y2="57" class="ink" stroke-width="1.2" />
+  <line x1="248" y1="57" x2="264" y2="57" class="ink" stroke-width="1.2" />
+  <line x1="376" y1="57" x2="392" y2="57" class="ink" stroke-width="1.2" />
+  <line x1="504" y1="57" x2="520" y2="57" class="ink" stroke-width="1.2" />
+  <path d="M576 88 L576 102 L64 102 L64 128" class="ink" stroke-width="1.2" />
+  <text x="8" y="122" class="strong">ASK AND ANSWER</text>
+  <g>
+    <rect x="8" y="132" width="112" height="62" class="fill-wash" stroke-width="1.2" />
+    <text x="16" y="150" class="blue-t">06</text>
+    <text x="16" y="166" class="strong">HTTP REQUEST</text>
+    <text x="16" y="184">½ RTT out</text>
+    <rect x="136" y="132" width="112" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="144" y="150" class="blue-t">07</text>
+    <text x="144" y="166" class="strong">CDN EDGE</text>
+    <text x="144" y="184">hit: ~1 ms</text>
+    <rect x="264" y="132" width="112" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="272" y="150" class="blue-t">08</text>
+    <text x="272" y="166" class="strong">LOAD BALANCER</text>
+    <text x="272" y="184">~0.1-1 ms</text>
+    <rect x="392" y="132" width="112" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="400" y="150" class="blue-t">09</text>
+    <text x="400" y="166" class="strong">APP SERVER</text>
+    <text x="400" y="184">1-500 ms</text>
+    <rect x="520" y="132" width="112" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="528" y="150" class="blue-t">10</text>
+    <text x="528" y="166" class="strong">DATABASE</text>
+    <text x="528" y="184">0.1-100 ms</text>
+  </g>
+  <line x1="120" y1="163" x2="136" y2="163" class="ink" stroke-width="1.2" />
+  <line x1="248" y1="163" x2="264" y2="163" class="ink dash" stroke-width="1.2" />
+  <line x1="376" y1="163" x2="392" y2="163" class="ink" stroke-width="1.2" />
+  <line x1="504" y1="163" x2="520" y2="163" class="ink" stroke-width="1.2" />
+  <text x="168" y="210">MISS → FORWARD</text>
+  <path d="M576 194 L576 214 L64 214 L64 238" class="ink" stroke-width="1.2" />
+  <text x="8" y="232" class="strong">DRAW</text>
+  <g>
+    <rect x="8" y="242" width="140" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="16" y="260" class="blue-t">11</text>
+    <text x="16" y="276" class="strong">RESPONSE STREAMS</text>
+    <text x="16" y="294">½ RTT back + size</text>
+    <rect x="168" y="242" width="140" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="176" y="260" class="blue-t">12</text>
+    <text x="176" y="276" class="strong">PARSE HTML</text>
+    <text x="176" y="294">as bytes arrive</text>
+    <rect x="328" y="242" width="140" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="336" y="260" class="blue-t">13</text>
+    <text x="336" y="276" class="strong">SUBRESOURCES</text>
+    <text x="336" y="294">css, js, img, font</text>
+    <rect x="488" y="242" width="144" height="62" class="fill-paper" stroke-width="1.2" />
+    <text x="496" y="260" class="blue-t">14</text>
+    <text x="496" y="276" class="strong">RENDER</text>
+    <text x="496" y="294">~ms per frame</text>
+  </g>
+  <line x1="148" y1="273" x2="168" y2="273" class="ink" stroke-width="1.2" />
+  <line x1="308" y1="273" x2="328" y2="273" class="ink" stroke-width="1.2" />
+  <line x1="468" y1="273" x2="488" y2="273" class="ink" stroke-width="1.2" />
+  <path d="M398 304 L398 320 L428 320" class="blue dash" stroke-width="1" />
+  <text x="434" y="324" class="blue-t">REPEATS 03-11 PER NEW HOST</text>
+</svg>
+</Figure>
+
+Notice the blue boxes. Those are the steps that cost <Term w="round trips">A round trip (RTT, round-trip time) is the time for a message to go from you to the other machine and for a reply to come back. Seattle to Virginia is roughly 70 ms; within one city, a few ms.</Term>, and round trips are the currency of web performance. From [How slow is slow?](/lessons/latency-numbers/): your CPU can do millions of things in the time one packet crosses the country and comes back. A page load is slow mostly because of how many times it has to wait for the other side, not because anything is computing hard.
+
+Now the stops.
+
+### 01. Parsing the URL
+
+The address bar first decides whether you typed an address or a search. `cat pictures` goes to your search engine. `en.wikipedia.org/wiki/Cat` looks like an address, so the browser treats it as one, assumes `https://` if you left it off, and splits it into parts.
+
+A <Term w="URL">Uniform Resource Locator. A string that says how to reach a thing (scheme), where (host and port), and which thing (path, query).</Term> like `https://en.wikipedia.org:443/wiki/Cat?lang=en#Behavior` has:
+
+| Part | Here | What it's for |
+| --- | --- | --- |
+| scheme | `https` | Which protocol. `https` means HTTP inside an encrypted TLS connection. |
+| host | `en.wikipedia.org` | The name DNS will turn into an IP address. |
+| port | `443` | Which door on that machine. Left out, it defaults to 443 for `https` and 80 for `http`. |
+| path | `/wiki/Cat` | Which thing on the server. Sent in the request. |
+| query | `lang=en` | Extra parameters. Sent in the request. |
+| fragment | `Behavior` | A spot inside the page. **Never sent to the server.** The browser uses it to scroll after loading. |
+
+Two small details. A <Term w="port">A 16-bit number that picks which program on a machine gets the connection. One IP address, many ports: 443 for HTTPS, 22 for SSH, 53 for DNS.</Term> is just a number that picks a program on the machine. And hostnames with non-English characters (like `münchen.de`) get converted to a plain-ASCII form (`xn--mnchen-3ya.de`, called punycode) before DNS ever sees them, because DNS was built for ASCII.
+
+### 02. Before touching the network: caches and HSTS
+
+The fastest network request is the one you don't make. Before anything goes out, the browser checks a few places.
+
+**Is this page already cached?** Browsers keep an <Term w="HTTP cache">A store on disk (and in memory) of earlier responses, kept as long as the server's Cache-Control header allows. A fresh hit needs zero network.</Term>. A previous response that came with `Cache-Control: max-age=3600` can be reused for an hour with no network at all. Older-but-not-expired entries can be checked cheaply with a "has this changed?" request (the server answers `304 Not Modified` with no body). A site can also install a <Term w="service worker">A script a site registers that sits between the page and the network, inside your browser, and can answer requests itself (this is how offline-capable web apps work).</Term> that intercepts requests before they reach the cache or network.
+
+**Must this site be HTTPS?** If you typed `http://`, a naive browser would connect on port 80 in plaintext, get a redirect to `https://`, and start over. That first plaintext hop is a security hole: anyone on the café Wi-Fi can answer it instead. <Term w="HSTS">HTTP Strict Transport Security. A response header (Strict-Transport-Security) that tells the browser: for the next N seconds, only ever talk to this host over HTTPS.</Term> fixes it. Once a site has sent you the header, the browser rewrites `http://` to `https://` itself, before any packet leaves. You'll see this in DevTools as a fake "307 Internal Redirect". For big sites, browsers ship a built-in <Term w="HSTS preload list">A list of domains compiled into Chrome (and used by other browsers) that are HTTPS-only from the very first visit, so even the first request can't be downgraded.</Term>. When you run the fetch script later you'll see Wikipedia's version of the header: `strict-transport-security: max-age=106384710; includeSubDomains; preload`, about three years.
+
+If nothing is cached, we need to talk to a server. And for that we need its address.
+
+### 03. DNS: turning a name into a number
+
+Computers on the internet are reached by <Term w="IP address">A number that identifies a network interface on the internet. IPv4 is 32 bits, written 198.35.26.224. IPv6 is 128 bits, written 2620:0:863:ed1a::1.</Term>. People use names. <Term w="DNS">Domain Name System. A worldwide distributed database that maps names like en.wikipedia.org to records such as IP addresses.</Term> is the phone book between them. Your diagnostic answer had "it goes towards a DNS server". There's a whole chain of them, and most of the time the answer comes from a cache long before anything like a "real" DNS server is reached.
+
+#### The chain of askers, nearest first
+
+**The browser's own cache.** Chrome keeps recently resolved names in memory for about a minute. Hit: zero cost. (See it at `chrome://net-internals/#dns`.)
+
+**The OS stub resolver.** If the browser doesn't know, it asks the operating system, usually via a C function called `getaddrinfo`. The part of the OS that handles this is the <Term w="stub resolver">The small DNS client built into your OS. It doesn't look things up itself; it checks /etc/hosts and its cache, then forwards the question to a configured DNS server and waits.</Term>. On macOS that's a background service called `mDNSResponder`, which keeps its own cache shared by every program on the machine. It also checks `/etc/hosts` first, the ghost of `HOSTS.TXT`. If the cache has the answer, you get it in well under a millisecond plus the cost of asking the service. I measured about 1-3 ms from Python on a warm cache.
+
+**The recursive resolver.** On a miss, the stub sends one small UDP packet to whatever DNS server your network handed you. At home that's often your router (mine is `192.168.86.1`; `scutil --dns` shows yours), which in turn forwards to your ISP's resolver, or to a public one like Google's `8.8.8.8` or Cloudflare's `1.1.1.1`. This is the <Term w="recursive resolver">A DNS server that takes your question and does all the legwork of finding the answer, walking the tree from the root if needed, then caches the result for everyone who asks after you.</Term>, and it does the hard work. Its big trick is that it's shared: thousands or millions of users ask the same one, so the answer for `en.wikipedia.org` is almost always already in its cache. A cache hit here costs you one round trip to the resolver, typically 5-30 ms.
+
+**The tree walk.** Only when the recursive resolver also doesn't have the answer does it go out and find it, by asking the tree from the top.
+
+<Figure n="002" title="WALKING THE DNS TREE" caption="On a full cache miss the recursive resolver asks three kinds of server in turn. None of them knows the whole answer; each one says who to ask next, until the authoritative server for the domain gives the actual record. Everything learned along the way is cached for its TTL, so the next lookup for anything under .org skips step 1 and the next lookup for wikipedia.org skips step 2 too.">
+<svg viewBox="0 0 640 340" role="img" aria-label="Laptop asks recursive resolver, which asks root, then TLD, then authoritative server">
+  <rect x="10" y="130" width="130" height="94" class="fill-paper" stroke-width="1.2" />
+  <text x="20" y="150" class="strong">YOUR LAPTOP</text>
+  <text x="20" y="168">browser cache</text>
+  <text x="20" y="184">/etc/hosts</text>
+  <text x="20" y="200">OS stub + cache</text>
+  <text x="20" y="216">(mDNSResponder)</text>
+  <rect x="200" y="130" width="140" height="94" class="fill-wash" stroke-width="1.2" />
+  <text x="210" y="150" class="strong">RECURSIVE</text>
+  <text x="210" y="166" class="strong">RESOLVER</text>
+  <text x="210" y="186">ISP, 8.8.8.8, 1.1.1.1</text>
+  <text x="210" y="202">shared, big cache</text>
+  <line x1="140" y1="166" x2="200" y2="166" class="blue" stroke-width="1.5" />
+  <line x1="200" y1="190" x2="140" y2="190" class="blue" stroke-width="1.5" />
+  <text x="146" y="160" class="blue-t">Q: A?</text>
+  <text x="146" y="206" class="blue-t">A: IP</text>
+  <rect x="440" y="14" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="450" y="34" class="strong">ROOT  "."</text>
+  <text x="450" y="52">13 names, a-m.root-servers</text>
+  <text x="450" y="70">→ "ask the .org servers"</text>
+  <rect x="440" y="134" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="450" y="154" class="strong">TLD  ".org"</text>
+  <text x="450" y="172">run by the registry</text>
+  <text x="450" y="190">→ "ask ns0.wikimedia.org"</text>
+  <rect x="440" y="254" width="190" height="76" class="fill-wash" stroke-width="1.2" />
+  <text x="450" y="274" class="strong">AUTHORITATIVE</text>
+  <text x="450" y="290">ns0.wikimedia.org</text>
+  <text x="450" y="306">→ CNAME dyna.wikimedia.org</text>
+  <text x="450" y="322" class="blue-t">A 198.35.26.224 TTL 180</text>
+  <line x1="340" y1="140" x2="440" y2="50" class="ink" stroke-width="1.2" />
+  <text x="372" y="88" class="strong">1</text>
+  <line x1="340" y1="170" x2="440" y2="170" class="ink" stroke-width="1.2" />
+  <text x="382" y="164" class="strong">2</text>
+  <line x1="340" y1="210" x2="440" y2="290" class="ink" stroke-width="1.2" />
+  <text x="372" y="262" class="strong">3</text>
+  <text x="10" y="270">EACH ARROW IS ONE UDP</text>
+  <text x="10" y="286">QUESTION + ONE ANSWER,</text>
+  <text x="10" y="302">~5-80 MS EACH</text>
+</svg>
+</Figure>
+
+The three levels:
+
+1. A <Term w="root server">One of the servers at the top of the DNS tree. They don't know any website's address; they only know who runs each top-level domain (.com, .org, .uk, ...).</Term>. There are 13 root server *names* (`a.root-servers.net` to `m.root-servers.net`), but each name is served by hundreds of physical machines around the world (more on how in a moment). The recursive resolver ships with their addresses built in.
+2. The <Term w="TLD">Top-level domain: the last label of a name, like com, org, io, uk. Each is run by a registry with its own nameservers.</Term> servers for `.org` know which nameservers are in charge of every `.org` domain.
+3. The <Term w="authoritative nameserver">The server that holds the real, official records for a domain, set by whoever owns the domain. It is the source of truth; everything else is a cache.</Term> for `wikipedia.org`, run by Wikimedia (or for many sites, by Cloudflare, Route 53, etc.), finally gives the answer.
+
+This is the hierarchy idea from 1983: nobody holds the whole phone book. The root only knows the TLDs, the TLD only knows who runs each domain, and each domain's owner runs their own branch. You'll watch this happen live with `dig +trace` in the Build.
+
+#### What the answers look like: records
+
+The data in DNS is a set of <Term w="resource records">One entry in DNS: a name, a type, a time-to-live, and a value. For example "example.com, type A, TTL 300, 104.20.23.154".</Term>, each with a type. The ones you'll meet:
+
+| Type | Means | Example (real, from my run) |
+| --- | --- | --- |
+| A | name → IPv4 address | `example.com A 104.20.23.154` |
+| AAAA | name → IPv6 address | `example.com AAAA 2606:4700:10::6814:179a` |
+| CNAME | "this name is an alias, go look up that one instead" | `www.wikipedia.org CNAME dyna.wikimedia.org` |
+| NS | "these servers are authoritative for this zone" | `example.com NS elliott.ns.cloudflare.com` |
+
+The <Term w="CNAME">Canonical name record. Says a name is an alias for another name. The resolver then looks up the target. Common for pointing your domain at a CDN or a cloud load balancer.</Term> is how most sites hand their traffic to a CDN or cloud provider: `www.yoursite.com CNAME yoursite.cdn-provider.net`, and the provider controls what that resolves to. Notice that each hop in a CNAME chain can need its own lookup.
+
+Most answers contain *several* A records (example.com returned two). The browser picks one and can fall back to another if it doesn't answer. If both IPv6 and IPv4 addresses come back, modern browsers race them, trying IPv6 first and starting IPv4 a few hundredths of a second later, keeping whichever connects first. That trick has the wonderful name <Term w="Happy Eyeballs">RFC 8305. Try IPv6 and IPv4 connections in a staggered race and use the winner, so a broken IPv6 path doesn't stall the page.</Term>.
+
+#### TTLs: how DNS survives billions of queries
+
+Every record carries a <Term w="TTL">Time to live. How many seconds a cache may keep this answer before it must ask again. Set by the domain owner.</Term>. `example.com A ... TTL 300` means "you may cache this for five minutes". Every cache in the chain (browser, OS, router, recursive resolver) counts down from what it received, and when it hits zero, asks again.
+
+This is the whole scaling story of DNS. The authoritative server for a popular domain doesn't get one query per page view. It gets roughly one query per recursive resolver per TTL. Google's public resolver might serve millions of people asking for `wikipedia.org`, but it only goes to Wikimedia's nameservers once every few minutes for it.
+
+The trade-off is the TTL itself. Long TTLs mean fewer queries and faster lookups. Short TTLs mean you can change your mind quickly: move to a new server, fail over away from a dead data center. When people say "DNS changes take time to propagate", what they really mean is "old answers are still sitting in caches until their TTLs run out". The NS records for `.com` in my trace had a TTL of 172,800 seconds, two days, because they almost never change. Wikimedia's actual address record (`dyna.wikimedia.org`, which `en.wikipedia.org` is a CNAME for) had 180 seconds, short enough to steer users away from a data center within minutes.
+
+#### Anycast: one address, many machines
+
+How can "the" root server answer quickly in both Seattle and Singapore? <Term w="anycast">Many machines in different places all announce the same IP address to the internet's routers. Routers deliver your packet to whichever one is closest in network terms.</Term>. The 13 root names are served by well over a thousand machines worldwide, many sharing an address. `8.8.8.8` and `1.1.1.1` work the same way, which is why both answer in a few ms from almost anywhere. You'll meet anycast again at the CDN stop, where the same trick routes you to the nearest edge server.
+
+DNS questions and answers mostly travel over UDP, the no-handshake transport from [TCP and UDP](/lessons/tcp-vs-udp/): one packet out, one packet back, no connection setup. That's why a DNS lookup can cost just one round trip. (When an answer is too big for one UDP packet, the server sets a "truncated" flag and the client retries over TCP.)
+
+<Predict id="dns-count">
+You visit a page on `blog.example.io` for the first time ever, and nobody using your ISP's resolver has visited any `.io` site in the last two days (unrealistic, but go with it). How many DNS questions get sent across the network in total, counting every hop? And how many will the *next* lookup of `shop.example.io` need, one minute later?
+<Fragment slot="answer">
+
+First visit: your stub asks the recursive resolver (1), which asks a root server (2), a `.io` TLD server (3), and `example.io`'s authoritative server (4), then answers you. Four questions crossing the network, plus four answers. If the name were a CNAME pointing somewhere else (say a CDN), add more for the target.
+
+The next lookup of `shop.example.io`: your stub asks the resolver (1). The resolver already has the `.io` and `example.io` NS records cached (days and hours of TTL), so it skips the root and the TLD and goes straight to `example.io`'s authoritative server (2). Two questions. And if you look up `blog.example.io` again within its TTL, it's zero or one: your OS cache answers, or the resolver does.
+
+</Fragment>
+</Predict>
+
+#### What a DNS message actually is
+
+Here's the part that makes DNS stop being magic: a DNS question is about 30 bytes, and you can write every one of them yourself. This is exactly what you'll build in Task 1.
+
+<Figure n="003" title="A DNS QUESTION, BYTE BY BYTE" caption="The whole query for example.com is 29 bytes: a 12-byte header and the question. The name is written as labels, each prefixed by its length, ending in a zero byte. The answer comes back with the same header and question, plus answer records that point back at the question's name with a 2-byte shortcut instead of repeating it.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Layout of a DNS query: header fields and question section">
+  <text x="10" y="18" class="strong">HEADER · 12 BYTES</text>
+  <rect x="10" y="28" width="100" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="60" y="46" text-anchor="middle" class="strong">ID</text>
+  <text x="60" y="62" text-anchor="middle">2 B random</text>
+  <rect x="110" y="28" width="100" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="160" y="46" text-anchor="middle" class="strong">FLAGS</text>
+  <text x="160" y="62" text-anchor="middle">0x0100</text>
+  <rect x="210" y="28" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="260" y="46" text-anchor="middle" class="strong">QDCOUNT</text>
+  <text x="260" y="62" text-anchor="middle">1</text>
+  <rect x="310" y="28" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="360" y="46" text-anchor="middle" class="strong">ANCOUNT</text>
+  <text x="360" y="62" text-anchor="middle">0</text>
+  <rect x="410" y="28" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="460" y="46" text-anchor="middle" class="strong">NSCOUNT</text>
+  <text x="460" y="62" text-anchor="middle">0</text>
+  <rect x="510" y="28" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="560" y="46" text-anchor="middle" class="strong">ARCOUNT</text>
+  <text x="560" y="62" text-anchor="middle">0</text>
+  <line x1="160" y1="72" x2="160" y2="96" class="blue" stroke-width="1" />
+  <text x="168" y="92" class="blue-t">BIT 8 SET = "RECURSION DESIRED": PLEASE DO THE WALK FOR ME</text>
+  <text x="10" y="128" class="strong">QUESTION · 17 BYTES</text>
+  <g>
+    <rect x="10" y="138" width="34" height="40" class="fill-blue" />
+    <text x="27" y="162" text-anchor="middle" style="fill:var(--paper)">07</text>
+    <rect x="44" y="138" width="168" height="40" class="fill-paper" stroke-width="1.2" />
+    <text x="128" y="162" text-anchor="middle" class="strong">e x a m p l e</text>
+    <rect x="212" y="138" width="34" height="40" class="fill-blue" />
+    <text x="229" y="162" text-anchor="middle" style="fill:var(--paper)">03</text>
+    <rect x="246" y="138" width="78" height="40" class="fill-paper" stroke-width="1.2" />
+    <text x="285" y="162" text-anchor="middle" class="strong">c o m</text>
+    <rect x="324" y="138" width="34" height="40" class="fill-blue" />
+    <text x="341" y="162" text-anchor="middle" style="fill:var(--paper)">00</text>
+    <rect x="370" y="138" width="110" height="40" class="fill-wash" stroke-width="1.2" />
+    <text x="425" y="156" text-anchor="middle" class="strong">QTYPE</text>
+    <text x="425" y="171" text-anchor="middle">00 01 = A</text>
+    <rect x="480" y="138" width="110" height="40" class="fill-wash" stroke-width="1.2" />
+    <text x="535" y="156" text-anchor="middle" class="strong">QCLASS</text>
+    <text x="535" y="171" text-anchor="middle">00 01 = IN</text>
+  </g>
+  <text x="10" y="198">LENGTH-PREFIXED LABELS. NO DOTS ON THE WIRE. 00 = END OF NAME.</text>
+  <text x="10" y="236" class="strong">EACH ANSWER RECORD</text>
+  <rect x="10" y="246" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="50" y="263" text-anchor="middle" class="strong">NAME</text>
+  <text x="50" y="278" text-anchor="middle">c0 0c</text>
+  <rect x="90" y="246" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="130" y="270" text-anchor="middle" class="strong">TYPE 2</text>
+  <rect x="170" y="246" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="210" y="270" text-anchor="middle" class="strong">CLASS 2</text>
+  <rect x="250" y="246" width="100" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="300" y="263" text-anchor="middle" class="strong">TTL</text>
+  <text x="300" y="278" text-anchor="middle">4 B seconds</text>
+  <rect x="350" y="246" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="400" y="263" text-anchor="middle" class="strong">RDLENGTH</text>
+  <text x="400" y="278" text-anchor="middle">2 B</text>
+  <rect x="450" y="246" width="140" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="520" y="263" text-anchor="middle" class="strong">RDATA</text>
+  <text x="520" y="278" text-anchor="middle">4 B = IPv4</text>
+  <line x1="50" y1="286" x2="50" y2="296" class="blue" stroke-width="1" />
+  <text x="58" y="298" class="blue-t">POINTER: "SAME NAME AS AT BYTE 12"</text>
+</svg>
+</Figure>
+
+The `c0 0c` is <Term w="name compression">DNS saves space by replacing a repeated name with a 2-byte pointer to where it already appeared in the message. A byte whose top two bits are 11 (0xC0) starts a pointer.</Term>: the top two bits `11` mean "this is a pointer, not a length", and the remaining 14 bits say "byte offset 12", which is where the question's name starts (right after the header). My hand-built query for `example.com` was 29 bytes and the answer, with two A records of 16 bytes each, was 61. That's the entire cost of a DNS lookup on the wire: two small packets.
+
+### 04. TCP: the handshake
+
+Now we have an IP address. To send an HTTP request we need a reliable byte stream to that machine, which is what TCP provides (the detail is in [TCP and UDP](/lessons/tcp-vs-udp/)). TCP starts with a three-message <Term w="handshake">A short exchange of messages at the start of a connection, so both sides agree it exists and agree on starting values before any real data flows.</Term>:
+
+1. Your machine sends a <Term w="SYN">"Synchronize." The first TCP packet of a connection: "I'd like to connect, and my byte numbering starts at X."</Term> to port 443.
+2. The server replies SYN-ACK: "OK, I got yours, and mine starts at Y."
+3. You send ACK: "Got yours."
+
+The cost that matters: **one full round trip** before you can send anything. Your third message can carry data with it, so the handshake costs exactly 1 RTT. From Seattle to a server in Virginia, that's ~70 ms of pure waiting. To a Cloudflare server in your own city, ~5 ms. That difference, multiplied by every round trip in the page load, is why CDNs exist.
+
+One nasty detail. If the SYN or SYN-ACK gets lost, your machine waits for a retransmission timer before trying again, and that timer starts at **1 second** (RFC 6298). While building this lesson I saw a `connect` to github.com take 1,013 ms once, on a run where every other connect took about 30 ms. That's almost certainly one lost packet and one 1-second timer. It's also a great example of why [tail latency](/lessons/tail-latency/) gets ugly: a rare lost packet turns a 30 ms step into a 1,000 ms one.
+
+### 05. TLS: encryption, in one more round trip
+
+`https` means the HTTP conversation runs inside <Term w="TLS">Transport Layer Security. A protocol on top of TCP that encrypts the bytes and proves the server is who it claims to be, using a certificate.</Term>. Before any HTTP flows, client and server do a TLS handshake that agrees on encryption keys and has the server prove its identity with a <Term w="certificate">A file containing a server's public key and its name, signed by a certificate authority your OS or browser already trusts. It's how you know you're talking to the real wikipedia.org.</Term>.
+
+How keys can be agreed in public and how certificates chain up to a trusted root is the whole next lesson, [How does HTTPS keep secrets?](/lessons/tls/). For now, three facts:
+
+- **TLS 1.3 costs 1 round trip.** Your first message (ClientHello) includes your half of the key exchange, guessing which method the server will pick. The server answers with its half, its certificate, and "finished" in one go. Older TLS 1.2 needed 2 round trips. Every site you'll test today speaks 1.3.
+- **The hostname is sent in that first message**, in the clear, as <Term w="SNI">Server Name Indication. The client puts the hostname it wants in the TLS ClientHello so that one IP address (one CDN server) can host thousands of sites and pick the right certificate.</Term>. That's how one Cloudflare IP serves millions of different sites.
+- **The protocol is chosen here too.** The client lists which HTTP versions it speaks (HTTP/2, HTTP/1.1) and the server picks one, a step called <Term w="ALPN">Application-Layer Protocol Negotiation. A TLS extension where client and server agree on which protocol (h2, http/1.1) will run inside the connection, without an extra round trip.</Term>.
+
+Here's the full count so far, on a fresh connection.
+
+<Figure n="004" title="ROUND TRIPS TO FIRST BYTE" caption="Time runs downward. Each diagonal is a packet crossing the network, about half an RTT. Before the first byte of HTML arrives, a fresh HTTPS request needs 1 RTT for TCP, 1 for TLS 1.3, and 1 for the request itself, plus however long the server thinks, plus DNS before all of it. At 80 ms RTT that's 240 ms of pure travel before the server's thinking time is even counted.">
+<svg viewBox="0 0 640 400" role="img" aria-label="Sequence diagram of TCP handshake, TLS 1.3 handshake, and HTTP request and response">
+  <text x="110" y="18" text-anchor="middle" class="strong">YOU</text>
+  <text x="470" y="18" text-anchor="middle" class="strong">SERVER</text>
+  <line x1="110" y1="26" x2="110" y2="390" class="ink" stroke-width="1.2" />
+  <line x1="470" y1="26" x2="470" y2="390" class="ink" stroke-width="1.2" />
+  <rect x="96" y="30" width="28" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="88" y="50" text-anchor="end">DNS</text>
+  <line x1="110" y1="66" x2="470" y2="96" class="ink" stroke-width="1.2" />
+  <text x="290" y="72" text-anchor="middle">SYN</text>
+  <line x1="470" y1="96" x2="110" y2="126" class="ink" stroke-width="1.2" />
+  <text x="290" y="124" text-anchor="middle">SYN-ACK</text>
+  <line x1="110" y1="126" x2="470" y2="156" class="blue" stroke-width="1.2" />
+  <text x="290" y="134" text-anchor="middle" class="blue-t">ACK + CLIENTHELLO (SNI, ALPN, KEY SHARE)</text>
+  <line x1="470" y1="156" x2="110" y2="186" class="blue" stroke-width="1.2" />
+  <text x="290" y="186" text-anchor="middle" class="blue-t">SERVERHELLO, CERT, FINISHED</text>
+  <line x1="110" y1="186" x2="470" y2="216" class="ink" stroke-width="1.5" />
+  <text x="290" y="196" text-anchor="middle" class="strong">FINISHED + GET /wiki/Cat</text>
+  <rect x="456" y="216" width="28" height="60" class="fill-wash" stroke-width="1" />
+  <text x="492" y="246">SERVER THINKS</text>
+  <line x1="470" y1="276" x2="110" y2="306" class="ink" stroke-width="1.5" />
+  <text x="290" y="304" text-anchor="middle" class="strong">HTTP/2 200 + FIRST BYTES</text>
+  <line x1="470" y1="300" x2="110" y2="330" class="ink dash" stroke-width="1" />
+  <line x1="470" y1="324" x2="110" y2="354" class="ink dash" stroke-width="1" />
+  <text x="290" y="364" text-anchor="middle">REST OF THE BODY</text>
+  <line x1="40" y1="66" x2="40" y2="126" class="ink" stroke-width="1" />
+  <line x1="36" y1="66" x2="44" y2="66" class="ink" stroke-width="1" />
+  <line x1="36" y1="126" x2="44" y2="126" class="ink" stroke-width="1" />
+  <text x="48" y="100">TCP 1 RTT</text>
+  <line x1="40" y1="126" x2="40" y2="186" class="blue" stroke-width="1" />
+  <line x1="36" y1="186" x2="44" y2="186" class="blue" stroke-width="1" />
+  <text x="48" y="160" class="blue-t">TLS 1 RTT</text>
+  <line x1="20" y1="186" x2="20" y2="306" class="ink" stroke-width="1" />
+  <line x1="16" y1="186" x2="24" y2="186" class="ink" stroke-width="1" />
+  <line x1="16" y1="306" x2="24" y2="306" class="ink" stroke-width="1" />
+  <text x="26" y="236">WAIT</text>
+  <text x="26" y="250">(TTFB)</text>
+  <text x="26" y="264">1 RTT +</text>
+  <text x="26" y="278">SERVER</text>
+</svg>
+</Figure>
+
+(Newer still: HTTP/3 runs over <Term w="QUIC">A transport protocol built on UDP that merges the transport and TLS handshakes into one round trip, and lets lost packets on one stream not stall the others. HTTP/3 runs on it.</Term>, which folds the transport and TLS handshakes into a single round trip. The `alt-svc: h3=":443"` header you'll see from example.com is the server advertising it. Browsers switch to it on later visits.)
+
+### 06. The HTTP request
+
+At last, the actual question. HTTP is a text protocol, and an HTTP/1.1 request is short enough to type by hand, which you'll do in Task 2:
+
+```http
+GET /wiki/Cat HTTP/1.1
+Host: en.wikipedia.org
+User-Agent: Mozilla/5.0 ...
+Accept: text/html
+Accept-Encoding: gzip, br
+Cookie: session=abc123
+```
+
+Followed by an empty line, which means "that's the end of the headers". The pieces:
+
+- The <Term w="method">The verb of an HTTP request. GET (read), POST (create or submit), PUT, PATCH, DELETE. GETs should not change anything on the server.</Term> (`GET`) and the path (`/wiki/Cat`, plus the query if any). Notice the fragment is not here.
+- <Term w="headers">Name: value lines after the first line of a request or response, carrying metadata: what host, what formats are accepted, cookies, caching rules, content length.</Term>. `Host` is required: one IP can serve many sites, and this says which one you mean. `Accept-Encoding` says "you may compress the response".
+- A <Term w="cookie">A small named value the server asked your browser to store (with a Set-Cookie header) and send back on every later request to that site. It's how a stateless protocol remembers you're logged in.</Term>. HTTP itself has no memory between requests. A server that wants to remember you sends `Set-Cookie: session=abc123` in a response, and your browser attaches `Cookie: session=abc123` to every request to that site after that. That's what "logged in" is.
+
+Browsers actually speak HTTP/2 to most sites, which sends the same information as compact binary frames instead of text, but the meaning (method, path, headers) is identical. The response comes back the same shape:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: text/html; charset=utf-8
+Content-Length: 123734
+Cache-Control: s-maxage=86400, max-age=3600
+Set-Cookie: ...
+
+<!DOCTYPE html><html> ...
+```
+
+The first line has a <Term w="status code">A three-digit number at the start of every HTTP response. 2xx success, 3xx go elsewhere (redirect, or 304 use your cached copy), 4xx you asked wrong (404 not found, 401 not logged in, 429 too many requests), 5xx the server failed.</Term>. Then headers, an empty line, then the body: the HTML itself.
+
+The time from sending the request to receiving the first byte of the response is called <Term w="TTFB">Time to first byte. From the moment the request is sent until the first byte of the response arrives. It's one round trip plus however long the server took to start answering.</Term>. It's one round trip plus server thinking time, and it's the number that tells you whether the server is the slow part.
+
+### 07-10. Who actually answers: edge, load balancer, app, database
+
+Your diagnostic said the IP "will point to an actual backend server". For a big site, it almost never does, directly. The IP you got belongs to the first in a line of machines.
+
+**The CDN edge.** A <Term w="CDN">Content delivery network. A company (Cloudflare, Akamai, Fastly, CloudFront) running servers in hundreds of cities. Sites point their DNS at it; it answers from a nearby server and only goes back to the site's own servers when it must.</Term> runs servers in hundreds of cities, called <Term w="edge">A CDN server near users. It terminates your TCP and TLS connections locally and keeps a cache of the site's responses.</Term> servers, usually all sharing addresses via anycast. Your TCP and TLS handshakes happen with the edge, a few ms away, not with the site's real servers. If the edge has a fresh copy of the response in its cache, it answers right there. Your fetch of example.com will show `server: cloudflare`, `cf-cache-status: HIT`, and `CF-RAY: ...-SEA` (the request was served from Seattle). If the edge doesn't have it (a miss, or a page that's different per user like your inbox), it forwards the request to the site's own servers, the <Term w="origin">The site's own servers, where the real content and application live. The CDN fetches from it on a cache miss.</Term>, usually over a connection it already has open, so you don't pay those handshakes across the ocean.
+
+**The load balancer.** At the origin, a <Term w="load balancer">A machine (or service) that receives all incoming connections and spreads them over many identical app servers, skipping ones that are unhealthy.</Term> picks one of many app servers. You built the reasoning for this in [Load balancing](/lessons/load-balancing/): why you need more than one server, how it picks, and the problem of state.
+
+**The app server and the database.** Then your request finally reaches code: Python, Go, Java, whatever renders the page. It might check a cache ([Caching](/lessons/caching/)), query a database ([Why databases?](/lessons/why-databases/)), call five other internal services, and assemble HTML. This is the "server thinks" box in Figure 004, and it ranges from 1 ms for a cached static file to hundreds of ms for a heavy dynamic page. The whole Scale track ([back-of-envelope](/lessons/back-of-envelope/), [tail latency](/lessons/tail-latency/), [rate limits](/lessons/rate-limits/)) is about making this box small and keeping it small when a million people press enter at once.
+
+### 11-13. The response streams in, and the page asks for more
+
+The response doesn't arrive in one piece. It arrives as a stream of TCP packets, and the browser doesn't wait for the end: it starts parsing HTML as the first bytes land. This is why servers try to send the `<head>` early.
+
+**How fast the bytes come is limited by the connection's age.** A new TCP connection doesn't know how much the network can carry, so it starts cautiously. The sender may only have about 10 packets (roughly 14 KB) in flight before waiting for an acknowledgment, then doubles that every round trip. This ramp-up is called <Term w="slow start">TCP's start-up behavior: begin with a small congestion window (about 10 packets, RFC 6928) and double it every round trip until packets start getting lost.</Term>. So a 60 KB HTML page on a fresh connection takes about three round trips to download (14 KB, then 28, then the rest), even on a fast link. On an old, warmed-up connection, it's one.
+
+**The HTML names more things to fetch.** As the parser reads, it finds `<link rel="stylesheet">`, `<script src>`, `<img>`, fonts referenced from the CSS, and so on. Each is a new request. A modern browser also runs a <Term w="preload scanner">A second, lightweight parser that races ahead through the raw HTML just to find URLs (scripts, styles, images) and start fetching them early, while the main parser is stuck.</Term> that skims ahead to start those fetches early. A page you think of as "one page" is often 50-150 requests.
+
+**Connection reuse.** If every one of those requests paid DNS + TCP + TLS again, pages would take seconds. They don't, because connections are kept open and reused, a feature called <Term w="keep-alive">Keeping a TCP connection open after a response, so the next request to the same host skips the handshakes. Default in HTTP/1.1 and later.</Term>. Requests to the same host share a connection that's already been through its handshakes *and* its slow start. Requests to a *different* host (a separate CDN domain, a font service, an analytics script) need their own DNS, TCP and TLS. That's why the dashed blue arrow in Figure 001 says the network steps repeat per new host, and why performance people say "reduce the number of origins". The `<link rel="preconnect">` hint exists to start those handshakes early.
+
+**HTTP/1.1 vs HTTP/2.** HTTP/1.1 can only have one request in flight per connection at a time: send, wait for the full response, send the next. If a big response is in front, everything behind it waits. That's called <Term w="head-of-line blocking">When one slow item at the front of a queue holds up everything behind it, even items that are ready.</Term>. Browsers work around it by opening up to 6 connections per host, each paying its own handshakes. HTTP/2 fixes it at the HTTP level with <Term w="multiplexing">Sending many requests and responses over one connection at the same time, chopped into small labeled frames that interleave and get reassembled on the other end.</Term>: one connection, many requests interleaved as small labeled frames. One handshake, one slow start, everything shares it. (Over TCP, one lost packet still stalls every stream until it's resent, because TCP delivers bytes strictly in order. Fixing that last bit of head-of-line blocking is why QUIC exists.)
+
+### 14. Rendering: bytes to pixels
+
+You had "and then rendered", which is right. The short version of what that means:
+
+<Figure n="005" title="THE RENDER PIPELINE" caption="HTML becomes the DOM, CSS becomes the CSSOM, together they say what is visible and how it looks. Layout computes where every box goes, paint draws them into layers, and the compositor stacks the layers on the GPU. A script can stop the HTML parser (unless it is async or defer) and can change either tree, which sends the pipeline back to an earlier step.">
+<svg viewBox="0 0 640 250" role="img" aria-label="HTML to DOM and CSS to CSSOM merge into render tree, then layout, paint, composite">
+  <rect x="10" y="30" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="55" text-anchor="middle" class="strong">HTML</text>
+  <rect x="130" y="30" width="90" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="175" y="55" text-anchor="middle" class="strong">DOM</text>
+  <line x1="100" y1="50" x2="130" y2="50" class="ink" stroke-width="1.2" />
+  <rect x="10" y="130" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="155" text-anchor="middle" class="strong">CSS</text>
+  <rect x="130" y="130" width="90" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="175" y="155" text-anchor="middle" class="strong">CSSOM</text>
+  <line x1="100" y1="150" x2="130" y2="150" class="ink" stroke-width="1.2" />
+  <rect x="250" y="80" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="295" y="98" text-anchor="middle" class="strong">RENDER</text>
+  <text x="295" y="112" text-anchor="middle" class="strong">TREE</text>
+  <line x1="220" y1="50" x2="250" y2="92" class="ink" stroke-width="1.2" />
+  <line x1="220" y1="150" x2="250" y2="108" class="ink" stroke-width="1.2" />
+  <rect x="360" y="80" width="80" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="400" y="105" text-anchor="middle" class="strong">LAYOUT</text>
+  <rect x="460" y="80" width="70" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="495" y="105" text-anchor="middle" class="strong">PAINT</text>
+  <rect x="550" y="80" width="84" height="40" class="fill-blue" />
+  <text x="592" y="105" text-anchor="middle" style="fill:var(--paper)">COMPOSITE</text>
+  <line x1="340" y1="100" x2="360" y2="100" class="ink" stroke-width="1.2" />
+  <line x1="440" y1="100" x2="460" y2="100" class="ink" stroke-width="1.2" />
+  <line x1="530" y1="100" x2="550" y2="100" class="ink" stroke-width="1.2" />
+  <text x="400" y="140" text-anchor="middle">WHERE</text>
+  <text x="495" y="140" text-anchor="middle">PIXELS</text>
+  <text x="592" y="140" text-anchor="middle">GPU STACKS</text>
+  <text x="592" y="154" text-anchor="middle">LAYERS</text>
+  <rect x="130" y="200" width="90" height="36" class="fill-paper dash" stroke-width="1" />
+  <text x="175" y="222" text-anchor="middle" class="strong">JS</text>
+  <line x1="160" y1="200" x2="160" y2="70" class="blue dash" stroke-width="1" />
+  <line x1="190" y1="200" x2="190" y2="170" class="blue dash" stroke-width="1" />
+  <text x="230" y="214" class="blue-t">CAN PAUSE THE PARSER</text>
+  <text x="230" y="228" class="blue-t">AND EDIT BOTH TREES</text>
+  <text x="10" y="18">BYTES</text>
+  <text x="130" y="18">TREES</text>
+</svg>
+</Figure>
+
+- The HTML parser turns the bytes into the <Term w="DOM">Document Object Model. The tree of elements the browser builds from the HTML: html, then head and body, then everything inside. JavaScript reads and edits it.</Term>, a tree of elements. CSS gets parsed into the <Term w="CSSOM">CSS Object Model. The browser's parsed form of all the style rules, which it matches against DOM elements to compute each one's final style.</Term>.
+- A plain `<script src>` in the page **stops the parser** until the script is downloaded and run, because the script might change the document. That's why `async` and `defer` exist. CSS doesn't stop parsing, but the browser won't paint until it has the CSS, to avoid flashing unstyled content. So CSS and early scripts are "render-blocking", and they sit on the path to first paint.
+- <Term w="layout">Computing the exact position and size of every visible box on the page, given the viewport width, fonts, and styles. Also called reflow.</Term> works out where every box goes. <Term w="paint">Filling in the actual pixels for each box: text, colors, borders, images, into one or more layers.</Term> fills in pixels. <Term w="compositing">Stacking the painted layers in the right order (often on the GPU) to make the final frame. Scrolling and some animations can be done here alone, which is why they're smooth.</Term> stacks the layers into the final frame.
+
+Each of these is milliseconds, not round trips, which is why the network usually dominates the first load. Once the page is up, rendering becomes the bottleneck (a janky scroll is layout or paint taking longer than one 16 ms frame), but that's a different lesson.
+
+### Putting it together: the waterfall
+
+Chrome DevTools draws each request as a horizontal bar with colored segments, one row per request, called a waterfall. Here's a toy one: an HTML page plus four files, with the segments you just learned about.
+
+<Predict id="waterfall">
+In the figure below, with everything cold and an 80 ms round trip to the origin, about 640 ms passes before the page is fully loaded. Which single toggle do you think saves the most: a warm DNS cache, a reused connection, or a CDN nearby? Roughly how many ms does each save?
+<Fragment slot="answer">
+
+In this model: warm DNS saves exactly the 60 ms DNS step, about 10%. The reused connection saves DNS, TCP and TLS (60 + 80 + 80) *and* the slow-start rounds on the HTML download, about half. The CDN saves the most on its own, about 54%: every round trip shrinks from 80 ms to 10 ms, for handshakes and every subresource request. But look at the HTML's waiting bar with the CDN on: it barely shrinks, because this page is dynamic and the edge still has to go to the origin and wait for the app to build it. A CDN makes *round trips* cheap. It doesn't make your server think faster, unless the response itself can be cached.
+
+</Fragment>
+</Predict>
+
+<Figure n="006" title="ONE PAGE LOAD, PHASE BY PHASE" caption="Toggle conditions and watch the bars shrink. DNS and connection setup only happen once, on the first row; the four subresources share the connection (HTTP/2) and each costs one round trip plus server time. The HTML's first download uses three slow-start rounds on a cold connection. The time axis stays fixed to the cold case so you can see how much disappears. A toy model, with plausible numbers: 60 ms cold DNS, 50 ms for the app to build the HTML, a 10 ms edge round trip." wide>
+
+<URLWaterfall />
+
+</Figure>
+
+Things to try. Turn on all three toggles, then drag the origin RTT to 250 ms (a user on another continent). The cold load explodes, and the fully warmed one barely moves except for the HTML wait: the CDN is hiding nearly all of the distance. Then turn off "CDN nearby" at 250 ms and look at what's left: three round trips to the HTML's first byte, and one more per wave of subresources. The font is always last because nobody knows about it until the CSS has arrived and been parsed. That chain (HTML, then CSS, then font) is a dependency chain in round trips, and it's the shape of most slow pages.
+
+## Build It
+
+You'll build `phases.py`: a fetcher that times each phase of an HTTPS request using only the standard library, and a hand-built DNS client inside it. Then you'll check your numbers against three tools that measure the same phases.
+
+<Task id="t0" title="Set up and get your baseline numbers" agent="ok">
+
+Make a folder (`~/workbench/url/`). No packages needed; everything is in the Python standard library. Python 3.12+ note: the old `ssl.wrap_socket()` function was removed in 3.12. Use `ssl.create_default_context().wrap_socket(sock, server_hostname=host)` instead.
+
+Get a baseline for how far away things are. `ping` sends a tiny packet and times the echo, which is one RTT with no handshake:
+
+```bash
+dig +short example.com          # one of its IPs
+ping -c 5 example.com           # RTT to the CDN edge
+dig +short dyna.wikimedia.org
+ping -c 5 dyna.wikimedia.org    # RTT to a Wikimedia data center
+scutil --dns | head -12         # which DNS server your Mac asks (macOS)
+```
+
+On my Mac in the Seattle area: example.com (Cloudflare) 4.5 ms, Wikimedia 30 ms. Write yours down. Every number later in this lesson should be explainable as a multiple of these.
+
+</Task>
+
+<Task id="t1" title="A DNS query from raw bytes" agent="hands">
+
+Build the 29-byte packet from Figure 003, send it to `8.8.8.8` port 53 over UDP, and parse the answer. This is the heart of the lesson: once you've done it, DNS is just bytes.
+
+```python
+# dnsq.py
+import random, socket, struct, time
+
+def build_query(name: str, qtype: int = 1) -> tuple[int, bytes]:
+    """Return (id, packet). Header: id, flags=0x0100, qdcount=1, others 0.
+    Question: length-prefixed labels, a zero byte, then qtype and qclass (1 = IN)."""
+    ...
+
+def read_name(buf: bytes, off: int) -> tuple[str, int]:
+    """Decode a name starting at buf[off]. Return (name, offset just past it).
+    Handle compression: a byte with top bits 11 starts a 2-byte pointer.
+    After following a pointer, the returned offset is just past the POINTER, not the target."""
+    ...
+
+def parse_response(buf: bytes, qid: int) -> list[tuple[str, int, int, str]]:
+    """Check the id matches. Skip the question(s). For each answer record return
+    (name, type, ttl, value) where value is a dotted IP for A (type 1),
+    a name for CNAME (type 5), or hex for anything else."""
+    ...
+
+def resolve(name: str, server: str = "8.8.8.8") -> tuple[float, list]:
+    """Send the query over UDP (timeout 2 s), return (ms, answers)."""
+    ...
+
+if __name__ == "__main__":
+    for host in ["example.com", "www.wikipedia.org", "www.github.com"]:
+        ms, answers = resolve(host)
+        print(f"{host}: {ms:.1f} ms")
+        for a in answers:
+            print("   ", a)
+```
+
+Hints:
+
+- `struct.pack("!HHHHHH", ...)` packs six unsigned 16-bit big-endian numbers ("network byte order", the `!`). The answer's fixed part after the name is `"!HHIH"`: type, class, TTL (32-bit), rdlength.
+- `socket.inet_ntoa(rdata)` turns 4 bytes into `"104.20.23.154"`. For AAAA (type 28), `socket.inet_ntop(socket.AF_INET6, rdata)`.
+- Print `len(packet)` for `example.com`. It must be 29. Print the response flags as hex: `0x8180` means "this is a response, recursion was desired, recursion was available, no error".
+- `www.wikipedia.org` should come back as two records: a CNAME, then an A record for the CNAME's target. That's your resolver following the alias for you.
+
+Stretch, and very worth it: become your own recursive resolver. Set flags to `0x0000` (no recursion), send the question for `en.wikipedia.org` to a root server (`198.41.0.4` is a.root-servers.net), and read the response. It will have zero answers and a list of NS records in the *authority* section, usually with their IPs in the *additional* section. Send the same question to one of those, and repeat until you get an A record. You'll have reimplemented Figure 002 in about 40 more lines.
+
+</Task>
+
+<Task id="t2" title="Fetch a page with raw sockets, timing every phase" agent="hands">
+
+Now the full trip. Same structure as `curl`, but you can see every step.
+
+```python
+# phases.py
+import socket, ssl, sys, time
+
+def fetch(host: str, path: str = "/") -> dict[str, float]:
+    """Return a dict of phase -> milliseconds: dns, connect, tls, ttfb, download, total.
+    Also print the status line, the negotiated TLS version, and the response headers."""
+    t0 = time.perf_counter()
+    # 1. DNS: socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM) -> pick the first IP
+    # 2. TCP: socket.create_connection((ip, 443))
+    # 3. TLS: ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+    #         (the handshake happens inside wrap_socket; print ss.version())
+    # 4. Send a raw HTTP/1.1 GET. Required: request line, Host header, blank line.
+    #    Add "Connection: close" so the server closes when it's done (makes step 6 easy).
+    # 5. TTFB: time until the first recv() returns any bytes
+    # 6. Download: keep calling recv(65536) until it returns b"" (server closed)
+    ...
+
+if __name__ == "__main__":
+    host = sys.argv[1] if len(sys.argv) > 1 else "example.com"
+    for run in range(3):
+        print(fetch(host))
+```
+
+Hints:
+
+- Lines in HTTP end with `\r\n`, not `\n`, and the headers end with an empty line, so the request ends in `\r\n\r\n`. Get this wrong and the server waits forever for the rest of your request.
+- Encode the request with `.encode()` and send it with `ss.sendall(...)`.
+- Split headers from body with `data.split(b"\r\n\r\n", 1)`.
+- Run it three times in a row. The first run's DNS includes a possible cache miss; runs 2 and 3 should hit the OS cache. Also try `www.wikipedia.org` (bigger page, farther away) and a site you've never visited.
+- Look at the response headers for clues about who answered: `server`, `cf-cache-status`, `x-cache`, `age`, `cf-ray`.
+
+</Task>
+
+<Task id="t3" title="Check yourself against curl" agent="explain">
+
+`curl` can print the same phases with its `-w` (write-out) option. Its timers are **cumulative from the start**, not per phase, so you subtract to compare:
+
+```bash
+curl -s -o /dev/null -w '
+dns      %{time_namelookup}
+connect  %{time_connect}
+tls      %{time_appconnect}
+ttfb     %{time_starttransfer}
+total    %{time_total}
+http     %{http_version}
+ip       %{remote_ip}
+' https://www.wikipedia.org/
+```
+
+Mine for Wikipedia: `dns 0.0025, connect 0.0268, tls 0.0561, ttfb 0.0882, total 0.1516`, so the TCP phase was 24 ms, TLS 29 ms, waiting 32 ms, download 63 ms. Compare against your `phases.py`. Notice `http 2`: curl negotiated HTTP/2 via ALPN, while your script speaks HTTP/1.1.
+
+Your TTFB will probably be about 40 ms *worse* than curl's. Don't fix it yet; that's Break It #1. Ask an agent to explain any phase that doesn't line up, but write any code changes yourself.
+
+</Task>
+
+<Task id="t4" title="Watch the DNS hierarchy with dig +trace" agent="explain">
+
+`dig +trace` skips your resolver and walks the tree itself, printing every hop, exactly Figure 002:
+
+```bash
+dig +trace +nodnssec @1.1.1.1 example.com
+dig +trace +nodnssec @1.1.1.1 en.wikipedia.org
+```
+
+The `@1.1.1.1` matters on many home networks: with plain `dig +trace`, my Mac asked my router for the list of root servers and got back an empty 28-byte reply, so the trace stopped immediately. Pointing the first step at a public resolver fixes it. (`+nodnssec` hides the signature records, which are a topic for another day.)
+
+Read the output in four blocks. Mine for example.com: the root server list from 1.1.1.1 (4 ms); `com.` NS records from `b.root-servers.net` (69 ms, TTL 172800); `example.com.` NS records (Cloudflare's nameservers) from `a.gtld-servers.net` (5 ms); and finally `example.com. 300 IN A 104.20.23.154` from `elliott.ns.cloudflare.com` (7 ms). Note which hops are fast (anycast, nearby) and which are slow.
+
+Then compare with an ordinary `dig example.com` twice in a row and look at the `Query time` and the TTL in the answer: the second time the TTL has counted down, because you're reading the resolver's cached copy.
+
+</Task>
+
+<Task id="t5" title="Read the DevTools waterfall" agent="explain">
+
+Open Chrome, open DevTools (Cmd+Option+I), Network tab, tick "Disable cache", and load `https://en.wikipedia.org/wiki/Cat`. Then:
+
+1. Hover the bar of the first (document) request, or click it and open the **Timing** tab. You'll see the same phases you measured: Queueing, Stalled, DNS Lookup, Initial connection, SSL, Request sent, Waiting for server response (that's TTFB), Content Download. In the waterfall the segments are colored; in recent Chrome versions DNS is green-teal, the connection orange, SSL purple, waiting green, download blue, but check the legend in your version rather than trusting colors. Match each to a step in Figure 001.
+2. Look at the requests after the first. Most have no DNS, connection or SSL segment at all. That's connection reuse.
+3. Right-click a column header and enable **Protocol** and **Connection ID**. You'll see `h2` (HTTP/2, maybe `h3`) and that many requests share one connection ID: multiplexing.
+4. Find a request to a *different* host (Wikipedia loads from `upload.wikimedia.org`). It pays its own DNS + connect + SSL. That's the per-host cost.
+5. Reload without "Disable cache". Many rows now say `(memory cache)` or `(disk cache)`: Step 02, no network at all.
+6. Use the throttling dropdown ("Fast 4G" / "Slow 4G") and watch the waterfall stretch. Throttling adds latency to every round trip, so the dependency chains (HTML → CSS → font) get long.
+
+Write down, for the document request: DNS, connect, SSL, waiting, download. Then explain each to yourself out loud using this lesson's words.
+
+</Task>
+
+<DoneWhen>
+
+- `dnsq.py` builds a 29-byte query for `example.com`, gets answers from `8.8.8.8`, and correctly follows a CNAME answer for `www.wikipedia.org`.
+- `phases.py` prints dns, connect, tls, ttfb, download and total for at least two sites, and the TLS version it negotiated.
+- Your connect time is close to your `ping` RTT, and you can say why.
+- You have the `curl -w` numbers, the `dig +trace` output and the DevTools timing for the same site, and every phase lines up with your script (or you can say exactly why it doesn't).
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Run each site three times and keep the median. Write your prediction for each phase *before* the first run, using only your `ping` RTT: connect ≈ 1 RTT, TLS ≈ 1 RTT plus a bit of crypto, TTFB ≈ 1 RTT plus server time.
+
+| Site | ping RTT | DNS (cold / warm) | connect | TLS | TTFB | download | total | curl total |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| example.com | | | | | | | | |
+| www.wikipedia.org | | | | | | | | |
+| a site you've never visited | | | | | | | | |
+| prediction (example.com) | | | | | | | | |
+
+For reference, my runs from an M-series Mac in the Seattle area, Python 3.14, home Wi-Fi. Yours will differ; the relationships between the columns should not.
+
+| Site | ping RTT | DNS (cold / warm) | connect | TLS | TTFB | download | curl (connect / tls / ttfb, cumulative) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| example.com (932 B, Cloudflare SEA) | 4.5 ms | 29 / 3 ms | 5 ms | 16-25 ms | 57-64 ms | ~0 ms | 7 / 17 / 31 ms |
+| www.wikipedia.org (124 KB) | 30 ms | 20 / 2-3 ms | 24-31 ms | 29-38 ms | 54-68 ms | 56-76 ms | 27 / 56 / 88 ms |
+
+Plus the hand-built UDP query to `8.8.8.8`: 21-30 ms. And a cold lookup of a name that doesn't exist (a random subdomain of `example.org`, which no cache can have): 46 ms.
+
+What the numbers should tell you:
+
+**Connect ≈ ping.** 5 ms vs 4.5 ms; 24-31 vs 30. The TCP handshake is one round trip and nothing else. If yours is far above ping, suspect a lost SYN (look for something near 1,000 ms) or a busy Wi-Fi network.
+
+**TLS ≈ one RTT plus ~10 ms.** For Wikipedia it's about one RTT. For example.com it's 16-25 ms against a 4.5 ms RTT. When the RTT is tiny, the fixed costs show: computing the key exchange and verifying the certificate chain on your side. That's my interpretation; you can check it by timing `ctx.wrap_socket` against a server on `localhost`, where the RTT is near zero.
+
+**Warm DNS is 1-3 ms, cold DNS is tens of ms.** Warm is the OS cache in `mDNSResponder`. Cold is one or more round trips to resolvers. Your `getaddrinfo` cold time and your hand-built UDP query time should be similar, because they're doing nearly the same thing.
+
+**TTFB is suspicious.** For example.com it should be about 1 RTT (5 ms) plus a few ms for a Cloudflare cache hit. curl agrees: 31 − 17 = 14 ms. Your script probably says ~60 ms. Something is adding about 40 ms, every time. Hold that thought.
+
+**Download depends on size and slow start.** example.com's 932 bytes fit in one packet, so download is ~0. Wikipedia's 124 KB needed about 60 ms, roughly two RTTs: slow start sends a first batch, waits for acknowledgments, sends a batch twice as big, and so on. (By the textbook 14 KB starting window it would be three; servers often start larger, and the window can grow during the handshake. Check yourself with a bigger page.) On a fast link, a fresh connection's download time is set by round trips, not bandwidth.
+
+**Add it up.** A fresh fetch of Wikipedia from Python: about 20 + 27 + 33 + 30 (with the fix) + 60 = ~170 ms, of which only a few ms is the server thinking. Everything else is travel.
+
+## Break It
+
+**1. The mystery 40 ms: Nagle meets delayed ACK.** Add one line after creating the socket and before the TLS handshake:
+
+```python
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+```
+
+Rerun. On my Mac, TTFB to example.com dropped from 57-65 ms to 12-28 ms (mostly around 15), and to Wikipedia from 46-65 to 23-30. Same server, one socket option. Here's the likely mechanism. TCP has an old feature, <Term w="Nagle's algorithm">A 1984 TCP rule: if you have a small amount of data to send and an earlier small packet hasn't been acknowledged yet, hold the new data until the ACK arrives, so you send fewer tiny packets.</Term>, that holds back a small write while an earlier small packet is still unacknowledged. The last step of your TLS handshake sent a small packet (the client's "Finished" message). Then your GET, also small, came right behind it, so Nagle held it. Meanwhile the server, using <Term w="delayed ACK">A receiver waits a short time (often around 40 ms) before acknowledging, hoping to piggyback the ACK on a reply or cover two packets with one ACK.</Term>, didn't bother acknowledging the Finished message right away. Each side waits on the other until the delayed-ACK timer fires, about 40 ms later. curl, browsers, and nearly every HTTP client set `TCP_NODELAY` for exactly this reason. Lesson: when a latency is a suspiciously round number that doesn't scale with distance, look for a timer.
+
+**2. Point DNS at nothing.** In `dnsq.py`, send your query to `10.255.255.1` (an address nothing answers on in most networks) with the 2-second timeout. You wait the full 2 seconds and get nothing: UDP has no "connection refused", only silence. Then put `127.0.0.1 example.com` in `/etc/hosts` (with `sudo`, and remove it after) and run `phases.py example.com`: `getaddrinfo` returns your own machine instantly and the connect fails, while your hand-built query to 8.8.8.8 still returns the real IP. That's the difference between asking the OS (which checks `/etc/hosts` first) and asking DNS directly, and it's how a stale hosts entry silently breaks one tool and not another.
+
+**3. Skip SNI, break the certificate.** In `phases.py`, call `wrap_socket(sock)` without `server_hostname`. With the default context, Python refuses outright, because it can't verify a certificate without knowing which name to check. Now pass the *wrong* name: connect to Wikipedia's IP but say `server_hostname="example.com"`. You get `SSLCertVerificationError: ... Hostname mismatch, certificate is not valid for 'example.com'`: the server presented its Wikimedia certificate, and your client correctly refused to accept it as example.com. (Try the reverse, Cloudflare's IP with a name Cloudflare doesn't host, and you get a different error: a handshake failure alert, because the edge doesn't even have a certificate to offer for that SNI.) Every "certificate name mismatch" error you'll ever see in production (wrong DNS record, CDN misconfigured, a corporate proxy) is this.
+
+**4. Pay for every handshake.** Change `phases.py` to fetch the same URL 10 times, first with a new connection each time, then with one connection reused for all 10 (remove `Connection: close`, read each response fully using `Content-Length` or the chunked terminator `0\r\n\r\n`, then send the next request on the same socket). Against Wikipedia, the new-connection version should cost roughly 2 RTTs more per request, ~60 ms × 10. This is what keep-alive saves, and why connection pools in `requests.Session` and `httpx.Client` matter so much for TinyFish-style fetch-heavy workloads.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Walk me through what happens when you type a URL and press enter.</summary>
+
+The browser parses the URL into scheme, host, port and path, and checks whether it can answer without the network: an HTTP cache hit, a service worker, or an HSTS rule that upgrades http to https. Then it needs the host's IP: browser DNS cache, then the OS stub resolver and its cache and /etc/hosts, then a recursive resolver, which on a miss walks root → TLD → authoritative nameserver and caches everything for its TTL. With an IP, it opens a TCP connection (1 round trip), then a TLS 1.3 handshake (1 more) that verifies the certificate and picks HTTP/2 via ALPN. It sends the GET with headers and cookies. That usually lands on a CDN edge nearby, which answers from cache or forwards to the origin's load balancer, which picks an app server, which may query caches and databases and builds the response. The response streams back; the browser parses HTML as it arrives, discovers CSS, JS, images and fonts, fetches them over the same connection (multiplexed in HTTP/2) or new ones for other hosts, builds the DOM and CSSOM, runs scripts, then does layout, paint and compositing to put pixels on screen.
+
+</details>
+
+<details>
+<summary>2. How does DNS handle billions of lookups a day without the authoritative servers melting?</summary>
+
+Caching at every layer, controlled by TTLs, plus a hierarchy. The browser, the OS, the home router and especially the shared recursive resolvers all cache answers for as long as the TTL says. A popular domain's authoritative server sees roughly one query per resolver per TTL, not one per user. The hierarchy means no server needs to know everything: the root only knows TLD servers, TLD servers only know each domain's nameservers, and those records have long TTLs (days), so resolvers rarely ask the root at all. Anycast spreads each "single" server address across many machines worldwide, so load and distance are both spread out. The cost of all this caching is that changes take up to a TTL to be seen everywhere.
+
+</details>
+
+<details>
+<summary>3. A page loads in 300 ms for you in Seattle and 2 seconds for users in India, from the same servers in Virginia. Where does the time go, and what do you change?</summary>
+
+Count round trips. Seattle to Virginia is ~70 ms RTT; India to Virginia might be ~200-250 ms. A cold load needs DNS, then 1 RTT for TCP, 1 for TLS, 1 for the HTML request, then more for slow start on the download, then at least one more wave for CSS/JS and another for fonts or late images, plus extra handshakes for every other host. Call it 6-8 round trips: ~0.5 s from Seattle, ~1.5-2 s from India, even if the server thinks for only 50 ms. The fix is mostly about distance and round trips: a CDN so handshakes and static files are served from a nearby edge, caching the HTML at the edge if it can be cached, fewer origins (or preconnect), HTTP/2 or HTTP/3 to avoid extra connections, and preloading the late discoveries (fonts, hero image) so they don't wait for an extra wave. Making the server faster helps only the "server thinks" slice.
+
+</details>
+
+<details>
+<summary>4. What does a CDN speed up, and what doesn't it?</summary>
+
+It speeds up anything that is round trips: the TCP and TLS handshakes now go to an edge a few ms away instead of across a continent, and the TCP slow start ramps on a short RTT. Cacheable responses (images, CSS, JS, fonts, and HTML that's the same for everyone) are answered at the edge with no trip to the origin at all. It also absorbs load and attacks. It doesn't speed up the origin's thinking: a dynamic, per-user page still has to go from the edge to the origin and wait for the app and database, though the edge's already-open connection to the origin saves those handshakes. So for a personalized page, TTFB stays about "edge RTT + edge-to-origin RTT + server time".
+
+</details>
+
+<details>
+<summary>5. Why did HTTP/2 help so much, and what problem is left that HTTP/3 fixes?</summary>
+
+HTTP/1.1 allows one outstanding request per connection, so a slow response blocks the ones behind it, and browsers open up to 6 connections per host to compensate, each with its own handshakes and slow start. HTTP/2 multiplexes many requests over one connection as interleaved frames: one set of handshakes, one warmed-up congestion window, no application-level head-of-line blocking. What's left is TCP's own head-of-line blocking: TCP delivers bytes strictly in order, so one lost packet stalls every stream on the connection until it's resent. HTTP/3 runs over QUIC on UDP, where each stream is ordered independently, so a loss only stalls its own stream, and QUIC also combines the transport and TLS handshakes into one round trip.
+
+</details>
+
+## Go Deeper
+
+- **Alex Gaynor and contributors, ["What happens when..."](https://github.com/alex/what-happens-when)** on GitHub. A famously exhaustive community answer to this exact question, down to keyboard interrupts and ARP. Read it after this lesson and notice how much you now recognize.
+- **Ilya Grigorik, _High Performance Browser Networking_** (O'Reilly, free at [hpbn.co](https://hpbn.co/)). The book on this topic. Chapters on TCP (slow start, Nagle), TLS, HTTP/1.1 vs HTTP/2, and "Primer on Web Performance" are the long version of everything here.
+- **Julia Evans, ["Implement DNS in a weekend"](https://implement-dns.wizardzines.com/)**. A guided build of a toy DNS resolver in Python, including the recursive walk from the root. The perfect companion to Task 1's stretch goal.
+- **Paul Mockapetris, RFC 1034 and RFC 1035, "Domain Names: Concepts and Facilities" and "Implementation and Specification"** (1987). The original design. Section 4.1 of RFC 1035 is the exact byte layout you built, including message compression. Surprisingly readable.
+- **MDN Web Docs, "How browsers work"** ([developer.mozilla.org](https://developer.mozilla.org/en-US/docs/Web/Performance/How_browsers_work)). A clear walk through navigation, parsing, the preload scanner, and the render pipeline.
+- **Chrome DevTools docs, "Network features reference"**, section "Timing breakdown phases explained", on developer.chrome.com. The official definition of every segment in the waterfall (Queueing, Stalled, Initial connection, SSL, Waiting).
+- **Eric Rescorla, RFC 8446, "The Transport Layer Security (TLS) Protocol Version 1.3"** (2018). Read the handshake overview in section 2 to see why it's 1 RTT; the details wait for the TLS lesson.
+- **Tali Garsiel and Paul Irish, "How Browsers Work: Behind the scenes of modern web browsers"** (2011, on web.dev / HTML5 Rocks). Older, but the classic deep explanation of parsing, the DOM, and layout.
+
+## Connections
+
+This lesson is a map, and most of its stops have their own lesson. Below it: [How does data travel?](/lessons/packets-and-ip/) (what an IP address and a route are) and [TCP and UDP](/lessons/tcp-vs-udp/) (the handshake, retransmission, slow start). Right after it: [How does HTTPS keep secrets?](/lessons/tls/) opens up the TLS box, and [HTTP from scratch](/lessons/http-from-scratch/) has you write the server side of the request you just typed by hand, keep-alive included. [Polling, SSE and WebSockets](/lessons/streaming/) is what happens when the response doesn't end.
+
+The "who answers" stops are the Scale track: [Load balancing](/lessons/load-balancing/), [Caching](/lessons/caching/), [Tail latency](/lessons/tail-latency/) (that 1-second SYN retry is a tail-latency story), and [Back of the envelope](/lessons/back-of-envelope/), where "count the round trips, multiply by RTT" becomes a habit. And all of it rests on [How slow is slow?](/lessons/latency-numbers/): a page load is a few milliseconds of computing wrapped in a few hundred milliseconds of waiting.

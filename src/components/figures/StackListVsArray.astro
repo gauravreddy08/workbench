@@ -1,0 +1,95 @@
+---
+// Slider: how much RAM N numbers take as a Python list vs a packed array.
+// Per-element costs are CPython 3.12+ on 64-bit, measured with tracemalloc (allocator rounding included).
+// Usage: <StackListVsArray />
+---
+<div class="lva" data-fig="stack-list-vs-array">
+  <div class="ctl">
+    <label>N <input type="range" min="3" max="9" step="0.05" value="6" data-in="n" /> <output>1,000,000</output></label>
+    <button class="btn" type="button" data-kind="int" aria-pressed="true">ints</button>
+    <button class="btn" type="button" data-kind="float" aria-pressed="false">floats</button>
+  </div>
+  <div class="lva-rows"></div>
+  <p class="lva-foot label"></p>
+</div>
+
+<style>
+  .lva-rows { margin-top: 18px; display: grid; gap: 12px; }
+  .lva-rows :global(.r) { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; }
+  .lva-rows :global(.r .h) { display: flex; justify-content: space-between; gap: 10px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); letter-spacing: 0.04em; }
+  .lva-rows :global(.track) { height: 14px; border: 1px solid var(--rule); background: var(--paper); position: relative; }
+  .lva-rows :global(.bar) { position: absolute; top: 0; bottom: 0; left: 0; display: flex; }
+  .lva-rows :global(.seg-ptr) { background: var(--blue); }
+  .lva-rows :global(.seg-obj) { background: var(--blue-fill); border-right: 1px solid var(--blue); }
+  .lva-rows :global(.seg-raw) { background: var(--ink-2); }
+  .lva-foot { margin: 14px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  // bytes per element, as tracemalloc sees it on CPython 3.12+ 64-bit
+  const ROWS = {
+    int: [
+      { name: 'Python list of int', ptr: 8, obj: 32, note: '8 B pointer + 32 B int object (28 B rounded up)' },
+      { name: 'array.array("q")', ptr: 0, obj: 0, raw: 8, note: '8 B, packed' },
+      { name: 'numpy int64', ptr: 0, obj: 0, raw: 8, note: '8 B, packed' },
+      { name: 'numpy int32', ptr: 0, obj: 0, raw: 4, note: '4 B, packed' },
+    ],
+    float: [
+      { name: 'Python list of float', ptr: 8, obj: 24, note: '8 B pointer + 24 B float object' },
+      { name: 'array.array("d")', ptr: 0, obj: 0, raw: 8, note: '8 B, packed' },
+      { name: 'numpy float64', ptr: 0, obj: 0, raw: 8, note: '8 B, packed' },
+      { name: 'numpy float32', ptr: 0, obj: 0, raw: 4, note: '4 B, packed' },
+    ],
+  } as const;
+
+  const fmtBytes = (b: number) => {
+    const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let k = 0;
+    while (b >= 1000 && k < u.length - 1) { b /= 1000; k++; }
+    return (b >= 100 ? b.toFixed(0) : b >= 10 ? b.toFixed(1) : b.toFixed(2)) + ' ' + u[k];
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="stack-list-vs-array"]').forEach((root) => {
+    const inp = root.querySelector<HTMLInputElement>('[data-in="n"]')!;
+    const outN = inp.parentElement!.querySelector('output')!;
+    const rowsEl = root.querySelector<HTMLElement>('.lva-rows')!;
+    const foot = root.querySelector<HTMLElement>('.lva-foot')!;
+    const kindBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-kind]')];
+    let kind: 'int' | 'float' = 'int';
+
+    function render() {
+      const N = Math.round(Math.pow(10, Number(inp.value)));
+      outN.textContent = N.toLocaleString('en-US');
+      const rows = ROWS[kind];
+      const per = rows.map((r: any) => r.ptr + r.obj + (r.raw ?? 0));
+      const max = Math.max(...per);
+      rowsEl.innerHTML = '';
+      rows.forEach((r: any, k) => {
+        const total = per[k] * N;
+        const el = document.createElement('div');
+        el.className = 'r';
+        const w = (x: number) => ((x / max) * 100).toFixed(2) + '%';
+        const segs = r.raw
+          ? `<span class="seg-raw" style="width:${w(r.raw)}"></span>`
+          : `<span class="seg-ptr" style="width:${w(r.ptr)}"></span><span class="seg-obj" style="width:${w(r.obj)}"></span>`;
+        el.innerHTML = `<div class="h"><span>${r.name}</span><span class="readout">${fmtBytes(total)}</span></div>` +
+          `<div class="track"><div class="bar" style="width:100%">${segs}</div></div>` +
+          `<div class="h"><span>${r.note}</span></div>`;
+        rowsEl.appendChild(el);
+      });
+      const listBytes = per[0] * N;
+      const spark = 128e9;
+      foot.textContent = listBytes > spark
+        ? `The list version (${fmtBytes(listBytes)}) does not fit in the Spark's 128 GB. The packed int32/float32 one needs ${fmtBytes(per[3] * N)}.`
+        : `List is ${(per[0] / per[2]).toFixed(0)}x bigger than the packed array. Ignores small fixed headers (~56-112 B per container).`;
+    }
+
+    kindBtns.forEach((b) => b.addEventListener('click', () => {
+      kind = b.dataset.kind as 'int' | 'float';
+      kindBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    inp.addEventListener('input', render);
+    render();
+  });
+</script>

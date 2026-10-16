@@ -1,0 +1,120 @@
+---
+// Where the forward-pass FLOPs of a GPT go, per token: attention projections, the attention
+// itself (scores + mixing, which grows with sequence length), the MLP, and the output head.
+// Sliders for d_model, layers and sequence length; toggles for KV heads and causal counting.
+// Usage: <ArchFlopBreakdown />
+---
+<div class="afb" data-fig="arch-flop-breakdown">
+  <svg viewBox="0 0 560 196" role="img" aria-label="Stacked bar of forward FLOPs per token split into projections, attention, MLP and output head">
+    <text x="10" y="16" class="strong">FORWARD FLOPS PER TOKEN</text>
+    <rect x="10" y="28" width="540" height="34" class="ink" stroke-width="1" />
+    <g data-layer="bar"></g>
+    <g data-layer="legend"></g>
+    <text x="10" y="164" class="strong" data-el="total"></text>
+    <text x="10" y="184" data-el="rule"></text>
+  </svg>
+  <div class="ctl">
+    <label>d_model <input type="range" min="0" max="8" step="1" value="3" data-in="d" /> <output data-out="d">768</output></label>
+    <label>layers <input type="range" min="0" max="8" step="1" value="3" data-in="L" /> <output data-out="L">12</output></label>
+  </div>
+  <div class="ctl">
+    <label>seq len <input type="range" min="0" max="10" step="1" value="3" data-in="T" /> <output data-out="T">1K</output></label>
+  </div>
+  <div class="ctl">
+    <span>kv heads</span>
+    <button class="btn" type="button" data-kv="1" aria-pressed="true">MHA</button>
+    <button class="btn" type="button" data-kv="4" aria-pressed="false">GQA /4</button>
+    <button class="btn" type="button" data-kv="0" aria-pressed="false">MQA</button>
+  </div>
+  <div class="ctl">
+    <span>attention counted</span>
+    <button class="btn" type="button" data-causal="0" aria-pressed="true">Full square</button>
+    <button class="btn" type="button" data-causal="1" aria-pressed="false">Causal half</button>
+  </div>
+  <div class="ctl">
+    <span>non-embedding params <span class="readout" data-out="N">-</span></span>
+    <span>attention / MLP <span class="readout" data-out="ratio">-</span></span>
+  </div>
+</div>
+
+<style>
+  .afb svg { width: 100%; }
+</style>
+
+<script>
+  const DS = [256, 384, 512, 768, 1024, 1536, 2048, 4096, 8192];
+  const LS = [4, 6, 8, 12, 16, 24, 32, 48, 80];
+  const TS = [128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const V = 50304;
+  const HD = 64;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  const fl = (x: number) => (x >= 1e12 ? `${(x / 1e12).toFixed(2)} TFLOP` : x >= 1e9 ? `${(x / 1e9).toFixed(2)} GFLOP` : `${(x / 1e6).toFixed(0)} MFLOP`);
+  const pc = (x: number) => `${(x * 100).toFixed(x < 0.1 ? 1 : 0)}%`;
+  const kk = (n: number) => (n >= 1024 ? `${n / 1024}K` : String(n));
+  const pn = (n: number) => (n >= 1e9 ? `${(n / 1e9).toFixed(1)}B` : `${(n / 1e6).toFixed(n < 1e7 ? 1 : 0)}M`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="arch-flop-breakdown"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const barG = q<SVGGElement>('[data-layer="bar"]');
+    const legG = q<SVGGElement>('[data-layer="legend"]');
+    const inp = (s: string) => q<HTMLInputElement>(`[data-in="${s}"]`);
+    const out = (s: string) => q<HTMLElement>(`[data-out="${s}"]`);
+    const el = (s: string) => q<SVGTextElement>(`[data-el="${s}"]`);
+    let kvDiv = 1; // 1 = MHA, 4 = n_head/4, 0 = MQA
+    let causal = false;
+
+    const render = () => {
+      const d = DS[+inp('d').value], L = LS[+inp('L').value], T = TS[+inp('T').value];
+      out('d').textContent = String(d); out('L').textContent = String(L); out('T').textContent = kk(T);
+      const H = d / HD;
+      const KV = kvDiv === 0 ? 1 : Math.max(1, Math.round(H / kvDiv));
+      const projP = L * (2 * d * d + 2 * d * KV * HD);
+      const mlpP = L * 8 * d * d;
+      const parts = [
+        { name: 'QKV+OUT PROJ', v: 2 * projP, cls: 'fill-wash' },
+        { name: 'ATTENTION', v: (causal ? 2 : 4) * L * T * d, cls: 'fill-attn' },
+        { name: 'MLP', v: 2 * mlpP, cls: 'fill-blue' },
+        { name: 'OUTPUT HEAD', v: 2 * d * V, cls: 'fill-paper' },
+      ];
+      const tot = parts.reduce((s, p) => s + p.v, 0);
+      barG.replaceChildren(); legG.replaceChildren();
+      let x = 10;
+      parts.forEach((p, i) => {
+        const w = (540 * p.v) / tot;
+        const r = mk('rect', { x, y: 28, width: Math.max(0, w), height: 34, class: p.cls, 'stroke-width': 1 });
+        if (p.cls === 'fill-attn') r.setAttribute('style', 'fill:var(--ink-2);stroke:var(--ink)');
+        barG.appendChild(r);
+        x += w;
+        const lx = 10 + (i % 2) * 280, ly = 88 + Math.floor(i / 2) * 26;
+        const sw = mk('rect', { x: lx, y: ly - 10, width: 12, height: 12, class: p.cls, 'stroke-width': 1 });
+        if (p.cls === 'fill-attn') sw.setAttribute('style', 'fill:var(--ink-2);stroke:var(--ink)');
+        legG.appendChild(sw);
+        legG.appendChild(mk('text', { x: lx + 20, y: ly }, `${p.name} ${pc(p.v / tot)}`));
+      });
+      const N = projP + mlpP;
+      el('total').textContent = `TOTAL ${fl(tot)} PER TOKEN`;
+      el('rule').textContent = `2N RULE (NON-EMB) SAYS ${fl(2 * N)}: COVERS ${pc((2 * N) / tot)}`;
+      out('N').textContent = pn(N);
+      out('ratio').textContent = (parts[1].v / parts[2].v).toFixed(2);
+    };
+
+    const wire = (attr: string, set: (v: number) => void) => {
+      const bs = [...root.querySelectorAll<HTMLButtonElement>(`[${attr}]`)];
+      bs.forEach((b) => b.addEventListener('click', () => {
+        bs.forEach((o) => o.setAttribute('aria-pressed', String(o === b)));
+        set(+b.getAttribute(attr)!);
+        render();
+      }));
+    };
+    wire('data-kv', (v) => (kvDiv = v));
+    wire('data-causal', (v) => (causal = v === 1));
+    ['d', 'L', 'T'].forEach((s) => inp(s).addEventListener('input', render));
+    render();
+  });
+</script>

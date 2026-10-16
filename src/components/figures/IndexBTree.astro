@@ -1,0 +1,337 @@
+---
+// Interactive B+tree. Insert keys, watch leaves and inner nodes split and the split propagate up,
+// search for a key and see the root-to-leaf path, with "pages read" for the tree vs a left-to-right
+// scan of the leaf pages. Every node is one page.
+---
+<div class="ibt" data-fig="index-btree">
+  <div class="ctl">
+    <label>Key <input type="number" min="1" max="999" value="42" data-k="key" aria-label="Key to insert or search" /></label>
+    <button class="btn" type="button" data-act="insert">Insert</button>
+    <button class="btn" type="button" data-act="search">Search</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="rand">+5 random</button>
+    <button class="btn" type="button" data-act="seq">+5 in order</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <span>Keys per page</span>
+    <button class="btn" type="button" data-order="3" aria-pressed="true">3</button>
+    <button class="btn" type="button" data-order="4" aria-pressed="false">4</button>
+  </div>
+  <div class="ibt-scroll">
+    <svg viewBox="0 0 640 200" role="img" aria-label="A B+tree drawn as boxes, one per page, with the search path highlighted"></svg>
+  </div>
+  <p class="ibt-read">
+    Keys <span class="readout" data-r="n">0</span> ·
+    height <span class="readout" data-r="h">1</span> ·
+    pages <span class="readout" data-r="pages">1</span> ·
+    leaf pages <span class="readout" data-r="leaves">1</span> ·
+    splits so far <span class="readout" data-r="splits">0</span>
+  </p>
+  <p class="ibt-read">
+    Last search: tree read <span class="readout" data-r="tree">-</span> pages ·
+    scan read <span class="readout" data-r="scan">-</span> pages.
+    Running total: tree <span class="readout" data-r="treeT">0</span> vs scan <span class="readout" data-r="scanT">0</span>
+  </p>
+  <ol class="ibt-log" data-r="log"></ol>
+</div>
+
+<style>
+  .ibt-scroll { overflow-x: auto; margin-top: 14px; }
+  .ibt-scroll svg { max-width: none; width: 100%; }
+  .ibt-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+  .ibt-log { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; padding-left: 1.4em; line-height: 1.55; min-height: 1.6em; }
+  .ibt-log li + li { margin-top: 2px; }
+  .ibt input[type='number'] {
+    width: 5.5em; font-family: var(--mono); font-size: 13px; padding: 5px 6px;
+    background: var(--paper); color: var(--ink); border: 1px solid var(--rule);
+  }
+  .ibt input[type='number']:focus { outline: 2px solid var(--blue); outline-offset: -1px; }
+  @media (prefers-reduced-motion: no-preference) {
+    .ibt svg rect { transition: fill 0.2s; }
+  }
+</style>
+
+<script>
+  type Leaf = { id: number; leaf: true; keys: number[]; next: Leaf | null };
+  type Inner = { id: number; leaf: false; keys: number[]; kids: Node[] };
+  type Node = Leaf | Inner;
+  const NS = 'http://www.w3.org/2000/svg';
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  // first index i with arr[i] > x (bisect_right)
+  const bisectRight = (a: number[], x: number) => { let i = 0; while (i < a.length && a[i] <= x) i++; return i; };
+
+  class Tree {
+    maxKeys: number; root: Node; uid = 0; splits = 0;
+    constructor(maxKeys: number) { this.maxKeys = maxKeys; this.root = this.newLeaf(); }
+    newLeaf(): Leaf { return { id: this.uid++, leaf: true, keys: [], next: null }; }
+    newInner(): Inner { return { id: this.uid++, leaf: false, keys: [], kids: [] }; }
+
+    path(key: number): Node[] {
+      const p: Node[] = [this.root];
+      let n = this.root;
+      while (!n.leaf) { n = n.kids[bisectRight(n.keys, key)]; p.push(n); }
+      return p;
+    }
+    has(key: number) { const p = this.path(key); return (p[p.length - 1] as Leaf).keys.includes(key); }
+
+    // returns log lines and the ids of nodes touched by splits
+    insert(key: number): { log: string[]; split: Set<number>; path: Node[] } {
+      const path = this.path(key);
+      const leaf = path[path.length - 1] as Leaf;
+      const log: string[] = [];
+      const split = new Set<number>();
+      if (leaf.keys.includes(key)) { log.push(`${key} is already in the tree. Nothing to do.`); return { log, split, path }; }
+      leaf.keys.splice(bisectRight(leaf.keys, key), 0, key);
+      log.push(`Read ${path.length} page${path.length > 1 ? 's' : ''} from root to leaf, put ${key} in sorted position.`);
+      if (leaf.keys.length <= this.maxKeys) return { log, split, path };
+
+      // leaf split: right half moves to a new page; its first key is COPIED up
+      const mid = Math.floor(leaf.keys.length / 2);
+      const right = this.newLeaf();
+      right.keys = leaf.keys.slice(mid); leaf.keys = leaf.keys.slice(0, mid);
+      right.next = leaf.next; leaf.next = right;
+      this.splits++; split.add(leaf.id); split.add(right.id);
+      let sep = right.keys[0];
+      let newKid: Node = right;
+      log.push(`Leaf overflowed (${this.maxKeys + 1} keys > ${this.maxKeys}). Split into [${leaf.keys.join(' ')}] and [${right.keys.join(' ')}], copy ${sep} up to the parent.`);
+
+      for (let lvl = path.length - 2; lvl >= 0; lvl--) {
+        const parent = path[lvl] as Inner;
+        const j = bisectRight(parent.keys, sep);
+        parent.keys.splice(j, 0, sep); parent.kids.splice(j + 1, 0, newKid);
+        if (parent.keys.length <= this.maxKeys) { log.push(`Parent has room. Done.`); return { log, split, path }; }
+        const m = Math.floor(parent.keys.length / 2);
+        const up = parent.keys[m];
+        const r = this.newInner();
+        r.keys = parent.keys.slice(m + 1); r.kids = parent.kids.slice(m + 1);
+        parent.keys = parent.keys.slice(0, m); parent.kids = parent.kids.slice(0, m + 1);
+        this.splits++; split.add(parent.id); split.add(r.id);
+        log.push(`Inner page overflowed too. Split into [${parent.keys.join(' ')}] and [${r.keys.join(' ')}], push ${up} up.`);
+        sep = up; newKid = r;
+      }
+      const root = this.newInner();
+      root.keys = [sep]; root.kids = [this.root, newKid];
+      this.root = root; split.add(root.id);
+      log.push(`The root split, so a new root holding ${sep} is made. The tree just got one level taller, everywhere at once.`);
+      return { log, split, path };
+    }
+
+    leaves(): Leaf[] {
+      let n = this.root;
+      while (!n.leaf) n = n.kids[0];
+      const out: Leaf[] = [];
+      let l: Leaf | null = n;
+      while (l) { out.push(l); l = l.next; }
+      return out;
+    }
+    height() { return this.path(0).length; }
+    count() { return this.leaves().reduce((a, l) => a + l.keys.length, 0); }
+    pages() {
+      let c = 0;
+      const walk = (n: Node) => { c++; if (!n.leaf) n.kids.forEach(walk); };
+      walk(this.root);
+      return c;
+    }
+    maxKey() { const ls = this.leaves(); for (let i = ls.length - 1; i >= 0; i--) if (ls[i].keys.length) return ls[i].keys[ls[i].keys.length - 1]; return 0; }
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="index-btree"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const keyIn = root.querySelector<HTMLInputElement>('[data-k="key"]')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const orderBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-order]')];
+    let tree = new Tree(3);
+    let hiPath = new Set<number>();
+    let hiSplit = new Set<number>();
+    let hiKey: number | null = null;
+    let newRoot = -1;
+    let treeTotal = 0, scanTotal = 0;
+    const CAP = 40;
+
+    function seed() {
+      tree = new Tree(tree.maxKeys);
+      [20, 40, 10, 30, 50, 60, 25, 35].forEach((k) => tree.insert(k));
+      hiPath = new Set(); hiSplit = new Set(); hiKey = null; newRoot = -1;
+      treeTotal = 0; scanTotal = 0;
+      r('tree').textContent = '-'; r('scan').textContent = '-';
+      setLog(['Started with 8 keys. Insert a key that lands in a full leaf to see a split.']);
+    }
+
+    function setLog(lines: string[]) {
+      const ol = r('log');
+      ol.replaceChildren(...lines.map((t) => { const li = document.createElement('li'); li.textContent = t; return li; }));
+    }
+
+    function draw() {
+      const CW = 26, PAD = 4, GAP = 14, LH = 30, VG = 46, TOP = 24;
+      const NW = tree.maxKeys * CW + PAD * 2;
+      const leaves = tree.leaves();
+      const H = tree.height();
+      const W = Math.max(640, leaves.length * (NW + GAP) + 20);
+      const leafX = new Map<number, number>();
+      const totalW = leaves.length * (NW + GAP) - GAP;
+      const x0 = (W - totalW) / 2;
+      leaves.forEach((l, i) => leafX.set(l.id, x0 + i * (NW + GAP)));
+      const pos = new Map<number, { x: number; y: number }>();
+      const place = (n: Node, depth: number): number => {
+        const y = TOP + depth * (LH + VG);
+        let x: number;
+        if (n.leaf) x = leafX.get(n.id)!;
+        else {
+          const cx = n.kids.map((k) => place(k, depth + 1));
+          x = (cx[0] + cx[cx.length - 1]) / 2;
+        }
+        pos.set(n.id, { x, y });
+        return x;
+      };
+      place(tree.root, 0);
+      const SH = TOP + H * (LH + VG) - VG + 30;
+      svg.setAttribute('viewBox', `0 0 ${W} ${SH}`);
+      svg.style.width = W > 640 ? `${Math.round(W * 0.8)}px` : '100%';
+      svg.style.minWidth = '100%';
+      svg.replaceChildren();
+
+      // edges first
+      const drawEdges = (n: Node) => {
+        if (n.leaf) return;
+        const p = pos.get(n.id)!;
+        n.kids.forEach((k, i) => {
+          const c = pos.get(k.id)!;
+          const onPath = hiPath.has(n.id) && hiPath.has(k.id);
+          svg.append(el('line', {
+            x1: p.x + PAD + i * (NW - 2 * PAD) / n.kids.length + (NW - 2 * PAD) / n.kids.length / 2, y1: p.y + LH,
+            x2: c.x + NW / 2, y2: c.y,
+            class: onPath ? 'blue' : 'ink', 'stroke-width': onPath ? 2 : 1, style: onPath ? '' : 'opacity:0.45',
+          }));
+          drawEdges(k);
+        });
+      };
+      drawEdges(tree.root);
+
+      // leaf sibling links
+      leaves.forEach((l, i) => {
+        if (i === leaves.length - 1) return;
+        const a = pos.get(l.id)!, b = pos.get(leaves[i + 1].id)!;
+        svg.append(el('line', { x1: a.x + NW, y1: a.y + LH / 2, x2: b.x - 2, y2: b.y + LH / 2, class: 'ink dash', 'stroke-width': 1 }));
+        svg.append(el('path', { d: `M${b.x - 2} ${b.y + LH / 2} l-5 -3 v6 z`, style: 'fill:var(--ink-2)' }));
+      });
+
+      // nodes
+      const drawNode = (n: Node) => {
+        const p = pos.get(n.id)!;
+        const on = hiPath.has(n.id);
+        const sp = hiSplit.has(n.id);
+        svg.append(el('rect', {
+          x: p.x, y: p.y, width: NW, height: LH,
+          class: on || sp ? 'fill-wash' : 'fill-paper',
+          'stroke-width': on ? 2 : 1.2,
+          ...(sp && !on ? { 'stroke-dasharray': '4 3' } : {}),
+        }));
+        for (let i = 1; i < tree.maxKeys; i++) {
+          svg.append(el('line', { x1: p.x + PAD + i * CW, y1: p.y + 6, x2: p.x + PAD + i * CW, y2: p.y + LH - 6, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+        }
+        n.keys.forEach((k, i) => {
+          const cx = p.x + PAD + i * CW + CW / 2;
+          const isHit = n.leaf && hiKey === k;
+          if (isHit) svg.append(el('rect', { x: cx - CW / 2 + 1, y: p.y + 4, width: CW - 2, height: LH - 8, class: 'fill-blue' }));
+          svg.append(el('text', {
+            x: cx, y: p.y + LH / 2 + 4, 'text-anchor': 'middle',
+            class: isHit ? '' : (n.leaf ? 'strong' : 'blue-t'),
+            style: isHit ? 'fill:var(--paper);font-weight:600' : '',
+          }, String(k)));
+        });
+        if (sp) svg.append(el('text', { x: p.x + NW / 2, y: p.y - 5, 'text-anchor': 'middle', class: 'blue-t', 'font-size': 9 }, n.id === newRoot ? 'NEW ROOT' : 'SPLIT'));
+        if (!n.leaf) n.kids.forEach(drawNode);
+      };
+      drawNode(tree.root);
+
+      // level labels
+      for (let d = 0; d < H; d++) {
+        const y = TOP + d * (LH + VG) + LH / 2 + 4;
+        const name = d === 0 ? (H === 1 ? 'ROOT = LEAF' : 'ROOT') : d === H - 1 ? 'LEAVES' : 'INNER';
+        svg.append(el('text', { x: 4, y, 'font-size': 9 }, name));
+      }
+
+      r('n').textContent = String(tree.count());
+      r('h').textContent = String(H);
+      r('pages').textContent = String(tree.pages());
+      r('leaves').textContent = String(leaves.length);
+      r('splits').textContent = String(tree.splits);
+      r('treeT').textContent = String(treeTotal);
+      r('scanT').textContent = String(scanTotal);
+    }
+
+    function readKey(): number | null {
+      const v = Math.round(Number(keyIn.value));
+      if (!Number.isFinite(v) || v < 1 || v > 999) { setLog(['Pick a whole number from 1 to 999.']); return null; }
+      return v;
+    }
+
+    function doInsert(k: number, quiet = false): string[] {
+      if (tree.count() >= CAP && !tree.has(k)) return ['The figure is full (40 keys). Reset to start again.'];
+      const before = tree.root;
+      const res = tree.insert(k);
+      hiPath = new Set(tree.path(k).map((n) => n.id));
+      hiSplit = res.split;
+      hiKey = k;
+      newRoot = before !== tree.root ? tree.root.id : -1;
+      return quiet ? [] : res.log;
+    }
+
+    function doSearch(k: number) {
+      const p = tree.path(k);
+      const leaf = p[p.length - 1] as Leaf;
+      const found = leaf.keys.includes(k);
+      const leaves = tree.leaves();
+      let scan = 0;
+      for (const l of leaves) { scan++; if (l.keys.includes(k)) break; }
+      treeTotal += p.length; scanTotal += scan;
+      hiPath = new Set(p.map((n) => n.id)); hiSplit = new Set(); hiKey = found ? k : null; newRoot = -1;
+      r('tree').textContent = String(p.length); r('scan').textContent = String(scan);
+      const steps = p.map((n, i) => (i < p.length - 1 ? `[${n.keys.join(' ')}]` : `leaf [${n.keys.join(' ')}]`)).join(' → ');
+      setLog([
+        `${steps}: ${found ? 'found' : 'not here, and it can be nowhere else'} after ${p.length} page read${p.length > 1 ? 's' : ''}.`,
+        `A scan from the leftmost leaf read ${scan} of ${leaves.length} leaf pages${found ? ' before finding it' : ' and never found it'}.`,
+      ]);
+    }
+
+    root.querySelector('[data-act="insert"]')!.addEventListener('click', () => { const k = readKey(); if (k !== null) { setLog(doInsert(k)); draw(); } });
+    root.querySelector('[data-act="search"]')!.addEventListener('click', () => { const k = readKey(); if (k !== null) { doSearch(k); draw(); } });
+    keyIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const k = readKey(); if (k !== null) { setLog(doInsert(k)); draw(); } } });
+    root.querySelector('[data-act="rand"]')!.addEventListener('click', () => {
+      const added: number[] = []; let splitsBefore = tree.splits; let hBefore = tree.height(); let tries = 0;
+      while (added.length < 5 && tries++ < 200) {
+        const k = 1 + Math.floor(Math.random() * 999);
+        if (tree.has(k)) continue;
+        if (tree.count() >= CAP) break;
+        doInsert(k, true); added.push(k);
+      }
+      hiPath = new Set(); hiKey = null;
+      setLog([added.length ? `Inserted ${added.join(', ')}. ${tree.splits - splitsBefore} split(s)${tree.height() > hBefore ? ', and the tree grew a level' : ''}.` : 'The figure is full (40 keys). Reset to start again.']);
+      draw();
+    });
+    root.querySelector('[data-act="seq"]')!.addEventListener('click', () => {
+      const start = tree.maxKey() + 1; const added: number[] = []; const splitsBefore = tree.splits;
+      for (let k = start; k < start + 5 && k <= 999 && tree.count() < CAP; k++) { doInsert(k, true); added.push(k); }
+      hiPath = new Set(); hiKey = null;
+      setLog([added.length ? `Inserted ${added.join(', ')}, each bigger than everything before. ${tree.splits - splitsBefore} split(s), all on the rightmost edge. Look at how full the leaves they left behind are.` : 'The figure is full (40 keys). Reset to start again.']);
+      draw();
+    });
+    root.querySelector('[data-act="reset"]')!.addEventListener('click', () => { seed(); draw(); });
+    orderBtns.forEach((b) => b.addEventListener('click', () => {
+      tree.maxKeys = Number(b.dataset.order);
+      orderBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      seed(); draw();
+    }));
+
+    seed();
+    draw();
+  });
+</script>

@@ -1,0 +1,214 @@
+---
+// Memory strip: pick an access pattern, see which cache lines get fetched vs which bytes you used.
+// 256 slots of 8 bytes (2 KB), drawn 16 slots (128 B) per row. Every pattern reads 16 numbers.
+// Usage: <CachesStrip />
+---
+<div class="cst" data-fig="caches-strip">
+  <div class="ctl" role="group" aria-label="Access pattern">
+    <button class="btn" type="button" data-p="seq" aria-pressed="true">in order</button>
+    <button class="btn" type="button" data-p="s2" aria-pressed="false">stride 2</button>
+    <button class="btn" type="button" data-p="s8" aria-pressed="false">stride 8</button>
+    <button class="btn" type="button" data-p="s16" aria-pressed="false">column</button>
+    <button class="btn" type="button" data-p="rand" aria-pressed="false">random</button>
+    <button class="btn" type="button" data-p="pyord" aria-pressed="false">py list</button>
+    <button class="btn" type="button" data-p="pyshuf" aria-pressed="false">py list, shuffled</button>
+  </div>
+  <div class="ctl" role="group" aria-label="Cache line size">
+    <span>LINE</span>
+    <button class="btn" type="button" data-l="64" aria-pressed="false">64 B (x86)</button>
+    <button class="btn" type="button" data-l="128" aria-pressed="true">128 B (Apple M)</button>
+    <button class="btn" type="button" data-act="play">play</button>
+    <button class="btn" type="button" data-act="shuffle">reshuffle</button>
+  </div>
+  <svg class="cst-svg" viewBox="0 0 340 300" role="img" aria-label="A strip of memory slots grouped into cache lines; used slots dark, fetched-but-unused slots light"></svg>
+  <div class="cst-legend label">
+    <span><i class="sw used"></i>number you needed</span>
+    <span><i class="sw ptr"></i>pointer / object header</span>
+    <span><i class="sw wasted"></i>fetched, never used</span>
+  </div>
+  <dl class="cst-read">
+    <div><dt class="label">lines fetched</dt><dd class="readout" data-o="lines"></dd></div>
+    <div><dt class="label">bytes moved</dt><dd class="readout" data-o="moved"></dd></div>
+    <div><dt class="label">bytes needed</dt><dd class="readout" data-o="need"></dd></div>
+    <div><dt class="label">useful</dt><dd class="readout" data-o="eff"></dd></div>
+    <div><dt class="label">prefetcher</dt><dd class="readout" data-o="pf"></dd></div>
+  </dl>
+  <p class="cst-note" data-o="note"></p>
+</div>
+
+<style>
+  .cst-svg { width: 100%; max-width: 520px; margin: 14px auto 0; display: block; }
+  .cst-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 10px; font-size: 10.5px; }
+  .cst-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .cst-legend .sw { display: inline-block; width: 12px; height: 12px; border: 1px solid var(--blue); }
+  .cst-legend .sw.used { background: var(--blue); }
+  .cst-legend .sw.ptr { background: var(--ink-3); border-color: var(--ink-3); }
+  .cst-legend .sw.wasted { background: var(--blue-fill); }
+  .cst-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(100px, 1fr)); gap: 8px 16px; margin: 14px 0 0; }
+  .cst-read div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .cst-read dt { font-size: 10px; }
+  .cst-read dd { margin: 2px 0 0; font-size: 15px; }
+  .cst-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const SLOTS = 256;           // 8-byte slots
+  const PER_ROW = 16;          // 128 B per drawn row
+  const CELL = 20, PAD_X = 10, PAD_Y = 8, GAP = 0;
+  const NS = 'http://www.w3.org/2000/svg';
+
+  type Access = { slot: number; kind: 'used' | 'ptr' };
+  type Pattern = { accesses: Access[]; pf: string; note: string };
+
+  // small seeded RNG so the "random" layouts are stable until you reshuffle
+  function rng(seed: number) {
+    let s = seed >>> 0 || 1;
+    return () => { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; return (s >>> 0) / 4294967296; };
+  }
+
+  function build(p: string, seed: number): Pattern {
+    const r = rng(seed);
+    const acc: Access[] = [];
+    const used = (s: number) => acc.push({ slot: s, kind: 'used' });
+    const ptr = (s: number) => acc.push({ slot: s, kind: 'ptr' });
+    if (p === 'seq') {
+      for (let i = 0; i < 16; i++) used(i);
+      return { accesses: acc, pf: 'predicts it', note: 'Every byte of every line you pulled in gets used. This is what numpy a.sum() does, and the prefetcher has the next line waiting before you ask.' };
+    }
+    if (p === 's2') {
+      for (let i = 0; i < 16; i++) used(i * 2);
+      return { accesses: acc, pf: 'predicts it', note: 'Half of each line is wasted. Twice the lines for the same 16 numbers. Like a[::2], or summing one field of an array of (x, y) pairs.' };
+    }
+    if (p === 's8') {
+      for (let i = 0; i < 16; i++) used(i * 8);
+      return { accesses: acc, pf: 'predicts it', note: 'Stride of 64 bytes. With 64 B lines, one number per line: 1/8 useful. With Apple’s 128 B lines you get two per line. The prefetcher still sees the pattern, so you pay bandwidth, not latency.' };
+    }
+    if (p === 's16') {
+      for (let i = 0; i < 16; i++) used(i * 16);
+      return { accesses: acc, pf: 'predicts it', note: 'Walking down a column of a 16-wide row-major matrix. Every number lives in its own line, and the rest of each line is the row you are not reading. Read the next column later and you fetch all these lines again, unless they are still in cache.' };
+    }
+    if (p === 'rand') {
+      const pick = new Set<number>();
+      while (pick.size < 16) pick.add(Math.floor(r() * SLOTS));
+      [...pick].forEach(used);
+      return { accesses: acc, pf: 'lost', note: 'Random gather, like a[perm]. Roughly one line per number, and no pattern to predict. Each miss is a full trip to RAM unless the core can overlap many of them (numpy can: it knows every index up front).' };
+    }
+    // Python list of 16 floats: an array of 16 pointers (slots 0..15), then float objects.
+    // A float object is 24 B (refcount, type pointer, the double), stored in a 32 B allocator block.
+    for (let i = 0; i < 16; i++) ptr(i);
+    const objStart: number[] = [];
+    if (p === 'pyord') {
+      for (let i = 0; i < 16; i++) objStart.push(32 + i * 4);
+    } else {
+      // scattered: shuffle 16 object positions over the rest of the strip
+      const spots: number[] = [];
+      for (let s = 24; s + 4 <= SLOTS; s += 4) spots.push(s);
+      for (let i = spots.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [spots[i], spots[j]] = [spots[j], spots[i]]; }
+      objStart.push(...spots.slice(0, 16));
+    }
+    for (const o of objStart) { ptr(o); ptr(o + 1); used(o + 2); }
+    return p === 'pyord'
+      ? { accesses: acc, pf: 'mostly predicts', note: 'Objects created one after another sit next to each other in memory, so following the pointers still walks forward. More bytes than numpy (pointers + 32 B object blocks), but few wasted lines. In practice the interpreter is the cost here, not memory.' }
+      : { accesses: acc, pf: 'lost', note: 'Same list, but the objects were made in a different order than the list visits them (shuffled, sorted, built from a dict...). Each pointer jumps somewhere new: about one cache line per number, and the prefetcher can’t guess the next one.' };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="caches-strip"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.cst-svg')!;
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const pBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-p]')];
+    const lBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-l]')];
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-act="play"]')!;
+    const shufBtn = root.querySelector<HTMLButtonElement>('[data-act="shuffle"]')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let pattern = 'seq', line = 128, seed = 7, timer = 0;
+
+    const rows = SLOTS / PER_ROW;
+    const H = PAD_Y * 2 + rows * (CELL - 3) + 16;
+    svg.setAttribute('viewBox', `0 0 ${PAD_X * 2 + PER_ROW * CELL} ${H}`);
+    const cellH = CELL - 3;
+    const cells: SVGRectElement[] = [];
+    for (let s = 0; s < SLOTS; s++) {
+      const rect = document.createElementNS(NS, 'rect');
+      const x = PAD_X + (s % PER_ROW) * CELL, y = PAD_Y + Math.floor(s / PER_ROW) * cellH;
+      rect.setAttribute('x', String(x + 1)); rect.setAttribute('y', String(y + 1));
+      rect.setAttribute('width', String(CELL - 2 - GAP)); rect.setAttribute('height', String(cellH - 2));
+      svg.appendChild(rect); cells.push(rect);
+    }
+    const lineLayer = document.createElementNS(NS, 'g');
+    svg.appendChild(lineLayer);
+    const cap = document.createElementNS(NS, 'text');
+    cap.setAttribute('x', String(PAD_X)); cap.setAttribute('y', String(H - 4));
+    svg.appendChild(cap);
+
+    function drawLines() {
+      lineLayer.innerHTML = '';
+      const perLine = line / 8; // slots per line
+      for (let s = 0; s < SLOTS; s += perLine) {
+        const x = PAD_X + (s % PER_ROW) * CELL, y = PAD_Y + Math.floor(s / PER_ROW) * cellH;
+        const r = document.createElementNS(NS, 'rect');
+        r.setAttribute('x', String(x)); r.setAttribute('y', String(y));
+        r.setAttribute('width', String(perLine * CELL)); r.setAttribute('height', String(cellH));
+        r.setAttribute('style', 'fill:none;stroke:var(--ink-3);stroke-width:1');
+        lineLayer.appendChild(r);
+      }
+      cap.textContent = `2 KB OF MEMORY · EACH BOX = 8 B · OUTLINE = ONE ${line} B LINE`;
+    }
+
+    function paint(acc: Access[], upto: number) {
+      const perLine = line / 8;
+      const fetched = new Set<number>();
+      const kind = new Map<number, 'used' | 'ptr'>();
+      acc.slice(0, upto).forEach((a) => { fetched.add(Math.floor(a.slot / perLine)); kind.set(a.slot, a.kind); });
+      cells.forEach((c, s) => {
+        const k = kind.get(s);
+        let st = 'fill:var(--paper);stroke:var(--rule);stroke-width:0.6';
+        if (k === 'used') st = 'fill:var(--blue);stroke:none';
+        else if (k === 'ptr') st = 'fill:var(--ink-3);stroke:none';
+        else if (fetched.has(Math.floor(s / perLine))) st = 'fill:var(--blue-fill);stroke:none';
+        c.setAttribute('style', st);
+      });
+      return fetched.size;
+    }
+
+    function render(animate: boolean) {
+      window.clearInterval(timer);
+      const pat = build(pattern, seed);
+      drawLines();
+      const total = pat.accesses.length;
+      const needB = pat.accesses.filter((a) => a.kind === 'used').length * 8;
+      const finish = () => {
+        const n = paint(pat.accesses, total);
+        out('lines').textContent = String(n);
+        out('moved').textContent = `${n * line} B`;
+        out('need').textContent = `${needB} B`;
+        out('eff').textContent = `${Math.round((needB / (n * line)) * 100)}%`;
+        out('pf').textContent = pat.pf;
+        out('note').textContent = pat.note;
+      };
+      if (!animate || reduce) { finish(); return; }
+      let i = 0;
+      out('note').textContent = '';
+      timer = window.setInterval(() => {
+        i++;
+        const n = paint(pat.accesses, i);
+        out('lines').textContent = String(n);
+        out('moved').textContent = `${n * line} B`;
+        if (i >= total) { window.clearInterval(timer); finish(); }
+      }, total > 20 ? 70 : 140);
+    }
+
+    pBtns.forEach((b) => b.addEventListener('click', () => {
+      pattern = b.dataset.p!;
+      pBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render(true);
+    }));
+    lBtns.forEach((b) => b.addEventListener('click', () => {
+      line = Number(b.dataset.l);
+      lBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render(false);
+    }));
+    playBtn.addEventListener('click', () => render(true));
+    shufBtn.addEventListener('click', () => { seed = (seed * 48271 + 11) % 2147483647; render(true); });
+    render(false);
+  });
+</script>

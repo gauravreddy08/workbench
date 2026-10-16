@@ -1,0 +1,108 @@
+---
+// Docker layer cache simulator. Pick a Dockerfile order and a change; see which steps hit the
+// cache and which rebuild. Rule: a step reruns if its own inputs changed, or if any step above
+// it reran (because its parent layer is now different). Times are illustrative.
+---
+<div class="ccache" data-fig="container-cache">
+  <div class="ctl">
+    <span>Dockerfile</span>
+    <button class="btn" type="button" data-order="naive" aria-pressed="true">Naive order</button>
+    <button class="btn" type="button" data-order="good" aria-pressed="false">Deps first</button>
+  </div>
+  <div class="ctl">
+    <span>Then you</span>
+    <button class="btn" type="button" data-chg="app" aria-pressed="true">Edit serve.py</button>
+    <button class="btn" type="button" data-chg="req" aria-pressed="false">Add a package</button>
+    <button class="btn" type="button" data-chg="base" aria-pressed="false">Bump base image</button>
+  </div>
+  <ol class="ccache-steps"></ol>
+  <p class="ccache-read">
+    Rebuild time <span class="readout" data-r="t">-</span> ·
+    steps rerun <span class="readout" data-r="n">-</span>
+  </p>
+  <p class="ccache-read" data-r="why"></p>
+</div>
+
+<style is:global>
+  .ccache-steps { list-style: none; margin: 14px 0 0; padding: 0; border-top: 1px solid var(--rule); }
+  .ccache-steps li { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; padding: 7px 0; border-bottom: 1px solid var(--rule); font-family: var(--mono); font-size: 12px; color: var(--ink); align-items: baseline; }
+  .ccache-steps code { overflow-wrap: anywhere; }
+  .ccache-steps .st { font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase; white-space: nowrap; }
+  .ccache-steps li.hit .st { color: var(--ink-3); }
+  .ccache-steps li.run { background: var(--blue-wash); }
+  .ccache-steps li.run .st { color: var(--blue); font-weight: 600; }
+  .ccache-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  type Step = { cmd: string; deps: string[]; secs: number };
+  const ORDERS: Record<string, Step[]> = {
+    naive: [
+      { cmd: 'FROM python:3.12-slim', deps: ['base'], secs: 0 },
+      { cmd: 'WORKDIR /app', deps: [], secs: 0.1 },
+      { cmd: 'COPY . .', deps: ['app', 'req'], secs: 0.5 },
+      { cmd: 'RUN pip install -r requirements.txt', deps: [], secs: 95 },
+      { cmd: 'CMD ["python", "serve.py"]', deps: [], secs: 0.1 },
+    ],
+    good: [
+      { cmd: 'FROM python:3.12-slim', deps: ['base'], secs: 0 },
+      { cmd: 'WORKDIR /app', deps: [], secs: 0.1 },
+      { cmd: 'COPY requirements.txt .', deps: ['req'], secs: 0.1 },
+      { cmd: 'RUN pip install -r requirements.txt', deps: [], secs: 95 },
+      { cmd: 'COPY . .', deps: ['app', 'req'], secs: 0.5 },
+      { cmd: 'CMD ["python", "serve.py"]', deps: [], secs: 0.1 },
+    ],
+  };
+  const PULL = 8; // seconds to pull a new base image, illustrative
+
+  document.querySelectorAll<HTMLElement>('[data-fig="container-cache"]').forEach((root) => {
+    const s = { order: 'naive', chg: 'app' };
+    const list = root.querySelector('ol')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const oBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-order]')];
+    const cBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-chg]')];
+
+    function draw() {
+      const steps = ORDERS[s.order];
+      let dirty = false, total = 0, n = 0;
+      list.replaceChildren();
+      steps.forEach((st, i) => {
+        const own = st.deps.includes(s.chg);
+        const run = dirty || own;
+        if (run) {
+          dirty = true; n++;
+          total += i === 0 ? PULL : st.secs;
+        }
+        const li = document.createElement('li');
+        li.className = run ? 'run' : 'hit';
+        const c = document.createElement('code');
+        c.textContent = st.cmd;
+        const tag = document.createElement('span');
+        tag.className = 'st';
+        tag.textContent = !run ? 'cached' : own ? (i === 0 ? 'pull' : 'input changed') : 'parent changed';
+        li.append(c, tag);
+        list.append(li);
+      });
+      r('t').textContent = `~${Math.round(total)} s`;
+      r('n').textContent = `${n} of ${steps.length}`;
+      let why = '';
+      if (s.chg === 'base') why = 'A new base image changes the very first layer, so nothing below it can be reused. Every build pays the full price.';
+      else if (s.chg === 'req') why = 'The package list really changed, so pip has to run again in either order. That is fine: it is the one case where it should.';
+      else if (s.order === 'naive') why = 'COPY . . copies serve.py too, so a one-line code edit changes that layer, and pip install sits on top of it. You reinstall every package to change one line.';
+      else why = 'Only requirements.txt feeds the pip layer. Editing code changes only the last COPY, which takes under a second.';
+      r('why').textContent = why;
+    }
+
+    oBtns.forEach((b) => b.addEventListener('click', () => {
+      s.order = b.dataset.order!;
+      oBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    cBtns.forEach((b) => b.addEventListener('click', () => {
+      s.chg = b.dataset.chg!;
+      cBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    draw();
+  });
+</script>

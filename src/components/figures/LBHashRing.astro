@@ -1,0 +1,138 @@
+---
+// Interactive: 60 keys (think: user IDs or conversation IDs) assigned to N servers, either by
+// hash(key) mod N or by a consistent-hash ring. Change N and count how many keys had to move.
+// Moved keys are drawn filled. Virtual nodes put each server on the ring many times to even out load.
+---
+<div class="lbr" data-fig="lb-ring">
+  <svg viewBox="0 0 420 270" role="img" aria-label="Hash ring with keys and servers"></svg>
+  <div class="lbr-read">
+    <div><span class="label">Keys that moved</span><span class="readout" data-o="moved">–</span></div>
+    <div><span class="label">Ideal (1 / new N)</span><span class="readout" data-o="ideal">–</span></div>
+    <div><span class="label">Busiest server</span><span class="readout" data-o="max">–</span></div>
+  </div>
+  <div class="ctl">
+    <label>Servers <input type="range" min="2" max="8" step="1" value="3" data-k="n" /><output></output></label>
+  </div>
+  <div class="ctl">
+    <span class="lbr-group" role="group" aria-label="Assignment">
+      <button class="btn" type="button" data-mode="mod" aria-pressed="true">hash mod N</button>
+      <button class="btn" type="button" data-mode="ring" aria-pressed="false">Hash ring</button>
+    </span>
+    <button class="btn" type="button" data-k="vn" aria-pressed="false">Virtual nodes</button>
+  </div>
+  <p class="lbr-note">Move the slider one step. Filled dots = keys whose server changed. On the ring, each key belongs to the first server mark clockwise from it.</p>
+</div>
+
+<style>
+  .lbr-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px 16px; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 8px; }
+  .lbr-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .lbr-read .label { font-size: 10px; }
+  .lbr-read .readout { font-size: 18px; }
+  .lbr-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .lbr-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const KEYS = 60, VN = 24;
+
+  function fnv(s: string) {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+    // final avalanche so nearby strings spread out
+    h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+    return h >>> 0;
+  }
+  const keyHash = Array.from({ length: KEYS }, (_, i) => fnv(`user-${i}`));
+
+  function assign(n: number, mode: string, vn: boolean) {
+    if (mode === 'mod') return keyHash.map((h) => h % n);
+    const pts: { p: number; s: number }[] = [];
+    for (let s = 0; s < n; s++) {
+      const reps = vn ? VN : 1;
+      for (let v = 0; v < reps; v++) pts.push({ p: fnv(`server-${s}#${v}`), s });
+    }
+    pts.sort((a, b) => a.p - b.p);
+    return keyHash.map((h) => {
+      const hit = pts.find((x) => x.p >= h) ?? pts[0];
+      return hit.s;
+    });
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="lb-ring"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const slider = root.querySelector<HTMLInputElement>('[data-k="n"]')!;
+    const modeBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const vnBtn = root.querySelector<HTMLButtonElement>('[data-k="vn"]')!;
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    let mode = 'mod', vn = false;
+    let prevN = +slider.value;
+
+    function render(fromN: number | null) {
+      const n = +slider.value;
+      const cur = assign(n, mode, vn);
+      const base = fromN === null ? cur : assign(fromN, mode, vn);
+      const moved = cur.map((s, i) => s !== base[i]);
+      svg.replaceChildren();
+      const cx = 135, cy = 135, R = 108;
+      svg.appendChild(el('circle', { cx, cy, r: R, class: 'ink', 'stroke-width': 1.2 }));
+      const ang = (h: number) => (h / 4294967296) * Math.PI * 2 - Math.PI / 2;
+      if (mode === 'ring') {
+        for (let s = 0; s < n; s++) {
+          const reps = vn ? VN : 1;
+          for (let v = 0; v < reps; v++) {
+            const a = ang(fnv(`server-${s}#${v}`));
+            const x1 = cx + Math.cos(a) * (R - 9), y1 = cy + Math.sin(a) * (R - 9);
+            const x2 = cx + Math.cos(a) * (R + 9), y2 = cy + Math.sin(a) * (R + 9);
+            svg.appendChild(el('line', { x1, y1, x2, y2, class: 'blue', 'stroke-width': vn ? 1 : 2 }));
+            if (!vn) {
+              const tx = cx + Math.cos(a) * (R + 20), ty = cy + Math.sin(a) * (R + 20) + 4;
+              svg.appendChild(el('text', { x: tx, y: ty, 'text-anchor': 'middle', class: 'blue-t' }, `S${s + 1}`));
+            }
+          }
+        }
+      } else {
+        svg.appendChild(el('text', { x: cx, y: cy - 4, 'text-anchor': 'middle', class: 'strong' }, 'server ='));
+        svg.appendChild(el('text', { x: cx, y: cy + 12, 'text-anchor': 'middle', class: 'strong' }, `hash % ${n}`));
+      }
+      keyHash.forEach((h, i) => {
+        const a = ang(h);
+        const x = cx + Math.cos(a) * R, y = cy + Math.sin(a) * R;
+        svg.appendChild(el('circle', { cx: x, cy: y, r: moved[i] ? 4 : 3, class: moved[i] ? 'fill-blue' : 'fill-paper', 'stroke-width': 1 }));
+      });
+      // per-server key counts
+      const counts = new Array(n).fill(0);
+      cur.forEach((s) => counts[s]++);
+      const bx = 290, bw = 100, top = 30, rowH = 26;
+      svg.appendChild(el('text', { x: bx, y: 18, class: 'strong' }, 'KEYS PER SERVER'));
+      const maxC = Math.max(...counts, 1);
+      counts.forEach((c, s) => {
+        const y = top + s * rowH;
+        svg.appendChild(el('text', { x: bx, y: y + 12 }, `S${s + 1}`));
+        svg.appendChild(el('rect', { x: bx + 24, y: y + 2, width: Math.max(1, (c / Math.max(maxC, 20)) * bw * 0.85), height: 12, class: 'fill-wash', 'stroke-width': 1 }));
+        svg.appendChild(el('text', { x: bx + 24 + (c / Math.max(maxC, 20)) * bw * 0.85 + 4, y: y + 12 }, String(c)));
+      });
+      const m = moved.filter(Boolean).length;
+      out('moved').textContent = fromN === null || fromN === n ? '–' : `${m} / ${KEYS} (${Math.round((m / KEYS) * 100)}%)`;
+      out('ideal').textContent = fromN === null || fromN === n ? '–' : `${Math.round((1 / Math.max(n, fromN)) * 100)}%`;
+      out('max').textContent = `${Math.max(...counts)} keys (fair: ${Math.round(KEYS / n)})`;
+      slider.nextElementSibling!.textContent = String(n);
+    }
+
+    slider.addEventListener('input', () => { const from = prevN; prevN = +slider.value; render(from); });
+    modeBtns.forEach((b) => b.addEventListener('click', () => {
+      mode = b.dataset.mode!;
+      modeBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render(null);
+    }));
+    vnBtn.addEventListener('click', () => { vn = !vn; vnBtn.setAttribute('aria-pressed', String(vn)); render(null); });
+    render(null);
+  });
+</script>

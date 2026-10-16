@@ -1,0 +1,255 @@
+---
+// Step through what the CPython eval loop does to run `a + b` (generic path, the 3.11+ specialized
+// path, and a guard miss), next to what compiled C does for the same line.
+// Usage: <PySpeedEvalLoop />
+---
+<div class="pel" data-fig="pyspeed-evalloop">
+  <div class="pel-modes" role="group" aria-label="Which implementation">
+    <button class="btn" type="button" data-mode="generic" aria-pressed="true">Python 3.10</button>
+    <button class="btn" type="button" data-mode="special" aria-pressed="false">3.11+ specialized</button>
+    <button class="btn" type="button" data-mode="miss" aria-pressed="false">3.11+ guard miss</button>
+    <button class="btn" type="button" data-mode="c" aria-pressed="false">C</button>
+  </div>
+
+  <svg viewBox="0 0 560 290" role="img" aria-label="Interpreter state: bytecode, frame, value stack, heap objects and the int type object" data-scene="py">
+    <text x="10" y="14" class="strong">BYTECODE</text>
+    <g data-k="i0"><rect x="10" y="22" width="128" height="26" class="fill-paper" /><text x="74" y="39" text-anchor="middle">LOAD_FAST a</text></g>
+    <g data-k="i1"><rect x="146" y="22" width="128" height="26" class="fill-paper" /><text x="210" y="39" text-anchor="middle">LOAD_FAST b</text></g>
+    <g data-k="i2"><rect x="282" y="22" width="150" height="26" class="fill-paper" /><text x="357" y="39" text-anchor="middle" data-t="op">BINARY_OP +</text></g>
+    <g data-k="i3"><rect x="440" y="22" width="110" height="26" class="fill-paper" /><text x="495" y="39" text-anchor="middle">NEXT ...</text></g>
+
+    <text x="10" y="78" class="strong">FRAME LOCALS</text>
+    <g data-k="la"><rect x="10" y="86" width="120" height="24" class="fill-paper" /><text x="20" y="102">a → obj</text></g>
+    <g data-k="lb"><rect x="10" y="114" width="120" height="24" class="fill-paper" /><text x="20" y="130">b → obj</text></g>
+
+    <text x="10" y="172" class="strong">VALUE STACK</text>
+    <g data-k="s1"><rect x="10" y="180" width="120" height="24" class="fill-paper" /><text x="20" y="196" data-t="s1">-</text></g>
+    <g data-k="s0"><rect x="10" y="208" width="120" height="24" class="fill-paper" /><text x="20" y="224" data-t="s0">-</text></g>
+    <text x="10" y="248">(top is the upper slot)</text>
+
+    <text x="180" y="78" class="strong">HEAP</text>
+    <g data-k="oa"><rect x="180" y="86" width="170" height="58" class="fill-paper" />
+      <text x="190" y="102" data-t="ra">refcnt 1</text><text x="190" y="118" data-k="ta">type → int</text><text x="190" y="134" data-k="va">value 2</text></g>
+    <g data-k="ob"><rect x="180" y="152" width="170" height="58" class="fill-paper" />
+      <text x="190" y="168" data-t="rb">refcnt 1</text><text x="190" y="184" data-k="tb" data-t="tb">type → int</text><text x="190" y="200" data-k="vb" data-t="vb">value 3</text></g>
+    <g data-k="or" class="pel-ghost"><rect x="180" y="218" width="170" height="58" class="fill-paper dash" />
+      <text x="190" y="234">refcnt 1</text><text x="190" y="250">type → int</text><text x="190" y="266" data-t="vr">value 5</text></g>
+
+    <text x="390" y="78" class="strong">TYPE OBJECT</text>
+    <g data-k="ty"><rect x="390" y="86" width="160" height="80" class="fill-paper" />
+      <text x="400" y="102" class="strong" data-t="tyname">int</text>
+      <text x="400" y="120">tp_name, tp_basicsize</text>
+      <text x="400" y="138" data-k="slot">nb_add → long_add</text>
+      <text x="400" y="156">nb_multiply, ...</text></g>
+
+    <g data-k="alu"><rect x="390" y="200" width="160" height="48" class="fill-paper" />
+      <text x="470" y="220" text-anchor="middle" class="strong">CPU ADD</text>
+      <text x="470" y="238" text-anchor="middle">1 instruction</text></g>
+
+    <line x1="130" y1="98" x2="178" y2="98" class="ink" stroke-width="1" marker-end="url(#pel-arr)" />
+    <line x1="130" y1="126" x2="178" y2="166" class="ink" stroke-width="1" marker-end="url(#pel-arr)" />
+    <line x1="350" y1="114" x2="388" y2="114" class="ink dash" stroke-width="1" marker-end="url(#pel-arr)" />
+    <line x1="350" y1="180" x2="388" y2="140" class="ink dash" stroke-width="1" marker-end="url(#pel-arr)" />
+    <defs><marker id="pel-arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="pel-tip" /></marker></defs>
+  </svg>
+
+  <svg viewBox="0 0 560 290" role="img" aria-label="Compiled C: two registers and one add instruction" data-scene="c" hidden>
+    <text x="10" y="14" class="strong">MACHINE CODE (cc -O2, ARM64)</text>
+    <g data-k="ci0"><rect x="10" y="22" width="200" height="26" class="fill-paper" /><text x="110" y="39" text-anchor="middle">add x0, x1, x0</text></g>
+    <g data-k="ci1"><rect x="218" y="22" width="80" height="26" class="fill-paper" /><text x="258" y="39" text-anchor="middle">ret</text></g>
+
+    <text x="10" y="90" class="strong">REGISTERS</text>
+    <g data-k="x0"><rect x="10" y="100" width="150" height="34" class="fill-paper" /><text x="20" y="122" data-t="x0">x0 = 2</text></g>
+    <g data-k="x1"><rect x="10" y="142" width="150" height="34" class="fill-paper" /><text x="20" y="164">x1 = 3</text></g>
+
+    <g data-k="calu"><rect x="260" y="100" width="160" height="76" class="fill-paper" />
+      <text x="340" y="132" text-anchor="middle" class="strong">CPU ADD</text>
+      <text x="340" y="152" text-anchor="middle">~1 cycle</text></g>
+    <line x1="160" y1="117" x2="258" y2="125" class="ink" stroke-width="1" />
+    <line x1="160" y1="159" x2="258" y2="150" class="ink" stroke-width="1" />
+
+    <text x="10" y="220">NO HEAP. NO TYPE OBJECT. NO REFCOUNT.</text>
+    <text x="10" y="238">THE COMPILER KNEW BOTH WERE 64-BIT INTS</text>
+    <text x="10" y="256">BEFORE THE PROGRAM EVER RAN.</text>
+  </svg>
+
+  <p class="pel-msg" data-msg aria-live="polite"></p>
+
+  <div class="ctl">
+    <button class="btn" type="button" data-prev>Back</button>
+    <button class="btn" type="button" data-next>Step</button>
+    <button class="btn" type="button" data-play>Play</button>
+    <button class="btn" type="button" data-reset>Reset</button>
+    <span>step <output data-o="step">0/0</output></span>
+    <span>type checks <output data-o="checks">0</output></span>
+    <span>objects made <output data-o="alloc">0</output></span>
+    <span>actual adds <output data-o="adds">0</output></span>
+  </div>
+</div>
+
+<style>
+  .pel-modes { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+  .pel svg { width: 100%; }
+  .pel svg[hidden] { display: none; }
+  .pel svg .pel-tip { fill: var(--ink); }
+  .pel svg g rect { transition: fill 0.15s, stroke 0.15s; }
+  .pel svg g.hot > rect { fill: var(--blue-fill); stroke: var(--blue); stroke-width: 2; }
+  .pel svg text.hot { fill: var(--blue); font-weight: 600; }
+  .pel svg g.pel-ghost { opacity: 0.18; }
+  .pel svg g.miss > rect { stroke: var(--warn); stroke-width: 2; }
+  .pel-msg { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink); margin: 12px 0 0; min-height: 5em; border-left: 2px solid var(--blue); padding-left: 10px; }
+  .pel .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  @media (prefers-reduced-motion: reduce) { .pel svg g rect { transition: none; } }
+</style>
+
+<script>
+  type Step = {
+    hl: string[];
+    text: string;
+    set?: Record<string, string>;
+    show?: string[];
+    miss?: string[];
+    checks?: number;
+    alloc?: number;
+    adds?: number;
+  };
+
+  const START: Record<string, string> = {
+    s0: '-', s1: '-', ra: 'refcnt 1', rb: 'refcnt 1', tb: 'type → int', vb: 'value 3', vr: 'value 5', tyname: 'int', x0: 'x0 = 2',
+  };
+
+  const loads: Step[] = [
+    { hl: ['i0'], text: 'Dispatch: read the next opcode (LOAD_FAST) from the bytecode and jump to the C code that handles it.' },
+    { hl: ['i0', 'la', 's0'], set: { s0: 'ptr → a', ra: 'refcnt 2' }, text: 'LOAD_FAST a: copy the POINTER to a onto the value stack. Bump a\'s reference count. No number has been looked at yet.' },
+    { hl: ['i1', 'lb', 's1'], set: { s1: 'ptr → b', rb: 'refcnt 2' }, text: 'Dispatch LOAD_FAST b, push the pointer to b, bump its refcount. Two pointers on the stack.' },
+  ];
+
+  const MODES: Record<string, { op: string; steps: Step[] }> = {
+    generic: {
+      op: 'BINARY_ADD',
+      steps: [
+        ...loads,
+        { hl: ['i2', 's0', 's1'], text: 'Dispatch BINARY_ADD (3.11 renamed it BINARY_OP). Pop two pointers. This instruction runs for EVERY "+" in every program: ints, floats, strings, lists, numpy arrays. It knows nothing yet.' },
+        { hl: ['oa', 'ta'], checks: 1, text: 'Follow the pointer to a on the heap and read its type field. It points at the int type object.' },
+        { hl: ['ob', 'tb'], checks: 1, text: 'Read b\'s type too. If b\'s type were a subclass of a\'s, Python would have to ask b first. Same type, so a goes first.' },
+        { hl: ['ty', 'slot'], text: 'Follow the type pointer to the int type object and look up its add slot (nb_add). It holds a pointer to a C function, long_add.' },
+        { hl: ['ty', 'slot'], checks: 1, text: 'Call long_add(a, b) through that function pointer. Inside, it checks again that both really are ints (it could be handed anything).' },
+        { hl: ['va', 'vb'], checks: 1, text: 'Are both "small" ints that fit one machine word? Yes. Read the raw values 2 and 3 out of the two heap objects.' },
+        { hl: ['alu'], adds: 1, text: 'The actual addition: 2 + 3 in a CPU register. One instruction. Everything before this was finding out what to do.' },
+        { hl: ['or'], show: ['or'], alloc: 1, text: 'Box the answer: wrap 5 in a new int object on the heap (header + value). (Ints from -5 to 256 are cached and reused, but a general int means an allocation.)' },
+        { hl: ['oa', 'ob', 's0'], set: { ra: 'refcnt 1', rb: 'refcnt 1', s0: 'ptr → result', s1: '-' }, text: 'Drop the references to a and b (decrement, check for zero, free if so). Push the pointer to the result.' },
+        { hl: ['i3'], text: 'Dispatch the next instruction. Count it up: 3 dispatches, 4 type checks, an indirect call, an allocation, refcount traffic. One real add.' },
+      ],
+    },
+    special: {
+      op: 'BINARY_OP_ADD_INT',
+      steps: [
+        ...loads,
+        { hl: ['i2'], text: 'After this line ran a few times with ints, the interpreter rewrote its own bytecode in place: BINARY_OP became BINARY_OP_ADD_INT. That is PEP 659 "quickening".' },
+        { hl: ['oa', 'ta', 'ob', 'tb'], checks: 2, text: 'Guard: is a\'s type exactly int, and is b\'s? Two pointer comparisons. No slot lookup, no function call through a pointer.' },
+        { hl: ['va', 'vb'], text: 'Guard passed. Read the two small values straight out of the objects.' },
+        { hl: ['alu'], adds: 1, text: 'Add them, inline, in the instruction\'s own C code.' },
+        { hl: ['or'], show: ['or'], alloc: 1, text: 'Still have to box the result into an int object. Specialization removes the type dispatch, not the boxing.' },
+        { hl: ['oa', 'ob', 's0'], set: { ra: 'refcnt 1', rb: 'refcnt 1', s0: 'ptr → result', s1: '-' }, text: 'Drop a and b, push the result.' },
+        { hl: ['i3'], text: 'Dispatch next. Fewer checks, no indirect call. Faster, but still an object per number and a dispatch per instruction.' },
+      ],
+    },
+    miss: {
+      op: 'BINARY_OP_ADD_INT',
+      steps: [
+        { hl: ['ob', 'vb', 'tb'], set: { tb: 'type → float', vb: 'value 3.0', vr: 'value 5.0' }, text: 'Same code, but this time b is 3.0, a float. The bytecode is still specialized for ints from earlier runs.' },
+        ...loads.slice(1),
+        { hl: ['i2'], text: 'Dispatch BINARY_OP_ADD_INT, which assumes ints.' },
+        { hl: ['oa', 'ta', 'ob', 'tb'], miss: ['ob'], checks: 2, text: 'Guard: a is an int, b is NOT. Guard fails. This is the price of guessing.' },
+        { hl: ['i2'], text: 'Deoptimize: jump to the generic BINARY_OP code and run the slow path from the 3.10 view. A miss counter ticks down.' },
+        { hl: ['ty', 'slot'], set: { tyname: 'int, then float' }, checks: 2, text: 'Generic path: int\'s add returns NotImplemented for a float, so Python tries float\'s add, which converts 2 to 2.0.' },
+        { hl: ['alu'], adds: 1, text: 'The actual add, 2.0 + 3.0.' },
+        { hl: ['or'], show: ['or'], alloc: 1, text: 'Box the float result.' },
+        { hl: ['i2'], text: 'If misses keep happening, the instruction is respecialized for what it now sees (BINARY_OP_ADD_FLOAT, or a mixed-type variant), or left generic. Run dis(f, adaptive=True) to watch.' },
+      ],
+    },
+    c: {
+      op: '',
+      steps: [
+        { hl: ['x0', 'x1'], text: 'The C compiler saw "long a, long b". It put a in register x0 and b in x1. The values are just 64 bits each. No header, no type, no heap.' },
+        { hl: ['ci0', 'calu', 'x0'], set: { x0: 'x0 = 5' }, adds: 1, text: 'add x0, x1, x0. One instruction, about one clock cycle. Often the compiler does 4 to 16 of these at once with SIMD.' },
+        { hl: ['ci1'], text: 'Return. That is the whole thing. The catch: if the sum overflows 64 bits it silently wraps. Python\'s ints never overflow, which is one reason they must be objects.' },
+      ],
+    },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="pyspeed-evalloop"]').forEach((root) => {
+    const py = root.querySelector<SVGSVGElement>('[data-scene="py"]')!;
+    const cs = root.querySelector<SVGSVGElement>('[data-scene="c"]')!;
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const out = (k: string) => root.querySelector<HTMLOutputElement>(`[data-o="${k}"]`)!;
+    const prev = root.querySelector<HTMLButtonElement>('[data-prev]')!;
+    const next = root.querySelector<HTMLButtonElement>('[data-next]')!;
+    const play = root.querySelector<HTMLButtonElement>('[data-play]')!;
+    let mode = 'generic';
+    let k = 0;
+    let timer: number | undefined;
+
+    const scene = () => (mode === 'c' ? cs : py);
+
+    function render() {
+      const m = MODES[mode];
+      py.hidden = mode === 'c';
+      cs.hidden = mode !== 'c';
+      const svg = scene();
+      const texts: Record<string, string> = { ...START };
+      const shown = new Set<string>();
+      let checks = 0, alloc = 0, adds = 0;
+      for (let i = 0; i < k; i++) {
+        const s = m.steps[i];
+        Object.assign(texts, s.set ?? {});
+        (s.show ?? []).forEach((x) => shown.add(x));
+        checks += s.checks ?? 0; alloc += s.alloc ?? 0; adds += s.adds ?? 0;
+      }
+      if (mode === 'miss') Object.assign(texts, { tb: 'type → float', vb: 'value 3.0', vr: 'value 5.0' });
+      const cur = k > 0 ? m.steps[k - 1] : null;
+      svg.querySelectorAll('[data-k]').forEach((el) => el.classList.remove('hot', 'miss'));
+      (cur?.hl ?? []).forEach((id) => svg.querySelectorAll(`[data-k="${id}"]`).forEach((el) => el.classList.add('hot')));
+      (cur?.miss ?? []).forEach((id) => svg.querySelectorAll(`[data-k="${id}"]`).forEach((el) => el.classList.add('miss')));
+      svg.querySelectorAll<SVGTextElement>('[data-t]').forEach((t) => {
+        const key = t.dataset.t!;
+        if (key === 'op') t.textContent = m.op || 'BINARY_OP +';
+        else if (key in texts) t.textContent = texts[key];
+      });
+      const ghost = svg.querySelector('[data-k="or"]');
+      if (ghost) ghost.classList.toggle('pel-ghost', !shown.has('or'));
+      msg.textContent = cur ? cur.text : 'Press Step to run the line "a + b" with a = 2, b = 3, one move at a time.';
+      out('step').textContent = `${k}/${m.steps.length}`;
+      out('checks').textContent = String(checks);
+      out('alloc').textContent = String(alloc);
+      out('adds').textContent = String(adds);
+      prev.disabled = k === 0;
+      next.disabled = k >= m.steps.length;
+    }
+
+    function stop() { if (timer) { clearTimeout(timer); timer = undefined; } play.textContent = 'Play'; }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.addEventListener('click', () => {
+      stop();
+      mode = b.dataset.mode!;
+      root.querySelectorAll('[data-mode]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      k = 0; render();
+    }));
+    next.addEventListener('click', () => { stop(); if (k < MODES[mode].steps.length) k++; render(); });
+    prev.addEventListener('click', () => { stop(); if (k > 0) k--; render(); });
+    root.querySelector('[data-reset]')!.addEventListener('click', () => { stop(); k = 0; render(); });
+    play.addEventListener('click', () => {
+      if (timer) { stop(); return; }
+      const n = MODES[mode].steps.length;
+      if (k >= n) k = 0;
+      if (matchMedia('(prefers-reduced-motion: reduce)').matches) { k = n; render(); return; }
+      play.textContent = 'Pause';
+      const tick = () => {
+        if (k < n) { k++; render(); timer = window.setTimeout(tick, 1600); }
+        else stop();
+      };
+      tick();
+    });
+    render();
+  });
+</script>

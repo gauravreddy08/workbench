@@ -1,0 +1,769 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import QueueSim from '../components/figures/QueueSim.astro';
+
+## Today
+
+- Explain what a message queue is, and the four reasons systems put one between services: different speeds, traffic spikes, independent retries, and fan-out.
+- Say exactly what happens when a worker dies halfway through a job: acks, leases (visibility timeouts), redelivery, and where a job goes when it fails forever (the dead-letter queue).
+- Explain at-most-once, at-least-once and "exactly-once", why the last one is mostly a marketing word, and why idempotent consumers are the real answer.
+- Tell a job queue (Celery, RQ, SQS) apart from a log (Kafka): offsets, partitions, consumer groups, retention, replay, and why ordering only holds inside one partition.
+- Size a worker pool with Little's Law, watch consumer lag, and run your ranker over millions of documents through a queue that survives `kill -9`.
+
+Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (Little's Law, the fake LLM), [Rate limits and backpressure](/lessons/rate-limits/) (why unbounded buffers hide overload, retries with backoff). [Transactions](/lessons/transactions/) helps for the idempotency part. Rough time: one evening to read, one or two to build.
+
+## The Problem
+
+You add a feature to the ranking service: for every document a user saves, call an LLM to write a two-line summary, then run the cross-encoder to score it against the user's saved queries. The obvious code does both inside the request handler. It works on your laptop. Each save takes about 6 seconds, and the user stares at a spinner for all of it.
+
+Then three things happen in one week.
+
+A customer imports 4,000 documents at once. Your API server suddenly has 4,000 requests each holding a connection open for 6 seconds, the LLM provider starts answering 429, and because the handler retries inline, the requests take 30 seconds and the load balancer times them out. The user retries the import. Now there are 8,000.
+
+You deploy a fix mid-afternoon. The rolling restart kills every in-flight request. Some summaries were written, some weren't, and nothing records which.
+
+And the research team asks you to re-score the whole corpus, 5 million documents, with the new ranker checkpoint. You write a loop. It dies at 3.2 million because one document has a malformed byte that crashes the tokenizer. You don't know which 3.2 million finished. You start over.
+
+All three have the same shape. Slow, failure-prone work is welded directly to whatever asked for it. If the asker is slow, impatient, or dead, the work suffers; if the work is slow or broken, the asker suffers. The fix is to put a buffer in between, a to-do list that both sides can read and write at their own pace and that remembers what's done. That's a queue.
+
+<Origin year="2010-2013" title="LinkedIn drowns in pipelines, and Kafka is the log">
+
+Around 2010, LinkedIn had dozens of systems that each needed data from dozens of others: page views into Hadoop, profile changes into search, activity into the recommendation models, metrics into monitoring. Every pair had its own custom pipeline, so the number of pipelines grew like the number of pairs, and each one broke in its own way. Jay Kreps, Neha Narkhede and Jun Rao built Kafka to replace them with one thing: a single, durable, append-only record of events that any system could write to and any system could read from, at its own pace. It was open-sourced in 2011.
+
+In December 2013 Kreps wrote "The Log: What every software engineer should know about real-time data's unifying abstraction" for LinkedIn's engineering blog. His argument was that a log, an ordered list of things that happened, kept for a while, is the idea underneath databases (the write-ahead log), replication, and data integration alike. Put a log in the middle, and every system becomes a reader that can catch up, fall behind, or start over without anyone else noticing. Kreps, Narkhede and Rao left to found Confluent in 2014. Most companies now run some version of that log.
+
+</Origin>
+
+## The Idea
+
+### A to-do list between two programs
+
+You already know the shape from a restaurant. The waiter doesn't cook. They write the order on a ticket, clip it to the rail, and go back to the dining room. The cooks take tickets off the rail when they're free. If ten tables order at once, the rail gets long, but nobody in the dining room is kept waiting at the kitchen door, and nobody in the kitchen is rushed.
+
+In software, the waiter is the <Term w="producer">The program that creates jobs or messages and puts them on the queue. Your API server, usually.</Term>, the cooks are <Term w="consumer">A program that takes messages off the queue and does something with them. When the something is a unit of work, people call it a worker.</Term>s (or workers), and the rail is a <Term w="message queue">A separate service that holds messages from producers until consumers take them. The producer doesn't need to know who consumes, or whether they're up right now.</Term>, run by a <Term w="broker">The server that stores the queue and hands messages out. Redis, RabbitMQ, SQS, and Kafka are all brokers of some kind.</Term>. A message is just bytes, usually a small JSON blob that says what to do: `{"doc_id": 81723, "task": "summarize"}`. Not the document itself; a pointer to it.
+
+<Figure n="001" title="TAKING SLOW WORK OUT OF THE REQUEST" caption="Top: the request handler does the slow work itself, so the user's connection, a server slot, and the LLM call are all tied together for 6 s, and if any one dies the work is lost. Bottom: the handler writes a job and answers in milliseconds. Workers drain the queue at their own pace; the client checks back for the result.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Request path before and after adding a queue">
+  <text x="10" y="22" class="strong">BEFORE: WORK INSIDE THE REQUEST</text>
+  <rect x="10" y="40" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="66" text-anchor="middle" class="strong">CLIENT</text>
+  <rect x="190" y="40" width="110" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="245" y="66" text-anchor="middle" class="strong">API</text>
+  <rect x="400" y="40" width="110" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="455" y="60" text-anchor="middle" class="strong">LLM + RANKER</text>
+  <text x="455" y="76" text-anchor="middle">~6 s</text>
+  <line x1="100" y1="56" x2="186" y2="56" class="ink" stroke-width="1.2" />
+  <line x1="300" y1="56" x2="396" y2="56" class="ink" stroke-width="1.2" />
+  <line x1="396" y1="70" x2="300" y2="70" class="ink dash" stroke-width="1" />
+  <line x1="186" y1="70" x2="100" y2="70" class="ink dash" stroke-width="1" />
+  <line x1="55" y1="92" x2="55" y2="104" class="blue" stroke-width="1.2" />
+  <line x1="55" y1="104" x2="455" y2="104" class="blue" stroke-width="1.2" />
+  <line x1="455" y1="92" x2="455" y2="104" class="blue" stroke-width="1.2" />
+  <text x="255" y="122" text-anchor="middle" class="blue-t">ONE CHAIN, HELD OPEN 6 S. ANY LINK DIES, WORK IS LOST</text>
+  <line x1="10" y1="142" x2="630" y2="142" class="ink dash" stroke-width="1" />
+  <text x="10" y="166" class="strong">AFTER: WORK BEHIND A QUEUE</text>
+  <rect x="10" y="184" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="210" text-anchor="middle" class="strong">CLIENT</text>
+  <rect x="150" y="184" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="195" y="210" text-anchor="middle" class="strong">API</text>
+  <rect x="290" y="184" width="130" height="44" class="fill-wash" stroke-width="1.2" />
+  <rect x="300" y="198" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="318" y="198" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="336" y="198" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="354" y="198" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <text x="355" y="244" text-anchor="middle" class="strong">QUEUE</text>
+  <rect x="470" y="176" width="70" height="22" class="fill-paper" stroke-width="1.2" />
+  <rect x="470" y="202" width="70" height="22" class="fill-paper" stroke-width="1.2" />
+  <rect x="470" y="228" width="70" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="505" y="191" text-anchor="middle">WORKER</text>
+  <text x="505" y="217" text-anchor="middle">WORKER</text>
+  <text x="505" y="243" text-anchor="middle">WORKER</text>
+  <rect x="570" y="190" width="60" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="600" y="216" text-anchor="middle">LLM</text>
+  <line x1="100" y1="200" x2="146" y2="200" class="ink" stroke-width="1.2" />
+  <line x1="146" y1="214" x2="100" y2="214" class="blue" stroke-width="1.2" />
+  <text x="123" y="270" text-anchor="middle" class="blue-t">202 + JOB ID</text>
+  <text x="123" y="284" text-anchor="middle" class="blue-t">IN ~15 MS</text>
+  <line x1="240" y1="206" x2="286" y2="206" class="ink" stroke-width="1.2" />
+  <line x1="420" y1="206" x2="466" y2="206" class="ink" stroke-width="1.2" />
+  <line x1="540" y1="212" x2="566" y2="212" class="ink" stroke-width="1.2" />
+  <text x="355" y="268" text-anchor="middle">EACH SIDE RUNS AT ITS OWN PACE</text>
+</svg>
+</Figure>
+
+That one change buys four separate things, and it's worth knowing them by name, because each is a reason someone will give you in a design review.
+
+1. **Decouple speed.** The API can accept 2,000 saves a second; the workers can summarize 20. Without a queue, the slow side sets the pace for the fast side. With one, the API stays fast and the backlog lives somewhere designed to hold it.
+2. **Absorb spikes.** Traffic arrives in bursts: an import, a cron job, Monday morning. The queue stores the burst and the workers work it off over the next few minutes. You size the workers for the *average* rate, not the peak, as long as the backlog drains before the next burst.
+3. **Retry independently.** If a summary fails because the LLM returned 503, the worker retries it later. The user's request finished long ago and never knew. And if the API deploys, the queued jobs don't care.
+4. **Fan out.** One event, "document saved", can be read by the summarizer, the ranker, the search indexer and the analytics pipeline, each on its own schedule. The producer writes once and doesn't need to know any of them exist. Adding a fifth reader doesn't touch the producer.
+
+The price: the work is now **asynchronous**. The user gets "accepted" instead of the answer, so you need a way to report the result later (poll `GET /jobs/<id>`, a webhook, a websocket push). And you've added a new system that can fail. Most of this lesson is about making that new system fail safely.
+
+### How many workers? Little's Law again
+
+In [Waiting vs working](/lessons/waiting-vs-working/) you met Little's Law: **in flight = arrival rate × time each one spends inside**. A worker pool is the cleanest case of it there is. Each worker handles one job at a time, so "jobs in flight" is "busy workers".
+
+<Predict id="worker-count">
+
+Saves arrive at a steady 30 per second. Each job (summary plus ranker) keeps a worker busy for 2 seconds. How many workers do you need, at minimum? What happens to the queue if you run one fewer than that?
+
+<Fragment slot="answer">
+
+Busy workers = 30 jobs/s × 2 s = **60 workers**, and that's the floor where they are busy 100% of the time. With 59 workers the pool finishes 29.5 jobs/s while 30 arrive, so the queue grows by 0.5 jobs every second, forever: 1,800 jobs after an hour, and each new job waits behind all of them. A queue does not add capacity. It only moves the waiting somewhere safer. In practice you'd run 70-80, for headroom: as [p99 and load testing](/lessons/tail-latency/) showed, waiting time explodes as utilization approaches 100%, even when the averages "fit".
+
+</Fragment>
+
+</Predict>
+
+The same arithmetic sizes a batch job. Re-scoring 5 million documents at 20 ms each is 100,000 worker-seconds. With 16 workers that's about 6,250 s, an hour and three quarters, if nothing else is the bottleneck. With 1 worker it's 28 hours. You will check where "if nothing else is the bottleneck" stops being true in Measure.
+
+### Watch it
+
+Here is a pool of workers draining a queue. Jobs arrive at random at the rate you set; each takes about half a second, so one worker does about 2 jobs per second. Try these in order:
+
+1. Leave it at 6 arrivals/s and 4 workers (capacity 8/s). The queue stays short. Now drop to 3 workers (capacity 6/s, equal to arrivals). Watch the lag graph wander up and not come back down reliably.
+2. Back to 4 workers, press **Spike**. The queue jumps by 60 and then drains at capacity minus arrivals, 8 − 6 = 2 jobs per second, so about 30 seconds. That's the spike being absorbed.
+3. Press **Kill -9 a worker** while it's busy. Its job doesn't vanish: it sits in "leased, owner dead" with a countdown, then reappears at the head of the queue, filled in dark (a retry). Count: redelivered goes up, lost stays 0.
+4. Turn on **Ack before work** and kill again. Now the job is simply gone. Lost goes up.
+
+<Figure n="002" title="PRODUCERS, QUEUE, WORKERS" caption="Lag (jobs waiting) is the line to watch. It's flat when workers keep up, climbs steadily when arrivals exceed capacity, and steps up then drains after a spike. Killing a worker costs a lease timeout before its job runs again, unless you acked before working, in which case the job is lost." wide>
+
+<QueueSim />
+
+</Figure>
+
+Two lessons are hiding in step 3 and 4. The first is the difference between "the broker handed you the job" and "the job is done", which is the whole subject of the next section. The second: in step 3, there's a 3-second gap where the job is neither waiting nor running. That gap is the price of surviving crashes.
+
+### Handing over a job: acks and leases
+
+When a worker takes a job, the broker has a decision to make: delete it now, or keep it until the worker says it's finished? That "I'm finished" message is an <Term w="ack">Acknowledgement. The consumer telling the broker "I've handled this message, you can forget it." Until the broker gets one, it assumes the message might still need doing.</Term>.
+
+If the broker deletes on handover, a worker crash loses the job. If the broker keeps it until the ack, it needs to know when to give up waiting, because a crashed worker never sends anything. A dead process doesn't announce that it's dead. From the broker's side, "still working on it" and "was `kill -9`'d ten minutes ago" look identical: silence.
+
+So the broker gives each handed-out job a <Term w="lease">Temporary ownership of a job with a deadline. If the holder doesn't finish (ack) or renew before the deadline, the job is given to someone else.</Term>. Amazon SQS calls the lease length the <Term w="visibility timeout">SQS's name for the lease: after a consumer receives a message, it's hidden from other consumers for this long. If not deleted by then, it becomes visible again and gets redelivered. Default 30 s.</Term>: once a worker receives a message, it becomes invisible to everyone else for, say, 30 seconds. If the worker deletes it (the ack) in time, it's gone for good. If not, it becomes visible again and some worker gets it. That's <Term w="redelivery">The broker handing the same message out again because the previous attempt never acked. The consumer gets a message it, or a dead colleague, may have already partly processed.</Term>.
+
+<Figure n="003" title="WHERE THE CRASH LANDS" caption="The same crash at three points in a job's life. Ack before work: a crash loses the job. Ack after work: a crash during work just means the job runs again later. The nasty one is the bottom row: the work finished and its result was saved, but the ack never arrived, so the job runs twice.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Three timelines showing the effect of a worker crash relative to the ack">
+  <text x="10" y="20" class="strong">ACK BEFORE WORK</text>
+  <line x1="10" y1="44" x2="470" y2="44" class="ink" stroke-width="1" />
+  <rect x="20" y="34" width="56" height="20" class="fill-wash" stroke-width="1" />
+  <text x="48" y="48" text-anchor="middle">CLAIM</text>
+  <rect x="80" y="34" width="40" height="20" class="fill-blue" />
+  <text x="100" y="70" text-anchor="middle" class="blue-t">ACK</text>
+  <rect x="124" y="34" width="200" height="20" class="fill-paper" stroke-width="1" />
+  <text x="190" y="48" text-anchor="middle">WORK</text>
+  <line x1="244" y1="26" x2="264" y2="62" class="blue" stroke-width="1.6" />
+  <line x1="264" y1="26" x2="244" y2="62" class="blue" stroke-width="1.6" />
+  <text x="490" y="40" class="strong">JOB LOST</text>
+  <text x="490" y="56">at-most-once</text>
+  <text x="10" y="102" class="strong">ACK AFTER WORK, CRASH DURING WORK</text>
+  <line x1="10" y1="126" x2="470" y2="126" class="ink" stroke-width="1" />
+  <rect x="20" y="116" width="56" height="20" class="fill-wash" stroke-width="1" />
+  <text x="48" y="130" text-anchor="middle">CLAIM</text>
+  <rect x="80" y="116" width="200" height="20" class="fill-paper" stroke-width="1" />
+  <text x="140" y="130" text-anchor="middle">WORK</text>
+  <line x1="200" y1="108" x2="220" y2="144" class="blue" stroke-width="1.6" />
+  <line x1="220" y1="108" x2="200" y2="144" class="blue" stroke-width="1.6" />
+  <line x1="80" y1="152" x2="400" y2="152" class="blue dash" stroke-width="1" />
+  <text x="240" y="166" text-anchor="middle" class="blue-t">LEASE RUNS OUT → REDELIVERED</text>
+  <text x="490" y="122" class="strong">RUNS AGAIN</text>
+  <text x="490" y="138">nothing lost</text>
+  <text x="10" y="194" class="strong">ACK AFTER WORK, CRASH BEFORE ACK</text>
+  <line x1="10" y1="218" x2="470" y2="218" class="ink" stroke-width="1" />
+  <rect x="20" y="208" width="56" height="20" class="fill-wash" stroke-width="1" />
+  <text x="48" y="222" text-anchor="middle">CLAIM</text>
+  <rect x="80" y="208" width="200" height="20" class="fill-paper" stroke-width="1" />
+  <text x="180" y="222" text-anchor="middle">WORK</text>
+  <rect x="284" y="208" width="70" height="20" class="fill-wash" stroke-width="1" />
+  <text x="319" y="222" text-anchor="middle">SAVE</text>
+  <line x1="362" y1="200" x2="382" y2="236" class="blue" stroke-width="1.6" />
+  <line x1="382" y1="200" x2="362" y2="236" class="blue" stroke-width="1.6" />
+  <text x="420" y="244" text-anchor="middle" class="blue-t">NO ACK</text>
+  <text x="490" y="214" class="strong">RUNS TWICE</text>
+  <text x="490" y="230">at-least-once:</text>
+  <text x="490" y="246">consumer must dedupe</text>
+</svg>
+</Figure>
+
+Two practical details follow from leases.
+
+**The lease must outlast the job.** If a job takes 90 seconds and the lease is 30, the broker hands the same job to a second worker while the first is still happily working on it, then a third. Nothing crashed, and the job runs three times. Long jobs either set a long lease, or **heartbeat**: every so often the worker says "still on it" and the broker pushes the deadline back (SQS: `ChangeMessageVisibility`). Celery's Redis transport has exactly this trap: its `visibility_timeout` defaults to one hour, and a task scheduled or running longer than that gets delivered again.
+
+**A short lease means fast recovery, a long lease means slow recovery.** When a worker really does die, its job sits untouched until the lease expires. In Figure 002 that was 3 seconds. With a one-hour lease, a crash means an hour's delay for that job. You pick the lease from the job length (longest normal job, times a safety factor) and heartbeat if the spread is wide.
+
+<Predict id="lease">
+
+Your ranker jobs normally take 1-3 s, but about 1 in 1,000 is a giant document that takes 50 s. Your lease is 30 s with no heartbeat. Workers never crash. What do you see in your results table, and in your bill?
+
+<Fragment slot="answer">
+
+Every giant document is processed at least twice, often more: at 30 s the lease expires, another worker picks it up while the first is still running, and if the second also passes 30 s a third one starts. With 5 million documents that's 5,000 giant ones, each running two or three times: maybe 10,000 extra 50-second jobs, a few extra worker-hours, and duplicate rows if writes aren't idempotent. It looks like a crash bug, but nothing crashed. Fix: heartbeat (extend the lease every 10 s while working), or a lease well above your p99.9 job time.
+
+</Fragment>
+
+</Predict>
+
+### At-most-once, at-least-once, and the myth of exactly-once
+
+Those three rows in Figure 003 have names, and you'll hear them in every design discussion about messaging.
+
+- <Term w="at-most-once">Each message is processed zero or one times. Never duplicated, but can be lost. What you get when you ack (or delete) before doing the work.</Term>: ack first, then work. A crash loses the job. Fine for things where losing one is cheaper than doing one twice: a metrics sample, a "user is typing" ping.
+- <Term w="at-least-once">Each message is processed one or more times. Never lost (while the broker survives), but can be duplicated. What you get when you ack only after the work is done.</Term>: work first, then ack. A crash means a redelivery. Nothing is lost, but some things happen twice. This is the default for almost every serious queue.
+- <Term w="exactly-once">Each message has its effect exactly one time, even with crashes. Not achievable as a delivery guarantee across arbitrary systems; achievable as an effect, by combining at-least-once delivery with deduplication.</Term>: what everyone wants.
+
+Here's why you can't get exactly-once *delivery*. Look at the bottom row again. The worker saved the result and then died before the ack reached the broker. Or the ack was sent and the network dropped it. Either way, the broker sees silence, and silence after a save looks exactly like silence before a save. The broker has to choose: redeliver (risk a duplicate) or not (risk a loss). There is no third option, because the broker can't see inside the worker. Move the ack earlier and you've just moved the gap. This is a cousin of the classic "two generals" problem: two parties talking over a channel that can lose messages can never be *sure* they agree.
+
+So the industry's real answer is: **at-least-once delivery, plus a consumer that makes duplicates harmless.** An operation is <Term w="idempotent">Doing it twice has the same effect as doing it once. "Set score to 0.83" is idempotent; "add 0.83 to the total" is not.</Term> when repeating it changes nothing. You make a consumer idempotent with an <Term w="idempotency key">A unique ID attached to a piece of work, so the receiver can recognize a repeat and skip it. For a job, the job ID or a natural key like (doc_id, model_version).</Term>, the same trick you saw for API retries in [the API lifecycle](/lessons/api-lifecycle/):
+
+- **Write the result and the "done" mark in one transaction.** `INSERT INTO scores (doc_id, model, score) ... ON CONFLICT DO NOTHING`, where `(doc_id, model)` is the primary key. The second delivery's insert is a no-op. If you also bump a counter, bump it *only when the insert actually inserted*, in the same transaction. That's [Transactions](/lessons/transactions/) earning its keep: the effect and the record of the effect can't come apart.
+- **Make the operation itself a "set", not an "add".** "Document 81723's score is 0.83" can be written any number of times. "Increment the user's processed count" can't, unless you dedupe first.
+- **For external side effects** (sending an email, charging a card, calling a paid API), pass the key along if the other side supports it (Stripe takes an `Idempotency-Key` header), or record "sent" before you'd risk sending twice and accept that a crash in between might mean zero sends. Somewhere, someone picks at-most-once or at-least-once. You just get to choose where.
+
+When Kafka advertises "exactly-once semantics" (added in 2017), it means something precise and narrower: a producer's retries don't create duplicates in the log, and a job that reads from Kafka and writes back to Kafka can commit its output and its read position atomically. That's real and useful. But the moment your consumer touches anything outside Kafka (a database, a model API, an email), you are back to at-least-once plus idempotency. People call the combination <Term w="effectively-once">At-least-once delivery plus an idempotent consumer, so each message's effect happens once even when the message is delivered more than once. The honest name for "exactly-once".</Term>.
+
+### Poison messages and the dead-letter queue
+
+Remember the document with the malformed byte that crashes the tokenizer. Under at-least-once, it's worse than you think. The worker claims it, crashes, the lease expires, another worker claims it, crashes... A <Term w="poison message">A message that fails every time it's processed, usually because of bad data or a bug, not a temporary outage. Retrying it forever wastes workers and can block the queue.</Term> can kill your whole pool in a loop, one worker at a time, forever.
+
+The fix is to count attempts. Every claim bumps the job's attempt counter. When it fails (or its lease expires) and the count has reached a limit, say 3 or 5, the broker moves it aside into a <Term w="dead-letter queue">A separate queue where messages go after failing too many times. Nobody processes it automatically; a human looks, fixes the bug or the data, and re-queues them. Often shortened to DLQ.</Term> instead of back into the main queue. SQS calls this a redrive policy with `maxReceiveCount`; RabbitMQ calls it a dead-letter exchange; Celery leaves it to you.
+
+Three rules make a DLQ useful instead of a graveyard:
+
+1. **Store why it died.** The last exception and traceback, the attempt count, the worker that saw it. Otherwise you're debugging blind.
+2. **Alert on it.** A DLQ that grows silently is the same as dropping messages.
+3. **Have a re-drive tool.** After you fix the bug, you want one command that moves everything from the DLQ back to the main queue. Since the consumer is idempotent, re-driving something that half-succeeded is safe.
+
+And separate *retryable* failures from *permanent* ones. A 503 from the LLM provider should be retried with backoff (and jitter, from [Rate limits](/lessons/rate-limits/)); a `UnicodeDecodeError` will fail identically on every attempt, so it can go straight to the DLQ.
+
+### Job queues and logs: two different machines
+
+Everything so far describes a <Term w="job queue">A queue where each message is a unit of work, handed to exactly one worker, and deleted once acked. Celery, RQ, Sidekiq, SQS, RabbitMQ.</Term>: each message goes to one worker and is deleted when acked. Celery, RQ (Redis Queue) and Sidekiq are libraries built on brokers like Redis or RabbitMQ; SQS is Amazon's hosted version. Under the hood in Redis, a queue is often just a list: producers push to one end, workers pop from the other.
+
+Kafka is a different machine, and the difference matters. It's a <Term w="log">An append-only, ordered sequence of records. New records only go on the end; nothing is changed in place. Each record gets a position number, its offset.</Term>. Messages aren't deleted when read. They're appended to the end of a file and kept for a fixed time (the default is 7 days) or up to a size limit, whether anyone has read them or not. Each record gets a number, its <Term w="offset">A record's position in a Kafka partition: 0, 1, 2, ... Consumers track "I've processed up to offset N" instead of deleting messages.</Term>, and a consumer doesn't ack individual messages; it remembers how far it has read, by periodically saving its current offset (a **commit**).
+
+<Figure n="004" title="QUEUE VS LOG" caption="A job queue hands each message to one worker and forgets it once acked. A log keeps every message for its retention period; each reader just remembers a position. Two groups read the same records independently, and either can rewind.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A job queue that deletes on ack compared with a log that keeps records and tracks offsets per reader">
+  <text x="10" y="20" class="strong">JOB QUEUE</text>
+  <text x="10" y="36">read + ack = gone</text>
+  <rect x="10" y="60" width="200" height="34" class="fill-paper" stroke-width="1.2" />
+  <rect x="20" y="68" width="18" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="44" y="68" width="18" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="68" y="68" width="18" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="92" y="68" width="18" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="166" y="68" width="18" height="18" class="fill-paper dash" stroke-width="1" />
+  <line x1="210" y1="77" x2="244" y2="62" class="ink" stroke-width="1.2" />
+  <line x1="210" y1="77" x2="244" y2="92" class="ink" stroke-width="1.2" />
+  <rect x="246" y="50" width="70" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="281" y="65" text-anchor="middle">W1</text>
+  <rect x="246" y="82" width="70" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="281" y="97" text-anchor="middle">W2</text>
+  <text x="10" y="122">each job to ONE worker</text>
+  <text x="10" y="138">no replay, no history</text>
+  <line x1="336" y1="10" x2="336" y2="220" class="ink dash" stroke-width="1" />
+  <text x="356" y="20" class="strong">LOG (KAFKA)</text>
+  <text x="356" y="36">append only, kept for N days</text>
+  <rect x="356" y="60" width="270" height="34" class="fill-paper" stroke-width="1.2" />
+  <rect x="362" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="388" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="414" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="440" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="466" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="492" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="518" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="544" y="68" width="22" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="570" y="68" width="22" height="18" class="fill-paper dash" stroke-width="1" />
+  <text x="373" y="56" text-anchor="middle">0</text>
+  <text x="451" y="56" text-anchor="middle">3</text>
+  <text x="555" y="56" text-anchor="middle">7</text>
+  <text x="604" y="81">→</text>
+  <text x="581" y="112" text-anchor="middle">NEW</text>
+  <line x1="451" y1="94" x2="451" y2="140" class="blue" stroke-width="1.2" />
+  <text x="451" y="156" text-anchor="middle" class="blue-t">GROUP B</text>
+  <text x="451" y="170" text-anchor="middle" class="blue-t">AT 3</text>
+  <line x1="555" y1="94" x2="555" y2="140" class="blue" stroke-width="1.2" />
+  <text x="555" y="156" text-anchor="middle" class="blue-t">GROUP A</text>
+  <text x="555" y="170" text-anchor="middle" class="blue-t">AT 7</text>
+  <text x="356" y="200">every group sees every record</text>
+  <text x="356" y="216">rewind = set offset back to 0</text>
+</svg>
+</Figure>
+
+That design gives a log three powers a job queue doesn't have:
+
+- **Many independent readers.** The summarizer, the search indexer and the analytics loader each keep their own position in the same log. A slow reader doesn't slow the others, and a new reader can start from the beginning.
+- **Replay.** Found a bug in the summarizer that ran for two days? Fix it, reset its offset to two days ago, and it reprocesses everything. With a job queue, those messages are gone the moment they were acked.
+- **History as data.** The log *is* a record of what happened, in order. That's Kreps' point: you can rebuild a search index, a cache, or a whole database table by reading the log from the start.
+
+The job queue has its own advantages: per-message acks, per-message retries and DLQs, no need to think about positions, and simple scaling by just adding workers. Rule of thumb: if each message is a **task** to get done once, use a job queue. If each message is an **event** (a fact about something that happened) that several systems care about, use a log.
+
+### Partitions, consumer groups, and why ordering is per partition
+
+One log on one disk can only go so fast. So a Kafka <Term w="topic">A named stream of records in Kafka, like "documents-saved". Physically split into partitions.</Term> is split into <Term w="partition">One independent, ordered log inside a topic. Records within a partition have a strict order; records in different partitions have none. Partitions are spread across brokers.</Term>s, each its own little append-only log, living on different machines. When a producer writes a record, it picks a partition, usually by hashing the record's **key**. Same key, same partition, every time.
+
+On the reading side, consumers join a <Term w="consumer group">A set of consumers that share the work of reading a topic. Kafka gives each partition to exactly one consumer in the group, so each record is processed once per group.</Term>. Kafka gives each partition to exactly one member of the group. That's how a log does load balancing: not message by message, but partition by partition.
+
+<Figure n="005" title="PARTITIONS AND A CONSUMER GROUP" caption="Records are routed to partitions by hashing their key, so every event for doc 17 lands in P1, in order. Each partition is read by exactly one consumer in the group. A fourth consumer has nothing to read: parallelism is capped by the partition count.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A topic with three partitions read by a consumer group of four consumers, one idle">
+  <rect x="10" y="80" width="90" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="102" text-anchor="middle" class="strong">PRODUCER</text>
+  <text x="55" y="120" text-anchor="middle">hash(key) % 3</text>
+  <line x1="100" y1="100" x2="146" y2="44" class="ink" stroke-width="1" />
+  <line x1="100" y1="108" x2="146" y2="108" class="ink" stroke-width="1" />
+  <line x1="100" y1="116" x2="146" y2="172" class="ink" stroke-width="1" />
+  <text x="150" y="20" class="strong">TOPIC: DOCS-SAVED</text>
+  <rect x="150" y="30" width="230" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="158" y="48" class="strong">P0</text>
+  <text x="190" y="48">d3 d9 d3 d12 d6</text>
+  <rect x="150" y="94" width="230" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="158" y="112" class="strong">P1</text>
+  <text x="190" y="112">d17 d4 d17 d17 d1</text>
+  <rect x="150" y="158" width="230" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="158" y="176" class="strong">P2</text>
+  <text x="190" y="176">d8 d5 d20 d8</text>
+  <text x="265" y="210" text-anchor="middle">ORDER HOLDS INSIDE A ROW ONLY</text>
+  <text x="440" y="20" class="strong">GROUP: RANKERS</text>
+  <rect x="460" y="30" width="80" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="500" y="48" text-anchor="middle">C1</text>
+  <rect x="460" y="76" width="80" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="500" y="94" text-anchor="middle">C2</text>
+  <rect x="460" y="122" width="80" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="500" y="140" text-anchor="middle">C3</text>
+  <rect x="460" y="168" width="80" height="28" class="fill-paper dash" stroke-width="1" />
+  <text x="500" y="186" text-anchor="middle">C4 IDLE</text>
+  <line x1="380" y1="44" x2="456" y2="44" class="blue" stroke-width="1.2" />
+  <line x1="380" y1="108" x2="456" y2="90" class="blue" stroke-width="1.2" />
+  <line x1="380" y1="172" x2="456" y2="136" class="blue" stroke-width="1.2" />
+</svg>
+</Figure>
+
+Three consequences you should be able to say out loud:
+
+1. **Ordering is only per partition.** Within P1, the events for document 17 are in the order they were written. Across partitions there is no order at all: C1 might process an event from P0 written an hour after an event C2 hasn't reached yet in P1. If order matters for some entity (the edits of one document, the events of one user), make that entity the key, so all its records share a partition. Global ordering would mean one partition, which means one consumer.
+2. **Parallelism is capped by partitions.** Three partitions, at most three busy consumers per group. The fourth sits idle as a hot spare. Pick the partition count for the parallelism you'll need later; adding partitions afterwards changes which partition each key hashes to, which breaks per-key ordering across the change.
+3. **One slow message blocks its whole partition.** A consumer reads its partition in order. If one record takes a minute, everything behind it in that partition waits, even though other consumers are idle. A job queue doesn't have this problem, since any free worker can take the next job. This is the deepest practical difference between the two, and why "Kafka as a job queue for slow, uneven jobs" often hurts. (Kafka 4.x is adding "share groups", queue-style consumption on top of a topic, for exactly this reason. Check the docs for its status.)
+
+Kafka's delivery semantics are the same story as before, told with offsets. If you commit the offset *before* processing, a crash skips records: at-most-once. If you commit *after*, a crash replays from the last commit: at-least-once, possibly a few hundred duplicates. The client's default, auto-commit every 5 seconds in the background, can do either depending on timing, which is why serious consumers turn it off and commit after they've processed.
+
+### Consumer lag: the one number to watch
+
+How do you know whether a queue is healthy? Not by its size alone; a big backlog that's shrinking is fine. You watch <Term w="consumer lag">How far behind the consumers are. In Kafka, the newest offset minus the committed offset, per partition. In a job queue, the number of waiting messages, or better, the age of the oldest one.</Term>.
+
+- In Kafka, lag for each partition is the latest offset minus the group's committed offset: "how many records written but not yet processed".
+- In a job queue, it's queue depth, and even better, the **age of the oldest message**. Depth tells you how much; age tells you how late. 10,000 tiny jobs might be 5 seconds of work; 100 huge ones might be an hour. SQS publishes this as `ApproximateAgeOfOldestMessage`.
+
+Lag has three shapes, and you saw all three in Figure 002. **Flat near zero**: keeping up. **Spike then decay**: a burst being absorbed, draining at (capacity − arrival rate). **A steady ramp**: arrivals exceed capacity, and it will never recover on its own. The ramp's slope is literally the shortfall. If lag grows by 600 jobs a minute, you're 10 jobs per second short, which by Little's Law is 10 × (job time) more workers.
+
+The time to drain a backlog B, once you add capacity, is B / (capacity − arrival rate). Note what's on the bottom: with a backlog of 100,000 jobs, capacity 110/s and arrivals 100/s, draining takes 10,000 s, almost three hours, even though you're "over capacity". Headroom is what clears backlogs.
+
+And notice what a queue does to backpressure. In [Rate limits](/lessons/rate-limits/) you saw that an unbounded buffer hides overload: the producer never feels the pressure. A queue is a very large buffer, on purpose. It is your *choice* to absorb rather than push back, which is fine for spikes and terrible for sustained overload. So bound it (a max length, or reject new jobs when the oldest is older than your deadline), and alert on lag. Otherwise the queue fills disk or memory and the failure is a lot bigger than a 429 would have been.
+
+### The outbox pattern: writing to the database and the queue at once
+
+One more trap, and it shows up the first day you wire a queue into a real app. The save handler does two things: insert the document row into Postgres, and enqueue a "summarize this" job.
+
+```python
+db.execute("INSERT INTO documents ...")   # 1
+db.commit()
+queue.enqueue({"doc_id": doc_id})         # 2
+```
+
+If the process dies between 1 and 2, the document exists and its job never will. Swap the order and the opposite happens: a job for a document that was rolled back. You can't wrap both in one transaction, because the database and the broker are two different systems. This is the <Term w="dual write">Writing the same change to two systems (say, a database and a queue) as two separate steps. A crash between them leaves the systems disagreeing, and neither knows.</Term> problem.
+
+The fix is the <Term w="outbox pattern">Write the outgoing message into an "outbox" table in the same database transaction as the business change. A separate relay process reads the outbox and publishes to the broker, deleting or marking rows once sent.</Term>: write the message to an `outbox` table *in the same database transaction* as the document. Now they either both exist or neither does. A separate small process, the relay, reads unsent outbox rows, publishes them to the queue, and marks them sent.
+
+<Figure n="006" title="THE TRANSACTIONAL OUTBOX" caption="The document row and the message commit together, so they can't disagree. The relay publishes from the outbox; if it crashes after publishing but before marking the row sent, it publishes again on restart. At-least-once, again, so the consumer still needs to be idempotent.">
+<svg viewBox="0 0 640 190" role="img" aria-label="The API writes a document row and an outbox row in one transaction; a relay publishes outbox rows to the queue">
+  <rect x="10" y="66" width="80" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="50" y="92" text-anchor="middle" class="strong">API</text>
+  <line x1="90" y1="88" x2="126" y2="88" class="ink" stroke-width="1.2" />
+  <rect x="130" y="20" width="220" height="140" class="fill-wash" stroke-width="1.2" />
+  <text x="142" y="40" class="strong">ONE DB TRANSACTION</text>
+  <rect x="146" y="54" width="188" height="36" class="fill-paper" stroke-width="1" />
+  <text x="240" y="76" text-anchor="middle">documents: doc 81723</text>
+  <rect x="146" y="102" width="188" height="36" class="fill-paper" stroke-width="1" />
+  <text x="240" y="124" text-anchor="middle">outbox: summarize 81723</text>
+  <line x1="334" y1="120" x2="396" y2="120" class="ink" stroke-width="1.2" />
+  <rect x="400" y="98" width="80" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="440" y="118" text-anchor="middle" class="strong">RELAY</text>
+  <text x="440" y="134" text-anchor="middle">poll / CDC</text>
+  <line x1="480" y1="120" x2="526" y2="120" class="ink" stroke-width="1.2" />
+  <rect x="530" y="98" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="580" y="124" text-anchor="middle" class="strong">QUEUE</text>
+  <text x="380" y="40" class="blue-t">BOTH ROWS OR NEITHER</text>
+  <text x="400" y="172">marks row sent after publish</text>
+</svg>
+</Figure>
+
+The relay can poll the table every few hundred milliseconds, or read the database's own write-ahead log with a <Term w="change data capture">Reading a database's internal change log (Postgres WAL, MySQL binlog) to stream every committed change to other systems. Debezium is the common tool. Often shortened to CDC.</Term> tool like Debezium. Notice that CDC is Kreps' argument made literal: the database already has a log; you're just letting other systems read it.
+
+### Which one do I reach for?
+
+| Need | Reach for | Why |
+| --- | --- | --- |
+| Background jobs in a Python app | Celery or RQ on Redis | Simple, per-job retries. Turn on `acks_late` in Celery, or a worker crash loses the task. |
+| Jobs on AWS, no servers to run | SQS (+ DLQ via redrive policy) | Visibility timeout and DLQ built in. Standard queues are at-least-once with best-effort order. |
+| Jobs, and you already have Postgres | A jobs table + `SELECT ... FOR UPDATE SKIP LOCKED` | Jobs commit in the same transaction as your data. No outbox needed. Fine up to thousands of jobs/s. |
+| Events many systems read, replay, history | Kafka, or Redpanda (Kafka-compatible) | Retention, offsets, consumer groups, per-key order. |
+| Something in between, already on Redis | Redis Streams (`XADD`, `XREADGROUP`, `XACK`) | A log with consumer groups and a per-consumer pending list, so you can reclaim stuck messages. |
+
+### Batch inference is a queue workload
+
+Back to the 5 million documents. A batch job is a queue with one giant spike at the start: all the arrivals happen at once, and lag is "how much is left". Treat it that way and the 3.2-million-and-crash problem disappears.
+
+- **Each job is a chunk, not a document.** Enqueue `{"shard": 412, "start": 412000, "end": 413000}`, not the documents themselves. One message per document means 5 million broker round trips; one per 1,000 documents means 5,000, and the worker can run the ranker on full GPU batches. Chunk size is a trade: bigger chunks are more efficient but redo more work when a worker dies mid-chunk.
+- **Results are keyed, so redelivery is free.** Write scores with primary key `(doc_id, model_version)` and `ON CONFLICT DO NOTHING` (or overwrite; the score is the same either way). Re-running a chunk is harmless, so you never need to know exactly which ones finished. You just re-enqueue anything not in the results table.
+- **Poison data goes to the DLQ, not into a crash loop.** The malformed document fails its chunk three times and gets parked, with its traceback, while the other 4,999 chunks keep moving. Even better, catch per-document errors inside a chunk and record them, so one bad document doesn't send 999 good ones to the DLQ.
+- **Little's Law sizes it, lag tracks it.** Workers × throughput per worker tells you the finish time before you start. Lag over time tells you whether you're on schedule, and its slope tells you when you'll finish.
+
+This is also what the batch APIs from model providers are under the hood: a durable queue of your requests, worked off whenever they have spare capacity, which is why they're cheaper.
+
+## Build It
+
+Everything goes in `~/workbench/queues/`. You'll build a Redis-backed job queue with leases, acks, retries and a dead-letter queue; move slow work out of a request; then try to break it with `kill -9`. Redis is used as a fast shared data-structure server here; you don't need to know it beyond the handful of commands below.
+
+<Task id="t0" title="Set up Redis and the project" agent="ok">
+
+```bash
+brew install redis && brew services start redis    # or: docker run -d -p 6379:6379 redis:7
+redis-cli ping                                     # PONG
+mkdir -p ~/workbench/queues && cd ~/workbench/queues
+python3 -m venv .venv && source .venv/bin/activate
+pip install redis fastapi uvicorn httpx
+```
+
+The stand-in for the ranker: about 20 ms of pure-Python-driven CPU work per document, so it behaves like a CPU-bound model call (it holds a core the whole time). Run `python -c "import work; work.bench()"` and adjust `ITERS` until one call takes 15-25 ms on your machine.
+
+```python
+# work.py: a fake ranker. CPU-bound, deterministic, ~20 ms per document.
+import hashlib, os, time
+ITERS = int(os.environ.get("ITERS", "20000"))
+
+def score(doc: str) -> float:
+    if "POISON" in doc:
+        raise ValueError(f"cannot tokenize {doc!r}")
+    h = doc.encode()
+    for _ in range(ITERS):
+        h = hashlib.sha256(h).digest()
+    return h[0] / 255
+
+def bench():
+    t = time.perf_counter(); score("hello"); print(f"{(time.perf_counter() - t) * 1000:.1f} ms")
+```
+
+And the results database. Two tables on purpose: `scores` will be written idempotently, `scores_naive` with a plain insert, so you can see the difference.
+
+```python
+# setup_db.py: fresh results database
+import os, sqlite3
+if os.path.exists("results.db"): os.remove("results.db")
+db = sqlite3.connect("results.db")
+db.executescript("""
+CREATE TABLE scores(job_id TEXT PRIMARY KEY, doc_id INT, score REAL);
+CREATE TABLE scores_naive(job_id TEXT, doc_id INT, score REAL);
+CREATE TABLE stats(n INT); INSERT INTO stats VALUES (0);
+""")
+db.commit()
+```
+
+</Task>
+
+<Task id="t1" title="Feel the slow request, then move the work out" agent="hands">
+
+First the "before". Write `api_sync.py`, a FastAPI app with `POST /docs` that takes `{"doc_id": int, "text": str}`, calls `work.score(text)` **ten times** (pretend it's summary plus ranker, about 200 ms) right in the handler, and returns the score. Run it with `uvicorn api_sync:app --port 8000 --workers 1` and hit it with 50 concurrent requests (reuse `loadgen.py` from [Waiting vs working](/lessons/waiting-vs-working/), or `httpx` with `asyncio.gather`). Write down p50 and p99. With one process doing CPU work, request 50 waits for the 49 in front of it.
+
+Now the "after". `api.py` keeps the same route, but the handler only writes a job and answers:
+
+```python
+@app.post("/docs", status_code=202)
+def save(doc: Doc):
+    job_id = f"doc-{doc.doc_id}"            # natural key: re-saving the same doc is a no-op job
+    q.enqueue({"doc_id": doc.doc_id, "text": doc.text}, job_id=job_id)
+    return {"job_id": job_id}
+
+@app.get("/jobs/{job_id}")
+def status(job_id: str):
+    ...  # "done" + score if it's in results.db, else "pending"/"dead", from Redis
+```
+
+(`q` is the library from the next task; write the API's shape now and finish it after.) Measure the same 50 requests. The p99 for *accepting* should drop from seconds to a few milliseconds. The work still takes as long; it's just not on the user's clock anymore.
+
+</Task>
+
+<Task id="t2" title="Write the queue: enqueue, claim, ack, reap" agent="hands">
+
+Write `q.py`. The data lives in four Redis keys:
+
+| Key | Type | Holds |
+| --- | --- | --- |
+| `q:pending` | list | job IDs waiting to be claimed |
+| `q:inflight` | sorted set | claimed job IDs, scored by lease deadline (unix time) |
+| `q:dlq` | list | job IDs that failed too many times |
+| `job:<id>` | hash | `payload` (JSON), `attempts`, `last_error` |
+
+A sorted set is a set where every member has a number (its score) and Redis keeps them ordered by it. "Which leases have expired?" becomes one range query: `ZRANGEBYSCORE q:inflight -inf <now>`.
+
+The hard part is **claim**: pop a job from `q:pending` *and* record its lease in `q:inflight`. If those are two separate commands and the worker dies between them, the job is in neither place: lost. So it has to be one atomic step. Redis runs a Lua script atomically (nothing else runs on the server mid-script), so claim is a tiny script. Here it is, since Lua syntax isn't the lesson:
+
+```python
+import json, time, uuid, redis
+r = redis.Redis(decode_responses=True)
+PENDING, INFLIGHT, DLQ = "q:pending", "q:inflight", "q:dlq"
+
+_claim = r.register_script("""
+local id = redis.call('RPOP', KEYS[1])
+if not id then return false end
+redis.call('ZADD', KEYS[2], ARGV[1], id)
+local n = redis.call('HINCRBY', 'job:' .. id, 'attempts', 1)
+return {id, redis.call('HGET', 'job:' .. id, 'payload'), n}
+""")
+
+def claim(lease_s: float):
+    """Returns (job_id, payload_dict, attempts) or None."""
+    res = _claim(keys=[PENDING, INFLIGHT], args=[time.time() + lease_s])
+    ...
+```
+
+The rest is yours:
+
+```python
+def enqueue(payload: dict, job_id: str | None = None) -> str: ...
+    # write job:<id> (payload, attempts=0), then LPUSH onto pending.
+    # Question for you: what if job:<id> already exists (same doc saved twice)?
+
+def ack(job_id: str) -> bool: ...
+    # remove from inflight and delete job:<id>. Atomic? What if the lease already
+    # expired and someone else holds the job now? (Hint: ZREM returns 0 or 1.)
+
+def extend(job_id: str, lease_s: float) -> bool: ...
+    # heartbeat: push the deadline back, only if still in inflight (ZADD with XX)
+
+def fail(job_id: str, error: str) -> None: ...
+    # record last_error, make the lease expire now so reap() handles it
+
+def reap(max_attempts: int = 3) -> tuple[int, int]: ...
+    # every expired lease: attempts >= max_attempts -> DLQ, else back to pending.
+    # Returns (requeued, dead). Must be atomic too: two workers reaping the same
+    # expired job must not requeue it twice. Write it as a second Lua script.
+```
+
+Hints: in `reap`, put requeued jobs where `claim` will find them *next* (the end `RPOP` reads from), so a retry doesn't wait behind the whole backlog. And don't use `KEYS *` anywhere; it scans the whole database.
+
+</Task>
+
+<Task id="t3" title="Write the worker, with an idempotent write" agent="hands">
+
+`worker.py` is a loop: reap, claim with a 2 s lease, score, write, ack. Shape:
+
+```python
+import os, sqlite3, time, traceback
+import q, work
+
+IDEM = os.environ.get("IDEM", "1") == "1"
+db = sqlite3.connect("results.db", timeout=30, isolation_level=None)
+db.execute("PRAGMA journal_mode=WAL")   # lets many worker processes write safely
+
+def apply(job_id: str, doc_id: int, s: float) -> None:
+    # IDEM=1: in ONE transaction, INSERT OR IGNORE into scores, and bump stats.n
+    #         only if a row was actually inserted (cursor.rowcount).
+    # IDEM=0: plain INSERT into scores_naive and always bump stats.n.
+    ...
+
+while True:
+    ...
+```
+
+Rules: catch exceptions from `work.score` and call `q.fail(job_id, traceback.format_exc())`. Ack only *after* `apply` commits. Read an `ACK_DELAY` environment variable and `time.sleep` that long between `apply` and `ack`; it's 0 normally, and you'll widen it in Measure to make the bottom row of Figure 003 easy to hit. Sleep briefly (50 ms) when there's nothing to claim, so idle workers don't spin the CPU. Use `BEGIN IMMEDIATE` to start the transaction so two workers don't deadlock upgrading read locks.
+
+</Task>
+
+<Task id="t4" title="The producer, the chaos monkey and the checker" agent="ok">
+
+```python
+# produce.py: python produce.py N   (every 1000th doc is poison)
+import sys, q
+q.r.delete(q.PENDING, q.INFLIGHT, q.DLQ)
+for k in q.r.scan_iter("job:*"): q.r.delete(k)
+n = int(sys.argv[1])
+for i in range(n):
+    doc = f"doc {i}" + (" POISON" if i % 1000 == 7 else "")
+    q.enqueue({"doc_id": i, "text": doc}, job_id=f"doc-{i}")
+print("enqueued", n)
+```
+
+```python
+# chaos.py: python chaos.py WORKERS   (CHAOS=0 to just run, no kills)
+import os, random, signal, subprocess, sys, time, q
+W, kills = int(sys.argv[1]), 0
+spawn = lambda: subprocess.Popen([sys.executable, "worker.py"])
+procs = [spawn() for _ in range(W)]
+t0 = time.time()
+while q.r.llen(q.PENDING) + q.r.zcard(q.INFLIGHT) > 0:
+    time.sleep(0.3)
+    if os.environ.get("CHAOS", "1") == "1":
+        i = random.randrange(W)
+        os.kill(procs[i].pid, signal.SIGKILL); procs[i].wait(); kills += 1
+        procs[i] = spawn()                      # the "supervisor" restarts it
+for p in procs: p.kill()
+print(f"done in {time.time() - t0:.1f} s, kills={kills}, dlq={q.r.llen(q.DLQ)}")
+```
+
+```python
+# verify.py
+import sqlite3
+db = sqlite3.connect("results.db")
+one = lambda sql: db.execute(sql).fetchone()[0]
+print("idempotent rows:", one("select count(*) from scores"),
+      "| naive rows:", one("select count(*) from scores_naive"),
+      "| naive distinct:", one("select count(distinct job_id) from scores_naive"),
+      "| counter:", one("select n from stats"))
+```
+
+Run: `python setup_db.py && python produce.py 2000 && python chaos.py 8 && python verify.py`. Every 0.3 s, a random worker gets `kill -9`, the signal a process can't catch or clean up after. The run ends when nothing is pending or in flight.
+
+</Task>
+
+<Task id="t5" title="Dead letters: inspect and re-drive" agent="review">
+
+Write `dlq.py` with two commands: `python dlq.py list` prints each dead job's ID, attempts and the last line of its `last_error`; `python dlq.py redrive` resets `attempts` to 0 and moves every job from `q:dlq` back to `q:pending`. Then "fix the bug" (make `work.score` strip the word POISON instead of raising), re-drive, and check that every one of the 2,000 documents now has exactly one score. Ask an agent to review your `reap` and `redrive` for races: what happens if a worker is reaping while you re-drive?
+
+</Task>
+
+<Task id="t6" title="Optional: a real log, replayed from offset 0" agent="explain">
+
+If you have Docker, run Redpanda, a Kafka-compatible broker that ships as one binary (check its quickstart for the current flags; roughly):
+
+```bash
+docker run -d --name rp -p 9092:9092 docker.redpanda.com/redpandadata/redpanda:latest \
+  redpanda start --mode dev-container --kafka-addr 0.0.0.0:9092 --advertise-kafka-addr localhost:9092
+docker exec rp rpk topic create docs-saved -p 3
+pip install confluent-kafka
+```
+
+Write a producer that sends 10,000 records keyed by `doc_id` and a consumer in group `rankers` with `enable.auto.commit` off that scores each record and commits after processing. Then:
+
+1. Run two consumers in the same group and one in a different group. Check with `docker exec rp rpk group describe rankers` which partitions each one owns, and that the other group sees every record.
+2. Run four consumers in a group on the 3-partition topic. One should own nothing.
+3. Stop everything, reset the group to the beginning (`rpk group seek rankers --to start`), and run again. Every record is reprocessed, and since your writes are keyed, the results table doesn't change. That's replay.
+
+An agent can explain client errors and config options; write the consumer loop yourself.
+
+</Task>
+
+<DoneWhen>
+
+- `POST /docs` answers in a few milliseconds no matter how slow scoring is, and `GET /jobs/<id>` reports pending, done (with score) or dead.
+- With 8 workers and a `kill -9` every 0.3 s, a 2,000-document run ends with 1,998 rows in `scores`, the counter at 1,998, and the 2 poison documents in the DLQ with their tracebacks.
+- With `IDEM=0` and a widened ack gap, you can show duplicates in `scores_naive` and explain exactly which line of Figure 003 made each one.
+- You have a throughput-vs-workers table and can point at the knee and say what caused it.
+- After a fix and a re-drive, the DLQ is empty and every document has exactly one score.
+
+</DoneWhen>
+
+## Measure
+
+**1. Nothing lost, nothing doubled.** Run the chaos test four ways and fill in the table. `ACK_DELAY=0.01` widens the gap between "saved" and "acked" from microseconds to 10 ms, so kills land in it often enough to count.
+
+| IDEM | ACK_DELAY | Kills | Rows | Distinct jobs | Counter | DLQ |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 0 | | | | | |
+| 1 | 0.01 | | | | | |
+| 0 | 0 | | | | | |
+| 0 | 0.01 | | | | | |
+
+What to expect: lost should be zero in every row: 1,998 distinct jobs scored plus 2 in the DLQ, because a job only leaves Redis on ack, and ack comes after the commit. With `IDEM=1`, rows and counter are exactly 1,998 every time. With `IDEM=0`, rows exceed distinct jobs by roughly the number of kills that landed between commit and ack. When I ran a version of this harness on an M4 Pro (with a Python stand-in for Redis, not real Redis), the `IDEM=0, ACK_DELAY=0.01` run had 23 kills and produced 2,009 rows for 1,998 distinct documents, so 11 duplicates and a counter of 2,009; the `IDEM=1` run with the same settings had 24 kills and exactly 1,998. With `ACK_DELAY=0` the window is tiny and you may see zero duplicates: that's the dangerous case, because the bug is still there, just rare enough to reach production.
+
+**2. Throughput vs worker count.** `CHAOS=0`, 2,000 documents (no kills), for 1, 2, 4, 6, 8, 10, 12, 16 and 24 workers. Throughput is documents / elapsed seconds.
+
+| Workers | Elapsed (s) | Docs/s | Docs/s per worker |
+| --- | --- | --- | --- |
+| 1 | | | |
+| 2 | | | |
+| 4 | | | |
+| 8 | | | |
+| 12 | | | |
+| 16 | | | |
+| 24 | | | |
+
+<Predict id="knee">
+
+Your job is CPU-bound, about 20 ms of one core. Run `sysctl hw.perflevel0.physicalcpu hw.perflevel1.physicalcpu` to see your performance and efficiency core counts. Where will throughput stop rising, and what will it do past that point?
+
+<Fragment slot="answer">
+
+Ideal is 50 docs/s per worker, rising in a straight line until you run out of cores. On an M4 Pro (10 performance + 4 efficiency cores) expect close-to-linear up to about 10, a smaller gain from the efficiency cores, then flat: 24 workers are 24 processes taking turns on 14 cores, so per-worker throughput falls while the total stays put (or dips a little from context switching and cache thrash). If the knee comes much *earlier*, something else is the bottleneck: the broker (each job costs several Redis round trips, around 0.1-0.2 ms each on localhost), SQLite's single writer, or your measurement (`chaos.py` polls every 0.3 s, so short runs are rounded up). That's the general lesson: throughput rises with workers until it hits the first shared resource, and the knee tells you which one. In my run with a slow Python Redis stand-in, throughput flattened at around 8 workers because the stand-in, not the cores, saturated. Real Redis does over 100,000 simple commands a second on one core, so it shouldn't be your knee at this scale. Check yourself.
+
+</Fragment>
+
+</Predict>
+
+Then use your number. If one machine tops out at P docs/s, re-scoring 5 million documents takes 5,000,000 / P seconds. Little's Law in reverse: to hit a deadline of D seconds, you need throughput 5,000,000 / D, and so that many divided by your per-worker rate, spread over enough machines to stay below each one's knee. On the Spark the ranker would run on the GPU in batches, so the knee will be GPU throughput, not CPU cores, and chunk size becomes the dial.
+
+**3. Lag under a spike.** Run 8 workers with no chaos and a producer that enqueues at a steady 200 docs/s (add a `time.sleep` to `produce.py`), then enqueue 5,000 extra at once. Sample `LLEN q:pending` every second (a 10-line script, or `watch -n1 redis-cli llen q:pending`) and plot it. It should look like the spike in Figure 002: a jump, then a straight-line decline with slope (capacity − 200) docs/s. Measure the slope and check it against your throughput table.
+
+## Break It
+
+1. **Lease shorter than the job.** Set the lease to 0.01 s with 20 ms jobs, no kills. Every job's lease expires mid-work, `reap` hands it to someone else, and the naive table fills with duplicates while workers are perfectly healthy. Then add a heartbeat (`extend` every half-lease, from a thread in the worker) and watch it stop. This is the most common queue bug in production, and it looks like "random duplicates under load", because jobs slow down under load.
+2. **No attempt limit.** Set `max_attempts` to a huge number. The poison jobs bounce between pending and in-flight forever, using a worker each time. With one poison message per 1,000 jobs and a slow failure (say the tokenizer hangs 10 s before crashing), a growing fraction of your pool ends up doing nothing but failing. Then put the limit back.
+3. **Ack before work.** Move `ack` before `apply` and rerun the chaos test. Now you'll be short: fewer than 1,998 rows, nothing in the DLQ for them, and no error anywhere. Silent loss is worse than duplicates, because nothing tells you.
+4. **Producer faster than consumers, no bound.** Run 2 workers and a producer at 500 docs/s for a few minutes. Watch `redis-cli info memory` climb and the oldest job's age grow without limit. Then add a guard to `enqueue`: if `LLEN q:pending` exceeds a limit, raise, and have the API return 503 with `Retry-After`. That's backpressure from [Rate limits](/lessons/rate-limits/), applied at the door of the queue.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Why would you put a queue between two services? What does it cost you?</summary>
+
+It decouples them. The producer can accept work at its own speed while consumers process at theirs; bursts are stored in the queue and drained over time, so you size workers for the average load rather than the peak; failed work can be retried by the consumer without the original caller waiting or even being alive; and one event can feed several consumers that the producer doesn't know about. The cost: the work becomes asynchronous, so you need another way to deliver results (polling, webhooks); you add a system that must be run, monitored and sized; and you take on delivery semantics, which in practice means duplicates, so consumers must be idempotent. A queue also doesn't add capacity: if arrivals exceed capacity for long, it just grows.
+
+</details>
+
+<details>
+<summary>2. What's the difference between at-most-once, at-least-once and exactly-once? Which do you build, and how?</summary>
+
+At-most-once acks before the work, so a crash loses the message but never duplicates it. At-least-once acks after the work, so a crash causes a redelivery and nothing is lost, but some messages are processed twice. Exactly-once delivery isn't possible across systems, because if the worker finishes and its ack is lost, the broker can't tell that apart from a worker that died before finishing; it has to either redeliver or not. So you build at-least-once delivery with an idempotent consumer: give every job a key, and write the result together with "this key is done" in one transaction (insert with a unique key and ignore conflicts), or make the operation a "set" rather than an "add". The combination is sometimes called effectively-once. Kafka's exactly-once is real but only covers Kafka-to-Kafka pipelines; anything external still needs idempotency.
+
+</details>
+
+<details>
+<summary>3. Your worker pool processes jobs from a queue. What happens, step by step, when a worker gets kill -9'd halfway through a job?</summary>
+
+The worker had claimed the job, which moved it to an in-flight set with a lease deadline. The kill stops the process instantly; it can't ack, fail, or clean up. The broker sees nothing, since silence looks the same as slow work. When the lease deadline passes, the job is made visible again (put back in the queue) and its attempt count goes up; another worker claims it and runs it from the start. If the dead worker had already saved its result before dying, the second run produces the same result and the idempotent write ignores it. If the job keeps failing until it reaches the attempt limit, it goes to the dead-letter queue with its last error for a human to look at. The cost of the crash is one lease-length of delay for that job, plus the wasted partial work.
+
+</details>
+
+<details>
+<summary>4. When would you use Kafka instead of a job queue like SQS or Celery?</summary>
+
+When messages are events that several independent systems need, when you want to replay history (reprocess after a bug, build a new index from the past), or when you need per-key ordering at high throughput. Kafka keeps records for a retention period regardless of reads, and each consumer group tracks its own offset, so readers are independent and can rewind. A job queue is better for tasks that should be done once by one worker, especially slow or uneven ones: any free worker takes the next job, and each job has its own ack, retry count and DLQ. In Kafka, a partition is read in order by one consumer, so one slow record blocks everything behind it in that partition, and parallelism is capped by the partition count.
+
+</details>
+
+<details>
+<summary>5. You need to re-score 50 million documents with a new ranker by tomorrow morning, 12 hours from now. How do you size and run it, and how does it scale?</summary>
+
+Throughput needed: 50M / 43,200 s ≈ 1,160 docs/s. Measure one worker's real throughput on the target hardware, say 400 docs/s per GPU with batched inference, so you need about 3 GPUs' worth, and I'd plan for 4-5 to leave headroom for retries and stragglers (Little's Law: in-flight work = throughput × time per chunk tells you how many concurrent chunks to have running). Enqueue chunks of a few thousand documents rather than single documents, to keep broker traffic small and batches full. Write results keyed by (doc_id, model_version) with ignore-on-conflict, so redelivered chunks are harmless and a restart only needs to enqueue chunks with missing results. Use a lease longer than the slowest chunk (or heartbeat), an attempt limit with a DLQ, and catch per-document errors so one bad document doesn't fail a chunk. Watch lag (chunks remaining) over time; its slope gives the finish time, and if it's too shallow, add workers until you hit the next shared limit: the database's write rate, the storage you read documents from, or the network. Scaling past that means sharding the results store or writing results to files per chunk instead of one database.
+
+</details>
+
+## Go Deeper
+
+- **Jay Kreps, "The Log: What every software engineer should know about real-time data's unifying abstraction"** (LinkedIn Engineering blog, December 2013). The essay behind this lesson. Long, clear, and it will change how you see databases, replication and data pipelines. Expanded into the short O'Reilly book **_I Heart Logs_** (Kreps, 2014).
+- **Jay Kreps, Neha Narkhede, Jun Rao, "Kafka: a Distributed Messaging System for Log Processing"** (NetDB workshop, 2011). The original Kafka paper: why LinkedIn built it, and the design choices (sequential disk writes, consumer-held offsets, no per-message acks) that made it fast.
+- **Martin Kleppmann, _Designing Data-Intensive Applications_, the chapter "Stream Processing"**. The best single explanation of message brokers vs logs, delivery semantics, and change data capture, with the trade-offs laid out. The chapter on batch processing is worth reading alongside it.
+- **Apache Kafka documentation, "Design" section** ([kafka.apache.org/documentation](https://kafka.apache.org/documentation/#design)). Covers persistence, the producer and consumer, and delivery semantics, written by the people who built it. Read the "Message Delivery Semantics" part twice.
+- **Amazon SQS Developer Guide: "Amazon SQS visibility timeout" and "Using dead-letter queues"**. The clearest official write-up of leases, redelivery, and redrive policies, with the real defaults and limits.
+- **Tyler Treat, "You Cannot Have Exactly-Once Delivery"** (Brave New Geek blog, 2015). A short, sharp argument for why delivery guarantees stop at at-least-once, and what people really mean by "exactly-once".
+- **Neha Narkhede, "Exactly-once Semantics Are Possible: Here's How Kafka Does It"** (Confluent blog, 2017). The other side: what Kafka's idempotent producer and transactions actually guarantee, and where the boundary is. Read it right after Treat.
+- **Chris Richardson, "Pattern: Transactional outbox"** ([microservices.io](https://microservices.io/patterns/data/transactional-outbox.html)). The outbox pattern and its relatives (polling publisher, log tailing) in one page.
+
+## Connections
+
+This lesson leans on [Waiting vs working](/lessons/waiting-vs-working/) for Little's Law and on [Rate limits and backpressure](/lessons/rate-limits/) for the idea that a buffer hides overload: a queue is a deliberately enormous buffer, so you need lag alerts and a bound to get the pressure signal back. The idempotent write is [Transactions](/lessons/transactions/) at work, and it's the same idempotency-key trick as API retries in [the API lifecycle](/lessons/api-lifecycle/). The "where's the knee" measurement is the same shape as [p99 and load testing](/lessons/tail-latency/), and the "is the bottleneck cores or something shared?" question comes from [Processes, threads and the GIL](/lessons/processes-threads-gil/), since each worker is a separate process exactly so CPU-bound scoring can use every core.
+
+Looking ahead: [Data pipelines](/lessons/data-pipelines/) is this lesson at training-data scale, where chunked, idempotent, replayable jobs are the whole design. [Batching](/lessons/batching/) is what a worker should do with a chunk once it has one on a GPU. And [Observability](/lessons/observability/) is where consumer lag and oldest-message age become dashboards and alerts.

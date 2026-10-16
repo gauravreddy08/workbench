@@ -1,0 +1,671 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import HorizonRuns from '../components/figures/HorizonRuns.astro';
+import HorizonCurves from '../components/figures/HorizonCurves.astro';
+
+## Today
+
+- Say what "long-horizon" means in one sentence, and why it is about the number of decisions before feedback, not the number of tokens.
+- Do the compounding-error math in your head: if each step works 99% of the time, what happens at 100 steps, and what the 50% horizon is.
+- Explain why real agents beat that math (recovery), and write down a model with both a per-step error rate and a recovery rate.
+- Explain what METR's "time horizon" measures, what it doesn't, and what "doubling every ~7 months" does and doesn't mean.
+- Build a task suite with a length knob, run a real model through it, fit the curves, then add a verifier and watch the curve move.
+
+Prerequisites: none strictly, but [Is that improvement real?](/lessons/statistics-for-evals/) helps with the error bars, and [Managing context](/lessons/context-management/) is the sibling lesson about what fills up as tasks get long. Rough time: one evening to read and build the harness, one session of model runs (budget a few dollars to a few tens of dollars, depending on the model; the cost math is in Build It).
+
+## The Problem
+
+You give a coding agent a small job: rename a config key in one file and fix the one test that uses it. It nails it. You give it ten of those, one after another, in the same repo. It nails nine of them, and on the tenth it is confidently editing a file it already edited, undoing its own work.
+
+Then you give it a real migration: forty files, each change depending on the one before. It runs for an hour, reports success, and the test suite fails. Somewhere around file 12 it misread a value, and every file after that was built on the misread. Every individual edit looks reasonable. The whole thing is wrong.
+
+The model didn't get dumber between task 1 and task 40. Each step is about as likely to go right as before. What changed is that you asked it to be right forty times in a row, with nobody checking in between. That is the whole subject of this lesson, and you can put numbers on it.
+
+When the Anthropic Code RL posting says "long-horizon autonomous engineering tasks", this is the problem it's pointing at. Short tasks are mostly solved. The frontier is getting a model to stay correct across hundreds of steps, which means getting the per-step error rate down, getting the model to notice and fix its own mistakes, and figuring out how to train any of that when the only signal comes at the very end.
+
+<Origin year="1989" title="The car that never learned to recover">
+
+ALVINN (Dean Pomerleau, Carnegie Mellon, 1989) was a small neural network that steered a van by watching a human drive. It learned to copy the human well. But a human driver rarely drifts toward the edge of the road, so the training data almost never showed what to do when you're already halfway off it. When the network made a small steering error, it landed in a situation it had never seen, made a bigger error, and drifted further. Pomerleau's fix was to synthesise shifted camera images, showing the van off-center, labelled with the correction. He taught it recovery.
+
+Twenty years later Stéphane Ross and Drew Bagnell made this precise for <Term w="imitation learning">Training a policy to copy an expert's actions from recorded demonstrations, the way ALVINN copied a human driver.</Term>. If a copied policy makes a mistake with probability ε per step, its total cost over T steps can grow like ε·T², not ε·T, because each mistake moves it into unfamiliar states where it makes more (Ross and Bagnell 2010; DAgger, Ross, Gordon and Bagnell 2011). The same worry came back with LLMs: if each token or step has some chance of going wrong, a long enough output almost surely goes wrong somewhere. Whether that is fatal depends entirely on recovery, which is where this lesson spends most of its time.
+
+</Origin>
+
+## The Idea
+
+### A horizon is how many decisions you make before anyone tells you how you did
+
+Start with a scene. You're learning to bake. In one version, a teacher stands next to you and says "too much flour" the moment you pour it. In the other, you bake alone and the only feedback is whether the cake tastes good three hours later. Same recipe, same number of actions. The second one is far harder to do well and far harder to learn from, because when the cake is bad you don't know which of the forty things you did caused it.
+
+An agent's work is a <Term w="trajectory">The full record of one attempt at a task: every observation the agent saw, every action it took, in order. Also called a rollout or an episode.</Term>: look at something, decide, act, see the result, repeat. Each turn of that loop is a step. A coding agent's step is usually one tool call: read a file, run a command, write an edit.
+
+The <Term w="horizon">How many steps an agent has to take before it gets feedback on whether it is succeeding. Long horizon means many decisions between checks.</Term> of a task is how many of those steps happen between the start and the moment you learn whether it worked. That is the definition to hold onto. It's not the number of tokens, and not wall-clock time, though both tend to go up with it. A model that writes a 3,000-token essay in one shot has made one decision about one thing, and is graded once. An agent that does 60 tool calls and is graded only when the final test suite runs has a horizon of 60.
+
+<Figure n="001" title="SHORT VS LONG HORIZON" caption="Top: every step gets a check, so a mistake is noticed one step after it happens. Bottom: forty steps run with no feedback, and the only signal is a pass or fail at the very end. Same work, very different problem.">
+<svg viewBox="0 0 640 240" role="img" aria-label="Two timelines of agent steps, one with feedback after every step, one with feedback only at the end">
+  <text x="10" y="22" class="strong">SHORT HORIZON · CHECK EVERY STEP</text>
+  <rect x="10" y="36" width="44" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="54" text-anchor="middle">ACT</text>
+  <rect x="62" y="36" width="20" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="72" y="54" text-anchor="middle">✓</text>
+  <rect x="92" y="36" width="44" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="114" y="54" text-anchor="middle">ACT</text>
+  <rect x="144" y="36" width="20" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="154" y="54" text-anchor="middle">✓</text>
+  <rect x="174" y="36" width="44" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="196" y="54" text-anchor="middle">ACT</text>
+  <rect x="226" y="36" width="20" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="236" y="54" text-anchor="middle">✗</text>
+  <rect x="256" y="36" width="44" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="278" y="54" text-anchor="middle">FIX</text>
+  <rect x="308" y="36" width="20" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="318" y="54" text-anchor="middle">✓</text>
+  <line x1="236" y1="70" x2="236" y2="88" class="blue" stroke-width="1" />
+  <text x="244" y="88" class="blue-t">MISTAKE SEEN AT ONCE</text>
+
+  <text x="10" y="132" class="strong">LONG HORIZON · ONE CHECK AT THE END</text>
+  <g>
+    <rect x="10" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="24" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="38" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="52" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="66" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="80" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="94" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="108" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="122" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="136" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="150" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="164" y="146" width="11" height="28" class="fill-blue" stroke-width="1" />
+    <rect x="178" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="192" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="206" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="220" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="234" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="248" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="262" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="276" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="290" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="304" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="318" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="332" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="346" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="360" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="374" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="388" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="402" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="416" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="430" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="444" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="458" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="472" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="486" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="500" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="514" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="528" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="542" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+    <rect x="556" y="146" width="11" height="28" class="fill-paper" stroke-width="1" />
+  </g>
+  <rect x="580" y="146" width="50" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="605" y="164" text-anchor="middle" class="strong">FAIL</text>
+  <line x1="169" y1="180" x2="169" y2="204" class="blue" stroke-width="1" />
+  <text x="177" y="210" class="blue-t">MISTAKE AT STEP 12, FOUND AT STEP 40</text>
+  <text x="10" y="232">WHICH OF THE 40 STEPS CAUSED THE FAIL? THE SIGNAL DOESN'T SAY.</text>
+</svg>
+</Figure>
+
+So a task gets long-horizon in two ways at once. There are more chances to be wrong, and mistakes stay hidden longer. Let's take them one at a time, starting with the arithmetic.
+
+### Being right forty times in a row
+
+Say an agent does each step correctly with probability `p`, and any wrong step ruins the task. The steps are independent: getting step 5 right doesn't change the odds for step 6. Then the chance of finishing an `n`-step task is the chance of getting every step right:
+
+```text
+P(success) = p × p × ... × p = p^n
+```
+
+That's the whole model. It is far more brutal than intuition says.
+
+<Predict id="p99">
+
+An agent gets each step right 99% of the time. That sounds excellent. What fraction of 100-step tasks does it finish? And at what length does it drop to a coin flip?
+
+<Fragment slot="answer">
+
+About 37%. `0.99^100 ≈ 0.366`. A "99% reliable" agent fails most 100-step tasks.
+
+The coin-flip length is where `p^n = 0.5`, so `n = ln(0.5) / ln(p)`. For `p = 0.99` that's about 69 steps. There's a handy shortcut: when `p` is close to 1, `ln(p) ≈ -(1 - p)`, so the 50% length is about `0.69 / (1 - p)`. One mistake per 100 steps gives a 50% length near 69 steps. One per 1,000 gives about 693. (I checked all of these in Python on this Mac.)
+
+</Fragment>
+
+</Predict>
+
+That shortcut, `0.69 / (1 - p)`, is the most useful line in the lesson. It says the length an agent can handle is inversely proportional to its per-step <Term w="failure rate">The chance a single step goes wrong, 1 - p. A 2% failure rate means p = 0.98.</Term>. Halve the failure rate and you double the length. Going from 98% to 99% per step sounds like a rounding error; it doubles how long a task the agent can do. Going from 99% to 99.9% multiplies it by ten.
+
+| Per-step success `p` | Failure rate | Success at 10 steps | Success at 100 steps | 50% length |
+| --- | --- | --- | --- | --- |
+| 0.90 | 10% | 35% | ~0% | ~7 steps |
+| 0.95 | 5% | 60% | 0.6% | ~14 steps |
+| 0.98 | 2% | 82% | 13% | ~34 steps |
+| 0.99 | 1% | 90% | 37% | ~69 steps |
+| 0.999 | 0.1% | 99% | 90% | ~693 steps |
+
+This is also why the gap between "a demo that works" and "a system that works" is so big for agents. A demo is usually one short run. Reliability across many steps is a different, much harder number.
+
+The curve has a name in other fields. A constant chance of failing at every step is a constant <Term w="hazard rate">The chance of failing in the next step, given you haven't failed yet. If it's the same at every step, survival decays exponentially, like radioactive decay.</Term>, and survival under a constant hazard decays exponentially. Your agent has a <Term w="half-life">The number of steps after which half the runs have failed. Under a constant hazard it's ln(2) / failure rate, the same formula as radioactive decay.</Term>, just like a radioactive atom. Hold onto that; it comes back with METR.
+
+### Feel it: twenty-four agents
+
+Here are 24 simulated agents doing the same task. Each square is one step. Set `p` and the task length, and watch how many make it.
+
+<Figure n="002" title="TWENTY-FOUR RUNS" caption="Each row is one run, each square one step. With r = 0, the first mistake (orange) kills the run and everything after it is wasted work (grey). Note the third readout: almost every step is right, yet most long runs fail. Then raise r, and then turn on verification." wide>
+<HorizonRuns />
+</Figure>
+
+Two things to try. First, at `p = 0.95` and 40 steps, read the "steps that were right" readout. It says about 95%. And yet only a few runs finish. Per-step accuracy and end-to-end success are wildly different numbers, and if someone quotes you one, ask for the other.
+
+Second, the grey squares. Every step after the fatal mistake is work the agent did, tokens you paid for, that could never lead to success. On long tasks the expensive failure isn't the run that crashes at step 3. It's the run that makes a quiet mistake at step 12 and keeps going, confidently, until step 40.
+
+### Real agents don't die at the first mistake
+
+If `p^n` were the full story, agents would be hopeless: no current model has a per-step error rate of 0.1% on hard steps, yet agents do finish tasks of a hundred-plus tool calls. The missing piece is that a mistake isn't always fatal.
+
+Watch a good engineer work. They mistype a path, the command fails, they fix it. That mistake cost one step. They write a function with an off-by-one bug, the test fails, they fix it. That one cost a few steps. Only some mistakes kill a project: the ones nobody notices until too late, and the ones you can't undo.
+
+<Figure n="003" title="THREE FATES OF A MISTAKE" caption="The same wrong step can cost one step, cost some rework, or kill the run. Which one you get depends on how soon the mistake becomes visible and whether the action can be undone, not on how big the mistake was.">
+<svg viewBox="0 0 640 260" role="img" aria-label="A wrong step branching into three outcomes: caught immediately, caught later, or never caught">
+  <rect x="10" y="108" width="110" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="65" y="128" text-anchor="middle" class="strong">WRONG STEP</text>
+  <text x="65" y="144" text-anchor="middle">at step k</text>
+  <line x1="120" y1="122" x2="200" y2="44" class="ink" stroke-width="1.2" />
+  <line x1="120" y1="130" x2="200" y2="130" class="ink" stroke-width="1.2" />
+  <line x1="120" y1="138" x2="200" y2="216" class="ink" stroke-width="1.2" />
+
+  <rect x="200" y="22" width="430" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="212" y="40" class="strong">1 · LOUD, RIGHT AWAY</text>
+  <text x="212" y="57">command errors, file not found → fix next step · cost: 1 step</text>
+
+  <rect x="200" y="108" width="430" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="212" y="126" class="strong">2 · CAUGHT LATER</text>
+  <text x="212" y="143">a test fails 6 steps on → find it, redo · cost: rework</text>
+
+  <rect x="200" y="194" width="430" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="212" y="212" class="strong blue-t">3 · SILENT OR IRREVERSIBLE</text>
+  <text x="212" y="229">nothing checks it, or it can't be undone · cost: the run</text>
+</svg>
+</Figure>
+
+So split each step into two questions. Did it go right (probability `p`)? And if it went wrong, does the agent notice and fix it before it matters (probability `r`, for <Term w="recovery">Noticing a mistake and repairing it before it causes the task to fail. Re-reading a file, seeing an error message, re-running a test.</Term>)? A step only ruins the task if it goes wrong and isn't recovered:
+
+```text
+chance a step is fatal  = (1 - p) × (1 - r)
+effective success  q    = p + (1 - p) × r
+P(success, n steps)     = q^n
+```
+
+This is still a constant-hazard model, just with a smaller hazard. And notice what it means for the half-life: `0.69 / ((1 - p)(1 - r))`. Recovery and per-step accuracy multiply. An agent that recovers from half its mistakes has exactly the same horizon as one that makes half as many mistakes. That's important for training: you can get longer horizons by making the model more careful, or by making it better at noticing and fixing, and the second might be easier.
+
+<Predict id="recovery">
+
+Agent A gets 97.5% of steps right and never recovers. Agent B gets 95% of steps right, but notices and fixes half its mistakes. Which one has the longer horizon?
+
+<Fragment slot="answer">
+
+Neither. They're the same. Agent B's fatal-step rate is `0.05 × 0.5 = 0.025`, which is exactly A's. Both have `q = 0.975` and a 50% length of about 27 steps.
+
+But they're not the same agent in practice. B uses more steps (every recovered mistake costs at least one extra step), and B's behaviour depends on its mistakes being *detectable*. Put B in an environment where errors are silent (no error messages, no tests) and its `r` collapses toward zero, and its horizon halves. A is robust to that. This is one reason the same model scores very differently on different harnesses.
+
+</Fragment>
+
+</Predict>
+
+### Verification: making mistakes loud
+
+Recovery only works if the mistake shows up somewhere the agent can see it. So the natural engineering move is to make mistakes visible on purpose: run the tests after each edit, type-check after each file, diff the output against expectations. A <Term w="verifier">Anything that checks the agent's work and reports a pass or fail: a test suite, a type checker, a linter, a script that compares output to a known answer.</Term> turns fate 3 in Figure 003 into fate 2.
+
+The model for that, which the next figure draws: every `k` steps, run a check. If the last block of `k` steps contains a fatal mistake, the check catches it with probability `c` (its <Term w="catch rate">The fraction of real bugs a verifier detects. A test suite with 60% catch rate misses 4 in 10 bugs. Related to recall.</Term>), and the agent throws the block away and redoes it, with up to 3 attempts. If the check misses it, the bug is silent and the run is doomed.
+
+```text
+b = q^k                      a block of k steps is clean
+f = (1 - b) × c              a block is bad and the check catches it
+P(block passes) = b × (1 + f + f^2)       (up to 3 attempts)
+P(success, n steps) = P(block passes)^(n / k)
+```
+
+I checked this closed form against a brute-force simulation in Python: at `p = 0.95`, `k = 5`, `c = 0.9`, 40 steps, the formula says 74.2% and 40,000 simulated runs gave 74.4%.
+
+<Predict id="verify">
+
+`p = 0.95`, no recovery, 40 steps. Without checks, success is `0.95^40 ≈ 13%`. Now run a check after every single step, with up to 3 tries per step. What's the success rate if the check is perfect (`c = 1`)? What if the check catches only half of the bugs (`c = 0.5`)?
+
+<Fragment slot="answer">
+
+With a perfect check: about 99.5%. Each step now fails only if all three tries are wrong, `0.05^3 ≈ 0.0001`, and `0.9999^40 ≈ 0.995`.
+
+With a check that catches half: about 35%. Better than 13%, but nowhere near 99%. Every time a bug slips past the check, that's a silent fatal mistake, and you get a fresh chance of one at every step. Checking more often with a weak verifier mostly buys you more chances to be fooled.
+
+The lesson: verifier *quality* matters more than verifier *frequency*. This is the same reason [Rewards and verifiers](/lessons/verifiers-rewards/) spends a whole lesson on how hard it is to write checks that can't be gamed.
+
+</Fragment>
+
+</Predict>
+
+Now play with all of it at once.
+
+<Figure n="004" title="SUCCESS VS STEPS" caption="Dashed: plain p^n. Thin: with recovery. Blue: with verification every k steps. Dots mark the 50% horizon of each. Watch the horizon readouts, and the cost readout: verification is not free, each check and each redo costs steps." wide>
+<HorizonCurves />
+</Figure>
+
+Things to find:
+
+- Set `p = 0.99`, nothing else. Horizon about 69. Now `p = 0.98`: about 34. A one-point drop in per-step accuracy halved the task length.
+- Set `p = 0.90` and recovery `r = 0.8`. Horizon jumps from about 7 to about 34, the same as `p = 0.98` with no recovery. A sloppy agent that catches its mistakes matches a careful agent that doesn't.
+- Turn verification to every 1 step with catch rate 1.0. The horizon runs off the right edge. Then slide the catch rate down to 0.5 and watch most of the gain disappear.
+- Set verification to every 20 steps. Blocks are now long enough that most of them have a bug, so the agent redoes big chunks of work and often runs out of attempts. Checking rarely is cheap per check and expensive per mistake.
+
+### What METR actually measured
+
+Everything so far counts in steps. That's natural for a harness, but steps aren't comparable across tasks: one step of "write a regex" and one step of "design the database schema" are not the same size. METR, a nonprofit that evaluates frontier AI systems, wanted one number that means the same thing across very different tasks. Their answer was to measure tasks in **human time**.
+
+The paper is Kwa et al. (2025), "Measuring AI Ability to Complete Long Tasks" (later versions are titled "...Long Software Tasks"; it appeared at NeurIPS 2025). Here's what they did, stated carefully:
+
+1. They collected about 170 software and research-engineering tasks from three suites: HCAST, RE-Bench, and a set of 66 new very short tasks (SWAA), ranging from a few seconds to many hours for a human.
+2. They paid skilled humans to do the tasks and recorded how long each took. That gives every task a length in human minutes.
+3. They ran many AI models (from GPT-2 in 2019 to models from early 2025) through the tasks in an agent scaffold and recorded pass or fail.
+4. For each model, they fit a <Term w="logistic curve">An S-shaped curve that goes smoothly from near 1 down to near 0. Here: probability of success against the log of task length.</Term> of success probability against the logarithm of human task time.
+5. The model's **50% time horizon** is the human task length where that fitted curve crosses 50%.
+
+<Figure n="005" title="THE TIME HORIZON, SCHEMATIC" caption="A sketch of METR's method for one model, not their data. Each dot is a task: its human completion time and whether the model passed. Fit an S-curve through them; where it crosses 50% is the model's time horizon. The 80% horizon is the same idea at a stricter bar, and it's much shorter.">
+<svg viewBox="0 0 600 260" role="img" aria-label="Schematic logistic curve of success probability against log human task time with the 50 percent crossing marked">
+  <line x1="60" y1="210" x2="580" y2="210" class="ink" stroke-width="1" />
+  <line x1="60" y1="20" x2="60" y2="210" class="ink" stroke-width="1" />
+  <text x="52" y="24" text-anchor="end">100%</text>
+  <text x="52" y="119" text-anchor="end">50%</text>
+  <text x="52" y="214" text-anchor="end">0%</text>
+  <line x1="60" y1="115" x2="580" y2="115" class="ink dash" stroke-width="0.8" />
+  <line x1="60" y1="58" x2="580" y2="58" class="ink dash" stroke-width="0.5" />
+  <text x="576" y="52" text-anchor="end">80%</text>
+  <text x="80" y="228">1 MIN</text>
+  <text x="210" y="228">10 MIN</text>
+  <text x="340" y="228">1 HR</text>
+  <text x="460" y="228">8 HR</text>
+  <text x="320" y="250" text-anchor="middle">HUMAN TIME TO DO THE TASK (LOG SCALE)</text>
+  <path d="M 60 26 C 180 28, 230 40, 280 80 S 360 180, 420 200 S 520 208, 580 209" class="blue" stroke-width="2" />
+  <circle cx="90" cy="26" r="3" class="fill-blue" />
+  <circle cx="120" cy="26" r="3" class="fill-blue" />
+  <circle cx="150" cy="26" r="3" class="fill-blue" />
+  <circle cx="175" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="200" cy="26" r="3" class="fill-blue" />
+  <circle cx="235" cy="26" r="3" class="fill-blue" />
+  <circle cx="260" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="275" cy="26" r="3" class="fill-blue" />
+  <circle cx="300" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="320" cy="26" r="3" class="fill-blue" />
+  <circle cx="340" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="370" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="395" cy="26" r="3" class="fill-blue" />
+  <circle cx="430" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="480" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <circle cx="530" cy="210" r="3" class="fill-paper" stroke-width="1" />
+  <line x1="313" y1="115" x2="313" y2="210" class="blue" stroke-width="1.2" />
+  <text x="321" y="140" class="blue-t">50% HORIZON</text>
+  <line x1="248" y1="58" x2="248" y2="210" class="ink" stroke-width="1" />
+  <text x="244" y="180" text-anchor="end">80% HORIZON</text>
+  <text x="96" y="16">● PASS</text>
+  <text x="160" y="16">○ FAIL</text>
+</svg>
+</Figure>
+
+The headline results, as the paper states them: frontier models of early 2025 (Claude 3.7 Sonnet was the top one) had a 50% time horizon of around 50 minutes on these tasks, and the 50% horizon of the frontier model has doubled roughly every seven months since 2019, possibly faster in 2024. The 80% horizon is several times shorter than the 50% one. They also report that the gains seem to come mostly from greater reliability and better ability to adapt to mistakes, which is exactly the `p` and `r` of the last section.
+
+Read that carefully, because it is easy to over-read:
+
+- **It is not "the model can work for 50 minutes".** It's "on tasks that take a skilled human about 50 minutes, the model succeeds about half the time". The model might take 5 minutes or 2 hours of its own time.
+- **It's tied to the task suite.** These are well-specified, automatically scored software tasks, mostly self-contained. Messy real-world tasks with unclear goals score worse; the authors discuss this "external validity" limit themselves.
+- **"Doubling every 7 months" is an observed trend line**, fit through a few dozen models over six years. It's a measurement, not a law. Extrapolating it is a forecast with all the usual risks.
+- **50% is a low bar.** For anything you'd hand off unsupervised you care about the 80% or 99% horizon, which are much shorter.
+
+Now connect it to the math. Toby Ord (2025, "Is there a half-life for the success rates of AI agents?") reanalysed METR's data and found it fits well with exactly the constant-hazard model from earlier: a constant chance of failing per minute of human task time, so success decays exponentially with task length, and each model has its own half-life. Under that model, "horizon doubles every 7 months" is the same statement as "the per-minute failure rate halves every 7 months". METR's own fit uses a logistic curve on log time instead, which decays more slowly at long lengths than an exponential does. You'll fit both to your own data and see which one your agent looks like.
+
+### What makes long tasks hard (beyond the arithmetic)
+
+The `p^n` math treats every step as an independent coin flip. Real long tasks are worse in ways that coin flips don't capture, and each of these is a research and engineering problem in its own right.
+
+**State tracking.** The agent has to remember what it has done and what's still true. Which files did I edit? Did I already rename that function? What was the value in file 12? Humans offload this to the codebase, notes and `git status`; an agent has to either keep it in context or re-derive it. Mistakes here are the "edited the same file twice" failure from The Problem. Per-step error rate goes *up* as the task goes on, because there's more state to keep straight, which breaks the constant-`p` assumption in the bad direction.
+
+**Context limits.** Every step adds tool output to the conversation. A 200-step trajectory can easily run past a <Term w="context window">The maximum amount of text (in tokens) a model can see at once: the system prompt, the conversation so far, and all tool output.</Term>. Even before it's full, the relevant fact from step 12 is buried under 150 steps of logs. Something has to summarise, drop or retrieve old content, and every summary can lose the one detail that mattered. That whole problem is [Managing context](/lessons/context-management/).
+
+**Sparse and delayed feedback.** On short tasks, feedback comes right away. On long ones, you may not know whether step 12 was right until step 40 runs the tests (Figure 001). This is what makes recovery hard: `r` is high for mistakes that cause an immediate error and near zero for mistakes that only show up much later.
+
+**Planning and decomposition.** A long task needs a plan: what to do first, what depends on what, when a subgoal is done. A bad plan can make every individual step correct and the whole task wrong. Good agents (and good engineers) split a long task into chunks that can each be checked, which is the "verify every `k` steps" model again, done by the agent itself.
+
+**Verification and self-correction.** The agent needs to check its own work and believe the check. Two failure modes: not checking (low `r`), and checking but trusting a weak check (low `c`), which is worse because it feels safe. An agent that writes a test that always passes and then reports success is the long-horizon version of this.
+
+**Irreversible actions.** Some steps can't be undone: dropping a database table, sending an email, `git push --force`, deleting a file nobody backed up. For those, `r = 0` by definition, no matter how smart the agent is. A good harness makes irreversible actions rare (sandboxes, dry runs, version control, asking first), which is a way of raising `r` from the outside.
+
+### Why long tasks are hard to learn, not just hard to do
+
+Here's the training side, which is the "Code RL" part of the job posting. In [reinforcement learning](/lessons/rl-environments/), an agent tries tasks, gets a <Term w="reward">A number the environment gives the agent to say how well it did. For a coding task, often 1 if the tests pass and 0 if not.</Term>, and the training algorithm nudges the model to make rewarded actions more likely and unrewarded ones less likely.
+
+For a 3-step task with a reward at the end, it's fairly clear which steps to credit. For a 60-step task with a single pass/fail at the end, it's not. Did it fail because of step 12, or step 47, or both? This is the <Term w="credit assignment">Working out which of many earlier actions deserve the credit (or blame) for a reward that arrives later.</Term> problem, and it's the core difficulty of long-horizon RL.
+
+<Figure n="006" title="CREDIT ASSIGNMENT" caption="One reward at the end of a long trajectory. The simplest methods give every step the same share of the blame: the 39 fine steps get pushed down along with the one bad one. Learning still works on average, over many runs, but the signal per run gets noisier the longer the trajectory is.">
+<svg viewBox="0 0 640 200" role="img" aria-label="A row of steps ending in a single reward, with arrows showing the reward being spread back over every step">
+  <g>
+    <rect x="20" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <rect x="70" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <rect x="120" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <rect x="170" y="70" width="40" height="30" class="fill-wash" stroke-width="1.2" />
+    <rect x="220" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <rect x="270" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <text x="335" y="90" text-anchor="middle">· · ·</text>
+    <rect x="360" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <rect x="410" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+    <rect x="460" y="70" width="40" height="30" class="fill-paper" stroke-width="1.2" />
+  </g>
+  <text x="40" y="90" text-anchor="middle">1</text>
+  <text x="90" y="90" text-anchor="middle">2</text>
+  <text x="140" y="90" text-anchor="middle">3</text>
+  <text x="190" y="90" text-anchor="middle" class="strong">4</text>
+  <text x="240" y="90" text-anchor="middle">5</text>
+  <text x="290" y="90" text-anchor="middle">6</text>
+  <text x="380" y="90" text-anchor="middle">38</text>
+  <text x="430" y="90" text-anchor="middle">39</text>
+  <text x="480" y="90" text-anchor="middle">40</text>
+  <line x1="500" y1="85" x2="540" y2="85" class="ink" stroke-width="1.2" />
+  <rect x="540" y="66" width="80" height="38" class="fill-wash" stroke-width="1.2" />
+  <text x="580" y="82" text-anchor="middle" class="strong">REWARD</text>
+  <text x="580" y="97" text-anchor="middle">0 (FAIL)</text>
+  <path d="M 580 104 C 580 160, 300 160, 40 108" class="blue dash" stroke-width="1" />
+  <line x1="190" y1="108" x2="190" y2="146" class="blue dash" stroke-width="1" />
+  <line x1="380" y1="108" x2="380" y2="146" class="blue dash" stroke-width="1" />
+  <text x="190" y="48" text-anchor="middle" class="blue-t">THE ACTUAL BUG</text>
+  <line x1="190" y1="52" x2="190" y2="68" class="blue" stroke-width="1" />
+  <text x="320" y="185" text-anchor="middle">"SOMETHING IN HERE WAS BAD" IS ALL THE SIGNAL SAYS</text>
+</svg>
+</Figure>
+
+The intuition for why length hurts: the reward is one number, but it's a verdict on the whole trajectory, so each individual step's contribution is buried under the randomness of all the others. Methods like REINFORCE, PPO and [GRPO](/lessons/grpo/) differ in how they try to reduce that noise (a learned value estimate in PPO, comparing a group of attempts at the same task in GRPO), but none of them gets to know which step was the bug. The practical levers are the same ones from this lesson, seen from the training side: denser feedback (intermediate rewards, tests that run partway), shorter effective horizons (decomposed tasks), and many more samples.
+
+### Benchmarks, briefly and carefully
+
+A few benchmarks you'll see cited for long-horizon agent work:
+
+- **SWE-bench** (Jimenez et al., 2023, ICLR 2024). 2,294 real GitHub issues from 12 popular Python repositories; the agent must produce a patch that makes the hidden tests from the real fix pass. **SWE-bench Verified** (2024) is a 500-task subset that humans checked for being solvable and fairly tested, and it's the version most often quoted. These tasks typically take an agent tens of tool calls.
+- **METR's task suites** (HCAST, RE-Bench) from the time-horizon paper, chosen to span seconds to many hours of human time.
+- **τ-bench** (Yao et al., 2024, Sierra). Agents talk to a simulated user and call tools in domains like airline and retail customer service. It introduced **pass^k**: the chance that all k independent attempts at the same task succeed. That's reliability across runs rather than steps, but it's the same `p^n` math, and it shows how fast "usually works" decays into "can't be trusted alone".
+
+Benchmark numbers move fast and depend heavily on the scaffold (the harness around the model), so for current scores, check the benchmark's own leaderboard rather than trusting any number written down months ago, including here.
+
+## Build It
+
+You'll build three things: a task suite where you control the length, a small agent harness that runs a real model through it, and an analysis script that fits the curves from this lesson to your data. Then you add a verifier and see whether the curve moves the way Figure 004 says.
+
+The task is a **dependency chain of config files**. It's a toy, but it has the shape of real migrations: each step needs the agent to read something, compute something from what it found earlier, and write it down, and an early mistake poisons everything after it.
+
+Each task is a folder of `n` small Python files, `m00.py` to `m{n-1}.py`. File `m00.py` has a known value. Every other file has a rule in a comment saying how to compute its value from earlier files, and a placeholder:
+
+```python
+# m07.py
+# RULE: VALUE = (VALUE of m06 * 3 + LEN of NAME in m04) % 1000
+NAME = "pelican"
+VALUE = None
+```
+
+The agent must fill in every `VALUE`. Because rules reference earlier files, including ones a few steps back, the agent has to track state across the whole task.
+
+Everything goes in `~/workbench/horizon/`.
+
+<Task id="t0" title="Set up the folder, a venv and an API key" agent="ok">
+
+```bash
+mkdir -p ~/workbench/horizon && cd ~/workbench/horizon
+python3 -m venv .venv && source .venv/bin/activate
+pip install anthropic numpy scipy matplotlib   # or your provider's SDK
+export ANTHROPIC_API_KEY=...                    # never commit this; put it in your shell profile or a .env you gitignore
+```
+
+Any LLM API with tool calling works. Use a **small, cheap model** for this. You want it to make mistakes at 20 to 40 steps; a frontier model may be so reliable on these toy rules that you need to make them harder (more back-references, string operations) before you see failures.
+
+**Budget first.** Each step is about two model calls (read, then write), and every call resends the whole conversation so far. If each call adds about 150 tokens of context, a task of `n` steps costs roughly `1600·n + 300·n²` input tokens. That's about 15k tokens at 5 steps and 540k at 40 steps. A sweep of lengths 5, 10, 20, 40 with 10 tasks each is about **8M input tokens**; the verify run roughly doubles it. Multiply by your model's current price (check the provider's pricing page; prompt caching cuts the cost of resent context a lot). Put a hard token cap in the harness so a stuck agent can't spend your budget.
+
+</Task>
+
+<Task id="t1" title="Write the task generator and the grader" agent="hands">
+
+```python
+# tasks.py
+import random
+from dataclasses import dataclass
+from pathlib import Path
+
+WORDS = ["pelican", "otter", "cobalt", "ember", "quartz", "lichen", ...]
+
+@dataclass
+class Rule:
+    prev: int        # index of the file whose VALUE is used (always k-1)
+    mul: int         # VALUE = (VALUE of prev * mul + extra) % 1000
+    ref: int | None  # optional second file whose NAME length is added
+    ...
+
+def make_task(n: int, seed: int, root: Path) -> list[int]:
+    """Write m00.py .. m{n-1}.py into root. Return the true VALUE for every file."""
+    ...
+
+def read_values(root: Path, n: int) -> list[int | None]:
+    """Parse VALUE out of each file the agent wrote. None if missing or unparseable."""
+    ...
+
+def grade(rules, truth, written) -> dict:
+    """Return:
+      global_ok:  list[bool], written[k] == truth[k]
+      local_ok:   list[bool], written[k] is correct GIVEN the agent's own written[k-1] (and ref)
+      success:    all(global_ok)
+    """
+    ...
+```
+
+Two grading ideas matter here.
+
+**Global correctness** asks "is this file's value the true one?" One mistake at file 12 makes files 12 to 39 globally wrong, even if the agent did every later computation perfectly from the wrong input.
+
+**Local correctness** asks "given what the agent wrote in the earlier files, did it compute this file correctly?" That isolates each step. The fraction of locally correct steps is your measured per-step reliability `p̂`. That's the number the whole model hangs on, so get this function right.
+
+Hints: seed a `random.Random(seed)` so every task is reproducible. Have `ref` point 2 to 5 files back about half the time, so state tracking matters. Unit-test `grade` on a hand-made wrong answer before you trust it.
+
+</Task>
+
+<Task id="t2" title="Build the harness, and test it on a fake agent first" agent="hands">
+
+The harness is a loop: send the conversation and the tool list to the model, run whatever tool it asks for, append the result, repeat until it says it's done, hits `max_steps`, or hits the token cap.
+
+```python
+# harness.py
+import json, time
+from pathlib import Path
+
+TOOLS = [
+    # name, description, JSON schema for arguments
+    {"name": "list_files", ...},
+    {"name": "read_file", ...},     # args: path
+    {"name": "write_file", ...},    # args: path, content
+    {"name": "done", ...},          # agent declares it is finished
+]
+
+def run_tool(root: Path, name: str, args: dict) -> str:
+    """Run one tool inside root only. Refuse paths that escape root."""
+    ...
+
+def run_episode(agent, root: Path, n: int, max_steps: int, token_cap: int, trace: Path) -> dict:
+    """Run until done / max_steps / token_cap. Append every call and result to trace (JSONL).
+    Return steps used, tokens used, why it stopped."""
+    ...
+```
+
+For the real model, the exact tool-calling request and response format depends on your SDK and version, so follow its docs (for Anthropic, the Messages API "tool use" guide). Keep the model code behind a small interface, something like `agent.step(messages, tools) -> (tool_name, args, tokens_used)`, so you can swap it.
+
+Then, **before spending a cent**, write a `FakeAgent` with the same interface. It walks the files in order, reads each one, and writes the correct value with probability `p`, else a wrong one. Run 200 fake episodes at `p = 0.95` for each length and check: does your grader's `p̂` come out near 0.95? Does end-to-end success track `0.95^n`? If your measurement pipeline can't recover a number you planted, it won't recover one you didn't.
+
+</Task>
+
+<Task id="t3" title="Run the real sweep" agent="review">
+
+Run the real model on lengths 5, 10, 20, 40, with 10 tasks per length (different seeds). Use a plain system prompt: what the files are, what the tools do, "fill in every VALUE, then call done". Don't give hints about checking your work yet; that's the next experiment.
+
+Save one JSON line per episode: `n`, seed, success, `local_ok` list, `global_ok` list, steps used, tokens used, stop reason. Also count **recoveries**: files whose first write was locally wrong but whose final value is locally right (the model went back and fixed it). You can find these in the trace.
+
+Then have an agent review your harness and sweep code for anything that would make the comparison unfair: tasks of different difficulty at different lengths, a `max_steps` that's too tight for `n = 40`, the token cap cutting off long runs (that's a failure, but a different kind; record it separately), retries on API errors that silently change the trajectory.
+
+</Task>
+
+<Task id="t4" title="Fit the three models" agent="hands">
+
+```python
+# fit.py
+import numpy as np
+from scipy.optimize import minimize_scalar, minimize
+
+def fit_pn(lengths, successes, trials):
+    """Fit one q so that P(success at n) = q**n. Maximise the binomial log-likelihood:
+    sum over lengths of  k*log(q**n) + (t-k)*log(1 - q**n)."""
+    ...
+
+def fit_logistic(lengths, successes, trials):
+    """METR-style: P = 1 / (1 + exp(-(a - b*log2(n)))). Fit a, b. Return them and the 50% length 2**(a/b)."""
+    ...
+```
+
+Compute and compare four numbers:
+
+1. `p̂`, the measured local per-step success rate from the grader.
+2. `q̂` from `fit_pn` on end-to-end success.
+3. The prediction `p̂^n` at each length, with no fitting at all.
+4. `r̂`, the measured recovery rate: recoveries divided by locally wrong first writes. Then the recovery-aware prediction with `q = p̂ + (1 - p̂)·r̂`.
+
+The question you're answering: **can you predict long-task success from short-task step reliability?** Plot measured success vs `n` with error bars (see Measure), with `p̂^n`, the recovery-aware curve, the fitted `q̂^n` and the fitted logistic on top.
+
+</Task>
+
+<Task id="t5" title="Add a verifier and rerun" agent="hands">
+
+Add one tool, `check()`, that reports which of the files written so far break their rule given the earlier written values, i.e. it reports local errors. Add a `catch_rate` parameter: each broken file is reported only with that probability, so you can make the verifier imperfect on purpose. Change the system prompt to say "call check() after every few files and fix anything it reports".
+
+Rerun the sweep with `catch_rate = 1.0`, then with `catch_rate = 0.5` at `n = 20` and `n = 40`. Measure success, steps used and tokens used. Before you run, use Figure 004 to predict how the curve should move.
+
+</Task>
+
+<DoneWhen>
+
+- The fake agent at `p = 0.95` gives `p̂` within about ±0.01 of 0.95 over 200 episodes, and its success tracks `0.95^n`.
+- You have real-model results for 4 lengths × 10 tasks, with and without the verifier, and a plot with all the fitted curves.
+- You can say, with a number, how well `p̂^n` predicted long-task success, and whether recovery explains the gap.
+- You can say what the verifier cost (steps and tokens) and what it bought (horizon).
+
+</DoneWhen>
+
+## Measure
+
+Fill these in. Use the trace files, not your memory of watching runs.
+
+| Length `n` | Runs | Succeeded | Success ± SE | `p̂` (local) | `p̂^n` | Recoveries / wrong first writes | Mean steps | Mean tokens |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 5 | 10 | | | | | | | |
+| 10 | 10 | | | | | | | |
+| 20 | 10 | | | | | | | |
+| 40 | 10 | | | | | | | |
+
+| Fit | Parameter(s) | 50% length |
+| --- | --- | --- |
+| `p̂^n` (no fitting) | `p̂ =` | |
+| `q̂^n` fitted | `q̂ =` | |
+| recovery-aware `(p̂ + (1-p̂)r̂)^n` | `r̂ =` | |
+| logistic in `log2(n)` | `a =`, `b =` | |
+
+| Verifier | `n` | Success | Mean steps | Mean tokens | Checks called |
+| --- | --- | --- | --- | --- | --- |
+| none | 20 | | | | |
+| `catch_rate = 1.0` | 20 | | | | |
+| `catch_rate = 0.5` | 20 | | | | |
+| none | 40 | | | | |
+| `catch_rate = 1.0` | 40 | | | | |
+| `catch_rate = 0.5` | 40 | | | | |
+
+**Error bars first.** With 10 runs per length, the <Term w="standard error">How much a measured average would jump around if you repeated the experiment. For a success rate p over N runs it's about sqrt(p(1-p)/N).</Term> of a success rate near 50% is `sqrt(0.25 / 10) ≈ 0.16`, so "50%" really means "somewhere from about 20% to 80%". Don't read anything into a 10-point difference. I simulated this with the fake agent: at true `p = 0.95` with 10 runs per length, the `q̂` fitted from end-to-end success ranged from about 0.931 to 0.965 across repeats (90% of the time). That's a 50% length of anywhere from 10 to 19.5 steps from the same agent. With 30 runs per length it tightens to 0.940 to 0.960. This is why per-step reliability `p̂` is so useful: a 40-step task gives you 40 step measurements but only one success measurement.
+
+**What the numbers should look like.** I can't run your model for you, so these are the shapes to expect and why, not values:
+
+- `p̂` should be roughly the same at every length if the steps really are independent. If it falls as `n` grows, that's state tracking or context getting worse over the run: the constant-`p` assumption is breaking, and pure `p^n` will be *optimistic* at long lengths.
+- If `q̂` (fitted from success) comes out **higher** than `p̂`, the agent is recovering. Your `r̂` should explain most of the gap. If the recovery-aware curve still undershoots, look at the traces for recoveries your counter missed (rewriting a file after re-reading an earlier one).
+- If `q̂` comes out **lower** than `p̂`, something kills runs that isn't a wrong value: token cap, `max_steps`, the agent calling `done` early, or skipping a file. Those are failures too, and they're often the main long-horizon failure in practice. Count them separately.
+- With the perfect verifier, success at 40 steps should go up a lot, and steps and tokens should go up too. With `catch_rate = 0.5`, expect only part of the gain, as in the Predict above. If the perfect verifier barely helps, check whether the model actually called `check()`; models often skip optional tools.
+- The logistic fit and the `q^n` fit will look similar over 5 to 40 steps. They differ in the tail. If you have budget, a few runs at 80 steps would tell them apart.
+
+## Break It
+
+**1. Make mistakes silent.** In `read_file`, strip the `RULE` comment out of files after the agent has written them once, so re-reading can't reveal a mistake. Recovery should drop toward zero, and success should fall toward `p̂^n`. This is the "detectability" point from the second Predict: the same model's horizon depends on whether the environment makes errors visible.
+
+**2. Starve the context.** Keep only the last 6 tool results in the conversation (drop older ones). Rules that reference files 5 back now need a re-read the agent may not think to do. Watch `p̂` fall for back-reference steps specifically, and fall more at higher `n`. This is the bridge to [Managing context](/lessons/context-management/), and it breaks the independent-steps assumption in the expected direction.
+
+**3. Add one irreversible action.** Add a `delete_file` tool and a rule in one file that says "if VALUE is even, delete m03.py". Any run that deletes the wrong file can't finish, because the value it needs is gone. Count how often it happens. Then add `git`-style undo (keep a backup and an `undo` tool) and see `r` for that step jump. Most of what makes a harness "safe" is turning `r = 0` steps into `r > 0` steps.
+
+**4. Game your own verifier.** Change `check()` to report only on the last file written. An agent can now pass every check while building on a wrong value from earlier. Success should drop below even the no-verifier case if the model trusts the check and stops re-reading. A weak verifier that the agent believes is worse than none, which is the whole worry behind [Rewards and verifiers](/lessons/verifiers-rewards/).
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What makes a task "long-horizon"? Is a 5,000-token essay long-horizon?</summary>
+
+The number of sequential decisions an agent has to make before it gets feedback on whether it's succeeding. Long tasks have many steps between checks, so there are more chances to make a mistake and mistakes stay hidden longer. A long essay written in one pass and graded once is a lot of tokens but essentially one decision with one grade; it can still fail in compounding ways, but the defining long-horizon problems (state tracking across actions, delayed feedback, credit assignment across steps) are much weaker. A 60-tool-call refactor graded only by the final test run is long-horizon.
+
+</details>
+
+<details>
+<summary>2. An agent is 99% reliable per step. How does it do on 100-step tasks, and how does that scale?</summary>
+
+If any mistake is fatal and steps are independent, `0.99^100 ≈ 37%`. The 50% length is `ln 0.5 / ln p ≈ 0.69 / (1 - p)`, about 69 steps. Horizon scales inversely with the failure rate: halve the failure rate and the horizon doubles, so going from 99% to 99.9% per step is a 10x longer horizon. Real agents do better than this because they recover from some mistakes; with recovery rate `r` the fatal rate is `(1 - p)(1 - r)`, so recovery and per-step accuracy are interchangeable for horizon. And they do worse if per-step accuracy decays over the run (context, state tracking), which `p^n` doesn't capture.
+
+</details>
+
+<details>
+<summary>3. What does METR's "50% time horizon" measure, and what are the caveats?</summary>
+
+They timed skilled humans on about 170 software and research-engineering tasks, ran AI agents on the same tasks, and for each model fit success probability against log human task time. The 50% time horizon is the human task length at which the model succeeds half the time: around 50 minutes for the best early-2025 models, doubling about every 7 months since 2019. Caveats: it's human time, not how long the model runs; it's tied to that task suite (well-specified, auto-scored, mostly self-contained); 50% is a low reliability bar and the 80% horizon is several times shorter; and the doubling is an empirical trend, not a law. Under a constant-hazard reading (Ord 2025), doubling the horizon means halving the per-minute failure rate.
+
+</details>
+
+<details>
+<summary>4. You add "run the tests after every edit" to your agent. When does that help a lot, and when barely?</summary>
+
+It helps when the tests actually catch the mistakes the agent makes (high catch rate), and when errors are fixable (not irreversible). Then a bad edit is caught one step later and retried, so the fatal rate per step drops from `1 - q` to roughly `(1 - q)^attempts` plus whatever the tests miss. It barely helps when the tests are weak: every missed bug is still a silent fatal mistake, so success is bounded by the miss rate no matter how often you check. It also costs steps, tokens and wall time, and more if the test suite is slow. Checking very rarely is cheap but makes each failed block expensive to redo. So: improve the verifier before you increase the frequency.
+
+</details>
+
+<details>
+<summary>5. Why is RL on long tasks harder than on short ones, and what helps?</summary>
+
+With one reward at the end of a long trajectory, the training signal says "something in these 60 steps was good or bad" but not which step. The per-step signal is buried under the randomness of all the other steps, so the gradient estimate is noisier the longer the trajectory, and you need many more samples to learn the same thing. Also, rewards get rarer: if the model's long-task success rate is near 0, almost every trajectory gets reward 0 and there's little to learn from. Helps: denser feedback (intermediate checks, partial credit that can't be gamed), curricula that start short and get longer, decomposing tasks, value estimates or group baselines (PPO, GRPO) to reduce variance, and good verifiers so that the reward is actually right.
+
+</details>
+
+## Go Deeper
+
+- **Thomas Kwa, Ben West, Joel Becker et al. (METR), "Measuring AI Ability to Complete Long Tasks"** (2025), [arxiv.org/abs/2503.14499](https://arxiv.org/abs/2503.14499). The time-horizon paper. Read the methodology and the limitations sections, not just the headline plot.
+- **Toby Ord, "Is there a half-life for the success rates of AI agents?"** (2025), [arxiv.org/abs/2505.05115](https://arxiv.org/abs/2505.05115). Short, and the clearest link between METR's data and the constant-hazard `p^n` model in this lesson.
+- **Carlos E. Jimenez, John Yang et al., "SWE-bench: Can Language Models Resolve Real-World GitHub Issues?"** (ICLR 2024), [arxiv.org/abs/2310.06770](https://arxiv.org/abs/2310.06770), and the SWE-bench site [swebench.com](https://www.swebench.com/). The benchmark most long-horizon coding work is measured on. Read how tasks are built and graded.
+- **John Yang et al., "SWE-agent: Agent-Computer Interfaces Enable Automated Software Engineering"** (2024). Shows how much the tool design around the model changes success on long tasks. Good preparation for [Inside an agent harness](/lessons/agent-harness/).
+- **Shunyu Yao et al., "τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains"** (2024). Where `pass^k` comes from; a clean way to measure reliability rather than best-case ability.
+- **Stéphane Ross, Geoffrey Gordon and J. Andrew Bagnell, "A Reduction of Imitation Learning and Structured Prediction to No-Regret Online Learning"** (AISTATS 2011), the DAgger paper. The classic statement of why errors compound for a policy that never learned to recover.
+- **Richard Sutton and Andrew Barto, _Reinforcement Learning: An Introduction_** (2nd ed., 2018), free at [incompleteideas.net/book/the-book.html](http://incompleteideas.net/book/the-book.html). Chapters on temporal-difference learning and eligibility traces are the textbook treatment of credit assignment over long trajectories.
+- **Anthropic, "Building effective agents"** (Erik Schluntz and Barry Zhang, Dec 2024), on anthropic.com/engineering. Practical patterns (workflows vs agents, checkpoints, when to add verification) from the people building them.
+
+## Connections
+
+This lesson is the "why" behind most of the Agents & RL track. [Managing context](/lessons/context-management/) attacks one cause of per-step reliability falling over a long run. [What is an RL environment?](/lessons/rl-environments/) turns your task suite into something a model can be trained on, and [Rewards and verifiers](/lessons/verifiers-rewards/) is about making `c` high and hard to game. [RL with verifiable rewards](/lessons/grpo/) is where credit assignment over long trajectories stops being a figure and becomes a loss function. [Inside an agent harness](/lessons/agent-harness/) is the engineering side: sandboxes, undo and checkpoints, all ways to raise `r` from outside the model.
+
+For the statistics in Measure, [Is that improvement real?](/lessons/statistics-for-evals/) goes deeper on why 10 runs can't distinguish 40% from 60%, and how many you actually need.

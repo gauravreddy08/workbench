@@ -1,0 +1,185 @@
+---
+// A toy page load drawn as a DevTools-style waterfall. One HTML document plus four
+// subresources over one HTTP/2 connection. Toggles: warm DNS cache, reused connection,
+// CDN nearby. Slider: round trip to the origin server.
+---
+<div class="uw" data-fig="url-waterfall">
+  <div class="ctl" role="group" aria-label="Conditions">
+    <button class="btn" type="button" data-t="dns" aria-pressed="false">Warm DNS cache</button>
+    <button class="btn" type="button" data-t="reuse" aria-pressed="false">Reused connection</button>
+    <button class="btn" type="button" data-t="cdn" aria-pressed="false">CDN nearby</button>
+  </div>
+  <div class="ctl">
+    <label>RTT TO ORIGIN <input type="range" data-k="rtt" min="10" max="250" step="10" value="80" /><output>80 ms</output></label>
+  </div>
+  <svg class="uw-svg" viewBox="0 0 640 260" role="img" aria-label="Waterfall timeline of one page load"></svg>
+  <div class="uw-legend" aria-hidden="true">
+    <span><i style="background:var(--ok)"></i>DNS</span>
+    <span><i style="background:var(--warn)"></i>TCP</span>
+    <span><i style="background:var(--ink-2)"></i>TLS</span>
+    <span><i class="uw-wait"></i>WAITING (TTFB)</span>
+    <span><i style="background:var(--blue)"></i>DOWNLOAD</span>
+  </div>
+  <div class="ctl uw-read" aria-live="polite">
+    <span>FIRST PAINT <span class="readout" data-r="paint"></span></span>
+    <span>ALL LOADED <span class="readout" data-r="load"></span></span>
+    <span>VS COLD START <span class="readout" data-r="vs"></span></span>
+  </div>
+</div>
+
+<style>
+  .uw-svg { width: 100%; margin-top: 12px; }
+  .uw-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 6px; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; color: var(--ink-2); }
+  .uw-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .uw-legend i { display: inline-block; width: 14px; height: 9px; }
+  .uw-legend i.uw-wait { background: var(--blue-fill); border: 1px solid var(--blue); }
+  .uw-read { gap: 10px 22px; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  type Seg = { kind: 'dns' | 'tcp' | 'tls' | 'wait' | 'dl'; a: number; b: number };
+  type Row = { name: string; segs: Seg[]; start: number; end: number };
+
+  // Toy model. Numbers are illustrative, chosen to be in the right ballpark.
+  const DNS_COLD = 60; // stub -> recursive resolver -> (cache miss) -> authoritative
+  const EDGE_RTT = 10; // a CDN edge in your city
+  const HTML_SERVER = 50; // app server + database to build the HTML
+  const STATIC_SERVER_ORIGIN = 8; // origin reading a static file
+  const STATIC_SERVER_EDGE = 2; // edge cache hit
+  const BW = 6.25; // KB per ms, about 50 Mbit/s
+  const IW = 14.6; // TCP initial window: 10 segments of ~1460 bytes, in KB
+
+  // A response on a brand-new connection is limited by slow start: the sender may
+  // only have IW in flight, then 2*IW, 4*IW... one batch per round trip.
+  function coldDownload(kb: number, rtt: number) {
+    let sent = 0, w = IW, rounds = 0;
+    while (sent < kb) { sent += w; w *= 2; rounds++; }
+    return (rounds - 1) * rtt + kb / BW;
+  }
+
+  function model(dnsWarm: boolean, reuse: boolean, cdn: boolean, originRtt: number) {
+    const R = cdn ? Math.min(EDGE_RTT, originRtt) : originRtt; // client <-> whoever answers
+    const htmlServer = HTML_SERVER + (cdn ? originRtt : 0); // edge forwards dynamic HTML to origin
+    const staticServer = cdn ? STATIC_SERVER_EDGE : STATIC_SERVER_ORIGIN;
+    const rows: Row[] = [];
+
+    let t = 0;
+    const html: Seg[] = [];
+    if (!reuse) {
+      const d = dnsWarm ? 0 : DNS_COLD;
+      if (d) html.push({ kind: 'dns', a: t, b: t + d });
+      t += d;
+      html.push({ kind: 'tcp', a: t, b: t + R }); t += R;
+      html.push({ kind: 'tls', a: t, b: t + R }); t += R;
+    }
+    const htmlWaitEnd = t + R + htmlServer;
+    html.push({ kind: 'wait', a: t, b: htmlWaitEnd });
+    const htmlKB = 60;
+    const htmlDl = reuse ? htmlKB / BW : coldDownload(htmlKB, R);
+    const htmlEnd = htmlWaitEnd + htmlDl;
+    html.push({ kind: 'dl', a: htmlWaitEnd, b: htmlEnd });
+    rows.push({ name: 'page.html', segs: html, start: 0, end: htmlEnd });
+
+    // <head> arrives in the first packets: the parser (and preload scanner) finds CSS and JS.
+    const headSeen = htmlWaitEnd + 1;
+    const fetch = (name: string, start: number, kb: number): Row => {
+      const w = start + R + staticServer;
+      const e = w + kb / BW; // connection is already warm by now
+      return { name, segs: [{ kind: 'wait', a: start, b: w }, { kind: 'dl', a: w, b: e }], start, end: e };
+    };
+    const css = fetch('style.css', headSeen, 30);
+    const js = fetch('app.js', headSeen, 120);
+    const font = fetch('font.woff2', css.end, 40); // only discovered once CSS is parsed
+    const img = fetch('hero.jpg', htmlEnd, 200); // discovered late in the body
+    rows.push(css, js, font, img);
+
+    const paint = Math.max(htmlEnd, css.end, js.end) + 16;
+    const load = Math.max(...rows.map((r) => r.end));
+    return { rows, paint, load };
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, parent: Element) {
+    const e = document.createElementNS(NS, tag);
+    for (const [a, v] of Object.entries(attrs)) e.setAttribute(a, String(v));
+    parent.appendChild(e);
+    return e;
+  }
+
+  const fill: Record<Seg['kind'], string> = {
+    dns: 'fill:var(--ok)',
+    tcp: 'fill:var(--warn)',
+    tls: 'fill:var(--ink-2)',
+    wait: 'fill:var(--blue-fill);stroke:var(--blue);stroke-width:1',
+    dl: 'fill:var(--blue)',
+  };
+
+  const ms = (v: number) => Math.round(v) + ' ms';
+
+  document.querySelectorAll<HTMLElement>('[data-fig="url-waterfall"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.uw-svg')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-t]')];
+    const rtt = root.querySelector<HTMLInputElement>('input[data-k="rtt"]')!;
+    const out = rtt.nextElementSibling as HTMLOutputElement;
+    const on = (k: string) => btns.find((b) => b.dataset.t === k)!.getAttribute('aria-pressed') === 'true';
+
+    function draw() {
+      const R = parseFloat(rtt.value);
+      out.textContent = R + ' ms';
+      const m = model(on('dns'), on('reuse'), on('cdn'), R);
+      const cold = model(false, false, false, R);
+
+      const W = 640, left = 86, right = 14, top = 30, rowH = 34;
+      const axisY = top + rowH * m.rows.length + 4;
+      svg.setAttribute('viewBox', `0 0 ${W} ${axisY + 30}`);
+      svg.replaceChildren();
+      const scaleMax = Math.max(cold.load, 200) * 1.02; // fixed to the cold case so you can see the shrink
+      const x = (v: number) => left + (v / scaleMax) * (W - left - right);
+
+      const step = [50, 100, 200, 250, 500, 1000].find((s) => scaleMax / s <= 7) ?? 2000;
+      for (let s = 0; s <= scaleMax; s += step) {
+        el('line', { x1: x(s), x2: x(s), y1: top - 6, y2: axisY, style: 'stroke:var(--rule)', 'stroke-width': 1 }, svg);
+        const tx = el('text', { x: x(s), y: axisY + 15, 'text-anchor': 'middle' }, svg);
+        tx.textContent = s + '';
+      }
+      const unit = el('text', { x: W - right, y: axisY + 28, 'text-anchor': 'end' }, svg);
+      unit.textContent = 'MS';
+      el('line', { x1: left, x2: W - right, y1: axisY, y2: axisY, class: 'ink', 'stroke-width': 1 }, svg);
+
+      m.rows.forEach((r, i) => {
+        const y = top + i * rowH;
+        const lab = el('text', { x: left - 8, y: y + 17, 'text-anchor': 'end', class: i === 0 ? 'strong' : '' }, svg);
+        lab.textContent = r.name;
+        for (const s of r.segs) {
+          const w = Math.max(1.5, x(s.b) - x(s.a));
+          el('rect', { x: x(s.a), y: y + 6, width: w, height: 16, style: fill[s.kind] }, svg);
+        }
+        const end = el('text', { x: Math.min(x(r.end) + 5, W - right - 30), y: y + 32, class: 'blue-t' }, svg);
+        end.textContent = ms(r.end);
+        end.setAttribute('font-size', '9');
+      });
+
+      const marker = (v: number, label: string, row: number) => {
+        el('line', { x1: x(v), x2: x(v), y1: top - 10, y2: axisY, style: 'stroke:var(--blue)', 'stroke-width': 1, 'stroke-dasharray': '3 3' }, svg);
+        const t = el('text', { x: x(v), y: row, 'text-anchor': x(v) > W - 120 ? 'end' : 'middle', class: 'blue-t' }, svg);
+        t.textContent = label;
+      };
+      marker(m.paint, 'PAINT', 10);
+      marker(m.load, 'LOAD', 22);
+
+      (root.querySelector('[data-r="paint"]') as HTMLElement).textContent = ms(m.paint);
+      (root.querySelector('[data-r="load"]') as HTMLElement).textContent = ms(m.load);
+      const pct = Math.round((1 - m.load / cold.load) * 100);
+      (root.querySelector('[data-r="vs"]') as HTMLElement).textContent = pct > 0 ? `−${pct}%` : '—';
+    }
+
+    btns.forEach((b) =>
+      b.addEventListener('click', () => {
+        b.setAttribute('aria-pressed', String(b.getAttribute('aria-pressed') !== 'true'));
+        draw();
+      }),
+    );
+    rtt.addEventListener('input', draw);
+    draw();
+  });
+</script>

@@ -1,0 +1,153 @@
+---
+// Interactive: one request's journey through vLLM's processes, step by step.
+// Illustrative request: 41 prompt tokens (first 32 are a cached system prompt), 256 output tokens,
+// block size 16, sharing the GPU with 15 other running requests.
+---
+<div class="ej" data-fig="engine-journey">
+  <svg viewBox="0 0 480 196" role="img" aria-label="Three lanes: API server, engine core, GPU worker. A dot shows where the request is.">
+    <g class="ej-lanes"></g>
+    <circle class="ej-dot" r="7" cx="70" cy="34" />
+  </svg>
+  <div class="ej-state">
+    <div><span class="label">Step</span><span class="readout" data-o="n"></span></div>
+    <div><span class="label">Tokens out</span><span class="readout" data-o="tok"></span></div>
+    <div><span class="label">KV blocks (16 tok)</span><span class="ej-blocks" data-o="blocks"></span></div>
+  </div>
+  <p class="ej-title" data-o="title"></p>
+  <p class="ej-text" data-o="text"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-a="prev">Back</button>
+    <button class="btn" type="button" data-a="next">Next</button>
+    <button class="btn" type="button" data-a="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-a="reset">Reset</button>
+  </div>
+  <p class="ej-note">Blocks: light = reused from the prefix cache, solid = allocated for this request, empty = not needed yet.</p>
+</div>
+
+<style>
+  .ej svg { width: 100%; }
+  .ej-dot { fill: var(--blue); stroke: var(--paper); stroke-width: 2; transition: cx 0.5s ease, cy 0.5s ease; }
+  @media (prefers-reduced-motion: reduce) { .ej-dot { transition: none; } }
+  .ej-state { display: grid; grid-template-columns: auto auto 1fr; gap: 10px 22px; border-top: 1px solid var(--rule); padding-top: 10px; margin-top: 6px; }
+  .ej-state > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .ej-state .label { font-size: 10px; }
+  .ej-state .readout { font-size: 17px; }
+  .ej-blocks { display: flex; flex-wrap: wrap; gap: 2px; padding-top: 4px; }
+  .ej-blocks i { width: 9px; height: 12px; border: 1px solid var(--rule); display: block; }
+  .ej-blocks i.c { background: var(--blue-fill); border-color: var(--blue); }
+  .ej-blocks i.o { background: var(--blue); border-color: var(--blue); }
+  .ej-title { font-family: var(--mono); font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--blue); margin: 12px 0 4px; }
+  .ej-text { font-size: 15.5px; line-height: 1.5; margin: 0; min-height: 4.5em; }
+  .ej-note { font-family: var(--mono); font-size: 10.5px; color: var(--ink-3); margin: 10px 0 0; line-height: 1.5; }
+  @media (max-width: 520px) { .ej-state { grid-template-columns: 1fr 1fr; } .ej-state > div:last-child { grid-column: 1 / -1; } }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const LANES = [
+    { y: 34, name: 'API SERVER' },
+    { y: 98, name: 'ENGINE CORE' },
+    { y: 162, name: 'GPU WORKER' },
+  ];
+  // stations: [lane, x, label]
+  const ST: Record<string, [number, number, string]> = {
+    http: [0, 130, 'HTTP'],
+    tok: [0, 210, 'TOKENIZE'],
+    detok: [0, 430, 'DETOK+SSE'],
+    wait: [1, 130, 'WAITING'],
+    sched: [1, 230, 'SCHEDULE'],
+    alloc: [1, 330, 'KV ALLOC'],
+    update: [1, 430, 'UPDATE'],
+    prep: [2, 230, 'INPUTS'],
+    fwd: [2, 330, 'FORWARD'],
+    sample: [2, 430, 'SAMPLE'],
+  };
+  type S = { at: string; title: string; text: string; tok: number; c: number; o: number };
+  const STEPS: S[] = [
+    { at: 'http', tok: 0, c: 0, o: 0, title: 'Request arrives', text: 'POST /v1/chat/completions. FastAPI validates the body and turns it into sampling parameters: temperature 0, max_tokens 256, ignore_eos.' },
+    { at: 'tok', tok: 0, c: 0, o: 0, title: 'Template + tokenize', text: 'Chat template applied, 41 prompt tokens. This happens in the API process, so tokenizing never pauses the GPU loop.' },
+    { at: 'wait', tok: 0, c: 0, o: 0, title: 'Across the process wall', text: 'The request is serialized and sent over a ZMQ socket to the engine-core process. It joins the waiting queue. Nothing has touched the GPU yet.' },
+    { at: 'sched', tok: 0, c: 2, o: 0, title: 'Scheduler step: admit', text: 'Running requests get their 1 decode token each first. Budget is left, so this request is admitted. Prefix lookup: its first 32 tokens hash to 2 blocks already in the cache (same system prompt as earlier requests). Only 9 tokens need computing.' },
+    { at: 'alloc', tok: 0, c: 2, o: 1, title: 'allocate_slots', text: 'One new block for the 9 uncached tokens. If the pool were empty this would fail, and the scheduler would preempt the newest running request to make room.' },
+    { at: 'prep', tok: 0, c: 2, o: 1, title: 'Build the batch', text: 'The worker gets the scheduler output (mostly a diff from last step) and updates its persistent batch: token ids, positions, block table, slot mapping.' },
+    { at: 'fwd', tok: 0, c: 2, o: 1, title: 'One forward pass, mixed batch', text: '9 prefill tokens for this request and 1 decode token for each of 15 others, in one pass over the weights. Attention reads the 32 cached tokens through the block table.' },
+    { at: 'sample', tok: 1, c: 2, o: 1, title: 'Sample', text: 'Logits at this request’s last position become a token: "Once". The whole batch is sampled together.' },
+    { at: 'update', tok: 1, c: 2, o: 1, title: 'update_from_output', text: 'The scheduler appends the token, checks stop conditions, and packages outputs for every request that produced a token this step.' },
+    { at: 'detok', tok: 1, c: 2, o: 1, title: 'First chunk out: TTFT', text: 'Back in the API process: detokenize incrementally, build the SSE chunk, write it. Your harness stamps time to first token here.' },
+    { at: 'fwd', tok: 7, c: 2, o: 1, title: 'Decode steps', text: 'Now the loop repeats with 1 token per step. The batch shape matches a captured CUDA graph, so the whole forward pass replays from one launch instead of hundreds.' },
+    { at: 'alloc', tok: 8, c: 2, o: 2, title: 'A block fills', text: 'The KV of 48 tokens (41 prompt + 7 fed back) fills 3 blocks exactly. Feeding the 8th token back in needs slot 49, so allocate_slots hands out a fourth block. Memory grows 16 tokens at a time and is never reserved up front.' },
+    { at: 'detok', tok: 256, c: 2, o: 17, title: 'Finish', text: 'Token 256: finish_reason "length". The final chunk carries usage, then [DONE]. Blocks go back to the free queue; the full ones keep their hashes, so the next request with this prefix can reuse them until they are evicted.' },
+  ];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="engine-journey"]').forEach((root) => {
+    const lanes = root.querySelector('.ej-lanes')!;
+    const dot = root.querySelector<SVGCircleElement>('.ej-dot')!;
+    const o = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const play = root.querySelector<HTMLButtonElement>('[data-a="play"]')!;
+    const mk = (tag: string, a: Record<string, string | number>, t?: string) => {
+      const e = document.createElementNS(NS, tag);
+      for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+      if (t) e.textContent = t;
+      return e;
+    };
+    LANES.forEach((l) => {
+      lanes.appendChild(mk('rect', { x: 4, y: l.y - 26, width: 472, height: 52, style: 'fill:var(--paper);stroke:var(--ink);stroke-width:1' }));
+      lanes.appendChild(mk('text', { x: 12, y: l.y - 12, style: 'font-size:9px;fill:var(--ink-3)' }, l.name));
+    });
+    lanes.appendChild(mk('text', { x: 12, y: 74, style: 'font-size:8.5px;fill:var(--blue)' }, 'ZMQ'));
+    lanes.appendChild(mk('text', { x: 12, y: 138, style: 'font-size:8.5px;fill:var(--blue)' }, 'RPC'));
+    const boxes: Record<string, SVGRectElement> = {};
+    for (const [id, [lane, x, label]] of Object.entries(ST)) {
+      const y = LANES[lane].y;
+      const r = mk('rect', { x: x - 38, y: y - 9, width: 76, height: 30, style: 'fill:var(--paper-2);stroke:var(--rule);stroke-width:1' }) as SVGRectElement;
+      lanes.appendChild(r);
+      boxes[id] = r;
+      lanes.appendChild(mk('text', { x, y: y + 15, 'text-anchor': 'middle', style: 'font-size:10px' }, label));
+    }
+
+    let i = 0;
+    let timer: number | undefined;
+    function render() {
+      const s = STEPS[i];
+      const [lane, x] = ST[s.at];
+      dot.setAttribute('cx', String(x + 30));
+      dot.setAttribute('cy', String(LANES[lane].y - 12));
+      for (const [id, r] of Object.entries(boxes))
+        r.setAttribute('style', id === s.at ? 'fill:var(--blue-fill);stroke:var(--blue);stroke-width:1.2' : 'fill:var(--paper-2);stroke:var(--rule);stroke-width:1');
+      o('n').textContent = `${i + 1} / ${STEPS.length}`;
+      o('tok').textContent = String(s.tok);
+      o('title').textContent = s.title;
+      o('text').textContent = s.text;
+      const b = o('blocks');
+      b.replaceChildren();
+      for (let k = 0; k < 20; k++) {
+        const e = document.createElement('i');
+        if (k < s.c) e.className = 'c';
+        else if (k < s.c + s.o) e.className = 'o';
+        b.appendChild(e);
+      }
+    }
+    const stop = () => {
+      if (timer) window.clearInterval(timer);
+      timer = undefined;
+      play.setAttribute('aria-pressed', 'false');
+      play.textContent = 'Play';
+    };
+    const go = (d: number) => { i = Math.max(0, Math.min(STEPS.length - 1, i + d)); render(); };
+    root.querySelector('[data-a="next"]')!.addEventListener('click', () => { stop(); go(1); });
+    root.querySelector('[data-a="prev"]')!.addEventListener('click', () => { stop(); go(-1); });
+    root.querySelector('[data-a="reset"]')!.addEventListener('click', () => { stop(); i = 0; render(); });
+    play.addEventListener('click', () => {
+      if (timer) return stop();
+      if (i === STEPS.length - 1) i = 0;
+      play.setAttribute('aria-pressed', 'true');
+      play.textContent = 'Pause';
+      render();
+      timer = window.setInterval(() => {
+        if (i >= STEPS.length - 1) return stop();
+        go(1);
+      }, 2200);
+    });
+    render();
+  });
+</script>

@@ -1,0 +1,36 @@
+---
+// Static: block hashes are chained. Each full block's key = H(parent key, its 16 token ids).
+// Two requests share three system-prompt blocks, then diverge. The partial tail is never cached.
+const BW = 112, GAP = 14, X0 = 20;
+const bx = (i: number) => X0 + i * (BW + GAP);
+const reqs = [
+  { name: 'REQUEST 1', y: 40, blocks: ['SYS 0-15', 'SYS 16-31', 'SYS 32-47', 'USER: WEATHER?'], keys: ['h1', 'h2', 'h3', 'h4'], marks: ['MISS', 'MISS', 'MISS', 'MISS'] },
+  { name: 'REQUEST 2', y: 170, blocks: ['SYS 0-15', 'SYS 16-31', 'SYS 32-47', 'USER: CODE?'], keys: ['h1', 'h2', 'h3', "h4'"], marks: ['HIT', 'HIT', 'HIT', 'MISS'] },
+];
+---
+<svg viewBox="0 0 640 300" role="img" aria-label="Chained block hashes for two requests that share a system prompt">
+  {reqs.map((r) => (
+    <g>
+      <text x="20" y={r.y - 10} class="strong">{r.name}</text>
+      {r.blocks.map((b, i) => (
+        <g>
+          <rect x={bx(i)} y={r.y} width={BW} height="30" class={i < 3 ? 'fill-wash' : 'fill-paper'} stroke-width="1" />
+          <text x={bx(i) + BW / 2} y={r.y + 19} text-anchor="middle" class="strong">{b}</text>
+          <text x={bx(i) + BW / 2} y={r.y + 52} text-anchor="middle" class={r.marks[i] === 'HIT' ? 'blue-t' : ''}>{`${r.keys[i]} · ${r.marks[i]}`}</text>
+          <line x1={bx(i) + BW / 2} y1={r.y + 30} x2={bx(i) + BW / 2} y2={r.y + 40} class="ink" stroke-width="1" />
+          {i > 0 && <line x1={bx(i - 1) + BW / 2 + 42} y1={r.y + 48} x2={bx(i) + BW / 2 - 42} y2={r.y + 48} class="blue" stroke-width="1" marker-end="url(#pxh-arrow)" />}
+        </g>
+      ))}
+      <rect x={bx(4)} y={r.y} width="74" height="30" class="fill-paper dash" stroke-width="1" />
+      <text x={bx(4) + 37} y={r.y + 19} text-anchor="middle">TAIL</text>
+      <text x={bx(4) + 37} y={r.y + 52} text-anchor="middle">NOT CACHED</text>
+    </g>
+  ))}
+  <defs>
+    <marker id="pxh-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" class="fill-blue" />
+    </marker>
+  </defs>
+  <text x="20" y="262">h1 = H(ROOT, tok 0-15)  h2 = H(h1, tok 16-31)  h3 = H(h2, tok 32-47)</text>
+  <text x="20" y="284" class="blue-t">A KEY NAMES A BLOCK AND ALL BEFORE IT. SAME TOKENS, NEW PAST: NEW KEY.</text>
+</svg>

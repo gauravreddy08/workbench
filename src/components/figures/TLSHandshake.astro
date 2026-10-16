@@ -1,0 +1,192 @@
+---
+// Step through a TLS 1.3 handshake. Two modes: a full first-time handshake, and resumption with 0-RTT
+// early data. Ink arrows are plaintext, blue arrows are encrypted with handshake keys, thick blue arrows
+// are application data. The panel says what each side knows and what an eavesdropper can read.
+---
+<div class="hsx" data-fig="tls-handshake">
+  <div class="ctl hsx-top">
+    <button class="btn" type="button" data-mode="full" aria-pressed="true">First visit (1-RTT)</button>
+    <button class="btn" type="button" data-mode="zero" aria-pressed="false">Return visit (0-RTT)</button>
+  </div>
+  <svg viewBox="0 0 360 330" role="img" aria-label="TLS 1.3 handshake sequence diagram" data-svg></svg>
+  <div class="ctl">
+    <button class="btn" type="button" data-back>Back</button>
+    <button class="btn" type="button" data-next>Next message</button>
+    <button class="btn" type="button" data-all>Show all</button>
+    <span class="label">msg <span class="readout" data-n>1</span> / <span data-total>8</span></span>
+  </div>
+  <div class="hsx-panel">
+    <div class="hsx-title" data-title></div>
+    <p data-what></p>
+    <dl>
+      <dt>Client has</dt><dd data-c></dd>
+      <dt>Server has</dt><dd data-s></dd>
+      <dt>Eve reads</dt><dd data-e></dd>
+    </dl>
+  </div>
+</div>
+
+<style>
+  .hsx svg { width: 100%; max-width: 520px; }
+  .hsx-top { margin: 0 0 10px; }
+  .hsx .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .hsx-panel { margin-top: 14px; border: 1px solid var(--rule); background: var(--paper); padding: 12px 14px; }
+  .hsx-title { font-family: var(--mono); font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--blue); }
+  .hsx-panel p { font-size: 15.5px; line-height: 1.5; margin: 6px 0 10px; color: var(--ink); }
+  .hsx-panel dl { display: grid; grid-template-columns: 92px 1fr; gap: 4px 12px; margin: 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.45; }
+  .hsx-panel dt { color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+  .hsx-panel dd { margin: 0; color: var(--ink-2); }
+  .hsx svg :global(.hsx-m) { transition: opacity 0.25s; }
+  .hsx svg :global(.hsx-m.off) { opacity: 0.08; }
+  .hsx svg :global(.hsx-m.now text) { fill: var(--blue); }
+  @media (prefers-reduced-motion: reduce) { .hsx svg :global(.hsx-m) { transition: none; } }
+</style>
+
+<script>
+  type Kind = 'plain' | 'hs' | 'app' | 'early';
+  interface Msg { dir: 'cs' | 'sc'; label: string; sub?: string; kind: Kind; title: string; what: string; c: string; s: string; e: string }
+
+  const FULL: Msg[] = [
+    { dir: 'cs', label: 'ClientHello', sub: '+ key_share, SNI', kind: 'plain', title: 'ClientHello',
+      what: 'The client says hello: a random number, the cipher suites and key-exchange groups it supports, the hostname it wants (SNI), and, guessing the server will accept X25519, its half of a Diffie-Hellman exchange already.',
+      c: 'its DH secret x, and public X = x·G', s: 'nothing yet', e: 'everything: hostname, cipher list, X' },
+    { dir: 'sc', label: 'ServerHello', sub: '+ key_share', kind: 'plain', title: 'ServerHello',
+      what: 'The server picks one cipher suite and sends its own DH half. Now both sides can compute the same shared secret, and from it (through HKDF) a pair of handshake keys. Everything after this message is encrypted.',
+      c: 'shared secret, handshake keys', s: 'its DH secret y, shared secret, handshake keys', e: 'X and Y, but not the shared secret' },
+    { dir: 'sc', label: '{EncryptedExtensions}', kind: 'hs', title: 'EncryptedExtensions',
+      what: 'The rest of the server\'s settings, such as which application protocol it chose (ALPN: h2 or http/1.1). Already encrypted, so a network observer can\'t read it.',
+      c: 'handshake keys', s: 'handshake keys', e: 'a record of some length, contents unreadable' },
+    { dir: 'sc', label: '{Certificate}', sub: 'leaf + intermediates', kind: 'hs', title: 'Certificate',
+      what: 'The server\'s certificate chain: "this public key belongs to example.com", signed by a certificate authority. In TLS 1.3 this is encrypted, so Eve can\'t even see which certificate was sent (in TLS 1.2 she could).',
+      c: 'server\'s public key, chain to check against its root store', s: 'its long-term private key (never sent)', e: 'a few KB of ciphertext' },
+    { dir: 'sc', label: '{CertificateVerify}', sub: 'signature over transcript', kind: 'hs', title: 'CertificateVerify',
+      what: 'The server signs a hash of every handshake message so far with the private key that matches the certificate. This is the step that defeats a man in the middle: only the real owner of that key could sign this exact conversation, including both DH halves.',
+      c: 'proof the server holds the cert\'s private key', s: 'same', e: 'ciphertext' },
+    { dir: 'sc', label: '{Finished}', sub: 'HMAC over transcript', kind: 'hs', title: 'Server Finished',
+      what: 'An HMAC of the whole transcript under a key derived from the handshake secret. If anyone tampered with any earlier message (say, deleting the strong cipher suites from the ClientHello), the two sides\' transcripts differ and this check fails.',
+      c: 'can now derive application keys', s: 'application keys', e: 'ciphertext' },
+    { dir: 'cs', label: '{Finished} + [GET /]', kind: 'app', title: 'Client Finished, then data',
+      what: 'The client checks the certificate chain, the signature and the server Finished, sends its own Finished, and in the same flight its first request, encrypted with the application keys. One round trip after it started.',
+      c: 'application keys', s: 'application keys', e: 'IPs, ports, record sizes and timing. Not the URL, headers or body.' },
+    { dir: 'sc', label: '[200 OK ...]', kind: 'app', title: 'Application data',
+      what: 'The response. From here on it is just AES-GCM (or ChaCha20-Poly1305) records in both directions. The DH secrets x and y can now be deleted, which is what gives forward secrecy. The server also sends a session ticket for next time.',
+      c: 'app keys, session ticket for resumption', s: 'app keys', e: 'sizes and timing only' },
+  ];
+
+  const ZERO: Msg[] = [
+    { dir: 'cs', label: 'ClientHello', sub: '+ key_share + PSK + early_data', kind: 'plain', title: 'ClientHello with a ticket',
+      what: 'Second visit. The client still sends a fresh DH half, plus the session ticket the server gave it last time (a pre-shared key, PSK), and says it will send early data.',
+      c: 'PSK from last visit, new DH secret x', s: 'its ticket key (it can decrypt the ticket)', e: 'hostname, X, an opaque ticket' },
+    { dir: 'cs', label: '(GET /)', sub: 'early data, PSK key', kind: 'early', title: '0-RTT early data',
+      what: 'In the same first flight, before hearing anything back, the client sends its request, encrypted with a key derived from the PSK alone. Zero round trips of waiting. The catch: anyone who recorded this flight can send it to the server again, and the server cannot tell it\'s a copy. So only send idempotent requests (a GET, never "transfer $100") as early data.',
+      c: 'early-data key (from PSK only)', s: 'early-data key once it reads the ticket', e: 'ciphertext, which she can replay' },
+    { dir: 'sc', label: 'ServerHello', sub: '+ PSK + key_share', kind: 'plain', title: 'ServerHello accepts the PSK',
+      what: 'The server accepts the ticket and sends its own DH half. The new handshake keys mix the PSK and a fresh DH result, so the rest of the connection still gets forward secrecy. Early data does not.',
+      c: 'handshake keys (PSK + fresh DH)', s: 'same', e: 'X and Y' },
+    { dir: 'sc', label: '{EncryptedExtensions}', sub: 'early_data accepted', kind: 'hs', title: 'Early data accepted',
+      what: 'No Certificate and no CertificateVerify this time: knowing the PSK already proves the server is the one you talked to before.',
+      c: 'handshake keys', s: 'handshake keys', e: 'ciphertext' },
+    { dir: 'sc', label: '{Finished}', kind: 'hs', title: 'Server Finished',
+      what: 'Same transcript HMAC as before.', c: 'can derive app keys', s: 'app keys', e: 'ciphertext' },
+    { dir: 'sc', label: '[200 OK ...]', kind: 'app', title: 'Response',
+      what: 'The server can answer the early request right away, so the response arrives after one round trip instead of two.',
+      c: 'response to its 0-RTT request', s: 'app keys', e: 'sizes and timing' },
+    { dir: 'cs', label: '{EndOfEarlyData} {Finished}', kind: 'hs', title: 'Client finishes',
+      what: 'The client marks the end of early data and sends Finished. Later requests use the full-strength application keys.',
+      c: 'app keys', s: 'app keys', e: 'ciphertext' },
+  ];
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const CX = 44, SX = 316, TOP = 40, ROW = 40, DROP = 12;
+
+  function el(name: string, attrs: Record<string, string | number>, text?: string) {
+    const n = document.createElementNS(NS, name);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+    if (text) n.textContent = text;
+    return n;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="tls-handshake"]').forEach((root, idx) => {
+    const svg = root.querySelector<SVGSVGElement>('[data-svg]')!;
+    const $ = (s: string) => root.querySelector<HTMLElement>(s)!;
+    let msgs = FULL;
+    let step = 0;
+    const mid = `hsx-${idx}`;
+
+    function draw() {
+      svg.replaceChildren();
+      const h = TOP + msgs.length * ROW + 40;
+      svg.setAttribute('viewBox', `0 0 360 ${h}`);
+      const defs = el('defs', {});
+      for (const [name, cls] of [['ink', 'ink'], ['blue', 'fill-blue']] as const) {
+        const m = el('marker', { id: `${mid}-${name}`, viewBox: '0 0 10 10', refX: 9, refY: 5, markerWidth: 7, markerHeight: 7, orient: 'auto-start-reverse' });
+        const path = el('path', { d: 'M0,0 L10,5 L0,10 z' });
+        if (cls === 'ink') path.setAttribute('style', 'fill:var(--ink)'); else path.setAttribute('class', 'fill-blue');
+        m.appendChild(path); defs.appendChild(m);
+      }
+      svg.appendChild(defs);
+      svg.appendChild(el('text', { x: CX, y: 16, 'text-anchor': 'middle', class: 'strong' }, 'CLIENT'));
+      svg.appendChild(el('text', { x: SX, y: 16, 'text-anchor': 'middle', class: 'strong' }, 'SERVER'));
+      svg.appendChild(el('line', { x1: CX, y1: 24, x2: CX, y2: h - 10, class: 'ink', 'stroke-width': 1 }));
+      svg.appendChild(el('line', { x1: SX, y1: 24, x2: SX, y2: h - 10, class: 'ink', 'stroke-width': 1 }));
+
+      msgs.forEach((m, i) => {
+        const g = el('g', { class: 'hsx-m', 'data-i': i });
+        const y = TOP + i * ROW;
+        const ly = y + (m.sub ? 26 : 14);
+        const [x1, x2] = m.dir === 'cs' ? [CX, SX] : [SX, CX];
+        const blue = m.kind !== 'plain';
+        const line = el('line', {
+          x1, y1: ly, x2: x2 + (m.dir === 'cs' ? -2 : 2), y2: ly + DROP,
+          class: blue ? 'blue' : 'ink',
+          'stroke-width': m.kind === 'app' || m.kind === 'early' ? 2.4 : 1.2,
+          'marker-end': `url(#${mid}-${blue ? 'blue' : 'ink'})`,
+        });
+        if (m.kind === 'early') line.setAttribute('stroke-dasharray', '5 3');
+        g.appendChild(line);
+        const tx = (CX + SX) / 2;
+        g.appendChild(el('text', { x: tx, y: y + 6, 'text-anchor': 'middle', class: blue ? 'blue-t' : 'strong' }, m.label));
+        if (m.sub) g.appendChild(el('text', { x: tx, y: y + 18, 'text-anchor': 'middle' }, m.sub));
+        svg.appendChild(g);
+      });
+
+      // Round-trip brackets on the client side.
+      const appIdx = msgs.findIndex((m) => m.kind === 'app' && m.dir === 'sc');
+      const yA = TOP + 26;
+      const yB = msgs === FULL ? TOP + (appIdx - 1) * ROW + 14 : TOP + appIdx * ROW + 14 + DROP;
+      const bx = 22;
+      svg.appendChild(el('path', { d: `M${bx + 6},${yA} H${bx} V${yB} H${bx + 6}`, class: 'blue', 'stroke-width': 1 }));
+      const lbl = el('text', { x: 12, y: (yA + yB) / 2, 'text-anchor': 'middle', class: 'blue-t', transform: `rotate(-90 12 ${(yA + yB) / 2})` },
+        msgs === FULL ? '1 RTT TO FIRST REQUEST' : '1 RTT TO FIRST RESPONSE');
+      svg.appendChild(lbl);
+      $('[data-total]').textContent = String(msgs.length);
+    }
+
+    function render() {
+      svg.querySelectorAll<SVGGElement>('.hsx-m').forEach((g) => {
+        const i = +g.dataset.i!;
+        g.classList.toggle('off', i > step);
+        g.classList.toggle('now', i === step);
+      });
+      const m = msgs[Math.min(step, msgs.length - 1)];
+      $('[data-title]').textContent = `${Math.min(step, msgs.length - 1) + 1}. ${m.title}`;
+      $('[data-what]').textContent = m.what;
+      $('[data-c]').textContent = m.c;
+      $('[data-s]').textContent = m.s;
+      $('[data-e]').textContent = m.e;
+      $('[data-n]').textContent = String(Math.min(step, msgs.length - 1) + 1);
+      (root.querySelector('[data-back]') as HTMLButtonElement).disabled = step === 0;
+      (root.querySelector('[data-next]') as HTMLButtonElement).disabled = step >= msgs.length - 1;
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b) => b.addEventListener('click', () => {
+      msgs = b.dataset.mode === 'zero' ? ZERO : FULL;
+      root.querySelectorAll('[data-mode]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      step = 0; draw(); render();
+    }));
+    root.querySelector('[data-next]')!.addEventListener('click', () => { step = Math.min(step + 1, msgs.length - 1); render(); });
+    root.querySelector('[data-back]')!.addEventListener('click', () => { step = Math.max(step - 1, 0); render(); });
+    root.querySelector('[data-all]')!.addEventListener('click', () => { step = msgs.length - 1; render(); });
+    draw(); render();
+  });
+</script>

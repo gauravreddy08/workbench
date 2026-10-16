@@ -1,0 +1,767 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import TokTrainer from '../components/figures/TokTrainer.astro';
+import TokMerges from '../components/figures/TokMerges.astro';
+
+## Today
+
+- Say what a token actually is, in one sentence, and why models use neither letters nor whole words.
+- Explain UTF-8 well enough to see why a byte-level tokenizer can never meet a character it doesn't know.
+- Train a byte-pair encoding (BPE) tokenizer from scratch, encode and decode with it, and prove it round-trips any Unicode string.
+- Load GPT-2's real merge table into your own encoder and match `tiktoken` token for token.
+- Explain, with numbers you measured, why tokens drive your bill and context window, why models fumble spelling and long arithmetic, and why the same sentence costs several times more in Telugu than in English.
+
+Prerequisites: Python, and the idea of an embedding table from your GPT-2 build. No ML theory needed. Rough time: one evening for the core build, a second for the comparisons and the failure hunt. Everything runs on your Mac; the Spark is only needed if you want to run a local model in the last task.
+
+## The Problem
+
+You have built GPT-2 from scratch. The first line of your model was `nn.Embedding(50257, 768)`. Where did 50,257 come from? You probably took it from the paper and moved on, because the model starts at token IDs and the tokenizer was somebody else's library.
+
+Here is what that library decides for you. Paste this into a terminal with `tiktoken` installed:
+
+```python
+import tiktoken
+enc = tiktoken.get_encoding("cl100k_base")   # GPT-4's tokenizer
+print(enc.encode(" strawberry"))              # [73700]
+print(enc.encode("strawberry"))               # [496, 675, 15717]
+```
+
+The same word is one token with a space in front of it and three tokens without. The model never sees the letters s-t-r-a-w-b-e-r-r-y. It sees the number 73700, an ID with no letters inside it. Then people ask it how many r's are in strawberry and are surprised when it guesses.
+
+Now the part that touches you directly. I took Article 1 of the Universal Declaration of Human Rights, in English, Hindi and Telugu, and counted tokens. In English it is 33 tokens for GPT-2, GPT-4 and GPT-4o alike. In Telugu it is 429 tokens for GPT-2, 279 for GPT-4, 78 for GPT-4o. Same meaning. If you paid per token, a Telugu speaker using GPT-4 paid about eight times what you paid, and got an eighth of the context window to work with.
+
+Cost, context length, spelling, arithmetic, fairness across languages, even a few famous bugs where a model goes haywire on one specific word: all of them come from one small, unglamorous preprocessing step. Let's open it up.
+
+<Origin year="1994 / 2016" title="A compression trick, rescued for translation">
+
+In February 1994, Philip Gage published "A New Algorithm for Data Compression" in *The C Users Journal*. The idea fit in a paragraph: find the most common pair of adjacent bytes in a file, replace every occurrence with a byte value the file doesn't use, write down the substitution, and repeat until no pair is common enough to be worth it. He called it byte pair encoding. It was simple and fast to decompress, and then, like most compression schemes, it was mostly forgotten.
+
+Twenty years later, neural machine translation had a vocabulary problem. Models picked the 30,000 to 50,000 most common words and mapped everything else to a single "unknown" symbol. Names, rare words and compounds (German loves compounds) all came out as unknown, so the translator literally could not translate them. In 2015 Rico Sennrich, Barry Haddow and Alexandra Birch at Edinburgh posted "Neural Machine Translation of Rare Words with Subword Units" (published at ACL 2016). They took Gage's loop and ran it on characters inside words instead of bytes in a file. Frequent words ended up as one symbol, rare words as a few familiar pieces, and nothing was ever unknown. In 2019, GPT-2 moved the same loop back down to raw bytes, which is where nearly every large model's tokenizer lives today.
+
+</Origin>
+
+## The Idea
+
+### A token is an ID for a chunk of text
+
+A neural network only eats numbers. To feed it text you need two things: a way to cut the text into pieces, and a fixed list that gives every possible piece a number. The piece is a <Term w="token">One chunk of text that the model treats as a single unit, and the integer ID that stands for it. Could be a letter, a word, part of a word, a space, or a few raw bytes.</Term>. The fixed list is the <Term w="vocabulary">The complete, fixed list of tokens a model knows, each with an ID from 0 to V-1. Its size V is decided before training and baked into the model's first and last layers.</Term>. The program that does the cutting and the numbering, in both directions, is the <Term w="tokenizer">The program that turns text into a list of token IDs (encoding) and token IDs back into text (decoding). It's trained separately from the model, before the model exists.</Term>.
+
+Each ID then picks a row from the embedding table you built in GPT-2: a learned vector of 768 numbers. That is the only thing the model ever knows about the token. If the token is " strawberry", the model knows one vector. It doesn't know that vector was spelled with three r's unless it learned that fact from seeing the word spelled out somewhere in training.
+
+So the real question is: where should the cuts go?
+
+### Why not letters? Why not words?
+
+Try the two obvious answers.
+
+**Letters.** The vocabulary is tiny (a few hundred symbols covers most of the world's alphabets, if you're careful) and nothing is ever unknown. But sequences get long. English averages a bit under 4 characters per GPT-4 token on typical prose (you'll measure it), so a character-level model sees each text as roughly 4 times as many positions. Your context window holds 4 times less text. Every generated letter costs a full forward pass, so generation is about 4 times slower. And attention compares every position with every other position, so its cost grows with the square of the length: 4 times longer is about 16 times more attention work. The model also spends its capacity relearning, over and over, that t-h-e is a word.
+
+**Words.** Sequences are short, and each token carries a whole meaning. But how many words are there? I counted the distinct words in the prose of this site's own lessons, about 1.3 MB of text: 9,538 different words, and 3,252 of them appeared exactly once. Count only the first half of the text and you get 6,776, so the list was still growing fast when the text ran out. Real web text has every name, typo, number, URL, hashtag, and every form of every word ("tokenize", "tokenizes", "tokenizing", "tokenizer", "tokenizers"). A word vocabulary that covers it has millions of entries, and each one needs its own row in the embedding table, trained from however few times that word appeared. Whatever doesn't make the list becomes an <Term w="unknown token">A single placeholder, often written [UNK], used for any piece of text that isn't in the vocabulary. Its meaning is lost: every unknown word maps to the same vector.</Term>, and its meaning is gone.
+
+<Figure n="001" title="WHERE TO CUT" caption="The same sentence at three granularities. Characters never fail but make long sequences; words make short sequences but drop anything not in the list; subwords keep common words whole and build rare ones from known parts.">
+
+<svg viewBox="0 0 640 250" role="img" aria-label="One sentence split three ways">
+<text x="0" y="14" class="strong">CHARACTERS</text><text x="640" y="14" text-anchor="end" class="blue-t">35 PIECES, VOCAB ~100s</text>
+<rect x="0.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="8.0" y="39" text-anchor="middle" class="strong">T</text>
+<rect x="17.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="25.6" y="39" text-anchor="middle" class="strong">o</text>
+<rect x="35.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="43.2" y="39" text-anchor="middle" class="strong">k</text>
+<rect x="52.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="60.8" y="39" text-anchor="middle" class="strong">e</text>
+<rect x="70.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="78.4" y="39" text-anchor="middle" class="strong">n</text>
+<rect x="88.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="96.0" y="39" text-anchor="middle" class="strong">i</text>
+<rect x="105.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="113.6" y="39" text-anchor="middle" class="strong">z</text>
+<rect x="123.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="131.2" y="39" text-anchor="middle" class="strong">e</text>
+<rect x="140.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="148.8" y="39" text-anchor="middle" class="strong">r</text>
+<rect x="158.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="166.4" y="39" text-anchor="middle" class="strong">s</text>
+<rect x="176.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="184.0" y="39" text-anchor="middle" class="strong">·</text>
+<rect x="193.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="201.6" y="39" text-anchor="middle" class="strong">a</text>
+<rect x="211.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="219.2" y="39" text-anchor="middle" class="strong">r</text>
+<rect x="228.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="236.8" y="39" text-anchor="middle" class="strong">e</text>
+<rect x="246.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="254.4" y="39" text-anchor="middle" class="strong">·</text>
+<rect x="264.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="272.0" y="39" text-anchor="middle" class="strong">u</text>
+<rect x="281.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="289.6" y="39" text-anchor="middle" class="strong">n</text>
+<rect x="299.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="307.2" y="39" text-anchor="middle" class="strong">b</text>
+<rect x="316.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="324.8" y="39" text-anchor="middle" class="strong">e</text>
+<rect x="334.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="342.4" y="39" text-anchor="middle" class="strong">l</text>
+<rect x="352.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="360.0" y="39" text-anchor="middle" class="strong">i</text>
+<rect x="369.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="377.6" y="39" text-anchor="middle" class="strong">e</text>
+<rect x="387.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="395.2" y="39" text-anchor="middle" class="strong">v</text>
+<rect x="404.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="412.8" y="39" text-anchor="middle" class="strong">a</text>
+<rect x="422.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="430.4" y="39" text-anchor="middle" class="strong">b</text>
+<rect x="440.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="448.0" y="39" text-anchor="middle" class="strong">l</text>
+<rect x="457.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="465.6" y="39" text-anchor="middle" class="strong">y</text>
+<rect x="475.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="483.2" y="39" text-anchor="middle" class="strong">·</text>
+<rect x="492.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="500.8" y="39" text-anchor="middle" class="strong">u</text>
+<rect x="510.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="518.4" y="39" text-anchor="middle" class="strong">s</text>
+<rect x="528.0" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="536.0" y="39" text-anchor="middle" class="strong">e</text>
+<rect x="545.6" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="553.6" y="39" text-anchor="middle" class="strong">f</text>
+<rect x="563.2" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="571.2" y="39" text-anchor="middle" class="strong">u</text>
+<rect x="580.8" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="588.8" y="39" text-anchor="middle" class="strong">l</text>
+<rect x="598.4" y="24" width="16" height="22" class="fill-paper" stroke-width="1" /><text x="606.4" y="39" text-anchor="middle" class="strong">.</text>
+<text x="0" y="96" class="strong">WORDS</text><text x="640" y="96" text-anchor="end" class="blue-t">5 PIECES, VOCAB MILLIONS</text>
+<rect x="0.0" y="106" width="45.5" height="22" class="fill-paper" stroke-width="1" />
+<text x="22.8" y="121" text-anchor="middle" class="strong">[UNK]</text>
+<rect x="48.5" y="106" width="31.3" height="22" class="fill-paper" stroke-width="1" />
+<text x="64.2" y="121" text-anchor="middle" class="strong">are</text>
+<rect x="82.8" y="106" width="95.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="130.4" y="121" text-anchor="middle" class="strong">unbelievably</text>
+<rect x="181.0" y="106" width="52.6" height="22" class="fill-paper" stroke-width="1" />
+<text x="207.3" y="121" text-anchor="middle" class="strong">useful</text>
+<rect x="236.6" y="106" width="17.1" height="22" class="fill-paper" stroke-width="1" />
+<text x="245.2" y="121" text-anchor="middle" class="strong">.</text>
+<rect x="0" y="106" width="45.5" height="22" class="fill-wash" stroke-width="1" /><text x="22.7" y="121" text-anchor="middle" class="blue-t">[UNK]</text>
+<text x="0" y="146">"TOKENIZERS" WAS NOT IN THE WORD LIST: ITS MEANING IS GONE</text>
+<text x="0" y="188" class="strong">SUBWORDS (GPT-4, CL100K)</text><text x="640" y="188" text-anchor="end" class="blue-t">7 PIECES, VOCAB 100K</text>
+<rect x="0.0" y="198" width="45.5" height="22" class="fill-wash" stroke-width="1" />
+<text x="22.8" y="213" text-anchor="middle" class="strong">Token</text>
+<rect x="48.5" y="198" width="45.5" height="22" class="fill-wash" stroke-width="1" />
+<text x="71.2" y="213" text-anchor="middle" class="strong">izers</text>
+<rect x="97.0" y="198" width="38.4" height="22" class="fill-wash" stroke-width="1" />
+<text x="116.2" y="213" text-anchor="middle" class="strong">·are</text>
+<rect x="138.4" y="198" width="66.8" height="22" class="fill-wash" stroke-width="1" />
+<text x="171.8" y="213" text-anchor="middle" class="strong">·unbelie</text>
+<rect x="208.2" y="198" width="45.5" height="22" class="fill-wash" stroke-width="1" />
+<text x="230.9" y="213" text-anchor="middle" class="strong">vably</text>
+<rect x="256.7" y="198" width="59.7" height="22" class="fill-wash" stroke-width="1" />
+<text x="286.6" y="213" text-anchor="middle" class="strong">·useful</text>
+<rect x="319.4" y="198" width="17.1" height="22" class="fill-wash" stroke-width="1" />
+<text x="327.9" y="213" text-anchor="middle" class="strong">.</text>
+<text x="0" y="238">COMMON WORDS STAY WHOLE, RARE ONES SPLIT INTO KNOWN PARTS</text>
+</svg>
+
+</Figure>
+
+**Subwords** are the compromise. Keep common words whole (" are", " useful"), and break rare words into pieces you've seen many times ("Token" + "izers"). The sequence stays short for normal text, the vocabulary stays a manageable size, and any word can be built from parts. The question becomes how to choose the pieces, and BPE's answer is: let the data decide, by merging whatever appears together most often.
+
+But before merging anything, we need to decide what the smallest piece is. Letters sound natural. They are a trap.
+
+### Bytes, and why "letters" is the wrong floor
+
+Text in a computer is stored as numbers. The international standard, <Term w="Unicode">The standard that gives every character in every writing system a number, called a code point, written like U+0C05 (Telugu letter A). About 150,000 characters are assigned so far, including emoji.</Term>, gives every character a number called a code point. "a" is U+0061. Telugu "అ" is U+0C05. 😀 is U+1F600.
+
+Code points go up to about 1.1 million, so they don't fit in one byte. The standard way to store them as bytes is <Term w="UTF-8">The way almost all text on the web and on disk is stored: each Unicode character becomes 1 to 4 bytes. Plain English letters are 1 byte each, so ASCII text is already valid UTF-8.</Term>, which uses a clever variable-length scheme: 1 byte for plain English letters, 2 for most accented Latin, Greek, Cyrillic, Arabic and Hebrew letters, 3 for most other scripts (Hindi, Telugu, Chinese, Japanese), and 4 for emoji and rarer characters.
+
+<Predict id="utf8-bytes">
+
+How many bytes is the Telugu word "తెలుగు" in UTF-8? It looks like 3 letters to a reader. Guess before you run `len("తెలుగు".encode())`.
+
+<Fragment slot="answer">
+
+18 bytes. What a reader sees as 3 letters is 6 code points: త + ె (a vowel sign), ల + ు, గ + ు. Telugu writes vowels as marks attached to the consonant, and each mark is its own code point. Each code point is 3 bytes. So 6 × 3 = 18. Hindi works the same way. This is the first reason Indian languages are expensive: before any tokenizer touches them, they are already about 3 times as many bytes per character as English.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="002" title="UTF-8: ONE CHARACTER, 1 TO 4 BYTES" caption="The first byte's leading bits say how long the character is; every continuation byte starts with 10. So you can always tell where a character begins, even if you land in the middle of one.">
+
+<svg viewBox="0 0 640 236" role="img" aria-label="Characters encoded as one to four UTF-8 bytes">
+<text x="0" y="14" class="strong">CHAR</text><text x="60" y="14" class="strong">CODE POINT</text><text x="170" y="14" class="strong">UTF-8 BYTES (HEX, THEN BITS)</text>
+<text x="12" y="58" font-size="20" class="strong">a</text><text x="60" y="56">U+0061</text>
+<rect x="170" y="34" width="108" height="36" class="fill-paper" stroke-width="1" />
+<text x="224" y="49" text-anchor="middle" class="strong">61</text><text x="224" y="63" text-anchor="middle" font-size="9.5">01100001</text>
+<text x="640" y="56" text-anchor="end" class="blue-t">1 B</text>
+<text x="12" y="106" font-size="20" class="strong">é</text><text x="60" y="104">U+00E9</text>
+<rect x="170" y="82" width="108" height="36" class="fill-paper" stroke-width="1" />
+<text x="224" y="97" text-anchor="middle" class="strong">C3</text><text x="224" y="111" text-anchor="middle" font-size="9.5">110 00011</text>
+<rect x="284" y="82" width="108" height="36" class="fill-wash" stroke-width="1" />
+<text x="338" y="97" text-anchor="middle" class="strong">A9</text><text x="338" y="111" text-anchor="middle" font-size="9.5">10 101001</text>
+<text x="640" y="104" text-anchor="end" class="blue-t">2 B</text>
+<text x="12" y="154" font-size="20" class="strong">అ</text><text x="60" y="152">U+0C05</text>
+<rect x="170" y="130" width="108" height="36" class="fill-paper" stroke-width="1" />
+<text x="224" y="145" text-anchor="middle" class="strong">E0</text><text x="224" y="159" text-anchor="middle" font-size="9.5">1110 0000</text>
+<rect x="284" y="130" width="108" height="36" class="fill-wash" stroke-width="1" />
+<text x="338" y="145" text-anchor="middle" class="strong">B0</text><text x="338" y="159" text-anchor="middle" font-size="9.5">10 110000</text>
+<rect x="398" y="130" width="108" height="36" class="fill-wash" stroke-width="1" />
+<text x="452" y="145" text-anchor="middle" class="strong">85</text><text x="452" y="159" text-anchor="middle" font-size="9.5">10 000101</text>
+<text x="640" y="152" text-anchor="end" class="blue-t">3 B</text>
+<text x="12" y="202" font-size="20" class="strong">😀</text><text x="60" y="200">U+1F600</text>
+<rect x="170" y="178" width="108" height="36" class="fill-paper" stroke-width="1" />
+<text x="224" y="193" text-anchor="middle" class="strong">F0</text><text x="224" y="207" text-anchor="middle" font-size="9.5">11110 000</text>
+<rect x="284" y="178" width="108" height="36" class="fill-wash" stroke-width="1" />
+<text x="338" y="193" text-anchor="middle" class="strong">9F</text><text x="338" y="207" text-anchor="middle" font-size="9.5">10 011111</text>
+<rect x="398" y="178" width="108" height="36" class="fill-wash" stroke-width="1" />
+<text x="452" y="193" text-anchor="middle" class="strong">98</text><text x="452" y="207" text-anchor="middle" font-size="9.5">10 011000</text>
+<rect x="512" y="178" width="108" height="36" class="fill-wash" stroke-width="1" />
+<text x="566" y="193" text-anchor="middle" class="strong">80</text><text x="566" y="207" text-anchor="middle" font-size="9.5">10 000000</text>
+<text x="640" y="200" text-anchor="end" class="blue-t">4 B</text>
+<text x="0" y="230">FIRST BYTE SAYS HOW MANY FOLLOW (0, 110, 1110, 11110); EVERY FOLLOWER STARTS 10</text>
+</svg>
+
+</Figure>
+
+Now the key move. If the smallest unit is a character, your base vocabulary needs every Unicode character (about 150,000), and a character you didn't include is unknown. If the smallest unit is a **byte**, the base vocabulary is exactly 256 entries, the values 0 to 255, and every possible string, in any language, any emoji, even corrupt binary junk, is some sequence of bytes. Nothing can ever be unknown. This is <Term w="byte-level BPE">BPE that starts from the 256 possible byte values instead of from characters. Introduced for GPT-2 (2019). Any input can be encoded, so there is no unknown token.</Term>, and it's what GPT-2, GPT-4, Llama 3, Qwen and most other recent models use.
+
+The cost: before merges, a byte-level tokenizer sees "తెలుగు" as 18 tokens. Everything now depends on which merges it learned.
+
+### BPE training: count pairs, merge the winner, repeat
+
+Here's the whole algorithm.
+
+1. Turn the training text into a list of byte values. These are your starting tokens, IDs 0 to 255.
+2. Count every adjacent pair of tokens in the text. (In "hello", the pairs are h-e, e-l, l-l, l-o.)
+3. Take the most frequent pair. Give it a new ID, 256. Replace every occurrence of that pair in the text with 256. Write down the rule: (a, b) → 256. That rule is a <Term w="merge">One learned rule of the form "when token a is followed by token b, replace both with the new token c". A BPE tokenizer is nothing more than 256 byte tokens plus an ordered list of merges.</Term>.
+4. Go back to step 2. Now the new token can itself be part of a pair. Stop when you've added as many tokens as you want.
+
+The vocabulary size is a knob you choose: 256 + number of merges. GPT-2 did 50,000 merges (plus one special token, which is how you get 50,257). The output of training is just the ordered list of merges. That's the tokenizer.
+
+Step through it by hand. The corpus below is the toy example from Sennrich's paper: "low" 5 times, "lower" twice, "newest" 6 times, "widest" 3 times. It uses letters instead of bytes so you can read it, and it treats each word separately (more on why soon).
+
+<Predict id="first-merge">
+
+Before you click: which pair gets merged first, and which second?
+
+<Fragment slot="answer">
+
+"e + s" first (6 from newest, 3 from widest = 9), tied with "s + t" (also 9); the tie goes to the pair seen first. Then "es + t" → "est" (9 again), since every "es" was followed by "t". Then "l + o" (7). The tokenizer has discovered the English suffix "-est" without anyone telling it what a suffix is, just because it's frequent.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="003" title="TRAIN BPE BY HAND" caption="Each click counts adjacent pairs (weighted by word frequency), merges the most common one everywhere, and records the rule. Edit the corpus to try your own words.">
+
+<TokTrainer />
+
+</Figure>
+
+Notice two things. The total number of symbols drops with each merge: that's compression, and it's literally what Gage built it for. And the merges are learned **in order**, and that order matters when you use them.
+
+### Encoding: replay the merges in the order they were learned
+
+Training happens once, on a big corpus. Encoding happens every time someone sends text. To encode a new string:
+
+1. Turn it into bytes.
+2. Look at every adjacent pair. Among the pairs that have a merge rule, find the one whose rule was learned **earliest** (lowest merge number).
+3. Apply that merge everywhere in the string. Repeat until no adjacent pair has a rule.
+
+Why earliest, not "most frequent in this string"? Because later merges were learned on text where the earlier merges had already been applied. Merge #500 might be (" th", "ink"); the token " th" only exists because merge #12 created it. Replaying in training order reproduces exactly the pieces the model saw during training. Pick a different order and you'll still decode back to the right text, but you'll produce token sequences the model has never seen, and it will behave worse. (You'll make this mistake on purpose in Break It.)
+
+Decoding is the easy direction: look up each ID's bytes, concatenate, and decode the bytes as UTF-8. Keep that "concatenate first, decode after" in mind. It comes back to bite in Break It.
+
+Now watch it happen on real text. The figure below holds 1,024 merges I trained, byte-level, on the prose of this site's own lessons (about 1.3 MB). Type anything. Drag the slider from 0 merges (every byte its own token) upward and watch the pieces fuse.
+
+<Figure n="004" title="MERGES, ONE AT A TIME" caption="Raw bytes that aren't a whole character are shown as hex. The filled token is the one created by the most recent merge. Try the Telugu preset: these merges were learned from English, so Telugu stays at one token per byte no matter how far you slide." wide>
+
+<TokMerges />
+
+</Figure>
+
+<Predict id="slider">
+
+With the English preset (65 bytes), how many tokens do you expect at 1,024 merges? And for the Telugu preset (76 bytes)?
+
+<Fragment slot="answer">
+
+English drops from 65 tokens to 23, about 2.8 bytes per token. Words this site uses a lot, like " token", " bytes" and " then", become single tokens; " merges" is still four pieces, because 1,024 merges isn't enough to reach it. The first merges are things like " t", " a", "he", "er", "in", " the": the most common pairs in English. Telugu doesn't move at all (76 bytes, 76 tokens): the training text contained essentially no Telugu, so there is not a single merge for Telugu byte pairs, and every byte stays its own token. That's the multilingual problem in miniature. A tokenizer is a compression scheme tuned to its training data, and it compresses whatever it saw a lot of.
+
+</Fragment>
+
+</Predict>
+
+### Pre-tokenization: fences that merges can't cross
+
+If you run BPE on raw text with no boundaries, it will happily learn merges that span words. I tried it on 150 KB of this site's prose: within 300 merges it had learned tokens like "e the ", "of the ", "is the ", "s. " and ".\n- **". That wastes vocabulary on accidental phrases, and it means "dog." "dog!" "dog?" and "dog " all end up as different, unrelated tokens.
+
+So before BPE runs, text is chopped into chunks by a regular expression, and merges only happen inside a chunk. This is <Term w="pre-tokenization">A first pass that splits text into chunks (roughly: words, numbers, punctuation runs, whitespace) with a regex, before BPE runs. Merges are never allowed to cross a chunk boundary.</Term>. GPT-2's pattern is:
+
+```text
+'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+```
+
+Read it as alternatives, tried left to right: common English contractions; an optional space then a run of letters (`\p{L}` is "any letter in any script"); an optional space then a run of digits; an optional space then a run of punctuation; then whitespace. The `\s+(?!\S)` part grabs a run of spaces but leaves the last one to attach to the next word. That's why the space lives at the *front* of a word in GPT-style tokenizers: " strawberry" is one chunk, and "strawberry" at the start of a line is a different chunk, which is exactly the one-token-vs-three-tokens surprise from the start of this lesson.
+
+GPT-4's `cl100k_base` pattern made a few deliberate changes. Contractions are case-insensitive. Runs of digits are cut into groups of **at most three** (`\p{N}{1,3}`). Newlines get their own handling, so code indentation compresses. Here's what the two patterns do to one line, measured with `tiktoken`'s own patterns:
+
+```text
+input: "Hello world, it's 2026!!   x=1234567\n    return"
+gpt2:   'Hello' ' world' ',' ' it' "'s" ' 2026' '!!' '  ' ' x' '=' '1234567' '\n   ' ' return'
+cl100k: 'Hello' ' world' ',' ' it' "'s" ' ' '202' '6' '!!' '  ' ' x' '=' '123' '456' '7' '\n' '   ' ' return'
+```
+
+Small regex choices, big consequences. Hold on to the digit grouping; it explains a lot about arithmetic.
+
+### Special tokens and chat templates
+
+Some tokens never come from text at all. A <Term w="special token">A token added to the vocabulary by hand, not learned by BPE, used as a control signal: end of document, start of a message, padding. Ordinary text should never be able to produce it.</Term> is a reserved ID with a job. GPT-2 has exactly one, `<|endoftext|>` (ID 50256), placed between documents during training so the model learns where one document stops. That's the +1 in 50,257.
+
+Chat models need more. A conversation has a system prompt, user turns and assistant turns, and the model has to know who said what and when it's its turn. The model doesn't receive a list of messages; it receives one long token sequence. The recipe that flattens messages into that sequence is the <Term w="chat template">A small program (on Hugging Face, a Jinja template stored with the tokenizer) that turns a list of messages into the exact text-plus-special-tokens string the model was fine-tuned on.</Term>. Here's Qwen2.5's, which uses a format called ChatML, rendered and tokenized:
+
+<Figure n="005" title="A CHAT, AS THE MODEL SEES IT" caption="Qwen2.5-0.5B-Instruct's template applied to a system message and 'Hi!', with add_generation_prompt=True. Each filled box is a single special-token ID. Measured with Hugging Face transformers.">
+
+<svg viewBox="0 0 640 214" role="img" aria-label="A chat rendered by the Qwen2.5 chat template into tokens">
+<rect x="0.0" y="8" width="95.2" height="22" class="fill-blue" stroke-width="1" />
+<text x="47.6" y="23" text-anchor="middle" style="fill:var(--paper)">&lt;|im_start|&gt;</text>
+<text x="47.6" y="43" text-anchor="middle" font-size="9">151644</text>
+<rect x="98.2" y="8" width="52.6" height="22" class="fill-paper" stroke-width="1" />
+<text x="124.5" y="23" text-anchor="middle" class="strong">system</text>
+<text x="124.5" y="43" text-anchor="middle" font-size="9">8948</text>
+<rect x="153.8" y="8" width="24.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="165.9" y="23" text-anchor="middle" class="strong">\n</text>
+<text x="165.9" y="43" text-anchor="middle" font-size="9">198</text>
+<rect x="181.0" y="8" width="31.3" height="22" class="fill-paper" stroke-width="1" />
+<text x="196.6" y="23" text-anchor="middle" class="strong">You</text>
+<text x="196.6" y="43" text-anchor="middle" font-size="9">2610</text>
+<rect x="215.3" y="8" width="38.4" height="22" class="fill-paper" stroke-width="1" />
+<text x="234.5" y="23" text-anchor="middle" class="strong">·are</text>
+<text x="234.5" y="43" text-anchor="middle" font-size="9">525</text>
+<rect x="256.7" y="8" width="66.8" height="22" class="fill-paper" stroke-width="1" />
+<text x="290.1" y="23" text-anchor="middle" class="strong">·helpful</text>
+<text x="290.1" y="43" text-anchor="middle" font-size="9">10950</text>
+<rect x="326.5" y="8" width="17.1" height="22" class="fill-paper" stroke-width="1" />
+<text x="335.0" y="23" text-anchor="middle" class="strong">.</text>
+<text x="335.0" y="43" text-anchor="middle" font-size="9">13</text>
+<rect x="346.6" y="8" width="81.0" height="22" class="fill-blue" stroke-width="1" />
+<text x="387.1" y="23" text-anchor="middle" style="fill:var(--paper)">&lt;|im_end|&gt;</text>
+<text x="387.1" y="43" text-anchor="middle" font-size="9">151645</text>
+<rect x="430.6" y="8" width="24.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="442.7" y="23" text-anchor="middle" class="strong">\n</text>
+<text x="442.7" y="43" text-anchor="middle" font-size="9">198</text>
+<rect x="0.0" y="60" width="95.2" height="22" class="fill-blue" stroke-width="1" />
+<text x="47.6" y="75" text-anchor="middle" style="fill:var(--paper)">&lt;|im_start|&gt;</text>
+<text x="47.6" y="95" text-anchor="middle" font-size="9">151644</text>
+<rect x="98.2" y="60" width="38.4" height="22" class="fill-paper" stroke-width="1" />
+<text x="117.4" y="75" text-anchor="middle" class="strong">user</text>
+<text x="117.4" y="95" text-anchor="middle" font-size="9">872</text>
+<rect x="139.6" y="60" width="24.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="151.7" y="75" text-anchor="middle" class="strong">\n</text>
+<text x="151.7" y="95" text-anchor="middle" font-size="9">198</text>
+<rect x="166.8" y="60" width="24.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="178.9" y="75" text-anchor="middle" class="strong">Hi</text>
+<text x="178.9" y="95" text-anchor="middle" font-size="9">13048</text>
+<rect x="194.0" y="60" width="17.1" height="22" class="fill-paper" stroke-width="1" />
+<text x="202.5" y="75" text-anchor="middle" class="strong">!</text>
+<text x="202.5" y="95" text-anchor="middle" font-size="9">0</text>
+<rect x="214.1" y="60" width="81.0" height="22" class="fill-blue" stroke-width="1" />
+<text x="254.6" y="75" text-anchor="middle" style="fill:var(--paper)">&lt;|im_end|&gt;</text>
+<text x="254.6" y="95" text-anchor="middle" font-size="9">151645</text>
+<rect x="298.1" y="60" width="24.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="310.2" y="75" text-anchor="middle" class="strong">\n</text>
+<text x="310.2" y="95" text-anchor="middle" font-size="9">198</text>
+<rect x="0.0" y="112" width="95.2" height="22" class="fill-blue" stroke-width="1" />
+<text x="47.6" y="127" text-anchor="middle" style="fill:var(--paper)">&lt;|im_start|&gt;</text>
+<text x="47.6" y="147" text-anchor="middle" font-size="9">151644</text>
+<rect x="98.2" y="112" width="73.9" height="22" class="fill-paper" stroke-width="1" />
+<text x="135.1" y="127" text-anchor="middle" class="strong">assistant</text>
+<text x="135.1" y="147" text-anchor="middle" font-size="9">77091</text>
+<rect x="175.1" y="112" width="24.2" height="22" class="fill-paper" stroke-width="1" />
+<text x="187.2" y="127" text-anchor="middle" class="strong">\n</text>
+<text x="187.2" y="147" text-anchor="middle" font-size="9">198</text>
+<text x="0" y="168" class="blue-t">FILLED = SPECIAL TOKEN: ONE ID, NEVER PRODUCED BY ORDINARY TEXT</text>
+<text x="0" y="186">THE PROMPT ENDS RIGHT AFTER "assistant\n": THE MODEL WRITES THE REPLY,</text>
+<text x="0" y="202">THEN EMITS &lt;|im_end|&gt; (151645) AND THE SERVER STOPS</text>
+</svg>
+
+</Figure>
+
+The roles ("system", "user", "assistant") are ordinary tokens; the boundaries are special. The rendered prompt ends with `<|im_start|>assistant\n`, which is a cliffhanger: the most likely continuation is the assistant's reply. When the model emits `<|im_end|>` the server stops generating. Llama 3 uses a different format (`<|start_header_id|>user<|end_header_id|>` ... `<|eot_id|>`). Every model family has its own, and using the wrong one is a classic silent failure: the model still produces text, just noticeably worse, because it's seeing a format it was never fine-tuned on. Two more details that matter: if you omit the system message, Qwen2.5's template silently inserts "You are Qwen, created by Alibaba Cloud. You are a helpful assistant." And because special tokens are matched before BPE, any user text that contains the literal string `<|im_end|>` might be turned into the real control token. You'll try that in Break It.
+
+### The other families: WordPiece, SentencePiece, Unigram
+
+You'll meet two other names. Briefly:
+
+- <Term w="WordPiece">Google's subword method (Schuster and Nakajima, 2012), used by BERT. Like BPE, but picks the merge that most increases the likelihood of the training data rather than the most frequent pair. Pieces that continue a word are marked with ##.</Term> is BERT's tokenizer. Encoding is greedy longest-match: take the longest vocabulary entry that matches the start of the word, then continue. Continuation pieces get a `##` prefix. BERT's version works on characters, not bytes, so it has an `[UNK]`. I ran Telugu through `bert-base-uncased`: almost every word came back as `[UNK]`. That's 17 tokens for the sentence, which looks cheap until you realize the meaning was thrown away.
+- <Term w="SentencePiece">A tokenizer library from Google (Kudo and Richardson, 2018) that treats the input as a raw stream, including spaces, so it needs no language-specific word splitting. It can train either BPE or Unigram models. Used by T5, Llama 1 and 2, Gemma.</Term> is a library, not an algorithm. It treats the space as an ordinary symbol (shown as ▁) so it works on languages that don't put spaces between words, like Japanese and Chinese. It can train BPE or a <Term w="Unigram">A subword method (Kudo, 2018) that works backwards from BPE: start with a huge candidate vocabulary and repeatedly delete the pieces whose removal hurts the likelihood of the training text least. Encoding picks the most probable split.</Term> model, and it can fall back to bytes for characters it hasn't seen ("byte fallback"), which Llama 2 used.
+
+The family differences matter less than the shared idea: frequent things get short codes. BPE byte-level won mostly because it's simple, fast and can't fail on any input.
+
+### How big should the vocabulary be?
+
+Vocabulary size V is a trade between two costs.
+
+**More tokens in the vocabulary means shorter sequences.** More merges, more whole words and common phrases, fewer tokens per sentence. Shorter sequences mean more text fits in the context window, fewer forward passes to generate a reply, less attention work, and a smaller <Term w="KV cache">The memory where a model keeps the attention keys and values of every past token so it doesn't recompute them. It grows with every token in the context.</Term> (see [the KV cache lesson](/lessons/kv-cache/)).
+
+**More tokens in the vocabulary means bigger matrices.** The embedding table has V rows of d numbers. The output layer, which scores every possible next token, is another d × V matrix (unless the model ties them together), and computing a probability for every vocabulary entry happens at every single position. And each extra token is rarer, so its row gets fewer training updates.
+
+From the models' published config files (check `config.json` on Hugging Face yourself):
+
+| Model | Vocab V | Width d | Embedding V × d | Share of params |
+| --- | --- | --- | --- | --- |
+| GPT-2 small | 50,257 | 768 | 38.6M | ~31% of 124M (tied in/out) |
+| Qwen2.5-0.5B | 151,936 | 896 | 136M | ~28% of ~494M (tied) |
+| Llama 3 8B | 128,256 | 4,096 | 525M, ×2 untied = 1.05B | ~13% of ~8B |
+
+For a small model, the vocabulary is a large share of everything it has. For a big model it's a modest tax, and the sequence-length savings pay for it many times over: Meta reported that Llama 3's 128K tokenizer (100K tokens from `tiktoken` plus 28K added for other languages) encodes English text in about 15% fewer tokens than Llama 2's 32K one. That's why vocabularies grew: GPT-2 50K, Llama 2 32K, GPT-4 100K, Llama 3 128K, Qwen2.5 152K, GPT-4o 200K, Gemma 256K. As models got wider, the per-token matrix cost shrank relative to the model, while serving many languages and long contexts made every saved token worth more.
+
+### What tokenization does to models
+
+Now the payoff: a list of strange model behaviors that stop being strange once you think in tokens.
+
+**Cost and context are counted in tokens.** API prices, rate limits and context windows are all per token, not per word or character. For English with a GPT-4-class tokenizer, the rule of thumb is about 4 characters per token, or roughly 0.75 words. For code it's lower; for most non-Latin scripts it's much lower.
+
+**Spelling and letter counting.** " strawberry" is ID 73700 in GPT-4's tokenizer. To count its r's, the model has to have memorized what's inside that ID, from rare places in training where words get spelled out. Ask it to spell the word with spaces first ("s t r a w b e r r y") and every letter becomes its own token, and the task gets far easier. Modern models often answer correctly anyway, because they've been trained on this exact meme and on spelling things out step by step, but the underlying weakness is still there. You'll reproduce it on a small model.
+
+**Arithmetic on long numbers.** GPT-2 split "1234567890" as 123 | 45 | 678 | 90; a slightly different number gets cut in completely different places, so the model can't learn a consistent "this column is the hundreds" structure. GPT-4's three-digit groups (123 | 456 | 789 | 0) are consistent from the left, but addition carries from the right, so the groups still don't line up with how you'd add. Llama 1 and 2 instead split every number into single digits. How to tokenize numbers is still an active design question.
+
+**Code and whitespace.** Python indentation is runs of spaces. GPT-2 tokenizes 4 spaces as 4 separate tokens, and an 8-space-indented `return` as 8 tokens. GPT-4's tokenizer has tokens for runs of spaces: the same line is 2 tokens. On a small Python function I measured 35 GPT-2 tokens versus 23 for GPT-4. A big reason later tokenizers got better at code was simply learning to compress whitespace.
+
+**Multilingual unfairness.** Back to the opening numbers, measured with each tokenizer on UDHR Article 1:
+
+<Figure n="006" title="THE SAME SENTENCE, THREE LANGUAGES" caption="Token counts for UDHR Article 1 (English, Hindi, Telugu; Indic texts as I transcribed them). Ratio is versus English. A tokenizer trained mostly on English compresses Telugu barely at all; GPT-2 used exactly one token per Telugu byte.">
+
+<svg viewBox="0 0 640 320" role="img" aria-label="Token counts for the same sentence in English, Hindi and Telugu">
+<text x="0" y="14" class="strong">TOKENS FOR UDHR ARTICLE 1</text><text x="640" y="14" text-anchor="end">EN 170 B · HI 500 B · TE 429 B</text>
+<text x="0" y="42" class="strong">GPT-2 (50K)</text>
+<text x="0" y="57">EN</text><rect x="28" y="48" width="33.1" height="11" class="fill-paper" stroke-width="1" /><text x="67.1" y="57">33  (1.0x)</text>
+<text x="0" y="72">HI</text><rect x="28" y="63" width="296.7" height="11" class="fill-wash" stroke-width="1" /><text x="330.7" y="72">296  (9.0x)</text>
+<text x="0" y="87">TE</text><rect x="28" y="78" width="430.0" height="11" class="fill-blue" stroke-width="1" /><text x="464.0" y="87">429  (13.0x)</text>
+<text x="0" y="113" class="strong">GPT-4 CL100K</text>
+<text x="0" y="128">EN</text><rect x="28" y="119" width="33.1" height="11" class="fill-paper" stroke-width="1" /><text x="67.1" y="128">33  (1.0x)</text>
+<text x="0" y="143">HI</text><rect x="28" y="134" width="181.4" height="11" class="fill-wash" stroke-width="1" /><text x="215.4" y="143">181  (5.5x)</text>
+<text x="0" y="158">TE</text><rect x="28" y="149" width="279.7" height="11" class="fill-blue" stroke-width="1" /><text x="313.7" y="158">279  (8.5x)</text>
+<text x="0" y="184" class="strong">QWEN2.5 (151K)</text>
+<text x="0" y="199">EN</text><rect x="28" y="190" width="33.1" height="11" class="fill-paper" stroke-width="1" /><text x="67.1" y="199">33  (1.0x)</text>
+<text x="0" y="214">HI</text><rect x="28" y="205" width="172.4" height="11" class="fill-wash" stroke-width="1" /><text x="206.4" y="214">172  (5.2x)</text>
+<text x="0" y="229">TE</text><rect x="28" y="220" width="228.5" height="11" class="fill-blue" stroke-width="1" /><text x="262.5" y="229">228  (6.9x)</text>
+<text x="0" y="255" class="strong">GPT-4O O200K</text>
+<text x="0" y="270">EN</text><rect x="28" y="261" width="33.1" height="11" class="fill-paper" stroke-width="1" /><text x="67.1" y="270">33  (1.0x)</text>
+<text x="0" y="285">HI</text><rect x="28" y="276" width="55.1" height="11" class="fill-wash" stroke-width="1" /><text x="89.1" y="285">55  (1.7x)</text>
+<text x="0" y="300">TE</text><rect x="28" y="291" width="78.2" height="11" class="fill-blue" stroke-width="1" /><text x="112.2" y="300">78  (2.4x)</text>
+</svg>
+
+</Figure>
+
+Telugu with GPT-2: 429 bytes, 429 tokens. Not a single merge applied. With GPT-4's tokenizer, Telugu still costs 8.5 times English. GPT-4o's 200K vocabulary was built with far more non-English text and brings it to about 2.4 times. Same meaning, but more tokens means a higher bill, less room in the context, slower replies, and, because the model sees Telugu as long strings of byte fragments, often worse quality too. Petrov et al. (2023) measured this across many languages and found gaps of 10 times or more for some language pairs on popular tokenizers.
+
+**Glitch tokens.** In early 2023, Jessica Rumbelow and Matthew Watkins found that GPT-3-era models went strange when asked to repeat certain strings: " SolidGoldMagikarp" was refused, replaced by other words, or answered with insults. The cause was tokenizer and model being trained on different data. The tokenizer's training text had lots of Reddit, including the r/counting community, whose most active users posted their names thousands of times; so " SolidGoldMagikarp" became a single token (GPT-2 ID 43453, you can check). The model's training data was filtered differently and almost never contained that token, so its embedding row was barely trained: near-random noise sitting in the vocabulary. Feed it in and the model gets a vector it has no idea what to do with. GPT-4's tokenizer doesn't have that token, but it has its own leftovers: " davidjl" (another r/counting username) is a single token in `cl100k_base`.
+
+## Build It
+
+Make a folder, say `~/workbench/tokenizers/`. You'll write one file, `bpe.py`, that grows through the tasks, and a few small scripts around it. The reference to keep open (to compare against, not to copy) is Andrej Karpathy's `minbpe` repository on GitHub, which is the same structure: a basic tokenizer, then a regex one, then one that matches GPT-4.
+
+<Task id="t0" title="Set up a venv and a corpus" agent="ok">
+
+```bash
+mkdir -p ~/workbench/tokenizers && cd ~/workbench/tokenizers
+python3 -m venv .venv && source .venv/bin/activate
+pip install tiktoken tokenizers transformers regex
+```
+
+`regex` is a drop-in replacement for Python's `re` that understands `\p{L}` (any letter) and `\p{N}` (any digit). The standard `re` module doesn't.
+
+For the corpus, pick text you actually care about, 1-5 MB total. A good mix: a public-domain novel from Project Gutenberg (English), a few hundred KB of your own Python source (code), and some Telugu (and/or Hindi) Wikipedia articles copied into a text file. Put them in `corpus/`, then:
+
+```python
+# build_corpus.py
+from pathlib import Path
+parts = [p.read_text(encoding="utf-8", errors="ignore") for p in sorted(Path("corpus").glob("*"))]
+text = "\n\n".join(parts)
+Path("train.txt").write_text(text, encoding="utf-8")
+print(f"{len(text):,} characters, {len(text.encode()):,} bytes")
+```
+
+Also hold back a separate test file per category (`test_en.txt`, `test_code.txt`, `test_te.txt`, a few KB each) that is *not* in the training corpus. Compression measured on training text flatters you.
+
+</Task>
+
+<Task id="t1" title="Look at bytes before you merge them" agent="hands">
+
+Five minutes in a Python shell, no file needed. Predict each answer before you press enter.
+
+```python
+s = "Hi అ 😀"
+len(s), len(s.encode("utf-8"))
+list(s.encode("utf-8"))
+[f"{b:08b}" for b in "అ".encode()]
+"అ".encode()[:2].decode("utf-8")                    # what happens?
+"అ".encode()[:2].decode("utf-8", errors="replace")  # and now?
+```
+
+Check the bit patterns against Figure 002. The error in the fifth line is the most important thing here: a slice of a character's bytes is not valid text. A byte-level tokenizer's tokens can end in the middle of a character, so a single token often can't be decoded on its own.
+
+</Task>
+
+<Task id="t2" title="Write the BPE trainer" agent="hands">
+
+Start from bytes, count pairs, merge, repeat. Fill in these three functions.
+
+```python
+# bpe.py
+def get_stats(ids: list[int], counts: dict | None = None) -> dict[tuple[int, int], int]:
+    """Count each adjacent pair in ids. Add into `counts` if given."""
+    ...
+
+def merge(ids: list[int], pair: tuple[int, int], new_id: int) -> list[int]:
+    """Replace every non-overlapping occurrence of `pair` in ids with new_id, left to right."""
+    ...
+
+def train(text: str, vocab_size: int, verbose: bool = False):
+    """Returns (merges, vocab).
+    merges: dict[(int, int), int]   pair -> new token id, in the order learned (dicts keep order)
+    vocab:  dict[int, bytes]        token id -> the bytes it stands for
+    """
+    ids = list(text.encode("utf-8"))
+    merges, vocab = {}, {i: bytes([i]) for i in range(256)}
+    for i in range(vocab_size - 256):
+        ...  # count, pick the max, merge, record, vocab[new] = vocab[a] + vocab[b]
+    return merges, vocab
+```
+
+Hints:
+- `merge` on `[1, 1, 1]` with pair `(1, 1)` must give `[new, 1]`, not `[new, new]`. Walk with an index and skip ahead 2 when you merge.
+- `max(stats, key=stats.get)` picks the most frequent pair; ties go to whichever pair was counted first.
+- Test on the toy corpus from Figure 003 first (as bytes, with spaces): your first merges should be the same pairs the figure found, give or take spaces.
+- Print each merge as `vocab[a] + vocab[b] -> vocab[new]` with `verbose`. Reading the first 50 merges of your corpus is half the fun.
+
+Train 256 merges on 100 KB of your corpus and time it. Then stop and do t4 before training anything big, because this version merges across word boundaries.
+
+</Task>
+
+<Task id="t3" title="Write encode and decode, then try to break the round-trip" agent="hands">
+
+```python
+def encode(text: str, merges: dict[tuple[int, int], int]) -> list[int]:
+    """Bytes, then repeatedly apply the earliest-learned merge present, until none apply."""
+    ...
+
+def decode(ids: list[int], vocab: dict[int, bytes]) -> str:
+    """Concatenate the bytes of every token, then decode once as UTF-8."""
+    ...
+```
+
+Hints for `encode`: loop while there are at least 2 tokens; compute `get_stats(ids)`; choose `min(stats, key=lambda p: merges.get(p, float("inf")))`; if that pair isn't in `merges`, you're done; otherwise merge it. For `decode`, use `errors="replace"`, because a model can generate an ID sequence that isn't valid UTF-8 and you shouldn't crash on it.
+
+Now prove the round-trip, `decode(encode(s)) == s`, for strings designed to hurt:
+
+```python
+import random
+def random_unicode(n: int) -> str:
+    out = []
+    while len(out) < n:
+        cp = random.choice([random.randint(0x20, 0x7E), random.randint(0x80, 0x7FF),
+                            random.randint(0x800, 0xFFFF), random.randint(0x10000, 0x10FFFF)])
+        if 0xD800 <= cp <= 0xDFFF:   # surrogates are not real characters; UTF-8 can't encode them
+            continue
+        out.append(chr(cp))
+    return "".join(out)
+```
+
+Run 1,000 random strings, plus a few by hand: an empty string, a single emoji, Telugu, `"\x00"`, a zero-width space `"​"`, and a string of 10,000 spaces.
+
+</Task>
+
+<Task id="t4" title="Add GPT-2-style pre-tokenization and special tokens" agent="hands">
+
+Change `train` and `encode` so that text is first split with the GPT-2 pattern from The Idea, and BPE runs on each chunk separately.
+
+```python
+import regex as re
+GPT2_SPLIT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+```
+
+The trick that makes training fast enough: the same chunk (" the") appears thousands of times, so count chunks first with `collections.Counter(re.findall(GPT2_SPLIT, text))`, keep one byte list per *distinct* chunk with its count, and add `count` (not 1) for each pair inside it. Merging then only touches distinct chunks. With that, my plain-Python version trained 1,024 merges on 1.3 MB in about 60 seconds on a Mac; without the dedup it would be far slower.
+
+Then special tokens: give `encode` an `allowed_special` set. Split the text on the special strings first (escape them with `re.escape`), emit the special ID for each match, and run normal BPE on the pieces in between. By default, allow none, like `tiktoken` does.
+
+Retrain on your full corpus. Pick a vocab size: 4,096 is a good first target (expect a few minutes in plain Python). Save the merges to a file (`json.dump` a list of `[a, b]` pairs in order) so you don't retrain every time.
+
+</Task>
+
+<Task id="t5" title="Match tiktoken's GPT-2 tokenizer exactly" agent="review">
+
+The only real test of an encoder is to load someone else's merges into it and get their exact output. `tiktoken` gives you GPT-2's table as `enc._mergeable_ranks`: a dict from token bytes to rank (its ID). It doesn't give you the merges themselves, so you recover them:
+
+```python
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+ranks = enc._mergeable_ranks        # private attribute: check it still exists in your version
+
+def recover_merges(ranks: dict[bytes, int]) -> dict[tuple[int, int], int]:
+    """For every multi-byte token, run BPE on its bytes using only merges ranked below it.
+    It ends as exactly two parts (a, b); record (ranks[a], ranks[b]) -> ranks[token]."""
+    ...
+```
+
+Two gotchas. First, in GPT-2's table the single bytes don't have IDs equal to their values (the byte for space, 32, has ID 220), so you need a 256-entry map from raw byte to ID, applied before merging, and its inverse when decoding. Second, the tiny inconsistencies between GPT-2's regex in `tiktoken` and the one above don't matter for normal text, but if you see a mismatch, print the chunk.
+
+Run your encoder and `enc.encode(text, disallowed_special=())` over 200 KB of mixed text including Telugu and emoji, and assert the lists are identical. When I did this, my plain-Python encoder matched all 49,730 tokens exactly. Then ask an agent to review your `encode` for edge cases. `minbpe`'s `gpt4.py` does this same exercise for `cl100k_base`; read it after you're done, not before.
+
+</Task>
+
+<Task id="t6" title="Compare compression with real tokenizers" agent="explain">
+
+Write `compare.py` that loads your tokenizer and a few real ones, encodes each held-out test file, and prints bytes per token (higher is better compression):
+
+```python
+import tiktoken
+from transformers import AutoTokenizer
+
+real = {n: tiktoken.get_encoding(n) for n in ["gpt2", "cl100k_base", "o200k_base"]}
+qwen = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")   # downloads only the tokenizer
+bert = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+def n_tokens_hf(tok, text):
+    return len(tok(text, add_special_tokens=False)["input_ids"])
+```
+
+Also count how many `[UNK]` IDs BERT produces on the Telugu file (`bert.unk_token_id`). An agent can explain any result that surprises you, but write the script yourself.
+
+</Task>
+
+<Task id="t7" title="Inspect a real chat template" agent="ok">
+
+```python
+from transformers import AutoTokenizer
+tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
+msgs = [{"role": "system", "content": "You are helpful."},
+        {"role": "user", "content": "Hi!"}]
+text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+print(repr(text))
+ids = tok(text, add_special_tokens=False)["input_ids"]
+print([(i, tok.decode([i])) for i in ids])
+print(tok.chat_template)          # the Jinja source: read the tools branch too
+```
+
+Now remove the system message and print again. Then render the same `msgs` with `add_generation_prompt=False` and spot the difference. If you have access to a Llama 3 instruct tokenizer (gated on Hugging Face, needs a license click), compare its format.
+
+</Task>
+
+<Task id="t8" title="Reproduce a tokenization failure" agent="hands">
+
+Make a small instruct model fail at counting letters, then show the failure is about tokens. On the Spark (or your Mac, it's small), load `Qwen/Qwen2.5-0.5B-Instruct` with `transformers` (needs `torch`), or use any chat API you have.
+
+Shape of the experiment:
+
+```python
+words = ["strawberry", "bookkeeper", "mississippi", "referral", "nonnegotiable",
+         "zzyzx", "parallelogram", "embarrassment"]   # add 10 of your own, including invented ones
+
+def ask(prompt: str) -> str: ...      # chat template + greedy generate, max ~20 new tokens
+
+for w in words:
+    letter = ...                      # pick the most repeated letter
+    truth = w.count(letter)
+    plain  = ask(f"How many times does the letter '{letter}' appear in '{w}'? Answer with a number.")
+    spaced = ask(f"How many times does the letter '{letter}' appear in '{' '.join(w)}'? Answer with a number.")
+    # also record: how many tokens is " " + w? (tok.encode)
+```
+
+Score accuracy for plain vs spaced. Then try addition: 20 random pairs of 3-digit numbers, then 20 pairs of 9-digit numbers, and look at how each number is tokenized with Qwen's tokenizer (Qwen splits numbers into single digits; compare with `cl100k_base`'s groups of three). I haven't run the model side of this here, so I can't give you the scores. Expect the 0.5B model to do badly on plain counting and noticeably better on the spaced version. If a big frontier model gets everything right, that's expected too, and worth thinking about why.
+
+</Task>
+
+<DoneWhen>
+
+- `decode(encode(s)) == s` for 1,000 random Unicode strings plus your hand-picked nasty ones.
+- Your encoder, loaded with GPT-2's recovered merges, produces exactly `tiktoken`'s output on 200 KB of mixed text.
+- You've trained your own tokenizer (at least 4,096 tokens) on your corpus, and can read and explain its first 30 merges.
+- The comparison table in Measure is filled in, including Telugu or Hindi.
+- You have a plain-vs-spaced letter-counting result from a real model, in numbers.
+
+</DoneWhen>
+
+## Measure
+
+### Compression: bytes per token
+
+Fill this in with your held-out files. Bytes per token = `len(text.encode())` / number of tokens.
+
+| Tokenizer | Vocab | English | Code | Hindi | Telugu |
+| --- | --- | --- | --- | --- | --- |
+| Yours, 1,024 merges | 1,280 | | | | |
+| Yours, 4,096+ | | | | | |
+| GPT-2 | 50,257 | | | | |
+| cl100k_base (GPT-4) | 100,277 | | | | |
+| o200k_base (GPT-4o) | 200,019 | | | | |
+| Qwen2.5 | 151,665 | | | | |
+
+What I measured, for reference. My 1,024-merge tokenizer trained on this site's English prose: 2.7 bytes per token on that prose (in-sample, so flattering), 1.5 on a Python file, and exactly 1.0 on Hindi and Telugu (no merges for them at all). On the same prose, GPT-2 got 3.7, `cl100k_base` 4.0, `o200k_base` 4.0. On the Python file: GPT-2 2.1, `cl100k_base` and `o200k_base` 3.2-3.3. On UDHR Article 1: English 5.2 bytes per token for all three OpenAI tokenizers; Telugu 1.0 (GPT-2), 1.5 (`cl100k_base`), 5.5 (`o200k_base`).
+
+What to expect from your own table, and why:
+
+- **Your tokenizer will lose on English** to the big ones by a wide margin. 4,096 tokens can't hold many whole words, and your corpus is tiny compared to theirs.
+- **Your tokenizer might beat GPT-2 and even `cl100k_base` on Telugu**, if your corpus had real Telugu in it. A tokenizer compresses what it was trained on. A small vocab with the right data can beat a big vocab with the wrong data. That's the whole story of multilingual tokenizers, measured on your own machine.
+- **Code** depends on whitespace handling. Compare GPT-2 against `cl100k_base` on the same file; most of the gap is indentation.
+
+### Training time and vocab size
+
+Time training at 512, 1,024, 2,048 and 4,096 merges on the same corpus, and record bytes per token on your English test file at each size.
+
+| Merges | Train time (s) | Bytes/token, English test |
+| --- | --- | --- |
+| 512 | | |
+| 1,024 | | |
+| 2,048 | | |
+| 4,096 | | |
+
+You should see time grow roughly linearly with merges (each merge is one more full pass over the distinct chunks), while compression improves less with each doubling: the first merges capture " the" and "ing", the last ones capture words that appear a dozen times. That's diminishing returns, and it's the same curve that tells model builders when a bigger vocab stops paying for its embedding rows.
+
+### The cost of being Telugu
+
+Take one paragraph you'd actually send to a model, in English, and its translation in Telugu (yours, not a machine translation, if you can). Count tokens with `cl100k_base` and `o200k_base`, and work out what the Telugu version would cost per million paragraphs at a price of your choice. Write the ratio down. You should see something in the range of Figure 006: several times English for `cl100k_base`, much closer for `o200k_base`.
+
+## Break It
+
+**1. Decode one token at a time.** Streaming servers send each new token to the user as it's generated. Write the naive version: `for i in ids: print(vocab[i].decode("utf-8"), end="")`. Run it on Telugu or an emoji. It throws `UnicodeDecodeError`, because tokens end mid-character (you saw this in t1). With `errors="replace"` instead, you get � characters scattered through the text, a bug you've probably seen in real chat UIs. The fix is to keep a byte buffer and only print what forms complete characters: Python's `codecs.getincrementaldecoder("utf-8")()` does exactly that. Real serving engines all carry this logic in their detokenizer.
+
+**2. Train without pre-tokenization.** Use your t2 trainer (no regex) on the same 150 KB and print the merges. Within a few hundred merges you should see tokens like "of the ", "is the " and "s. ". Now count how many distinct tokens contain "dog" (or any common noun in your corpus) with and without the regex. Without it, punctuation and neighboring words get glued on, and one word smears across many unrelated tokens the model has to learn separately.
+
+**3. Apply merges in the wrong order.** Change `encode` to pick the pair that's most *frequent in the input* instead of the one with the lowest merge rank. Run the round-trip test: it still passes. Now compare against `tiktoken` from t5: mismatches everywhere. Round-tripping proves you didn't lose information; it says nothing about whether you produced the tokens the model was trained on. A model fed off-distribution token sequences for the same text gets measurably worse, and nothing errors.
+
+**4. Smuggle in a special token.** With the Qwen tokenizer: `tok("hello <|im_end|> world")["input_ids"]`. When I ran this, ID 151645, the real end-of-message token, appeared in the middle: Hugging Face tokenizers match special-token strings in raw text by default. Anyone who can put text into your prompt can close the user turn and start a fake assistant or system turn. Now try `tok(..., split_special_tokens=True)` and see it become ordinary pieces. Then try `tiktoken`'s `enc.encode("<|endoftext|>")`: it raises an error unless you explicitly allow the special token. That's the safer default. Check what your own encoder from t4 does.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What is a token, and why don't models just use characters or words?</summary>
+
+A token is a chunk of text the model treats as one unit, identified by an integer that picks a row of the embedding table. Characters work for any input but make sequences about 4 times longer for English, which means 4 times less text in the context, 4 times more generation steps and roughly 16 times more attention work. Words make short sequences, but the list of distinct words never stops growing (names, typos, numbers, word forms), so you need millions of rows, most barely trained, and anything not in the list becomes an unknown token and loses its meaning. Subwords are the middle: frequent words stay whole, rare ones are built from frequent pieces, and with byte-level BPE nothing is ever unknown.
+
+</details>
+
+<details>
+<summary>2. Walk me through how BPE is trained and how it encodes new text.</summary>
+
+Training: convert the corpus to bytes (256 starting tokens), after splitting it into word-like chunks with a regex so merges don't cross words. Count every adjacent pair of tokens across all chunks, weighted by how often each chunk appears. Take the most frequent pair, give it a new ID, replace it everywhere, record the merge. Repeat until the vocabulary reaches the target size. The tokenizer is just the 256 bytes plus that ordered list of merges. Encoding: split the new text the same way, turn each chunk into bytes, and repeatedly apply whichever applicable merge was learned earliest, until none apply. Earliest-first matters because later merges were learned on text where earlier merges had already happened, so replaying in order reproduces the exact token sequences the model saw in training. Decoding: concatenate each token's bytes, then decode the whole thing as UTF-8 once.
+
+</details>
+
+<details>
+<summary>3. Why do language models struggle to count the r's in "strawberry", or to add two long numbers?</summary>
+
+The model never sees letters. " strawberry" is one token in GPT-4's tokenizer, a single ID whose embedding doesn't contain its spelling; the model can only know the letters if it memorized them from text where the word was spelled out. Spacing the letters out turns each into its own token and the task becomes easy. For numbers, tokenizers chop digits into chunks: GPT-2 did it inconsistently (123|45|678|90), GPT-4 uses groups of three from the left, but carrying in addition goes from the right, so the chunks don't line up with place value. Some models (Llama 1 and 2, Qwen) split every digit separately to make the structure consistent.
+
+</details>
+
+<details>
+<summary>4. You're designing a new model. Vocab of 32K or 256K? How does that choice scale?</summary>
+
+A bigger vocab means fewer tokens per text: more text per context window, fewer decoding steps per reply, a smaller KV cache per document, and much better treatment of non-English languages and code if the tokenizer's training data includes them. The costs are the embedding and output matrices, each V × d: for Llama 3 8B, 128,256 × 4,096 is about 525M parameters each, about 1.05B of the 8B total since they're untied; at every position the output layer scores all V tokens; and each extra token is rarer, so its embedding gets fewer updates (the extreme case is a glitch token). For a small model, a 256K vocab could be most of its parameters, so 32K-64K is sensible. For a big model the matrices are a small share and sequence savings dominate, which is why frontier vocabularies grew to 100K-256K. I'd decide by measuring tokens per byte on the target data mix at several vocab sizes and comparing that to the parameter cost.
+
+</details>
+
+<details>
+<summary>5. Why does the same request cost more in Telugu than in English, and what could a model provider do about it?</summary>
+
+A BPE tokenizer is a compression scheme trained on a particular text mix. If that mix is mostly English, it learns long merges for English and few or none for Telugu. Telugu also starts at 3 bytes per code point in UTF-8, and its vowel signs are separate code points. So with GPT-2 every Telugu byte stayed its own token (429 tokens for UDHR Article 1 against 33 in English), and GPT-4's tokenizer still used about 8.5 times as many. The user pays more, gets less context, waits longer, and often gets worse answers. Fixes: train the tokenizer on a more balanced language mix and give it a larger vocab (GPT-4o's 200K vocab brings Telugu to about 2.4 times English; Llama 3 added 28K tokens for other languages), or price per character instead of per token.
+
+</details>
+
+<details>
+<summary>6. What was SolidGoldMagikarp?</summary>
+
+A glitch token. GPT-2/GPT-3's tokenizer was trained on data with lots of Reddit, including r/counting, where a few usernames appeared thousands of times, so " SolidGoldMagikarp" became a single token. The model itself was trained on differently filtered data where that token almost never appeared, so its embedding stayed close to its random starting point. When prompted with it, the model behaved erratically: refusing, substituting other words, or producing nonsense. Lesson: the tokenizer and the model should be trained on the same data distribution, and it's worth checking for vocabulary entries that the model's training data barely contains.
+
+</details>
+
+## Go Deeper
+
+- **Rico Sennrich, Barry Haddow, Alexandra Birch, "Neural Machine Translation of Rare Words with Subword Units"**, ACL 2016 ([arXiv:1508.07909](https://arxiv.org/abs/1508.07909)). The paper that brought BPE into NLP. Short, and the core algorithm is a dozen lines of Python printed in the paper.
+- **Philip Gage, "A New Algorithm for Data Compression"**, *The C Users Journal*, February 1994. The original byte pair encoding, as a compression tool. Worth reading just to see how little changed.
+- **Alec Radford et al., "Language Models are Unsupervised Multitask Learners"** (the GPT-2 paper, OpenAI, 2019), section 2.2 "Input Representation". Why byte-level, and why they had to stop BPE from merging across character categories.
+- **Andrej Karpathy, "Let's build the GPT Tokenizer"** (YouTube, 2024) and the companion repository **[github.com/karpathy/minbpe](https://github.com/karpathy/minbpe)**. Two hours that cover everything in this lesson by building it, including the GPT-4 regex and a list of tokenization-caused model weirdness.
+- **Taku Kudo and John Richardson, "SentencePiece: A simple and language independent subword tokenizer and detokenizer for Neural Text Processing"** (EMNLP 2018, [arXiv:1808.06226](https://arxiv.org/abs/1808.06226)), and **Taku Kudo, "Subword Regularization"** (ACL 2018, [arXiv:1804.10959](https://arxiv.org/abs/1804.10959)) for the Unigram model.
+- **Aleksandar Petrov, Emanuele La Malfa, Philip Torr, Adel Bibi, "Language Model Tokenizers Introduce Unfairness Between Languages"** (NeurIPS 2023, [arXiv:2305.15425](https://arxiv.org/abs/2305.15425)). The careful, many-language version of Figure 006.
+- **Jessica Rumbelow and Matthew Watkins, "SolidGoldMagikarp (plus, prompt generation)"**, LessWrong, February 2023. The original glitch-token writeup, with the list of strange tokens and how they were found.
+- **[openai/tiktoken](https://github.com/openai/tiktoken)** and the **Hugging Face LLM Course, chapter 6 ("The Tokenizers library")**, which implements BPE, WordPiece and Unigram side by side. Use them to check your understanding of the differences.
+
+## Connections
+
+This lesson explains the first and last layers of the model you built in GPT-2: the embedding table's height is V, and the output layer scores V options at every step. [How much memory does a model need?](/lessons/memory-math/) counts those V × d parameters, and the [KV cache](/lessons/kv-cache/) and [FlashAttention](/lessons/flash-attention/) lessons are about costs that grow with every token in the sequence, which is why saving tokens matters.
+
+[Prefix caching](/lessons/prefix-caching/) reuses work for prompts that start with the same tokens, so a chat template that renders the same system prompt identically every time is what makes it work, and one stray space breaks it. [Serving engines](/lessons/serving-engines/) contain the incremental detokenizer from Break It 1. And next, [Train a small LM, end to end](/lessons/tiny-lm/), starts by choosing a tokenizer for your own model, which you'll now do with numbers instead of copying 50,257 from a paper.

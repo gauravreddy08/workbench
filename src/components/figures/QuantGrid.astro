@@ -1,0 +1,212 @@
+---
+// Quantize a small weight matrix (4 channels x 512 inputs) with a bit-width slider, a choice of
+// scale granularity (per-tensor, per-channel, group 128, group 32), symmetric vs affine, and an
+// outlier toggle. Top: histogram of the group that holds weight [0, 40] with the quantization grid
+// drawn over it. Bottom: one cell per scale, shaded by that group's error.
+// Usage: <QuantGrid />
+---
+<div class="qg" data-fig="quant-grid">
+  <svg viewBox="0 0 560 300" role="img" aria-label="Histogram of one group of weights with the quantization levels drawn over it, and a grid of groups shaded by error">
+    <text x="10" y="16" class="strong" data-el="title">GROUP HOLDING W[0,40]</text>
+    <text x="550" y="16" text-anchor="end" data-el="range"></text>
+    <rect x="10" y="26" width="540" height="130" class="ink" stroke-width="1" />
+    <g data-layer="levels"></g>
+    <g data-layer="hist"></g>
+    <line data-el="zero" x1="0" y1="26" x2="0" y2="156" class="ink dash" stroke-width="1" />
+    <text x="10" y="172" data-el="lo"></text>
+    <text x="280" y="172" text-anchor="middle" data-el="mid">0</text>
+    <text x="550" y="172" text-anchor="end" data-el="hi"></text>
+    <text x="10" y="196" class="strong">ONE CELL PER SCALE · DARKER = MORE ERROR</text>
+    <text x="550" y="196" text-anchor="end" data-el="nscales"></text>
+    <g data-layer="cells"></g>
+    <text x="10" y="292">ROW = OUTPUT CHANNEL · 512 WEIGHTS EACH</text>
+  </svg>
+  <div class="ctl">
+    <label>bits <input type="range" min="2" max="8" step="1" value="4" data-in="bits" /><output data-out="bits">4</output></label>
+    <button class="btn" type="button" data-act="outlier" aria-pressed="false">Outlier</button>
+    <button class="btn" type="button" data-act="affine" aria-pressed="false">Affine (zero-point)</button>
+  </div>
+  <div class="ctl">
+    <span>scale per</span>
+    <button class="btn" type="button" data-g="tensor" aria-pressed="false">Tensor</button>
+    <button class="btn" type="button" data-g="channel" aria-pressed="false">Channel</button>
+    <button class="btn" type="button" data-g="128" aria-pressed="true">128</button>
+    <button class="btn" type="button" data-g="32" aria-pressed="false">32</button>
+  </div>
+  <div class="ctl">
+    <span>step Δ <span class="readout" data-out="step">-</span></span>
+    <span>rounded to 0 <span class="readout" data-out="zero">-</span></span>
+    <span>levels used <span class="readout" data-out="used">-</span></span>
+  </div>
+  <div class="ctl">
+    <span>error ‖W−Ŵ‖/‖W‖ <span class="readout" data-out="err">-</span></span>
+    <span>bits per weight <span class="readout" data-out="bpw">-</span></span>
+  </div>
+</div>
+
+<style>
+  .qg svg { width: 100%; }
+</style>
+
+<script>
+  const ROWS = 4, COLS = 512;
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  // deterministic weights: roughly bell-shaped, a different spread per row (real channels differ)
+  let seed = 7;
+  const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648);
+  const gauss = () => {
+    const u = Math.max(rnd(), 1e-9), v = rnd();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  };
+  const rowStd = [0.012, 0.03, 0.02, 0.016];
+  const BASE: number[] = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) BASE.push(gauss() * rowStd[r] + 0.002 * (r - 1.5));
+  const BASE_RMS = Math.sqrt(BASE.reduce((a, w) => a + w * w, 0) / BASE.length);
+  const OUT_IDX = 40; // row 0, column 40
+  const OUT_VAL = 0.5;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="quant-grid"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const bitsIn = q<HTMLInputElement>('[data-in="bits"]');
+    const outBtn = q<HTMLButtonElement>('[data-act="outlier"]');
+    const affBtn = q<HTMLButtonElement>('[data-act="affine"]');
+    const gBtns = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-g]'));
+    const levelsG = q<SVGGElement>('[data-layer="levels"]');
+    const histG = q<SVGGElement>('[data-layer="hist"]');
+    const cellsG = q<SVGGElement>('[data-layer="cells"]');
+    const zeroL = q<SVGLineElement>('[data-el="zero"]');
+    let bits = 4, outlier = false, affine = false, gran = '128';
+
+    const render = () => {
+      const W = BASE.slice();
+      if (outlier) W[OUT_IDX] = OUT_VAL;
+      // group size along a row; per-tensor is one group of everything
+      const gsize = gran === 'tensor' ? ROWS * COLS : gran === 'channel' ? COLS : Number(gran);
+      const nGroups = (ROWS * COLS) / gsize;
+      const Wq = new Array(W.length).fill(0);
+      const gErr: number[] = [];
+      let focus = { lo: 0, hi: 0, s: 0, z: 0, idx: [] as number[], q: [] as number[] };
+      for (let g = 0; g < nGroups; g++) {
+        const idx = Array.from({ length: gsize }, (_, k) => g * gsize + k);
+        let lo = Infinity, hi = -Infinity;
+        for (const i of idx) { lo = Math.min(lo, W[i]); hi = Math.max(hi, W[i]); }
+        let s: number, z: number, qmin: number, qmax: number;
+        if (affine) {
+          qmin = 0; qmax = 2 ** bits - 1;
+          s = (hi - lo) / qmax || 1e-12;
+          z = Math.round(-lo / s);
+        } else {
+          qmax = 2 ** (bits - 1) - 1; qmin = -qmax - 1;
+          const m = Math.max(Math.abs(lo), Math.abs(hi));
+          s = m / qmax || 1e-12; z = 0;
+          lo = -m; hi = m;
+        }
+        let e = 0, n = 0;
+        const qs: number[] = [];
+        for (const i of idx) {
+          const qi = Math.min(qmax, Math.max(qmin, Math.round(W[i] / s) + z));
+          qs.push(qi);
+          Wq[i] = (qi - z) * s;
+          e += (W[i] - Wq[i]) ** 2; n += W[i] ** 2;
+        }
+        gErr.push(e);
+        if (idx[0] <= OUT_IDX && OUT_IDX <= idx[idx.length - 1]) {
+          focus = { lo: affine ? lo : -Math.max(Math.abs(lo), Math.abs(hi)), hi, s, z, idx, q: qs };
+          if (affine) focus.lo = (0 - z) * s, focus.hi = (2 ** bits - 1 - z) * s;
+        }
+      }
+
+      // --- top panel: histogram of the focus group with the grid
+      const X0 = 14, XW = 532, Y0 = 30, YH = 122;
+      const span = focus.hi - focus.lo || 1e-9;
+      const px = (v: number) => X0 + ((v - focus.lo) / span) * XW;
+      levelsG.replaceChildren();
+      const nLev = 2 ** bits;
+      for (let k = 0; k < nLev; k++) {
+        const v = affine ? (k - focus.z) * focus.s : (k - 2 ** (bits - 1)) * focus.s;
+        const x = px(v);
+        if (x < X0 - 1 || x > X0 + XW + 1) continue;
+        levelsG.appendChild(mk('line', { x1: x, y1: Y0 - 2, x2: x, y2: Y0 + YH + 2, style: `stroke:var(--blue);opacity:${bits > 6 ? 0.25 : 0.5}`, 'stroke-width': 1 }));
+      }
+      const BINS = 64;
+      const counts = new Array(BINS).fill(0);
+      for (const i of focus.idx) {
+        const b = Math.min(BINS - 1, Math.max(0, Math.floor(((W[i] - focus.lo) / span) * BINS)));
+        counts[b]++;
+      }
+      const cmax = Math.max(...counts);
+      histG.replaceChildren();
+      counts.forEach((c, b) => {
+        if (!c) return;
+        const h = Math.max(2, (c / cmax) * (YH - 6));
+        histG.appendChild(mk('rect', { x: X0 + (b / BINS) * XW + 0.5, y: Y0 + YH - h, width: XW / BINS - 1, height: h, class: 'fill-wash', 'stroke-width': 0.8 }));
+      });
+      if (outlier && focus.idx.includes(OUT_IDX)) {
+        const x = px(OUT_VAL);
+        histG.appendChild(mk('text', { x: Math.min(x, X0 + XW) - 4, y: Y0 + 14, 'text-anchor': 'end', class: 'blue-t' }, 'OUTLIER 0.5 →'));
+      }
+      zeroL.setAttribute('x1', String(px(0))); zeroL.setAttribute('x2', String(px(0)));
+      q<SVGTextElement>('[data-el="lo"]').textContent = focus.lo.toFixed(3);
+      q<SVGTextElement>('[data-el="hi"]').textContent = focus.hi.toFixed(3);
+      const mid = q<SVGTextElement>('[data-el="mid"]');
+      mid.setAttribute('x', String(px(0)));
+      const label = gran === 'tensor' ? 'WHOLE TENSOR (2,048 WEIGHTS)' : gran === 'channel' ? 'ROW 0 (512 WEIGHTS)' : `GROUP OF ${gran} HOLDING W[0,40]`;
+      q<SVGTextElement>('[data-el="title"]').textContent = label;
+      q<SVGTextElement>('[data-el="range"]').textContent = `${nLev} LEVELS`;
+
+      // --- bottom panel: one cell per scale
+      cellsG.replaceChildren();
+      const perRow = gran === 'tensor' ? 1 : COLS / gsize;
+      const CX = 10, CW = 540, CY = 206, CH = 16, GAP = 4;
+      // shade by each group's RMS error relative to the RMS of the ordinary weights (outlier excluded),
+      // so a group whose weights all collapsed to zero reads as dark even though the outlier itself is exact
+      const rel = gErr.map((e) => Math.sqrt(e / gsize) / BASE_RMS);
+      if (gran === 'tensor') {
+        const a = Math.min(1, rel[0] / 0.8);
+        cellsG.appendChild(mk('rect', { x: CX, y: CY, width: CW, height: ROWS * (CH + GAP) - GAP, style: `fill:var(--blue);fill-opacity:${(0.06 + 0.94 * a).toFixed(3)};stroke:var(--blue)`, 'stroke-width': 1 }));
+      } else {
+        for (let r = 0; r < ROWS; r++) {
+          for (let k = 0; k < perRow; k++) {
+            const g = r * perRow + k;
+            const a = Math.min(1, rel[g] / 0.8);
+            const w = CW / perRow;
+            cellsG.appendChild(mk('rect', { x: CX + k * w, y: CY + r * (CH + GAP), width: Math.max(1, w - (perRow > 16 ? 1 : 2)), height: CH, style: `fill:var(--blue);fill-opacity:${(0.06 + 0.94 * a).toFixed(3)};stroke:var(--blue)`, 'stroke-width': perRow > 16 ? 0.5 : 1 }));
+          }
+        }
+      }
+      q<SVGTextElement>('[data-el="nscales"]').textContent = `${nGroups} SCALE${nGroups > 1 ? 'S' : ''}`;
+
+      // --- readouts
+      let e = 0, n = 0;
+      for (let i = 0; i < W.length; i++) { e += (W[i] - Wq[i]) ** 2; n += W[i] ** 2; }
+      const zeroQ = affine ? focus.z : 0;
+      const zeros = focus.q.filter((v) => v === zeroQ).length;
+      const used = new Set(focus.q).size;
+      // overhead: one fp16 scale per group (+ one zero-point of `bits` bits when affine)
+      const bpw = bits + (nGroups * (16 + (affine ? bits : 0))) / (ROWS * COLS);
+      out('bits').textContent = String(bits);
+      out('step').textContent = focus.s.toExponential(2);
+      out('zero').textContent = `${((zeros / focus.q.length) * 100).toFixed(0)}%`;
+      out('used').textContent = `${used} / ${nLev}`;
+      out('err').textContent = `${(Math.sqrt(e / n) * 100).toFixed(1)}%`;
+      out('bpw').textContent = bpw.toFixed(3);
+    };
+
+    bitsIn.addEventListener('input', () => { bits = Number(bitsIn.value); render(); });
+    outBtn.addEventListener('click', () => { outlier = !outlier; outBtn.setAttribute('aria-pressed', String(outlier)); render(); });
+    affBtn.addEventListener('click', () => { affine = !affine; affBtn.setAttribute('aria-pressed', String(affine)); render(); });
+    gBtns.forEach((b) => b.addEventListener('click', () => {
+      gran = b.dataset.g!;
+      gBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    render();
+  });
+</script>

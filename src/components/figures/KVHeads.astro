@@ -1,0 +1,133 @@
+---
+// KV cache size calculator for a Llama-3.1-8B-shaped model (32 layers, 32 query heads of 128 dims,
+// bf16 weights ~16 GB). Pick how many K/V heads the query heads share (MHA / GQA / MQA), a sliding
+// window, a cache precision, a context length and a number of users.
+// Usage: <KVHeads />
+---
+<div class="kvh" data-fig="kv-heads">
+  <svg viewBox="0 0 560 250" role="img" aria-label="Query heads connected to the key/value heads they share, and bars comparing cache size with the model weights">
+    <text x="10" y="14" class="strong">32 QUERY HEADS</text>
+    <g data-layer="q"></g>
+    <g data-layer="links"></g>
+    <g data-layer="kv"></g>
+    <text x="10" y="112" class="strong" data-el="kvlabel"></text>
+    <text x="10" y="148" class="strong">MEMORY · SPARK 128 GB</text>
+    <rect x="10" y="156" width="540" height="18" class="ink" stroke-width="1" />
+    <g data-layer="bar"></g>
+    <text x="10" y="192" data-el="barlabel"></text>
+    <text x="10" y="216" class="strong" data-el="big"></text>
+    <text x="10" y="236" data-el="small"></text>
+  </svg>
+  <div class="ctl">
+    <span>heads</span>
+    <button class="btn" type="button" data-kv="32" aria-pressed="false">MHA</button>
+    <button class="btn" type="button" data-kv="8" aria-pressed="true">GQA-8</button>
+    <button class="btn" type="button" data-kv="1" aria-pressed="false">MQA</button>
+  </div>
+  <div class="ctl">
+    <span>cache dtype</span>
+    <button class="btn" type="button" data-dt="2" aria-pressed="true">BF16</button>
+    <button class="btn" type="button" data-dt="1" aria-pressed="false">FP8</button>
+    <button class="btn" type="button" data-dt="0.5" aria-pressed="false">INT4</button>
+    <span>window</span>
+    <button class="btn" type="button" data-w="0" aria-pressed="true">Full</button>
+    <button class="btn" type="button" data-w="4096" aria-pressed="false">4K</button>
+  </div>
+  <div class="ctl">
+    <label>context <input type="range" min="0" max="7" step="1" value="3" data-in="ctx" /> <output data-out="ctx">8K</output></label>
+    <label>users <input type="range" min="0" max="6" step="1" value="0" data-in="users" /> <output data-out="users">1</output></label>
+  </div>
+  <div class="ctl">
+    <span>per token <span class="readout" data-out="tok">-</span></span>
+    <span>all users <span class="readout" data-out="all">-</span></span>
+    <span>ceiling per stream <span class="readout" data-out="ceil">-</span></span>
+  </div>
+</div>
+
+<style>
+  .kvh svg { width: 100%; }
+</style>
+
+<script>
+  const L = 32, HQ = 32, D = 128;
+  const WEIGHTS = 16.06e9; // bf16 Llama 3.1 8B, bytes
+  const MEM = 128e9; // spec-sheet
+  const BW = 273e9; // spec-sheet
+  const CTX = [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072];
+  const USERS = [1, 2, 4, 8, 16, 32, 64];
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  };
+  const fmt = (b: number) => (b >= 1024 ** 3 ? `${(b / 1024 ** 3).toFixed(b >= 10 * 1024 ** 3 ? 0 : 1)} GiB` : b >= 1024 ** 2 ? `${(b / 1024 ** 2).toFixed(0)} MiB` : `${(b / 1024).toFixed(0)} KiB`);
+  const k = (n: number) => (n >= 1024 ? `${n / 1024}K` : String(n));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="kv-heads"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const qG = q<SVGGElement>('[data-layer="q"]');
+    const lG = q<SVGGElement>('[data-layer="links"]');
+    const kvG = q<SVGGElement>('[data-layer="kv"]');
+    const barG = q<SVGGElement>('[data-layer="bar"]');
+    const out = (s: string) => q<HTMLElement>(`[data-out="${s}"]`);
+    const el = (s: string) => q<SVGTextElement>(`[data-el="${s}"]`);
+    const ctxIn = q<HTMLInputElement>('[data-in="ctx"]');
+    const usIn = q<HTMLInputElement>('[data-in="users"]');
+    let HKV = 8, DT = 2, W = 0;
+
+    const X0 = 12, QW = 13, QS = 16.8;
+    const qx = (i: number) => X0 + i * QS;
+    const render = () => {
+      qG.replaceChildren(); lG.replaceChildren(); kvG.replaceChildren(); barG.replaceChildren();
+      const group = HQ / HKV;
+      for (let i = 0; i < HQ; i++) qG.appendChild(mk('rect', { x: qx(i), y: 24, width: QW, height: 16, class: 'fill-paper', 'stroke-width': 1 }));
+      for (let g = 0; g < HKV; g++) {
+        const first = qx(g * group), lastEnd = qx((g + 1) * group - 1) + QW;
+        const cx = (first + lastEnd) / 2;
+        const w = Math.max(QW, Math.min(lastEnd - first, 60));
+        kvG.appendChild(mk('rect', { x: cx - w / 2, y: 80, width: w, height: 16, class: 'fill-wash', 'stroke-width': 1 }));
+        for (let i = g * group; i < (g + 1) * group; i++) {
+          lG.appendChild(mk('line', { x1: qx(i) + QW / 2, y1: 40, x2: cx, y2: 80, class: 'blue', 'stroke-width': 0.8 }));
+        }
+      }
+      el('kvlabel').textContent = `${HKV} K/V HEAD${HKV > 1 ? 'S' : ''} · CACHED · ${group} QUER${group > 1 ? 'IES SHARE' : 'Y USES'} EACH`;
+
+      const ctx = CTX[Number(ctxIn.value)], users = USERS[Number(usIn.value)];
+      const kept = W ? Math.min(ctx, W) : ctx;
+      const perTok = 2 * L * HKV * D * DT;
+      const perUser = perTok * kept;
+      const all = perUser * users;
+      out('ctx').textContent = k(ctx);
+      out('users').textContent = String(users);
+      out('tok').textContent = fmt(perTok);
+      out('all').textContent = fmt(all);
+      const read = WEIGHTS + all;
+      out('ceil').textContent = `${(BW / read).toFixed(1)} tok/s`;
+
+      const sx = (b: number) => (b / MEM) * 540;
+      const ww = sx(WEIGHTS);
+      barG.appendChild(mk('rect', { x: 10, y: 157, width: ww, height: 16, class: 'fill-blue' }));
+      const kvw = Math.min(sx(all), 540 - ww);
+      if (kvw > 0) barG.appendChild(mk('rect', { x: 10 + ww + 2, y: 157, width: Math.max(kvw - 2, 1), height: 16, class: 'fill-wash', 'stroke-width': 1 }));
+      const over = WEIGHTS + all > MEM;
+      el('barlabel').textContent = `WEIGHTS 16 GB  +  KV ${fmt(all)}${over ? '  · DOES NOT FIT' : ''}`;
+      el('big').textContent = `${fmt(perTok)}/TOKEN × ${kept.toLocaleString('en-US')} TOKENS KEPT × ${users} USER${users > 1 ? 'S' : ''} = ${fmt(all)}`;
+      el('small').textContent = `PER TOKEN: 2 × ${L} LAYERS × ${HKV} KV HEADS × ${D} × ${DT} B${W && ctx > W ? ' · WINDOW CAPS IT' : ''}`;
+    };
+    const wire = (attr: string, set: (v: number) => void) => {
+      root.querySelectorAll<HTMLButtonElement>(`[${attr}]`).forEach((b) => b.addEventListener('click', () => {
+        root.querySelectorAll(`[${attr}]`).forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        set(Number(b.getAttribute(attr)));
+        render();
+      }));
+    };
+    wire('data-kv', (v) => (HKV = v));
+    wire('data-dt', (v) => (DT = v));
+    wire('data-w', (v) => (W = v));
+    ctxIn.addEventListener('input', render);
+    usIn.addEventListener('input', render);
+    render();
+  });
+</script>

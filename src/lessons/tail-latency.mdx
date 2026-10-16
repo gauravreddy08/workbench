@@ -1,0 +1,745 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import TailFanout from '../components/figures/TailFanout.astro';
+import TailQueue from '../components/figures/TailQueue.astro';
+
+## Today
+
+- Say exactly what p50, p99 and p99.9 are, why the mean misleads, and why you can't average two p99s.
+- Explain where the long tail of a latency distribution comes from, and why fan-out turns one backend's rare bad day into most users' normal day.
+- Predict, with one formula, how latency grows as a server gets busier, and find the knee of the curve on a real server.
+- Tell a closed-loop load generator from an open-loop one, catch coordinated omission in the act, and record latencies in an HDR histogram.
+- Build hedged requests and measure what they do to p99, and what they cost.
+
+Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (your async `loadgen.py` and Little's Law) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your benchmark harness, and why 20 samples can't give a p99). Rough time: two evenings.
+
+## The Problem
+
+You run your load generator from lesson 4 against a service before you ship it. Sixteen workers, a few thousand requests. The summary says p50 83 ms, p99 136 ms. Clean. You ship it.
+
+A week later someone shows you the dashboard from the real thing. At about the same request rate, p99 is over a second, and every few minutes there's a cliff where it touches ten. Nothing changed in the code. The server is the same. So which number was the lie?
+
+The load test was. Not because of a bug in your arithmetic, but because of *how it sent requests*. Your sixteen workers each waited politely for an answer before sending the next request. Real users don't. When the server slowed down, your load test slowed down with it and stopped sending exactly the requests that would have been slow. The test measured a gentler world than the one you shipped into.
+
+That's one of three ideas in this lesson. The other two explain why it matters: latency is a lopsided pile in which the rare bad requests decide how a big system feels, and as a server gets busier those bad requests don't grow politely, they explode, at a point you can find on a chart.
+
+<Origin year="2013" title="The Tail at Scale">
+
+By the early 2010s, one Google search touched hundreds or thousands of machines, each holding a slice of the index, and the answer couldn't come back until the slowest slice did. The machines were fast on average and the product was still slow, because some machine, somewhere, was always having a bad moment.
+
+In February 2013 Jeff Dean and Luiz André Barroso published "The Tail at Scale" in Communications of the ACM. Its point was blunt: at this scale you can't get rid of rare slowness, so design systems that tolerate it, the way you design for machines that fail. It gave the industry its vocabulary (tail latency, hedged requests) and the arithmetic in Figure 002.
+
+Around the same time, Gil Tene, CTO of Azul Systems (a company that made low-pause Java virtual machines, so tails were its business), began giving a talk called "How NOT to Measure Latency". He showed that most load-testing tools systematically hid the tail, named the bug (coordinated omission), and wrote the HdrHistogram for recording latencies without losing it.
+
+</Origin>
+
+## The Idea
+
+### A pile, not a number
+
+Time a thousand requests to the same endpoint. You don't get one number; you get a thousand different ones. Sort them and you get a shape like this.
+
+<Figure n="001" title="A LONG TAIL" caption="A typical latency histogram (illustrative). There's a hard floor, the work itself, and almost nothing can be faster. Most requests land just above it. Then a thin tail stretches far to the right. The median sits in the hump, the mean gets dragged right by the tail, and p99 lives out where almost nothing is.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A right-skewed latency histogram with p50, mean, p99 and p99.9 marked">
+  <rect x="52.1" y="84.4" width="10.6" height="95.6" class="fill-wash" stroke-width="0.8" />
+  <rect x="63.7" y="50.0" width="10.6" height="130.0" class="fill-wash" stroke-width="0.8" />
+  <rect x="75.3" y="77.8" width="10.6" height="102.2" class="fill-wash" stroke-width="0.8" />
+  <rect x="86.9" y="110.8" width="10.6" height="69.2" class="fill-wash" stroke-width="0.8" />
+  <rect x="98.5" y="134.6" width="10.6" height="45.4" class="fill-wash" stroke-width="0.8" />
+  <rect x="110.1" y="149.4" width="10.6" height="30.6" class="fill-wash" stroke-width="0.8" />
+  <rect x="121.7" y="158.1" width="10.6" height="21.9" class="fill-wash" stroke-width="0.8" />
+  <rect x="133.3" y="163.2" width="10.6" height="16.8" class="fill-wash" stroke-width="0.8" />
+  <rect x="144.9" y="166.3" width="10.6" height="13.7" class="fill-wash" stroke-width="0.8" />
+  <rect x="156.5" y="168.4" width="10.6" height="11.6" class="fill-wash" stroke-width="0.8" />
+  <rect x="168.1" y="169.8" width="10.6" height="10.2" class="fill-wash" stroke-width="0.8" />
+  <rect x="179.7" y="170.9" width="10.6" height="9.1" class="fill-wash" stroke-width="0.8" />
+  <rect x="191.3" y="171.9" width="10.6" height="8.1" class="fill-wash" stroke-width="0.8" />
+  <rect x="202.9" y="172.7" width="10.6" height="7.3" class="fill-wash" stroke-width="0.8" />
+  <rect x="214.5" y="173.4" width="10.6" height="6.6" class="fill-wash" stroke-width="0.8" />
+  <rect x="226.1" y="174.0" width="10.6" height="6.0" class="fill-wash" stroke-width="0.8" />
+  <rect x="237.7" y="174.6" width="10.6" height="5.4" class="fill-wash" stroke-width="0.8" />
+  <rect x="249.3" y="175.1" width="10.6" height="4.9" class="fill-wash" stroke-width="0.8" />
+  <rect x="260.9" y="175.6" width="10.6" height="4.4" class="fill-wash" stroke-width="0.8" />
+  <rect x="272.5" y="176.0" width="10.6" height="4.0" class="fill-wash" stroke-width="0.8" />
+  <rect x="284.1" y="176.4" width="10.6" height="3.6" class="fill-wash" stroke-width="0.8" />
+  <rect x="295.7" y="176.7" width="10.6" height="3.3" class="fill-wash" stroke-width="0.8" />
+  <rect x="307.3" y="177.0" width="10.6" height="3.0" class="fill-wash" stroke-width="0.8" />
+  <rect x="318.9" y="177.3" width="10.6" height="2.7" class="fill-wash" stroke-width="0.8" />
+  <rect x="330.5" y="177.6" width="10.6" height="2.4" class="fill-wash" stroke-width="0.8" />
+  <rect x="342.1" y="177.8" width="10.6" height="2.2" class="fill-wash" stroke-width="0.8" />
+  <rect x="353.7" y="178.0" width="10.6" height="2.0" class="fill-wash" stroke-width="0.8" />
+  <rect x="365.3" y="178.2" width="10.6" height="1.8" class="fill-wash" stroke-width="0.8" />
+  <rect x="376.9" y="178.4" width="10.6" height="1.6" class="fill-wash" stroke-width="0.8" />
+  <rect x="388.5" y="178.5" width="10.6" height="1.5" class="fill-wash" stroke-width="0.8" />
+  <rect x="400.1" y="178.7" width="10.6" height="1.3" class="fill-wash" stroke-width="0.8" />
+  <rect x="411.7" y="178.8" width="10.6" height="1.2" class="fill-wash" stroke-width="0.8" />
+  <rect x="423.3" y="178.9" width="10.6" height="1.1" class="fill-wash" stroke-width="0.8" />
+  <rect x="434.9" y="179.0" width="10.6" height="1.0" class="fill-wash" stroke-width="0.8" />
+  <rect x="446.5" y="179.1" width="10.6" height="0.9" class="fill-wash" stroke-width="0.8" />
+  <rect x="458.1" y="179.2" width="10.6" height="0.8" class="fill-wash" stroke-width="0.8" />
+  <rect x="469.7" y="179.3" width="10.6" height="0.7" class="fill-wash" stroke-width="0.8" />
+  <rect x="481.3" y="179.3" width="10.6" height="0.7" class="fill-wash" stroke-width="0.8" />
+  <rect x="504.5" y="179.2" width="10.6" height="0.8" class="fill-wash" stroke-width="0.8" />
+  <rect x="550.9" y="179.2" width="10.6" height="0.8" class="fill-wash" stroke-width="0.8" />
+  <rect x="597.3" y="179.2" width="10.6" height="0.8" class="fill-wash" stroke-width="0.8" />
+  <line x1="40" y1="180" x2="624" y2="180" class="ink" stroke-width="1.2" />
+  <line x1="40" y1="180" x2="40" y2="185" class="ink" stroke-width="1" />
+  <text x="40" y="198" text-anchor="middle">0</text>
+  <line x1="185" y1="180" x2="185" y2="185" class="ink" stroke-width="1" />
+  <text x="185" y="198" text-anchor="middle">50 MS</text>
+  <line x1="330" y1="180" x2="330" y2="185" class="ink" stroke-width="1" />
+  <text x="330" y="198" text-anchor="middle">100 MS</text>
+  <line x1="475" y1="180" x2="475" y2="185" class="ink" stroke-width="1" />
+  <text x="475" y="198" text-anchor="middle">150 MS</text>
+  <line x1="620" y1="180" x2="620" y2="185" class="ink" stroke-width="1" />
+  <text x="620" y="198" text-anchor="end">200 MS</text>
+  <line x1="52" y1="40" x2="52" y2="180" class="ink dash" stroke-width="1" />
+  <text x="48" y="34" text-anchor="end">FLOOR</text>
+  <line x1="80.6" y1="22" x2="80.6" y2="180" class="ink" stroke-width="1.2" />
+  <text x="84" y="20" class="strong">P50 14 MS</text>
+  <line x1="116.2" y1="58" x2="116.2" y2="180" class="ink dash" stroke-width="1" />
+  <text x="120" y="56">MEAN 26 MS</text>
+  <line x1="451.8" y1="98" x2="451.8" y2="180" class="blue" stroke-width="1.5" />
+  <text x="447" y="94" text-anchor="end" class="blue-t">P99 142 MS</text>
+  <line x1="591" y1="128" x2="591" y2="180" class="blue dash" stroke-width="1.2" />
+  <text x="620" y="122" text-anchor="end" class="blue-t">P99.9 190 MS</text>
+  <line x1="170" y1="214" x2="620" y2="214" class="blue" stroke-width="1" />
+  <line x1="170" y1="210" x2="170" y2="218" class="blue" stroke-width="1" />
+  <line x1="620" y1="210" x2="620" y2="218" class="blue" stroke-width="1" />
+  <text x="395" y="228" text-anchor="middle" class="blue-t">THE TAIL: RARE, BUT IT GOES A LONG WAY</text>
+</svg>
+</Figure>
+
+You already got the key fact right in the diagnostic: p99 tells you about the bad experiences, the mean doesn't. Let's make that precise.
+
+A <Term w="percentile">The value below which that fraction of measurements fall. p99 = 120 ms means 99% of requests took 120 ms or less, and 1% took longer.</Term> answers "how slow is the request that only N% of requests are worse than?" Sort the samples; p50 (the <Term w="median">The middle value once sorted. Half the requests were faster, half slower. Same thing as p50.</Term>) is the one in the middle, p99 is the one 99% of the way along, p99.9 is 999 out of 1,000 of the way along. At 100 requests a second, your p99 happens every second. A user whose 10 page views make 300 requests meets it about three times.
+
+Why not the mean? Because it describes nobody. Take 99 requests at 10 ms and one at 10 seconds. The mean is about 110 ms: eleven times worse than what 99% of requests saw, ninety times better than what the unlucky one saw. In a long-tailed pile the mean is a tug-of-war between the hump and the tail, and it won't tell you who's winning.
+
+Two rules follow, and people break both all the time.
+
+**You can't average percentiles.** If server A's p99 is 50 ms and server B's is 500 ms, the p99 of both together is not 275 ms; it depends on how many requests each served and the whole shape. Same for time: the average of sixty per-second p99s is not the p99 of the minute, and it can be wrong in either direction (you'll see both in Break It). To combine, you need the underlying counts. Hold that thought until the HDR histogram.
+
+**Report p99 next to n.** With 20 samples, "p99" is just your slowest request. You'll put numbers on this later.
+
+### Why the pile is lopsided
+
+In Figure 001 the left edge is a wall: a request can't be faster than its work. The right edge is open, because there are dozens of ways to be *slower*, and they only ever add time.
+
+- **Waiting in line.** If another request is being served when yours arrives, you wait. This one is so important it gets its own section below.
+- **Pauses.** A <Term w="garbage collector">The part of a language runtime (Python, Java, Go) that finds and frees memory nobody uses. Some collectors briefly stop all the program's threads while they work, and every request in flight waits.</Term> stopping the world for 50 ms.
+- **The machine doing something else.** A backup, a cron job, another container stealing CPU (the "noisy neighbour").
+- **Cold caches.** After a deploy or an eviction, a request goes to disk instead of RAM: up to 1,000x, from [How slow is slow?](/lessons/latency-numbers/).
+- **The network.** A lost packet makes TCP wait before resending, and on Linux that wait has a floor of about 200 ms, more than most whole requests take.
+- **Locks.** Two requests want the same row or mutex. One waits.
+
+Each is rare and adds a lot. Stack rare-but-large delays on a fixed floor and you get Figure 001. That's not a bug in your server; it's what latency looks like on every computer ever measured.
+
+### Fan-out: when the tail becomes the body
+
+Here's where rare stops being rare. Most real requests aren't one call. A search goes to many index <Term w="shards">Slices of a big dataset (an index, a table, a vector store), each held by a different server. A query that needs all the data asks every shard.</Term>. A RAG pipeline queries several vector-store shards and a reranker. An agent step calls three tools in parallel. In each case the answer can't come back until **every** piece has. That's <Term w="fan-out">One incoming request triggering many outgoing requests (to shards, replicas, tools), whose answers must all come back before it can finish.</Term>, and it means the user doesn't see a backend's typical latency. They see the worst of N draws.
+
+<Predict id="fanout">
+A page needs answers from 100 backends, in parallel. Each backend is fast 99% of the time and slower than its own p99 the other 1%. What fraction of page loads hit at least one slow backend? Write a percentage.
+<Fragment slot="answer">
+
+About 63%. Each backend is fine with probability 0.99, so all 100 are fine with probability 0.99^100 ≈ 0.366. Everything else, 1 − 0.366 ≈ 63%, hits at least one backend's tail. Most of your users are now living in what each backend team thinks of as its rare bad case. This is exactly the example from "The Tail at Scale": servers with a 10 ms typical and 1 s p99, and a request needing 100 of them, means 63% of user requests take over a second.
+
+</Fragment>
+</Predict>
+
+Now play with it. Push the backends up, and switch between "slow" meaning past p90, p99 or p99.9.
+
+<Figure n="002" title="FAN-OUT CALCULATOR" caption="Chance that a user request, which needs all N backends, hits at least one backend's tail: 1 − (1 − p)^N. The second readout turns it around: the typical (median) user request is as slow as each backend's p-whatever. At 100 backends, the median user waits for the backends' p99.3.">
+
+<TailFanout />
+
+</Figure>
+
+That second readout is the one to sit with. If a request needs N backends and you want to know what the *median* user sees, ask: what latency do all N backends beat half the time? If each beats latency x with probability q, all N do with probability q^N. Set q^N = 0.5 and q = 0.5^(1/N). For N = 100 that's 0.9931. **The typical user of a 100-way fan-out sees each backend's p99.3.** The backend's tail has become the product's median.
+
+So a backend team that says "our p99 is fine, it's only 1%" is watching the wrong number. The paper's measurements make the same point from the other end: in one Google service, with a root server waiting on 100 leaves, the slowest 5% of leaf requests accounted for about half of the root's 99th-percentile latency. (The formula assumes backends are slow independently. Shared causes, like one overloaded switch, break that, but fan-out still amplifies the tail.)
+
+### Queues: why busy servers have huge tails
+
+The biggest single source of tail latency is waiting in line. Picture a coffee shop with one barista. Each drink takes about a minute. If one customer walks in every ten minutes, you almost never wait. If customers come every 1.1 minutes, on average the barista keeps up, but people don't arrive evenly. Three show up together, the line forms, and before it clears two more arrive. Some customers wait ten minutes for a one-minute drink.
+
+<Origin year="1909" title="Erlang counts phone calls">
+
+Agner Krarup Erlang, an engineer at the Copenhagen Telephone Company, needed to know how many lines a town needs so callers rarely get a busy signal, without paying for idle lines. In 1909 he published the first paper of what became queueing theory, treating calls as random arrivals. The math he started now sizes call centers, CPU schedulers, and the request queue in front of your GPU.
+
+</Origin>
+
+Three names. The <Term w="arrival rate">How many requests show up per second, on average. Written λ (lambda).</Term> λ, how often requests show up. The <Term w="service time">How long the server spends actually working on one request, not counting waiting. Its inverse, the service rate μ (mu), is the most requests per second the server could ever finish.</Term> S, how long each takes to serve, so the server can finish at most μ = 1/S per second. And the <Term w="utilization">The fraction of time the server is busy: arrival rate times service time, written ρ (rho). ρ = 0.9 means busy 90% of the time. Must stay below 1 or the line grows forever.</Term> ρ = λ × S: the fraction of time the server is busy.
+
+Queueing theorists name the simplest useful model <Term w="M/M/1">Kendall's notation: arrivals are Markovian (random, Poisson), service times are Markovian (exponential), and there is 1 server. The "hello world" of queueing theory.</Term>: requests arrive at random, each takes a random amount of work (exponentially distributed, mean S), and there's one server. You don't need the derivation. You need two results, at cartoon level.
+
+The average time a request spends in the system, waiting plus being served, is
+
+**T = S / (1 − ρ)**
+
+and in M/M/1 that total time has an <Term w="exponential distribution">The shape of "waiting for a random event that is equally likely at every moment". Many short values, a few long ones; its p99 is 4.6 times its mean.</Term>, so its percentiles are fixed multiples of the average: p50 = 0.69 × T, p99 = 4.6 × T (that's ln 100).
+
+Put numbers on it for S = 10 ms. I checked these by simulating 400,000 requests in Python; the simulation lands within a few percent of the formula.
+
+| Utilization ρ | Mean T | p50 | p99 | p99 as a multiple of S |
+| --- | --- | --- | --- | --- |
+| 50% | 20 ms | 14 ms | 92 ms | 9x |
+| 80% | 50 ms | 35 ms | 230 ms | 23x |
+| 90% | 100 ms | 69 ms | 460 ms | 46x |
+| 95% | 200 ms | 139 ms | 920 ms | 92x |
+| 99% | 1 s | 690 ms | 4.6 s | 460x |
+
+That `1 / (1 − ρ)` is the whole story. From 50% to 90% busy, the server does 1.8x more work and p99 gets 5x worse. From 90% to 99%, 10% more throughput costs a 10x worse p99.
+
+<Predict id="queue-90">
+A server takes 10 ms per request on average and you run it at 90% busy (90 requests a second). Before touching the figure: what's the p99? And if every request took exactly 10 ms, no variation at all, would it be better, worse, or the same?
+<Fragment slot="answer">
+
+From the table, about 460 ms for exponential service times, 46 times the 10 ms of actual work. With perfectly constant service times it's better, roughly half (the simulator gives around 220 ms), but still more than 20x the work. Arrivals are still random, so lines still form; you just removed one of the two sources of randomness. Variability in either arrivals or service makes queues worse, and near ρ = 1 every bit of it is amplified.
+
+</Fragment>
+</Predict>
+
+Now drive it yourself. Slide the arrival rate. Watch the histogram stretch to the right, and watch where your dot sits on the curve below it. Then switch the service times between constant, exponential, and "rare 100 ms": mostly quick requests with an occasional slow one, the same 10 ms average.
+
+<Figure n="003" title="QUEUE SIMULATOR" caption="A single server with random arrivals. Up to about 60% busy, p99 barely moves. Past about 80%, it bends upward hard; past 95%, every step on the slider multiplies it. Switch to 'rare 100 ms': same average work, much fatter tail at every load, because one slow request makes everyone behind it wait too." wide>
+
+<TailQueue />
+
+</Figure>
+
+Three things to take from the simulator.
+
+**The hockey stick.** Latency against utilization is flat, then bends, then goes nearly vertical. The bend is the <Term w="knee">The point on a latency-vs-load curve where latency stops growing slowly and starts growing fast. Past it, small increases in load cause large increases in latency.</Term> of the curve. Below it, extra load is almost free; above it, you pay in tail latency. Real servers often have a sharper knee than M/M/1, because overloaded servers also do *more* work per request (cold caches, lock contention, retries).
+
+**Variability is the enemy, not just load.** The three service-time settings have the same average, so the same utilization, yet very different tails. A rule called <Term w="Kingman's formula">An approximation for the average wait in a single-server queue with any arrival and service distributions: wait ≈ (ρ / (1 − ρ)) × ((Ca² + Cs²) / 2) × S, where Ca and Cs measure how variable arrivals and service times are.</Term> says the average wait is roughly (utilization term) × (variability term) × (service time). You can attack either factor: lower utilization (more servers) or lower variability (cap request sizes, split big jobs, move the slow 1% to a separate queue).
+
+**Why people run servers at 50-70%.** Because the knee is there and traffic is bursty. At a normal 60%, a spike of 30% takes you to 90% and p99 goes up 5x. At a normal 85%, the same spike takes you past 100% and the queue grows until something times out. In the [baseline lesson](/lessons/baseline-vs-fireworks/) the naive Spark server had to stay near 1% utilization for 99% of requests to see no wait. That was this curve at its most brutal.
+
+### Closed loop and open loop
+
+Now back to the lie in The Problem. There are two ways to generate load, and they answer different questions.
+
+A <Term w="closed-loop">A load generator with a fixed number of workers (or "virtual users"). Each sends a request, waits for the answer, then sends the next. The next request depends on the previous one finishing.</Term> generator has c workers that each send, wait, send again. Your `loadgen.py` from lesson 4 is one: the semaphore lets at most c requests be in flight, and a new one starts only when one finishes.
+
+An <Term w="open-loop">A load generator that sends requests on a schedule (say 100 per second, at random times), whether or not earlier requests have finished. Like real users, who don't wait for each other.</Term> generator decides *when* each request goes out before the test starts, then sticks to the schedule no matter how the server is doing.
+
+Little's Law (L = λW, from lesson 4) says what each one controls. A closed loop fixes L, the number in flight, at c, so throughput is λ = c / W. When the server slows down, W rises and the generator sends fewer requests per second. It backs off exactly when the server struggles, so it **can never push the server past its knee**. An open loop fixes λ. When the server slows down, L, the pile of unfinished requests, grows. That's what real traffic does: users on the internet don't know your server is slow; they keep clicking.
+
+That's why the test in The Problem looked fine. On my Mac, closed-loop c = 16 drove the server to about 185 requests per second with p99 136 ms. An open loop at 190 per second, a hair more, got p99 of ten seconds: 190 was just past capacity, so the queue grew for the whole test. One test asked "how fast is it when we're careful?" The other asked "what happens when traffic doesn't care?"
+
+<Figure n="004" title="COORDINATED OMISSION" caption="The server freezes for 500 ms. Top: a closed-loop worker is stuck inside one request for the whole freeze, records one slow sample, and sends nothing else. Bottom: an open-loop schedule keeps sending, and every request that should have gone out during the freeze waits for it to end. Same freeze: one bad sample versus a whole column of them." wide>
+<svg viewBox="0 0 640 320" role="img" aria-label="Timelines of a closed-loop and an open-loop generator during a 500 ms server freeze">
+  <rect x="220" y="24" width="200" height="270" class="fill-wash" stroke-width="0" opacity="0.6" />
+  <text x="320" y="18" text-anchor="middle" class="blue-t">SERVER FROZEN 500 MS</text>
+  <text x="10" y="56" class="strong">CLOSED LOOP</text>
+  <text x="10" y="70">1 WORKER</text>
+  <rect x="100" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="120" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="140" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="160" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="180" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="200" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="220" y="78" width="210" height="12" class="fill-blue" />
+  <rect x="432" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="452" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="472" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="492" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="512" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="532" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="552" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="572" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <rect x="592" y="78" width="18" height="12" class="fill-paper" stroke-width="1" />
+  <line x1="325" y1="92" x2="325" y2="112" class="blue" stroke-width="1" />
+  <text x="325" y="124" text-anchor="middle" class="blue-t">1 SLOW SAMPLE. NOTHING ELSE SENT.</text>
+  <line x1="20" y1="150" x2="630" y2="150" class="ink dash" stroke-width="1" />
+  <text x="10" y="176" class="strong">OPEN LOOP</text>
+  <text x="10" y="190">SENDS ON A</text>
+  <text x="10" y="204">SCHEDULE</text>
+  <line x1="100" y1="172" x2="620" y2="172" class="ink" stroke-width="1" />
+  <line x1="100" y1="166" x2="100" y2="178" class="ink" stroke-width="1" />
+  <line x1="120" y1="166" x2="120" y2="178" class="ink" stroke-width="1" />
+  <line x1="140" y1="166" x2="140" y2="178" class="ink" stroke-width="1" />
+  <line x1="160" y1="166" x2="160" y2="178" class="ink" stroke-width="1" />
+  <line x1="180" y1="166" x2="180" y2="178" class="ink" stroke-width="1" />
+  <line x1="200" y1="166" x2="200" y2="178" class="ink" stroke-width="1" />
+  <line x1="220" y1="166" x2="220" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="240" y1="166" x2="240" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="260" y1="166" x2="260" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="280" y1="166" x2="280" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="300" y1="166" x2="300" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="320" y1="166" x2="320" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="340" y1="166" x2="340" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="360" y1="166" x2="360" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="380" y1="166" x2="380" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="400" y1="166" x2="400" y2="178" class="blue" stroke-width="1.5" />
+  <line x1="440" y1="166" x2="440" y2="178" class="ink" stroke-width="1" />
+  <line x1="460" y1="166" x2="460" y2="178" class="ink" stroke-width="1" />
+  <line x1="480" y1="166" x2="480" y2="178" class="ink" stroke-width="1" />
+  <line x1="500" y1="166" x2="500" y2="178" class="ink" stroke-width="1" />
+  <line x1="520" y1="166" x2="520" y2="178" class="ink" stroke-width="1" />
+  <line x1="540" y1="166" x2="540" y2="178" class="ink" stroke-width="1" />
+  <line x1="560" y1="166" x2="560" y2="178" class="ink" stroke-width="1" />
+  <line x1="580" y1="166" x2="580" y2="178" class="ink" stroke-width="1" />
+  <line x1="600" y1="166" x2="600" y2="178" class="ink" stroke-width="1" />
+  <rect x="220" y="186" width="210" height="6" class="fill-blue" />
+  <rect x="240" y="196" width="190" height="6" class="fill-blue" />
+  <rect x="260" y="206" width="170" height="6" class="fill-blue" />
+  <rect x="280" y="216" width="150" height="6" class="fill-blue" />
+  <rect x="300" y="226" width="130" height="6" class="fill-blue" />
+  <rect x="320" y="236" width="110" height="6" class="fill-blue" />
+  <rect x="340" y="246" width="90" height="6" class="fill-blue" />
+  <rect x="360" y="256" width="70" height="6" class="fill-blue" />
+  <rect x="380" y="266" width="50" height="6" class="fill-blue" />
+  <rect x="400" y="276" width="30" height="6" class="fill-blue" />
+  <text x="440" y="236">10 SLOW SAMPLES:</text>
+  <text x="440" y="250">500, 480, 460 ... 20 MS</text>
+  <text x="440" y="264" class="blue-t">MEASURED FROM WHEN</text>
+  <text x="440" y="278" class="blue-t">EACH SHOULD HAVE GONE</text>
+  <text x="100" y="312">TIME →</text>
+</svg>
+</Figure>
+
+### Coordinated omission
+
+Figure 004 is the bug Gil Tene named. Say your server freezes for 500 ms every 5 seconds (a GC pause, a stalled disk), so it's frozen about 9% of the time. A closed-loop worker caught mid-request records one 500 ms sample, then nothing for the rest of the freeze, because it's waiting. Generator and server have "coordinated": the generator omitted exactly the requests that would have seen the freeze. That's <Term w="coordinated omission">A measurement error where the load generator stops sending while the server is slow, so the slow periods are under-sampled and the reported tail looks far better than what real users would see.</Term>.
+
+<Predict id="co">
+Your server does about 150 requests per second, normally answering in 5 ms, and freezes for 500 ms every 5 seconds. You test it with one closed-loop worker for 20 seconds, about 3,000 requests. What p99 does it report? What p99 would 100 real users per second, arriving at random, actually see?
+<Fragment slot="answer">
+
+The closed loop reports a p99 of about 25 ms: I measured 25.5 ms on my Mac. The four freezes in 20 seconds produced four slow samples out of about 2,900, far fewer than 1%, so p99 doesn't see them at all. Only the max (518 ms) gives the game away.
+
+An open-loop generator at 100 per second, measuring from when each request was *supposed* to be sent, reported p99 473 ms. About 9% of the time the server is frozen, so about 9% of real arrivals land in a freeze and wait an average of 250 ms for it to end. That's well over 1% of requests, so p99 sits deep inside the freeze. Same server, 19x different p99.
+
+</Fragment>
+</Predict>
+
+There are two fixes, and they're the same idea.
+
+1. **Generate load open-loop and measure from the intended send time.** Decide the schedule up front, `t_intended = start + i / rate` (or random gaps with that average), and compute latency as `t_done − t_intended`, not `t_done − t_actually_sent`. If your generator was late sending a request, maybe because it was itself stuck, that lateness counts. A real user would have experienced it.
+2. **Or correct afterwards.** If a closed-loop worker meant to send every 5 ms and one request took 500 ms, it knows it skipped about 99 sends. You can back-fill them: one sample at 495 ms, one at 490 ms, and so on down to 5 ms, the latencies those skipped requests would have seen. That's what HdrHistogram's `record_corrected_value(value, expected_interval)` does. It's an estimate, and it needs you to say what the intended rate was, but it's far better than nothing.
+
+It also hides where you wouldn't look. The `wrk` HTTP benchmark has it (Tene wrote `wrk2`, which sends at a fixed rate and measures from the intended time). So does any tool that starts the stopwatch *after* waiting for a free connection, worker, or semaphore. Your own `loadgen.py` starts it inside `async with sem:`. That's honest for a closed-loop tool, and coordinated omission the moment you treat it as a schedule. You'll reproduce exactly that in Break It.
+
+### Counting the tail: samples and HDR histograms
+
+Two practical problems remain: how many samples you need, and how to store them.
+
+**Samples.** You can't measure p99 with 100 requests. You can barely measure it with 1,000. Here's a simulation: sample from a distribution whose true p99 is 46 ms, estimate p99, repeat 2,000 times, and see how much the estimate wanders.
+
+| Samples | Middle 90% of p99 estimates (true value 46 ms) |
+| --- | --- |
+| 100 | 31 to 57 ms |
+| 1,000 | 41 to 51 ms |
+| 10,000 | 44 to 48 ms |
+| 100,000 | 45.5 to 46.6 ms |
+
+At 100 samples, p99 is the slowest or second-slowest request, and two runs can differ by almost 2x. You want at least ten samples past the percentile, so 1,000+ for p99 and 10,000+ for p99.9. A 10-minute test at 100 requests per second gives 60,000, plenty. The corollary: **a p99.9 from a 30-second test is a max with extra steps.**
+
+**Storage.** A Python list of every latency is fine for a test. It's not fine for 10,000 requests a second, all day, on 50 machines, when you want p99 per minute per endpoint. You need a summary, and the naive ones fail: a mean loses the tail, and fixed linear buckets (0-10 ms, 10-20 ms...) either need millions of buckets or lose all detail at the low end.
+
+An <Term w="HDR histogram">High Dynamic Range histogram (Gil Tene). Buckets that grow exponentially in width, each split into many equal sub-buckets, so every recorded value is kept to a fixed relative precision (say 3 significant digits) across a huge range, in a fixed amount of memory.</Term> solves this by making bucket width grow with the value. The buckets are powers of two (1-2 µs, 2-4 µs, 4-8 µs, ...), and each one is split into the same number of equal sub-buckets, enough to keep, say, 3 significant digits. So a 1.234 ms latency is stored as "somewhere in 1.234 ms ± 0.05%", and so is 12.34 s. A histogram covering 1 microsecond to an hour at 3 significant digits takes about 185 KB with 64-bit counters (I checked with the Python package), however many values you record, and recording a value is a couple of arithmetic operations and one counter increment.
+
+The killer feature: **histograms add**. Two with the same layout combine by adding counts bucket by bucket. Record one per machine per minute, add them up, and ask the sum for its p99: the true p99 of all those requests, to 3 significant digits. That's the fix for "you can't average percentiles": keep histograms, compute percentiles at the end. Prometheus histograms and OpenTelemetry's exponential histograms use versions of the same idea.
+
+### Cutting the tail
+
+You can't make every machine fast every time. Dean and Barroso's argument: treat slowness like failure. Expect it and route around it.
+
+**Timeouts.** A <Term w="timeout">The longest a client will wait for an answer before giving up. It caps how long one request can hurt you, and turns "slow" into "failed", which you then have to handle.</Term> caps the damage of one stuck call. Set it from measured data (a bit above your p99.9), not a round number, and decide what happens after it fires.
+
+**Retries.** After a timeout, try again, ideally on a different <Term w="replica">One of several identical copies of a service, any of which can answer a request.</Term>. But a retry is extra load, and you've seen what extra load does near the knee. If a server is slow *because it's overloaded*, retries double its load and make it slower: a <Term w="retry storm">A feedback loop where slowness causes timeouts, timeouts cause retries, and retries add load that causes more slowness. Can keep a service down after the original problem is gone.</Term>. Real systems cap retries with a budget (at most, say, 10% extra traffic) and back off randomly between attempts; see the [rate limits lesson](/lessons/rate-limits/).
+
+**Hedged requests.** The clever one. Send to one replica. If it hasn't answered within some delay, send the same request to a second, use whichever answers first, and cancel the other.
+
+<Figure n="005" title="A HEDGED REQUEST" caption="Replica A hits a 100 ms stall. At the hedge delay (set near the p95, here 10 ms) the client sends a copy to replica B, which answers 6 ms later. The user sees 16 ms instead of 100. Because only requests still waiting at the p95 get a second copy, the extra load is about 5%.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Timeline of a hedged request: a slow first replica, a second copy sent after a delay that wins">
+  <line x1="110" y1="190" x2="620" y2="190" class="ink" stroke-width="1.2" />
+  <line x1="110" y1="186" x2="110" y2="194" class="ink" stroke-width="1" />
+  <text x="110" y="208" text-anchor="middle">0</text>
+  <line x1="161" y1="186" x2="161" y2="194" class="ink" stroke-width="1" />
+  <text x="161" y="208" text-anchor="middle">10</text>
+  <line x1="365" y1="186" x2="365" y2="194" class="ink" stroke-width="1" />
+  <text x="365" y="208" text-anchor="middle">50</text>
+  <line x1="620" y1="186" x2="620" y2="194" class="ink" stroke-width="1" />
+  <text x="620" y="208" text-anchor="end">100 MS</text>
+  <text x="10" y="52" class="strong">CLIENT</text>
+  <line x1="110" y1="40" x2="620" y2="40" class="ink dash" stroke-width="1" />
+  <circle cx="110" cy="40" r="3.5" class="fill-blue" />
+  <text x="104" y="24" text-anchor="end">SEND TO A</text>
+  <circle cx="161" cy="40" r="3.5" class="fill-blue" />
+  <text x="167" y="30">NO ANSWER YET: SEND TO B</text>
+  <circle cx="192" cy="40" r="5" class="fill-blue" />
+  <text x="200" y="60" class="blue-t">B ANSWERS AT 16 MS: DONE, CANCEL A</text>
+  <text x="10" y="104" class="strong">REPLICA A</text>
+  <rect x="110" y="92" width="82" height="16" class="fill-wash" stroke-width="1.2" />
+  <rect x="192" y="92" width="428" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="300" y="104" text-anchor="middle">STALL · GC PAUSE · BUSY DISK</text>
+  <text x="560" y="124" text-anchor="middle">WOULD HAVE BEEN 100 MS</text>
+  <line x1="192" y1="86" x2="192" y2="114" class="ink" stroke-width="1.5" />
+  <text x="186" y="84" text-anchor="end">✕</text>
+  <text x="10" y="154" class="strong">REPLICA B</text>
+  <rect x="161" y="142" width="31" height="16" class="fill-blue" />
+  <line x1="161" y1="40" x2="161" y2="142" class="blue dash" stroke-width="1" />
+  <line x1="192" y1="142" x2="192" y2="45" class="blue" stroke-width="1" />
+  <text x="200" y="154">6 MS OF REAL WORK</text>
+  <text x="161" y="176" text-anchor="middle" class="blue-t">HEDGE DELAY ≈ P95</text>
+</svg>
+</Figure>
+
+The trick is the delay. Two copies of every request doubles your load to fix a 1% problem. Waiting until the request has been out longer than your p95 means only 5% ever get a second copy, about 5% extra load, aimed exactly at the requests headed for the tail. The paper reports a Google BigTable benchmark where hedging after 10 ms cut the 99.9th-percentile latency for a 1,000-key read from 1,800 ms to 74 ms while sending only 2% more requests.
+
+Hedging works because tail slowness is often *about the machine, not the request*: replica A is in a GC pause, replica B isn't. That gives the two cases where it fails:
+
+- **When the slowness is the request.** If the query is slow because it's a huge query, sending it twice gets you two slow answers and double the work.
+- **When the slowness is load.** If every replica is slow because they're all near the knee, hedging adds load to a system that's slow *because* of load. You'll measure this in Break It, and it isn't subtle.
+
+And only hedge requests that are safe to do twice. A read, a search, a rerank, an LLM completion: fine. "Charge this card": not without an idempotency key, a unique ID the server uses to recognise and ignore a duplicate.
+
+**Refinements.** <Term w="Tied requests">Dean and Barroso's refinement of hedging: send the request to two servers at once, each told about the other. Whichever starts working on it first tells the other to cancel, so the duplicate rarely costs real work.</Term> send to two servers at once but let them cancel each other as soon as one starts, so you get the latency benefit with almost none of the duplicated work. <Term w="Backup tasks">MapReduce's version of hedging (Dean and Ghemawat, 2004): near the end of a job, re-launch the still-running "straggler" tasks on other machines and take whichever copy finishes first.</Term> are the batch-job version: MapReduce re-runs the last few straggling tasks of a job on other machines, and the MapReduce paper reported that one large sort took 44% longer with the feature turned off. In your world: an LLM request stuck behind a giant prompt on one replica, a vector-index shard on a sick machine, a flaky tool API. Same shape.
+
+## Build It
+
+Everything goes in one folder, say `~/workbench/tail/`. The server and the generators run on the same machine at first, which is fine as long as you remember the generator itself costs CPU. On my Mac, one httpx `AsyncClient` adds about 3 ms per request and tops out somewhere around a thousand requests a second, so keep the server's capacity well below that.
+
+<Task id="t0" title="Set up and run a server with knobs" agent="ok">
+
+```bash
+mkdir -p ~/workbench/tail && cd ~/workbench/tail
+python3 -m venv .venv && source .venv/bin/activate
+pip install httpx numpy matplotlib hdrhistogram
+```
+
+The `hdrhistogram` package imports as `hdrh`. Check it with `python -c "from hdrh.histogram import HdrHistogram"`.
+
+Then this server. It's plain `asyncio` with a hand-rolled bit of HTTP, so there's no framework overhead to blur the picture, and every kind of slowness in this lesson is a flag. `--workers 1` makes it a single-server queue, the M/M/1 of the Idea section (well, almost: the service times are exponential with the mean you choose).
+
+```python
+# tail_server.py: a tiny HTTP server with a knob for every kind of slowness.
+import argparse, asyncio, random, time
+
+p = argparse.ArgumentParser()
+p.add_argument("--port", type=int, default=8090)
+p.add_argument("--workers", type=int, default=1, help="requests served at once; 0 = unlimited")
+p.add_argument("--service-ms", type=float, default=5.0, help="mean service time")
+p.add_argument("--dist", choices=["exp", "const"], default="exp")
+p.add_argument("--slow-prob", type=float, default=0.0, help="chance a request is a straggler")
+p.add_argument("--slow-ms", type=float, default=100.0)
+p.add_argument("--stall-every", type=float, default=0.0, help="seconds between whole-server freezes")
+p.add_argument("--stall-ms", type=float, default=0.0)
+args = p.parse_args()
+
+sem = asyncio.Semaphore(args.workers) if args.workers > 0 else None
+BODY = b"ok\n"
+RESP = (b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: text/plain\r\n\r\n" % len(BODY)) + BODY
+
+
+def service_time() -> float:
+    if args.slow_prob and random.random() < args.slow_prob:
+        return args.slow_ms / 1000
+    m = args.service_ms / 1000
+    return random.expovariate(1 / m) if args.dist == "exp" else m
+
+
+async def work():
+    if sem is None:
+        await asyncio.sleep(service_time())
+    else:
+        async with sem:
+            await asyncio.sleep(service_time())
+
+
+async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+    try:
+        while True:
+            await reader.readuntil(b"\r\n\r\n")  # we only serve GETs with no body
+            await work()
+            writer.write(RESP)
+            await writer.drain()
+    except (asyncio.IncompleteReadError, ConnectionError):
+        pass
+    finally:
+        writer.close()
+
+
+async def staller():
+    # Freeze the whole event loop, like a stop-the-world GC pause or a noisy neighbour.
+    while True:
+        await asyncio.sleep(args.stall_every)
+        time.sleep(args.stall_ms / 1000)
+
+
+async def main():
+    server = await asyncio.start_server(handle, "127.0.0.1", args.port, backlog=4096)
+    if args.stall_every > 0:
+        asyncio.create_task(staller())
+    print(f"listening on :{args.port} workers={args.workers or 'inf'} "
+          f"service={args.service_ms}ms {args.dist}")
+    async with server:
+        await server.serve_forever()
+
+
+asyncio.run(main())
+```
+
+Start it with the defaults (one worker, 5 ms average): `python tail_server.py`. On paper its capacity is 200 requests a second. In practice it's a bit less, because each request also pays for timer wake-ups and HTTP parsing; mine topped out around 185.
+
+</Task>
+
+<Task id="t1" title="A closed-loop generator that runs for a duration" agent="hands">
+
+Adapt your lesson-4 `loadgen.py` into `closed.py`: instead of `-n` total requests, run `c` workers for `d` seconds. Each worker loops: stamp, `await client.get(url)`, record, repeat. One shared `httpx.AsyncClient`, with `max_connections=c` and `timeout=None` (a load test should never silently drop the slow ones).
+
+```python
+async def closed_loop(url: str, conc: int, duration: float) -> tuple[list[float], float]:
+    """Run `conc` workers for `duration` seconds. Return (latencies in seconds, wall time)."""
+
+def summary(lat_s: list[float], wall: float, label: str) -> None:
+    """Print n, achieved req/s, mean, p50, p99, p99.9 and max, in ms. Use numpy.percentile."""
+```
+
+Run it at c = 1, 2, 4, 16 for 10 seconds each, and write down throughput and p99 for each. Before you do, use Little's Law to predict the throughput at c = 1 from the latency you expect.
+
+</Task>
+
+<Task id="t2" title="An open-loop generator that measures from the schedule" agent="hands">
+
+`open.py`. This is the one that tells the truth, so the details matter.
+
+```python
+async def open_loop(url: str, rate: float, duration: float) -> tuple[list[float], list[float], float]:
+    """Send about rate * duration requests at random (Poisson) times.
+    Return (latency from intended send time, latency from actual send time, wall time)."""
+    # 1. Build the whole schedule BEFORE starting: gaps = random.expovariate(rate), cumulative sum.
+    # 2. start = time.perf_counter(). For each scheduled offset s:
+    #       sleep until start + s (skip the sleep if you're already late),
+    #       then asyncio.create_task(one(start + s)).
+    # 3. one(t_intended): t_sent = now; await client.get(url); t_done = now;
+    #       record t_done - t_intended AND t_done - t_sent.
+    # 4. gather all the tasks, return.
+```
+
+Hints:
+
+- Every request is its own task, so nothing waits for anything else. That's the whole point.
+- The connection pool must not be the thing that queues. Use `httpx.Limits(max_connections=2000)` or so; at a few hundred requests a second that's never the limit.
+- Print the *achieved* rate (requests completed divided by wall time) next to the target. If they differ when the server isn't overloaded, your generator is the bottleneck, and every number it prints is suspect.
+- Why record both latencies? Right now they'll match, because your generator never falls behind. Break It makes them come apart.
+
+</Task>
+
+<Task id="t3" title="Find the knee" agent="hands">
+
+Write `sweep.py` that runs `open_loop` at a range of rates against the default server (1 worker, 5 ms), 20 seconds each, and plots p50 and p99 against offered load with matplotlib. Choose the rates from your closed-loop capacity number: something like 10%, 30%, 50%, 70%, 80%, 85%, 90%, 95%, 100% of it.
+
+Restart the server between runs, or at least wait for it to drain. A run past capacity leaves a backlog that pollutes the next one.
+
+Plot it twice: once with a linear y axis (to see the hockey stick) and once with a log y axis (to see the tail at low load). Mark where you'd draw the line if your SLO were "p99 under 100 ms". Then overlay the M/M/1 prediction, `p99 = 4.6 × S / (1 − ρ)`, with S your measured c = 1 latency and ρ = rate / capacity. Where does reality depart from the cartoon, and why?
+
+</Task>
+
+<Task id="t4" title="Catch coordinated omission, then correct it" agent="hands">
+
+Restart the server with a freeze: `python tail_server.py --stall-every 5 --stall-ms 500`. Now run:
+
+1. `closed.py` with c = 1 for 20 seconds.
+2. `closed.py` with c = 4 for 20 seconds.
+3. `open.py` at 100 per second for 20 seconds.
+
+Write your predictions for all three p99s first (Predict box above). Then record all three, plus the max.
+
+Then correct the closed-loop run after the fact. Re-run c = 1, but record into an HDR histogram as well as a list:
+
+```python
+from hdrh.histogram import HdrHistogram
+
+h = HdrHistogram(1, 60_000_000, 3)        # values in microseconds: 1 µs to 60 s, 3 significant digits
+h.record_corrected_value(latency_us, expected_interval_us)
+h.get_value_at_percentile(99.0)           # back in microseconds
+```
+
+What's the expected interval? It's how often the worker *meant* to send: for a closed loop running flat out, use the typical (median) latency you measured without stalls. Compare the corrected p99 to the open-loop p99 and to the raw closed-loop p99. Then check `h.get_total_count()` against the number of requests you actually sent, and explain the difference.
+
+</Task>
+
+<Task id="t5" title="Hedged requests" agent="review">
+
+Start two replicas that have rare, independent stragglers: 5 ms of constant work, but 3% of requests take 100 ms. Unlimited workers, so the slowness is about bad luck on the machine, not about queueing.
+
+```bash
+python tail_server.py --port 8101 --workers 0 --dist const --service-ms 5 --slow-prob 0.03 --slow-ms 100 &
+python tail_server.py --port 8102 --workers 0 --dist const --service-ms 5 --slow-prob 0.03 --slow-ms 100 &
+```
+
+Write `hedge.py` with three strategies, each with the signature `async def strategy(client, delay) -> httpx.Response`:
+
+```python
+async def plain(client, delay):
+    """Pick one replica at random and send."""
+
+async def hedged(client, delay):
+    """Send to one replica. If no answer within `delay` seconds, send to the other.
+    Return whichever finishes first; cancel the loser."""
+    # asyncio.wait({t1}, timeout=delay) tells you whether t1 finished in time.
+    # Then asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED).
+
+async def both(client, delay):
+    """Send to both at once, take the first. (The 'always hedge' baseline.)"""
+```
+
+Drive each strategy with your open-loop generator at 100 requests per second for 30 seconds, and count every request you actually send, so you can report the extra load as a percentage. Run `hedged` with delays around your measured p95 (find it from the `plain` run first) and a couple either side.
+
+When it works, have an agent review it for two things: that losers really get cancelled (a cancelled httpx request should close its connection, not leak it), and that your extra-load counter counts the second request only when it was actually sent.
+
+</Task>
+
+<Task id="t6" title="Give your benchmark harness an open-loop mode" agent="review">
+
+Your harness from [the baseline lesson](/lessons/baseline-vs-fireworks/) is closed-loop. Add `--rate` (requests per second, Poisson arrivals) as an alternative to `--concurrency`, measure TTFT and end-to-end from the intended send time, and record into HDR histograms you save next to the JSON (`h.encode()` gives a compact string). Run it against the fake streaming server you tested the harness with, at a rate that is about 80% of its capacity. Then, if you have an hour on the Spark, find the knee of your naive model server the same way (it will be at a laughably low rate; that's the point).
+
+</Task>
+
+<DoneWhen>
+
+- `closed.py`, `open.py`, `sweep.py` and `hedge.py` all run and print achieved rate, p50, p99 and n.
+- You have a latency-vs-offered-load plot with the knee marked, and you can say what rate you'd run this server at for a p99 under 100 ms.
+- You've seen a closed-loop test and an open-loop test disagree about p99 by more than 10x on the same server, and can explain why in one sentence.
+- You've measured hedging's p99 improvement and its extra load, and you know when it would make things worse.
+
+</DoneWhen>
+
+## Measure
+
+Fill in your numbers. Use runs of at least 20 seconds, and put n next to every percentile.
+
+| Test | Server | Achieved req/s | p50 | p99 | p99.9 | max | n | Your prediction (p99) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| closed c=1 | default | | | | | | | |
+| closed c=16 | default | | | | | | | |
+| open, 50% of capacity | default | | | | | | | |
+| open, 90% of capacity | default | | | | | | | |
+| open, just over capacity | default | | | | | | | |
+| closed c=1 | stall 500 ms / 5 s | | | | | | | |
+| closed c=1, HDR corrected | stall | | | | | | | |
+| open 100/s | stall | | | | | | | |
+| plain | 2 replicas, 3% stragglers | | | | | | | |
+| hedged at p95 | 2 replicas, 3% stragglers | | | | | | | |
+| both, always | 2 replicas, 3% stragglers | | | | | | | |
+
+For reference, my runs on an M-series MacBook, Python 3.14, httpx 0.28, client and server on the same machine. Yours will differ in the details; the shape should not.
+
+**Closed vs open, default server** (1 worker, 5 ms exponential):
+
+| Test | Achieved req/s | p50 | p99 |
+| --- | --- | --- | --- |
+| closed c=1 | 155 | 4.7 ms | 25 ms |
+| closed c=4 | 175 | 21 ms | 54 ms |
+| closed c=16 | 185 | 83 ms | 136 ms |
+| open 50/s | 52 | 6.6 ms | 34 ms |
+| open 100/s | 95-100 | 9-10 ms | 43-50 ms |
+| open 150/s | 150 | 22-25 ms | 118-156 ms |
+| open 165/s | 164 | 38 ms | 252 ms |
+| open 185-190/s | 130 (falling behind) | 370-530 ms | 10-11 s |
+
+**The closed loop never breaks.** At c = 16 the server is as busy as it gets, yet p99 is 136 ms: with sixteen in flight, at most fifteen are ahead of you. More workers just means linearly more latency. It can't show you the cliff.
+
+**The open loop finds the cliff.** p99 roughly doubles from 50/s to 130/s, triples again by 165/s, and at 185-190/s the backlog grows for the whole test, so p99 is set by how long the test ran. A p99 that grows with test duration is the signature of being past capacity. My knee was around 130-150 per second, 70-80% of capacity, about where M/M/1 says it should be.
+
+**Runs near the knee are noisy.** Two runs at 150/s gave p99 118 and 156 ms, and 175/s once beat 165/s. Near the knee one unlucky burst builds a queue that drains slowly, so a run may catch several or none. The variance explodes along with the mean; run those points longer.
+
+**Coordinated omission** (server freezes 500 ms every 5 s):
+
+| Test | p50 | p99 | p99.9 | max |
+| --- | --- | --- | --- | --- |
+| closed c=1 | 4.7 ms | 25.5 ms | 74 ms | 518 ms |
+| closed c=4 | 20 ms | 55 ms | 533 ms | 578 ms |
+| closed c=1, HDR corrected | 4.6 ms | 429 ms | | |
+| open 100/s | 15 ms | 473 ms | 518 ms | 533 ms |
+
+The closed loop sees the freezes only in its max. The corrected histogram lands within 10% of the open-loop answer, but its count was about double the requests sent, because correction also back-fills for ordinary slow requests over the expected interval. It's an estimate.
+
+**Hedging** (2 replicas, 5 ms constant, 3% of requests 100 ms; open loop 100/s, 30 s, n = 3,000):
+
+| Strategy | p50 | p95 | p99 | p99.9 | Extra requests |
+| --- | --- | --- | --- | --- | --- |
+| plain | 8.3 ms | 12.7 ms | 105 ms | 107 ms | 0% |
+| hedged at 10 ms | 8.9 ms | 13.4 ms | 21 ms | 103 ms | 4.4% |
+| hedged at 15 ms | 8.7 ms | 13.4 ms | 26 ms | 103 ms | 3.1% |
+| hedged at 20 ms | 8.7 ms | 13.4 ms | 31 ms | 34 ms | 3.1% |
+| both, always | 8.7 ms | 12.2 ms | 15.5 ms | 18.7 ms | 100% |
+
+(About 3 ms of every number is the client: an httpx request on localhost costs that much on its own.)
+
+p99 dropped from 105 ms to 21 ms for 4% more requests: roughly the hedge delay plus one normal request, as Figure 005 predicts. Always sending both is better still, at double the cost. Ignore the p99.9 column: with 3,000 samples it's the third-slowest request, decided by whether both copies of some request were stragglers (about 1 in 1,000).
+
+## Break It
+
+**1. Hedge a server that's slow because it's busy.** Restart the two replicas as plain queues (`--workers 1 --service-ms 5`, no stragglers) and drive them at 140 requests per second in total, about 40% busy each. Now the tail comes from queueing, and queueing is caused by load. On my run, `plain` gave p99 39 ms. `hedged` with a 12 ms delay, below the p95 of 27 ms, sent 34% extra requests and made p99 *worse*: 58 ms. Sending to both every time made it worse again: 64 ms, with each replica now about 75% busy. Each extra request pushed both replicas further up the hockey stick. Hedging is a fix for random bad luck on one machine, not for not having enough machines. And always set the delay from the measured p95, not from a guess.
+
+**2. Put coordinated omission back into an open loop.** In `open.py`, wrap the request in an `asyncio.Semaphore(4)` and stamp `t_sent` *after* acquiring it, so at most four requests are in flight, which is what lots of real load tools quietly do with a fixed connection pool. Run it at 100 per second against the stalling server. On mine, latency measured from the semaphore said p99 52 ms; measured from the schedule, 515 ms. The generator is sending "on a schedule", but it's measuring from when it *got around to it*. This is also what your lesson-4 `loadgen.py` does with its semaphore. Lesson: where you start the stopwatch decides which question you're answering.
+
+**3. Average your p99s.** Have `open.py` also compute p99 per one-second window, and compare the average of those to the p99 of the whole run. Against the stalling server they disagree badly. It can go either way: in a quick simulation of 20 windows, a stall window with few requests in it gave an average-of-p99s of 47 ms against a true p99 of 26 ms; a stall window with as many requests as the others gave 46 ms against a true 402 ms. Then record per-window HDR histograms, add them, and ask the sum for its p99. It matches the whole-run number to 3 digits.
+
+**4. Make the load generator the bottleneck.** Point `open.py` at a server with `--workers 0 --service-ms 1` and ask for 3,000 requests per second. Watch `top`: the Python process running the generator sits near 100% of a core. Compare the achieved rate to the target, and "from intended" to "from sent" latency: they finally come apart, because the generator falls behind its own schedule. What you're measuring now is your load generator. Real load tests use several generator processes or a generator written in something faster (`wrk2`, `k6`, `vegeta`), and always check that achieved rate equals target rate.
+
+## Explain It Back
+
+Answer out loud, as if in an interview, then check.
+
+<details>
+<summary>1. Why do people look at p99 instead of the average, and why can't you average p99s across servers?</summary>
+
+Latency is lopsided: a hard floor, most requests near it, a long thin tail. The mean blends hump and tail into a number almost nobody experiences. p99 says directly "1 in 100 requests is slower than this", which at real rates happens every second and to every user who loads a few pages. Percentiles don't average because they depend on the whole shape and how many samples each part has. To combine, keep counts (HDR histograms add bucket by bucket) and compute the percentile from the sum.
+
+</details>
+
+<details>
+<summary>2. A request fans out to 50 backends, each with p99 of 100 ms. What does a user see, and how does it scale as you go to 500 backends?</summary>
+
+The user waits for the slowest of 50. All 50 beat their p99 with probability 0.99^50 ≈ 0.61, so about 39% of user requests take 100 ms or more, versus 1% per backend. The median user sees each backend's p98.6 (0.5^(1/50)). At 500 backends, 0.99^500 ≈ 0.007: over 99% of user requests hit someone's p99. Each 10x in fan-out pushes what users feel one "nine" deeper into the backend's tail, so at scale you care about p99.9 and beyond, hedge, or reduce the fan-out.
+
+</details>
+
+<details>
+<summary>3. Your service is at 60% CPU at peak. Your manager wants to cut the fleet by a third to save money. What happens to latency?</summary>
+
+The same load on two thirds of the machines puts utilization at 90%. Time in system goes like 1 / (1 − ρ): from 2.5 to 10, so it roughly quadruples, and the tail with it. In M/M/1 terms with 10 ms of work, p99 goes from about 115 ms to 460 ms. And there's no headroom: a 15% spike goes past 100% and the queue grows until timeouts and retries make it worse. Measure the latency-vs-load curve, find the knee, and size the fleet so peak sits below it with room for spikes. A 15% cut might be safe; a third probably isn't.
+
+</details>
+
+<details>
+<summary>4. What is coordinated omission, and how do you design a load test that avoids it?</summary>
+
+The load generator stops sending while the server is slow, so it never records the requests that would have been slow: a closed-loop worker stuck for 500 ms records one sample instead of the hundred users who would have arrived meanwhile. Avoid it with an open loop: fix the arrival schedule up front, send every request on time (one task each, a big enough connection pool), and measure from the intended send time. Check the achieved rate equals the target. If stuck with a closed-loop tool, correct afterwards with `record_corrected_value`. And get at least 1,000 samples for p99, 10,000 for p99.9.
+
+</details>
+
+<details>
+<summary>5. When do hedged requests help, when do they hurt, and how would you set the delay?</summary>
+
+They help when slowness comes from the machine, not the request or the load: a GC pause or busy disk on one replica, so a copy elsewhere is very likely fast. Set the delay near the p95, so only about 5% of requests send a copy, aimed at exactly the ones heading for the tail. I measured p99 going from 105 ms to 21 ms for 4% more requests. They hurt when the system is slow because it's busy (copies add load and push every replica up the curve; I saw p99 go from 39 to 58 ms), when the request itself is expensive, and when it isn't safe to repeat. Always cancel the loser.
+
+</details>
+
+## Go Deeper
+
+- **Jeffrey Dean and Luiz André Barroso, "The Tail at Scale"**, Communications of the ACM, February 2013. Eight pages, and the reason everyone in the industry says "p99". The fan-out arithmetic, hedged and tied requests, micro-partitions, and the "tolerate it like failure" argument, with Google measurements.
+- **Gil Tene, "How NOT to Measure Latency"** (talk; the Strange Loop 2015 recording is the usual one to find). The talk that named coordinated omission, with the best explanation of why percentiles and averages mislead. Watch it after this lesson; it'll feel like a replay with more war stories.
+- **HdrHistogram** ([hdrhistogram.org](http://hdrhistogram.org/)) and **wrk2** ([github.com/giltene/wrk2](https://github.com/giltene/wrk2)). The data structure and the coordinated-omission-free load generator, both by Tene. The wrk2 README is itself a short, clear lesson in measuring from the intended send time.
+- **Bianca Schroeder, Adam Wierman and Mor Harchol-Balter, "Open Versus Closed: A Cautionary Tale"**, NSDI 2006. A careful study of how the choice of open vs closed load generation changes your conclusions about a system, including which scheduling tricks look good.
+- **Mor Harchol-Balter, _Performance Modeling and Design of Computer Systems: Queueing Theory in Action_** (Cambridge, 2013). The friendliest real queueing-theory book: M/M/1, Kingman, the variability effects you saw in Figure 003, and why server farms are designed the way they are.
+- **Jeffrey Dean and Sanjay Ghemawat, "MapReduce: Simplified Data Processing on Large Clusters"**, OSDI 2004. Read the "backup tasks" section for the batch-world ancestor of hedging, with numbers.
+- **Brendan Gregg, _Systems Performance_ (2nd edition, 2020)**, the chapters on methodology and on benchmarking. How to do load testing without fooling yourself, from someone who has seen every way it goes wrong.
+- **Marc Brooker's blog** (brooker.co.za/blog), especially his posts on tail latency, retries and backoff, and metastable failures. Short, mathematical, and written by an engineer who runs very large systems at AWS.
+
+## Connections
+
+This lesson leans on [Waiting vs working](/lessons/waiting-vs-working/) (your load generator is the closed loop here, and Little's Law is how you tell the two kinds apart) and on [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), where you first met "20 samples can't give a p99" and the server that can only stay fast at 1% utilization.
+
+It feeds straight into [Rate limits and backpressure](/lessons/rate-limits/), which is what to do when offered load goes past the knee you found here, and [Load balancers and state](/lessons/load-balancing/), where the way you pick a replica changes the tail. [Batching](/lessons/batching/) is the inference version of the same trade-off: wait a little to fill a batch, so the GPU does more per pass, and watch what that does to p99. And when you build [observability](/lessons/observability/), you'll record HDR-style histograms, not averages.

@@ -1,0 +1,185 @@
+---
+// The write path, layer by layer: Python buffer -> kernel page cache -> drive cache -> NAND flash.
+// Push chunks down with write/flush/wait/fsync, then crash (kill -9 or power cut) and see what survives.
+---
+<div class="dwp" data-fig="disk-write-path">
+  <div class="dwp-os ctl">
+    <span>OS</span>
+    <button class="btn" type="button" data-os="linux" aria-pressed="true">Linux</button>
+    <button class="btn" type="button" data-os="mac" aria-pressed="false">macOS</button>
+  </div>
+  <div class="dwp-layers">
+    <div class="dwp-row" data-row="0">
+      <div class="dwp-name"><span class="dwp-t">Python buffer</span><span class="label">your process · RAM</span></div>
+      <div class="dwp-cells"></div>
+    </div>
+    <div class="dwp-gate label">── syscall boundary: write() ──</div>
+    <div class="dwp-row" data-row="1">
+      <div class="dwp-name"><span class="dwp-t">Page cache</span><span class="label">kernel · RAM</span></div>
+      <div class="dwp-cells"></div>
+    </div>
+    <div class="dwp-gate label">── NVMe bus ──</div>
+    <div class="dwp-row" data-row="2">
+      <div class="dwp-name"><span class="dwp-t">Drive cache</span><span class="label">SSD · DRAM, volatile</span></div>
+      <div class="dwp-cells"></div>
+    </div>
+    <div class="dwp-row" data-row="3">
+      <div class="dwp-name"><span class="dwp-t">NAND flash</span><span class="label">SSD · durable</span></div>
+      <div class="dwp-cells"></div>
+    </div>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="write">f.write(chunk)</button>
+    <button class="btn" type="button" data-act="flush">f.flush()</button>
+    <button class="btn" type="button" data-act="fsync">os.fsync(fd)</button>
+    <button class="btn" type="button" data-act="full">F_FULLFSYNC</button>
+    <button class="btn" type="button" data-act="wait">wait ~30 s</button>
+  </div>
+  <div class="ctl">
+    <span>Crash now</span>
+    <button class="btn dwp-crash" type="button" data-act="kill">kill -9</button>
+    <button class="btn dwp-crash" type="button" data-act="power">power cut</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+  </div>
+  <p class="dwp-msg" data-msg></p>
+  <p class="dwp-msg">On disk after reboot: <span class="readout" data-durable>nothing</span></p>
+</div>
+
+<style is:global>
+  .dwp-layers { display: grid; gap: 6px; margin-top: 4px; }
+  .dwp-row { display: grid; grid-template-columns: 150px 1fr; gap: 12px; align-items: center; border: 1px solid var(--rule); background: var(--paper); padding: 8px 10px; }
+  .dwp-row[data-row='3'] { border-color: var(--ink); }
+  .dwp-name { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .dwp-name .label { font-size: 9.5px; }
+  .dwp-t { font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--ink); }
+  .dwp-cells { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 5px; }
+  .dwp-cell { height: 30px; border: 1px dashed var(--rule); display: grid; place-content: center; font-family: var(--mono); font-size: 13px; font-weight: 600; color: transparent; transition: background-color 0.2s, border-color 0.2s; }
+  .dwp-cell.dirty { border: 1.5px solid var(--blue); background: var(--blue-wash); color: var(--blue); }
+  .dwp-cell.clean { border: 1px solid var(--ink-3); background: var(--paper-2); color: var(--ink-3); }
+  .dwp-cell.durable { border: 1px solid var(--blue); background: var(--blue); color: var(--paper); }
+  .dwp-cell.lost { border: 1px dashed var(--warn); color: var(--warn); text-decoration: line-through; }
+  .dwp-gate { text-align: center; font-size: 9.5px; color: var(--blue); }
+  .dwp-msg { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; min-height: 1.6em; }
+  .dwp .btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .dwp .btn.dwp-crash { color: var(--warn); border-color: var(--warn); }
+  .dwp .btn.dwp-crash:hover:not(:disabled) { background: var(--warn); color: var(--paper); }
+  .dwp-os { margin-top: 0; margin-bottom: 10px; }
+  @media (max-width: 520px) {
+    .dwp-row { grid-template-columns: 1fr; gap: 6px; }
+    .dwp-cell { height: 26px; font-size: 12px; }
+  }
+  @media (prefers-reduced-motion: reduce) { .dwp-cell { transition: none; } }
+</style>
+
+<script>
+  // level per chunk: 0 = Python buffer, 1 = page cache (dirty), 2 = drive cache, 3 = NAND. -1 = lost.
+  const LETTERS = ['A', 'B', 'C', 'D', 'E', 'F'];
+  const BUF_CAP = 3; // Python flushes its buffer for you when it fills up
+
+  document.querySelectorAll<HTMLElement>('[data-fig="disk-write-path"]').forEach((root) => {
+    const rows = [...root.querySelectorAll<HTMLElement>('.dwp-row .dwp-cells')];
+    rows.forEach((r) => { for (let i = 0; i < LETTERS.length; i++) { const c = document.createElement('div'); c.className = 'dwp-cell'; r.append(c); } });
+    const msg = root.querySelector<HTMLElement>('[data-msg]')!;
+    const durableEl = root.querySelector<HTMLElement>('[data-durable]')!;
+    const btn = (a: string) => root.querySelector<HTMLButtonElement>(`[data-act="${a}"]`)!;
+    const osBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-os]')];
+
+    let os = 'linux';
+    let level: number[] = [];
+    let cached: boolean[] = [];
+    let lostRow: Record<number, number> = {}; // which row shows a lost chunk
+    let state: 'alive' | 'killed' | 'power' = 'alive';
+
+    function reset() {
+      level = []; cached = []; lostRow = {}; state = 'alive';
+      say('Empty file, opened for writing. Press f.write(chunk) to hand Python some bytes.');
+      draw();
+    }
+    function say(s: string) { msg.textContent = s; }
+    const count = (l: number) => level.filter((x) => x === l).length;
+
+    function moveAll(from: number, to: number) {
+      level = level.map((x) => (x === from ? to : x));
+    }
+    function draw() {
+      rows.forEach((r, rowIdx) => {
+        [...r.children].forEach((c, i) => {
+          const el = c as HTMLElement;
+          const l = level[i];
+          el.className = 'dwp-cell';
+          el.textContent = LETTERS[i];
+          if (l === undefined) return;
+          if (l === -1) { if (rowIdx === lostRow[i]) el.classList.add('lost'); return; }
+          if (rowIdx === 0 && l === 0) el.classList.add('dirty');
+          if (rowIdx === 1 && state !== 'power') {
+            if (l === 1) el.classList.add('dirty');
+            else if (l >= 2 && cached[i]) el.classList.add('clean');
+          }
+          if (rowIdx === 2 && l === 2) el.classList.add('dirty');
+          if (rowIdx === 3 && l === 3) el.classList.add('durable');
+        });
+      });
+      const dur = LETTERS.filter((_, i) => level[i] === 3);
+      durableEl.textContent = dur.length ? dur.join(' ') : 'nothing';
+      const dead = state !== 'alive';
+      ['write', 'flush', 'fsync', 'full'].forEach((a) => (btn(a).disabled = dead));
+      btn('write').disabled = dead || level.length >= LETTERS.length;
+      btn('full').disabled = dead || os !== 'mac';
+      btn('wait').disabled = state === 'power';
+      btn('kill').disabled = dead;
+      btn('power').disabled = state === 'power';
+    }
+
+    function act(a: string) {
+      if (a === 'reset') return reset();
+      if (a === 'write') {
+        level.push(0); cached.push(false);
+        if (count(0) >= BUF_CAP) {
+          moveAll(0, 1); cached = cached.map((c, i) => c || level[i] === 1);
+          say(`Buffer full, so Python made one write() syscall for you. ${BUF_CAP} chunks copied into the page cache. write() returned. The SSD has not been touched.`);
+        } else {
+          say(`f.write() copied ${LETTERS[level.length - 1]} into a buffer inside your own process. No syscall yet. Nothing left your process.`);
+        }
+      } else if (a === 'flush') {
+        if (!count(0)) say('Nothing in the Python buffer to flush.');
+        else { moveAll(0, 1); cached = cached.map((c, i) => c || level[i] === 1); say('f.flush() made a write() syscall: the bytes are now in the kernel page cache, marked dirty. The kernel will write them to the drive later, when it feels like it.'); }
+      } else if (a === 'fsync') {
+        const stuck = count(0);
+        if (os === 'linux') {
+          moveAll(1, 3); moveAll(2, 3);
+          say(`fsync on Linux: the kernel wrote every dirty page of this file to the drive and told the drive to flush its cache. Durable.${stuck ? ' But fsync cannot see bytes still in the Python buffer: those are not safe. Call f.flush() first.' : ''}`);
+        } else {
+          moveAll(1, 2);
+          say(`fsync on macOS: the kernel pushed the dirty pages to the drive, but did not ask the drive to empty its own cache. A power cut can still lose them. F_FULLFSYNC goes all the way.${stuck ? ' (And bytes in the Python buffer are not covered.)' : ''}`);
+        }
+      } else if (a === 'full') {
+        moveAll(1, 3); moveAll(2, 3);
+        say(`F_FULLFSYNC: pages to the drive, then the drive told to flush its cache to NAND. Durable, and about 100x slower than plain fsync on a Mac.${count(0) ? ' Python buffer still not covered.' : ''}`);
+      } else if (a === 'wait') {
+        const had = count(1) + count(2);
+        moveAll(2, 3); moveAll(1, 2);
+        say(had ? 'Time passed. Background writeback moved dirty pages toward the drive, and the drive drained its cache to flash on its own schedule. Nobody told you when.' : 'Time passed. Nothing in flight.');
+        if (state === 'killed' && had) say('Your process is dead, but the kernel is not. It keeps writing your dirty pages back. kill -9 only lost what was still inside the process.');
+      } else if (a === 'kill') {
+        const lost = count(0);
+        level.forEach((x, i) => { if (x === 0) lostRow[i] = 0; });
+        level = level.map((x) => (x === 0 ? -1 : x)); state = 'killed';
+        say(lost ? `kill -9: the process is gone, and so is its buffer (${lost} chunk${lost > 1 ? 's' : ''} lost). Everything already in the page cache survives: it belongs to the kernel. Try wait.` : 'kill -9: the process is gone, but its buffer was empty. Everything in the page cache survives: it belongs to the kernel. Try wait.');
+      } else if (a === 'power') {
+        const lost = level.filter((x) => x >= 0 && x < 3).length;
+        level.forEach((x, i) => { if (x >= 0 && x < 3) lostRow[i] = 3; });
+        level = level.map((x) => (x === 3 ? 3 : -1)); state = 'power';
+        say(lost ? `Power cut: all RAM is wiped, yours, the kernel's and the drive's. Only what reached NAND survives. ${lost} chunk${lost > 1 ? 's' : ''} lost, and write() said success for some of them.` : 'Power cut: all RAM is wiped. Everything had reached NAND, so nothing was lost.');
+      }
+      draw();
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act!)));
+    osBtns.forEach((b) => b.addEventListener('click', () => {
+      os = b.dataset.os!;
+      osBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    reset();
+  });
+</script>

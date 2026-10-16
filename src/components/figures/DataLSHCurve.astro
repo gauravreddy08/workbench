@@ -1,0 +1,96 @@
+---
+// LSH banding S-curve: split k = b*r MinHash values into b bands of r rows. Two docs become a
+// candidate pair if any band matches exactly. P(candidate) = 1 - (1 - s^r)^b.
+---
+<div class="lsh" data-fig="data-lsh">
+  <svg viewBox="0 0 520 300" role="img" aria-label="Probability two documents become a candidate pair, as a function of their Jaccard similarity">
+    <g data-grid></g>
+    <line x1="50" y1="260" x2="500" y2="260" class="ink" stroke-width="1" />
+    <line x1="50" y1="20" x2="50" y2="260" class="ink" stroke-width="1" />
+    <text x="275" y="292" text-anchor="middle">JACCARD SIMILARITY OF THE PAIR</text>
+    <text x="14" y="140" text-anchor="middle" transform="rotate(-90 14 140)">P(CANDIDATE)</text>
+    <polyline data-ideal class="ink dash" stroke-width="1" fill="none" />
+    <polyline data-curve class="blue" stroke-width="2" fill="none" />
+    <line data-thr class="blue dash" stroke-width="1" y1="20" y2="260" />
+    <text data-thrt class="blue-t" y="34"></text>
+  </svg>
+  <div class="ctl">
+    <label>bands b <input type="range" min="1" max="40" value="9" data-b /> <output data-bout>9</output></label>
+    <label>rows per band r <input type="range" min="1" max="25" value="13" data-r /> <output data-rout>13</output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-p="9,13">datasketch 0.8 (9×13)</button>
+    <button class="btn" type="button" data-p="14,8">FineWeb (14×8)</button>
+    <button class="btn" type="button" data-p="20,5">loose (20×5)</button>
+  </div>
+  <p class="lsh-read">
+    k = b × r = <span class="readout" data-k>-</span> hashes ·
+    threshold ≈ (1/b)<sup>1/r</sup> = <span class="readout" data-t>-</span><br />
+    P(caught) at J=0.9: <span class="readout" data-p9>-</span> ·
+    J=0.8: <span class="readout" data-p8>-</span> ·
+    J=0.5: <span class="readout" data-p5>-</span>
+  </p>
+</div>
+
+<style>
+  .lsh-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 12px 0 0; line-height: 1.8; }
+  .lsh svg .gl { stroke: var(--rule); stroke-width: 1; }
+</style>
+
+<script>
+  const X0 = 50, X1 = 500, Y0 = 260, Y1 = 20;
+  const sx = (s: number) => X0 + s * (X1 - X0);
+  const sy = (p: number) => Y0 - p * (Y0 - Y1);
+  const NS = 'http://www.w3.org/2000/svg';
+
+  document.querySelectorAll<HTMLElement>('[data-fig="data-lsh"]').forEach((root) => {
+    const bIn = root.querySelector<HTMLInputElement>('[data-b]')!;
+    const rIn = root.querySelector<HTMLInputElement>('[data-r]')!;
+    const curve = root.querySelector<SVGPolylineElement>('[data-curve]')!;
+    const ideal = root.querySelector<SVGPolylineElement>('[data-ideal]')!;
+    const thr = root.querySelector<SVGLineElement>('[data-thr]')!;
+    const thrt = root.querySelector<SVGTextElement>('[data-thrt]')!;
+    const grid = root.querySelector<SVGGElement>('[data-grid]')!;
+    for (let i = 0; i <= 10; i += 2) {
+      const v = i / 10;
+      const gx = document.createElementNS(NS, 'line');
+      gx.setAttribute('x1', String(sx(v))); gx.setAttribute('x2', String(sx(v)));
+      gx.setAttribute('y1', String(Y1)); gx.setAttribute('y2', String(Y0)); gx.setAttribute('class', 'gl');
+      const gy = document.createElementNS(NS, 'line');
+      gy.setAttribute('x1', String(X0)); gy.setAttribute('x2', String(X1));
+      gy.setAttribute('y1', String(sy(v))); gy.setAttribute('y2', String(sy(v))); gy.setAttribute('class', 'gl');
+      const tx = document.createElementNS(NS, 'text');
+      tx.setAttribute('x', String(sx(v))); tx.setAttribute('y', '276'); tx.setAttribute('text-anchor', 'middle'); tx.textContent = v.toFixed(1);
+      const ty = document.createElementNS(NS, 'text');
+      ty.setAttribute('x', '44'); ty.setAttribute('y', String(sy(v) + 4)); ty.setAttribute('text-anchor', 'end'); ty.textContent = v.toFixed(1);
+      grid.append(gx, gy, tx, ty);
+    }
+    const P = (s: number, b: number, r: number) => 1 - Math.pow(1 - Math.pow(s, r), b);
+
+    function render() {
+      const b = +bIn.value, r = +rIn.value;
+      root.querySelector('[data-bout]')!.textContent = String(b);
+      root.querySelector('[data-rout]')!.textContent = String(r);
+      const t = Math.pow(1 / b, 1 / r);
+      const pts: string[] = [];
+      for (let i = 0; i <= 200; i++) { const s = i / 200; pts.push(`${sx(s).toFixed(1)},${sy(P(s, b, r)).toFixed(1)}`); }
+      curve.setAttribute('points', pts.join(' '));
+      ideal.setAttribute('points', `${sx(0)},${sy(0)} ${sx(t)},${sy(0)} ${sx(t)},${sy(1)} ${sx(1)},${sy(1)}`);
+      thr.setAttribute('x1', String(sx(t))); thr.setAttribute('x2', String(sx(t)));
+      thrt.setAttribute('x', String(Math.min(sx(t) + 6, 430)));
+      thrt.textContent = `≈ ${t.toFixed(2)}`;
+      root.querySelector('[data-k]')!.textContent = String(b * r);
+      root.querySelector('[data-t]')!.textContent = t.toFixed(2);
+      root.querySelector('[data-p9]')!.textContent = P(0.9, b, r).toFixed(3);
+      root.querySelector('[data-p8]')!.textContent = P(0.8, b, r).toFixed(3);
+      root.querySelector('[data-p5]')!.textContent = P(0.5, b, r).toFixed(3);
+    }
+    bIn.addEventListener('input', render);
+    rIn.addEventListener('input', render);
+    root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((btn) => btn.addEventListener('click', () => {
+      const [b, r] = btn.dataset.p!.split(',');
+      bIn.value = b; rIn.value = r; render();
+    }));
+    render();
+  });
+</script>

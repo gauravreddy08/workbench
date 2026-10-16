@@ -1,0 +1,707 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import LatencyLadder from '../components/figures/LatencyLadder.astro';
+import LatencyTransfer from '../components/figures/LatencyTransfer.astro';
+
+## Today
+
+- Say from memory, to within a factor of a few, how long an L1 hit, a RAM read, an SSD read, a datacenter round trip and a round trip to Europe take, and how many times slower each one is than the last.
+- Explain why the ladder exists: why caches are fast and small, why RAM is slow even though it is a few centimetres away, why flash takes microseconds, and why no amount of money makes Europe closer.
+- Tell **latency** (how long until the first byte) apart from **bandwidth** (bytes per second once it is flowing), and know which one a given job is limited by.
+- Measure every rung yourself on your Mac and your DGX Spark, including the cache "staircase".
+- Use the numbers for a back-of-envelope answer to "can we serve this from disk, or does it need RAM?"
+
+**Prerequisites:** you can compile a C file and run Python. **Time:** an evening for the reading and the C benchmark, another for disks and network.
+
+## The Problem
+
+Here is the question you could not answer: how much slower is an SSD than RAM?
+
+Most people guess "10×, maybe". The real answer is closer to 1,000×. That gap is not a detail. It is the difference between a feature that works and a feature that falls over the first time someone uses it.
+
+Imagine you are building a lookup service for your ranker: given a document ID, return its precomputed features. You have 50 million documents. The features live in a file on disk because that was easy. Each request needs 200 lookups. Is that fine?
+
+If a lookup costs 100 nanoseconds (RAM), 200 of them take 20 microseconds. Nobody will ever notice. If a lookup costs 100 microseconds (a random SSD read), 200 of them take 20 milliseconds per request, and if they happen one after another your server tops out around 50 requests a second per waiting thread. Same code, same algorithm, a thousand times apart. The only thing that changed was where the bytes lived.
+
+Every "how does this scale?" question has this shape. The algorithm is usually fine. The question is how many times you touch slow things, and how slow they are. If you do not carry these numbers in your head, you cannot even start.
+
+<Predict id="ram-vs-ssd">
+Without looking anything up: a single random 4 KB read from a fast NVMe SSD, versus a single read from RAM that misses every cache. How many times slower is the SSD? And how many times slower is a round trip to a server in Europe than the SSD read?
+<Fragment slot="answer">
+RAM is around **100 ns**. A random NVMe read, with nothing else going on, is around **50-100 µs**. That is **500-1,000× slower**. A round trip from California to Europe is around **150 ms**, which is another **~2,000×** on top of the SSD. From RAM to Europe is roughly a million-fold.
+
+If you guessed within a factor of 3 on each, you are already ahead of most engineers. If you said "10×", that is exactly the gap this lesson closes.
+</Fragment>
+</Predict>
+
+<Origin year="2001" title="Numbers everyone should know">
+
+In 2001 Peter Norvig published an essay called *Teach Yourself Programming in Ten Years*. Tucked inside was a small table: approximate times for fetching from L1 cache, from main memory, seeking on a disk, sending a packet to Europe and back. His advice was simple: know these.
+
+A few years later Jeff Dean put an expanded version on a slide titled "Numbers Everyone Should Know" and carried it through his talks on building Google's systems. The point of the slide was not trivia. Google engineers had to choose designs before building them, and Dean showed how: write down how many disk seeks, memory reads and network trips a design needs, multiply by the numbers, and compare. One of his examples was a page of 30 image thumbnails: read them one after another from disk and the seeks alone cost about 300 ms; issue the reads in parallel and the page takes under 20 ms. No code written, decision made.
+
+The table has been copied into a thousand blog posts since. The exact numbers have drifted (disks got replaced by flash, networks got faster) but the shape has barely moved. That shape is what you are going to learn.
+
+</Origin>
+
+## The Idea
+
+### The units, once
+
+Everything here is in three small units, each a thousand times the last.
+
+A <Term w="nanosecond">One billionth of a second, written ns. A 4 GHz CPU ticks four times per nanosecond.</Term> is the world of the CPU. A <Term w="microsecond">One millionth of a second, written µs. A thousand nanoseconds.</Term> is the world of SSDs and the operating system. A <Term w="millisecond">One thousandth of a second, written ms. A thousand microseconds. A blink is about 100-400 ms.</Term> is the world of networks and humans. Moving one unit up is a factor of 1,000, which is the factor between "an instant" and "a quarter of an hour" in everyday life.
+
+### The ladder
+
+Here is the whole ladder on one scale. Each vertical gridline is a factor of 10. Bars in solid blue are things your code does (a Python call, a GPU launch, an API call); the lighter ones are hardware.
+
+<Figure n="001" title="THE LATENCY LADDER" caption="Every rung on one log scale. Flip to human scale: if an L1 hit took a second, RAM is under two minutes, an SSD read is most of a day, and Europe is five years away. Tap any rung for its honest range." wide>
+<LatencyLadder />
+</Figure>
+
+Read it top to bottom and notice where the big jumps are. From L1 to RAM is about 100×. From RAM to the SSD is about 1,000×. From the SSD to another continent is about 2,000×. Inside each band, things are within a few times of each other.
+
+All of these are approximate. A cache hit on your Mac and on the Spark will differ, an Apple SSD and a server SSD will differ, and your network depends on where you sit. The ranges in the figure are what you should expect; the Build section is where you find out your own numbers. What does not change across machines is the *ordering* and the rough *ratios*, and those are what you want in your head.
+
+### Human scale
+
+Nanoseconds are too small to feel. So stretch time by a billion: pretend an L1 cache hit takes one second. Brendan Gregg uses this trick in *Systems Performance* and it sticks.
+
+<Predict id="human-scale">
+If an L1 cache hit took 1 second, how long would a RAM read take? A random SSD read? A round trip from California to Europe? Give each in whatever unit feels natural (minutes, days, years).
+<Fragment slot="answer">
+Multiply by a billion, so "100 ns" becomes "100 seconds":
+
+- **RAM**, 100 ns: about **1.7 minutes**. You get up to fetch something from another room.
+- **SSD random read**, 80 µs: about **22 hours**. Most of a day.
+- **Same-datacenter round trip**, 200 µs: a bit over **2 days**.
+- **Europe and back**, 150 ms: about **4.8 years**.
+- **LLM time to first token**, 500 ms: about **16 years**.
+
+The useful feeling: from the CPU's point of view, every network call is a long trip. It can do hundreds of thousands of useful things while it waits. That is the whole argument for async code in [lesson 4](/lessons/waiting-vs-working/).
+</Fragment>
+</Predict>
+
+Press the "Human scale" button in Figure 001 and read the right column again. A Python function call is about a minute. A GPU kernel launch is over an hour, which is why launching thousands of tiny GPU operations is slow no matter how fast the GPU is. Reading every weight of an 8B model out of the Spark's memory is about two years, and your server does that once per generated token. Keep that one in mind for [lesson 5](/lessons/bandwidth-bound/).
+
+### Why the ladder exists: far and big
+
+There are two reasons something is slow to reach: it is far away, or it is big.
+
+**Far.** Nothing travels faster than light, and light is slow at this scale: about **30 cm per nanosecond** in a vacuum, about 20 cm per nanosecond in glass fiber or copper. During one tick of a 4 GHz clock, light covers 7.5 cm. That sets hard floors.
+
+| Trip | Distance (one way) | Light alone, round trip | What you actually see |
+|---|---|---|---|
+| Core to RAM | ~5 cm | ~0.5 ns | ~100 ns |
+| Across a datacenter | ~100 m | ~1 µs | ~50-500 µs |
+| California to Amsterdam | ~8,800 km | ~90 ms (in fiber) | ~140-150 ms |
+
+Look at the last column against the middle one. For Europe, distance is most of the cost: real cables do not run straight and routers add a little, but you will never get under ~90 ms, and no budget fixes that. For the datacenter, light is a rounding error; the cost is network cards, switches and the operating system's network code on both ends. For RAM, light is a rounding error too. So why is RAM 100× slower than L1?
+
+**Big.** Finding one byte among a few billion takes work that finding one byte among 64 thousand does not. The bigger a memory is, the longer its internal wires, the more steps it takes to decode an address, and the cheaper (and slower) each bit has to be to make it affordable. On the way out, the request also checks every cache level first and misses each one. That is the real reason for the ladder inside a machine: small things can be fast, and fast things have to be small.
+
+<Figure n="002" title="WHERE THE BYTES LIVE" caption="Each box outward holds more and takes longer. L1 sits inside the core. RAM is centimetres away but slow because it is huge. The SSD is a separate device, and the network leaves the machine entirely.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Nested boxes: core with L1 inside the CPU die, L2 and L3 on the die, DRAM in the package, SSD and network card on the board, and an arrow out to other machines">
+  <defs>
+    <marker id="lat2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="8" y="10" width="472" height="272" class="ink" stroke-width="1.2" />
+  <text x="18" y="28">MACHINE / BOARD</text>
+  <rect x="22" y="38" width="320" height="234" class="ink dash" stroke-width="1" />
+  <text x="32" y="56">CHIP PACKAGE</text>
+  <rect x="36" y="64" width="196" height="196" class="ink" stroke-width="1" />
+  <text x="46" y="82">CPU DIE</text>
+  <rect x="50" y="92" width="100" height="74" class="fill-paper" stroke-width="1" />
+  <text x="60" y="110" class="strong">CORE</text>
+  <rect x="60" y="118" width="80" height="40" class="fill-wash" stroke-width="1" />
+  <text x="100" y="135" text-anchor="middle" class="strong">L1</text>
+  <text x="100" y="150" text-anchor="middle">~1 NS</text>
+  <rect x="160" y="92" width="58" height="74" class="ink dash" stroke-width="1" />
+  <text x="189" y="126" text-anchor="middle">MORE</text>
+  <text x="189" y="140" text-anchor="middle">CORES</text>
+  <rect x="50" y="176" width="168" height="34" class="fill-paper" stroke-width="1" />
+  <text x="60" y="197">L2 · MBS · ~4 NS</text>
+  <rect x="50" y="218" width="168" height="34" class="fill-paper" stroke-width="1" />
+  <text x="60" y="239">L3 · 10S OF MB · ~15 NS</text>
+  <rect x="246" y="64" width="82" height="196" class="fill-wash" stroke-width="1" />
+  <text x="287" y="146" text-anchor="middle" class="strong">DRAM</text>
+  <text x="287" y="162" text-anchor="middle">10S OF GB</text>
+  <text x="287" y="178" text-anchor="middle">~100 NS</text>
+  <rect x="356" y="64" width="110" height="80" class="fill-paper" stroke-width="1" />
+  <text x="411" y="96" text-anchor="middle" class="strong">NVME SSD</text>
+  <text x="411" y="112" text-anchor="middle">TBS</text>
+  <text x="411" y="128" text-anchor="middle">~80 µS</text>
+  <rect x="356" y="170" width="110" height="56" class="fill-paper" stroke-width="1" />
+  <text x="411" y="194" text-anchor="middle" class="strong">NETWORK</text>
+  <text x="411" y="210" text-anchor="middle">CARD (NIC)</text>
+  <line x1="466" y1="198" x2="628" y2="198" class="blue" stroke-width="1.5" marker-end="url(#lat2-arr)" />
+  <text x="490" y="186" class="blue-t">DATACENTER ~0.2 MS</text>
+  <text x="490" y="218" class="blue-t">EUROPE ~150 MS</text>
+  <text x="492" y="72">EACH BOX OUTWARD:</text>
+  <text x="492" y="88">MORE ROOM,</text>
+  <text x="492" y="104">MORE TIME</text>
+</svg>
+</Figure>
+
+### What the memories are made of
+
+You do not need circuit diagrams, but a cartoon of each kind of memory explains its rung.
+
+**Caches are SRAM.** <Term w="SRAM">Static RAM. Each bit is a little loop of about six transistors that holds its value as long as there is power. Fast and needs no maintenance, but takes a lot of chip area per bit.</Term> answers in a few clock ticks, but it costs so much chip area per bit that you only get kilobytes to tens of megabytes of it.
+
+**Main memory is DRAM.** <Term w="DRAM">Dynamic RAM. Each bit is one tiny capacitor (a bucket of charge) plus one transistor (a tap). Very dense and cheap, but the charge leaks away, so every row has to be rewritten many times a second.</Term> packs billions of bits into a chip by storing each one as a bucket of charge. The buckets are so small that you cannot read one directly. To read anything, the chip first copies an entire row (thousands of bits) into a <Term w="row buffer">A strip of sensing circuits along the edge of a DRAM bank. Opening a row copies it here; reads then come out of the buffer.</Term>, then picks out the bytes you asked for, then writes the row back and closes it before the next row can open. Each of those steps takes on the order of 10-15 ns. Add the trip through the caches and the <Term w="memory controller">The part of the CPU chip that talks to the DRAM chips: it queues requests, opens and closes rows, and schedules refreshes.</Term>, and you land at ~100 ns.
+
+**SSDs are NAND flash.** <Term w="NAND flash">The memory inside SSDs and phones. Each cell traps a small amount of charge that stays put without power. Reading means testing how much charge is trapped, which is slow.</Term> keeps data without power by trapping electrons in each cell. To read, the chip applies a series of test voltages to a whole page of cells (several kilobytes) and senses which ones conduct. That sensing takes tens of microseconds, and it is most of why an SSD read is a thousand times slower than RAM. Writing is slower still, and erasing works only on big blocks at a time, which is why SSDs have a small computer inside (the controller) juggling where everything goes.
+
+**Spinning disks** are still in the old tables. A 7,200 rpm disk turns once every 8.3 ms, so on average you wait about 4 ms for your data to rotate under the head, plus the time for the arm to swing over. That is the "disk seek ~10 ms" that made 2000s-era engineers allergic to random reads.
+
+<Figure n="003" title="WHY RAM AND FLASH TAKE THE TIME THEY DO" caption="Left: DRAM opens a whole row before it can hand you a few bytes. Right: flash senses a whole page of trapped charge, which takes thousands of times longer. Timings are rough.">
+<svg viewBox="0 0 640 280" role="img" aria-label="Left panel: DRAM cell grid with one row highlighted, copied into a row buffer, then one column read out. Right panel: flash pages, one page sensed into a page buffer and sent out.">
+  <defs>
+    <marker id="lat3-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="24" class="strong">DRAM</text>
+  <rect x="40" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="66" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="92" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="118" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="144" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="170" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="196" y="40" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="222" y="40" width="22" height="16" class="fill-paper" stroke-width="1" />
+  <rect x="40" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="66" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="92" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="118" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="144" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="170" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="196" y="60" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="222" y="60" width="22" height="16" class="fill-paper" stroke-width="1" />
+  <rect x="40" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="66" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="92" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="118" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="144" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="170" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="196" y="80" width="22" height="16" class="fill-wash" stroke-width="1" /><rect x="222" y="80" width="22" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="40" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="66" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="92" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="118" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="144" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="170" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="196" y="100" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="222" y="100" width="22" height="16" class="fill-paper" stroke-width="1" />
+  <rect x="40" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="66" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="92" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="118" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="144" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="170" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="196" y="120" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="222" y="120" width="22" height="16" class="fill-paper" stroke-width="1" />
+  <text x="22" y="92" text-anchor="middle">ROW</text>
+  <line x1="142" y1="140" x2="142" y2="166" class="blue" stroke-width="1.2" marker-end="url(#lat3-arr)" />
+  <rect x="40" y="170" width="204" height="22" class="fill-wash" stroke-width="1" />
+  <rect x="144" y="170" width="26" height="22" class="fill-blue" />
+  <text x="44" y="185" font-size="10">ROW BUFFER</text>
+  <line x1="157" y1="194" x2="157" y2="222" class="blue" stroke-width="1.2" marker-end="url(#lat3-arr)" />
+  <text x="157" y="238" text-anchor="middle" class="blue-t">64 B OUT</text>
+  <text x="252" y="88" class="strong">1 OPEN ROW</text>
+  <text x="252" y="102">~15 NS</text>
+  <text x="252" y="180" class="strong">2 READ COLS</text>
+  <text x="252" y="194">~15 NS</text>
+  <text x="252" y="232" class="strong">3 CLOSE ROW</text>
+  <text x="252" y="246">~15 NS</text>
+  <text x="20" y="266">1 TRANSISTOR + 1 CAPACITOR PER BIT</text>
+
+  <line x1="342" y1="14" x2="342" y2="270" class="ink dash" stroke-width="1" />
+
+  <text x="360" y="24" class="strong">NAND FLASH (SSD)</text>
+  <rect x="370" y="40" width="150" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="370" y="58" width="150" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="370" y="76" width="150" height="14" class="fill-wash" stroke-width="1" />
+  <rect x="370" y="94" width="150" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="370" y="112" width="150" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="370" y="130" width="150" height="14" class="fill-paper" stroke-width="1" />
+  <text x="445" y="87" text-anchor="middle" font-size="10">ONE PAGE · 4-16 KB</text>
+  <line x1="445" y1="148" x2="445" y2="166" class="blue" stroke-width="1.2" marker-end="url(#lat3-arr)" />
+  <rect x="370" y="170" width="150" height="22" class="fill-wash" stroke-width="1" />
+  <text x="378" y="185" font-size="10">PAGE BUFFER</text>
+  <line x1="445" y1="194" x2="445" y2="222" class="blue" stroke-width="1.2" marker-end="url(#lat3-arr)" />
+  <text x="445" y="238" text-anchor="middle" class="blue-t">4 KB OUT OVER PCIE</text>
+  <text x="530" y="88" class="strong">SENSE PAGE</text>
+  <text x="530" y="102">~25-100 µS</text>
+  <text x="530" y="180" class="strong">TRANSFER</text>
+  <text x="530" y="194">A FEW µS</text>
+  <text x="360" y="266">CHARGE STAYS PUT WITHOUT POWER</text>
+</svg>
+</Figure>
+
+### Why caches exist, and why they work
+
+Through the 1980s and 90s, CPUs got faster by roughly half again every year. DRAM got bigger but its latency barely improved. By the mid-90s people were calling this the <Term w="memory wall">The growing gap between how fast a CPU can compute and how long it waits for main memory. Named in a 1995 paper by Wulf and McKee.</Term>: a CPU that could do hundreds of operations in the time it took to fetch one value from RAM. The fix was to put small, fast SRAM caches between the core and RAM, and then more of them, in levels: L1, L2, L3.
+
+A cache only helps if you ask for the same things again, or for things next to what you just asked for. Real programs do both, and that habit has a name: <Term w="locality">The tendency of programs to reuse data they used recently (temporal locality) and to use data stored near data they just used (spatial locality).</Term>. A loop reuses the same few variables; walking an array touches neighbours one after another.
+
+Think of a desk, a bookshelf, and a library across town. You keep the few papers you are using on the desk (L1), the books for this project on the shelf (L2, L3), and everything else at the library (RAM). Most of the time what you need is on the desk. When it is not, you do not fetch one page: you bring back the whole chapter, because you will probably want the next page too. The CPU does exactly this. It never fetches one byte from RAM; it fetches a <Term w="cache line">The fixed-size chunk that moves between RAM and the caches. 64 bytes on most chips; 128 bytes on Apple Silicon.</Term>, and often the next few lines as well, guessed by a <Term w="prefetcher">Hardware that watches your access pattern and fetches the next cache lines before you ask. Great for sequential and strided access, useless for random jumps.</Term>.
+
+The part of your data that a program is actively using is its <Term w="working set">The data a program touches over a short window of time. If it fits in a cache level, accesses run at that level's speed.</Term>. If your working set fits in L1, you live on the top rung. If it is 10 GB of scattered lookups, you live on the RAM rung no matter how clever your code is. This is the idea behind [Why is NumPy 100x faster?](/lessons/cpu-caches/), and you are about to see it directly in your own measurements.
+
+### Latency and bandwidth are different things
+
+So far every number has been a **latency**: how long you wait for something to *start* arriving. There is a second number for every rung, and mixing them up is the most common mistake in performance reasoning.
+
+<Term w="latency">The time from asking for data to the first byte arriving. Measured in seconds (ns, µs, ms).</Term> is how long the pipe is. <Term w="bandwidth">How many bytes per second can flow once data is moving. Measured in bytes per second (GB/s, MB/s). Also called throughput when it describes work actually done.</Term> is how wide it is.
+
+Picture a highway. Latency is how long the drive takes. Bandwidth is how many lanes there are. Adding lanes does not get any single car there faster; it lets more cars arrive per minute. A long, wide highway and a short, narrow one can deliver the same number of cars per hour, with very different waits for the first car.
+
+<Figure n="004" title="LENGTH IS LATENCY, WIDTH IS BANDWIDTH" caption="A short, fat pipe and a long, thin one. Small requests care about length. Big transfers care about width.">
+<svg viewBox="0 0 640 236" role="img" aria-label="Two pipes. RAM is a short wide pipe. The link to Europe is a long thin pipe. Length is latency, width is bandwidth.">
+  <defs>
+    <marker id="lat4-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+    <marker id="lat4-b" viewBox="0 0 10 10" refX="1" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M10,0 L0,5 L10,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="28" class="strong">RAM</text>
+  <rect x="20" y="40" width="110" height="50" class="fill-wash" stroke-width="1.2" />
+  <circle cx="122" cy="52" r="3" class="fill-blue" /><circle cx="122" cy="65" r="3" class="fill-blue" /><circle cx="122" cy="78" r="3" class="fill-blue" />
+  <line x1="144" y1="42" x2="144" y2="88" class="blue" stroke-width="1" marker-start="url(#lat4-b)" marker-end="url(#lat4-a)" />
+  <text x="156" y="56" class="blue-t">WIDTH = BANDWIDTH</text>
+  <text x="156" y="72">BYTES PER SECOND ONCE FLOWING</text>
+  <text x="156" y="88">RAM: ~100 NS LONG, 100S OF GB/S WIDE</text>
+  <text x="20" y="128" class="strong">LINK TO EUROPE</text>
+  <rect x="20" y="140" width="600" height="8" class="fill-wash" stroke-width="1.2" />
+  <circle cx="34" cy="144" r="2" class="fill-blue" />
+  <line x1="22" y1="166" x2="618" y2="166" class="blue" stroke-width="1" marker-start="url(#lat4-b)" marker-end="url(#lat4-a)" />
+  <text x="320" y="184" text-anchor="middle" class="blue-t">LENGTH = LATENCY: TIME UNTIL THE FIRST BYTE ARRIVES</text>
+  <text x="320" y="200" text-anchor="middle">EUROPE: ~150 MS LONG, ~60 MB/S WIDE (HOME INTERNET)</text>
+  <text x="320" y="226" text-anchor="middle" class="strong">TIME = LATENCY + SIZE ÷ BANDWIDTH</text>
+</svg>
+</Figure>
+
+The formula at the bottom of Figure 004 is worth memorising. To move a chunk of data:
+
+```text
+time ≈ latency + size / bandwidth
+```
+
+When `size` is small, latency dominates and bandwidth barely matters. When `size` is big, bandwidth dominates and latency barely matters. The size where the two parts are equal is `latency × bandwidth`. Below it you are waiting; above it you are pumping.
+
+<Predict id="16gb">
+Your Spark's memory has a spec-sheet bandwidth of about 273 GB/s. How long does it take to read 16 GB (the weights of an 8B model in bf16) out of it, once? And how long would it take to pull the same 16 GB from a server across a 1 Gb/s home network?
+<Fragment slot="answer">
+16 GB ÷ 273 GB/s ≈ **59 ms**. Latency (100 ns) is irrelevant here; this is pure bandwidth.
+
+A 1 Gb/s link is 1 billion **bits** per second, which is 125 million **bytes** per second. 16 GB ÷ 0.125 GB/s = **128 seconds**, over two minutes. Same bytes, about 2,000× longer, and again latency does not matter at all.
+
+That 59 ms is the heart of [lesson 5](/lessons/bandwidth-bound/): to generate one token, the model has to read every weight once. 1 ÷ 0.059 s ≈ 17 tokens per second, and that is a ceiling set by bandwidth, before you run a single line of code.
+</Fragment>
+</Predict>
+
+Now play with it. Drag the size and watch each bar switch from mostly hatched (waiting) to mostly solid (flowing).
+
+<Figure n="005" title="WAITING VS FLOWING" caption="Total time to move a chunk of data over five pipes, using time = latency + size ÷ bandwidth. Best-case numbers, rounded. 'Evens out at' is latency × bandwidth: the size where waiting and flowing take equally long.">
+<LatencyTransfer />
+</Figure>
+
+A few things to notice. A 64-byte cache line from RAM is almost all waiting; so is a 4 KB read from the SSD. A 16 GB model read from RAM is all flowing. The network to Europe is waiting-dominated for anything below about 10 MB, which is why chatty APIs (many small calls) feel slow across oceans while one big download feels fine.
+
+Here are bandwidth numbers to carry alongside the latencies. Like everything here, they are approximate; the spec-sheet ones are peaks you will not quite hit.
+
+| Pipe | Bandwidth (approx) | Notes |
+|---|---|---|
+| One CPU core reading RAM | ~10-100 GB/s | One core cannot keep enough requests in flight to fill the bus |
+| Mac unified memory | ~100-120 GB/s (base M-series), up to ~400-550 GB/s (Max) | Spec-sheet; check your exact chip |
+| DGX Spark LPDDR5x | ~273 GB/s | Spec-sheet: 256-bit bus × 8,533 million transfers/s ÷ 8 bits |
+| Datacenter GPU HBM (H100) | ~3,350 GB/s | Spec-sheet; why big GPUs decode so much faster |
+| NVMe SSD, sequential | ~3-7 GB/s (PCIe 4), ~10-14 GB/s (PCIe 5) | Only with big reads or many in flight |
+| 100 Gb/s datacenter network | ~12.5 GB/s | Divide bits by 8 |
+| 1 Gb/s Ethernet | ~125 MB/s | Divide bits by 8 |
+| Home internet | ~10-125 MB/s | 100 Mb/s to 1 Gb/s plans |
+
+Note the trap in the networking rows: network speeds are quoted in **bits** per second, storage and memory in **bytes**. Divide by 8.
+
+### Bytes in flight
+
+One more idea ties latency and bandwidth together, and it is the reason the next few lessons exist.
+
+Your NVMe SSD can deliver several GB/s. But one random 4 KB read takes about 80 µs. If you issue one read, wait, then issue the next, you get 4 KB every 80 µs: about 50 MB/s, roughly 1% of what the drive can do. The drive is not slow. You are leaving it idle.
+
+To use a pipe's full bandwidth you need enough requests in flight at once to fill its length. That rule is <Term w="Little's law">In any steady system: items in flight = arrival rate × time each item spends inside. For storage and networks: bytes in flight = bandwidth × latency.</Term>:
+
+```text
+bytes in flight = bandwidth × latency
+SSD:  7 GB/s × 80 µs ≈ 560 KB  ≈ 140 reads of 4 KB outstanding at once
+RAM:  273 GB/s × 100 ns ≈ 27 KB ≈ 430 cache lines of 64 B outstanding at once
+```
+
+A single CPU core can only track a few dozen outstanding cache misses, which is why one core cannot reach the Spark's 273 GB/s, and why the GPU, with thousands of threads each waiting on its own loads, can get much closer. For the SSD, the number of outstanding requests is called the <Term w="queue depth">How many I/O requests are waiting at the device at the same moment. QD1 means one at a time. Fast SSDs need QD 32 or more to reach their rated speed.</Term>, and SSD spec sheets quote <Term w="IOPS">I/O operations per second: how many separate reads or writes a device completes per second. Usually quoted at high queue depth.</Term> at high queue depth, not at one-at-a-time.
+
+The way to get many things in flight from one program is to not wait for each one before starting the next. That is concurrency, and it is exactly what [Waiting vs working](/lessons/waiting-vs-working/) is about.
+
+## Build It
+
+You are going to put a measured number next to every rung, on both machines. Make a folder, say `~/workbench/latency`, and keep every script and result there. Write your predictions into the Measure table before you run anything.
+
+<Task id="t1" title="Find your hardware's cache sizes" agent="ok">
+
+Before measuring the caches, find out what the chip claims. On the Mac:
+
+```bash
+sysctl -n machdep.cpu.brand_string
+sysctl hw.cachelinesize hw.pagesize
+sysctl hw.perflevel0.l1dcachesize hw.perflevel0.l2cachesize   # performance cores
+sysctl hw.perflevel1.l1dcachesize hw.perflevel1.l2cachesize   # efficiency cores
+```
+
+On the Spark:
+
+```bash
+lscpu
+lscpu -C                  # one line per cache level: size, line size, how many share it
+getconf PAGESIZE
+lscpu -e=CPU,MAXMHZ       # the GB10 mixes two core types; the higher-MHz ones are the big cores
+```
+
+Write down: L1 data size, L2 size, L3 (or Apple's system-level cache, which `sysctl` may not show; look up your chip), cache line size, page size. On Apple Silicon you should see a 128-byte cache line and 16 KB pages; on the Spark expect 64-byte lines. These sizes are where the steps in your staircase plot should land.
+
+</Task>
+
+<Task id="t2" title="Time the Python rungs" agent="hands">
+
+Start where you live. Use `timeit` from the command line, which runs a statement millions of times and reports the best per-loop time:
+
+```bash
+python3 -m timeit -s "def f(): pass" "f()"
+python3 -m timeit -s "d = {i: i for i in range(1000)}" "d[500]"
+python3 -m timeit -s "x = 1" "x + 1"
+```
+
+The third line is your floor: roughly what one trivial bytecode operation plus `timeit`'s own loop costs. Write down the other two minus that floor.
+
+Then feel the interpreter's overhead on memory. Write `chase_py(n, steps)` that builds a Python list `nxt` of length `n` forming one random cycle (see the hint in the next task), then times `steps` iterations of `i = nxt[i]`. Run it for `n` = 1,000 and `n` = 10,000,000.
+
+- Shape: build the list, warm it up with one full pass, then `t0 = time.perf_counter_ns()`, loop, `t1 = ...`, print `(t1 - t0) / steps`.
+- Use at least a few million steps so the timer's own cost disappears.
+
+You should find that the small list costs tens of nanoseconds per step, not one. The interpreter's work per step is bigger than the L1 and L2 latencies you are trying to see, so they are invisible. The big list will be slower, because it does miss cache, but the steps between cache levels are smeared out. That is why the real measurement is in C.
+
+</Task>
+
+<Task id="t3" title="Pointer-chase the cache staircase in C" agent="hands">
+
+The trick for measuring latency, not bandwidth, is to make every load depend on the one before it. Store an array where each slot holds the index of the next slot to visit, in a random order. Then `i = next[i]` in a loop: the CPU cannot know where to go next until the current load finishes, and the random order defeats the prefetcher. This is called <Term w="pointer chasing">Following a chain where each memory address comes from the previous load. The CPU cannot overlap or predict these loads, so the time per step is pure latency.</Term>.
+
+Here is the harness. The two functions marked TODO are yours.
+
+```c
+// chase.c: average latency of one dependent load, for growing array sizes.
+// build: cc -O2 -o chase chase.c       (same command on macOS and on the Spark)
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <time.h>
+
+static double now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec * 1e9 + (double)t.tv_nsec;
+}
+
+// TODO 1: fill next[0..n) so that starting at 0 and following i = next[i]
+// visits every slot exactly once, in random order, before returning to 0.
+static void make_cycle(size_t *next, size_t n);
+
+// TODO 2: follow the chain `steps` times starting from 0; return the final index.
+static size_t chase(const size_t *next, size_t steps);
+
+int main(void) {
+    const size_t steps = 20 * 1000 * 1000;
+    for (size_t bytes = 4 << 10; bytes <= ((size_t)1 << 30); bytes *= 2) {
+        size_t n = bytes / sizeof(size_t);
+        size_t *next = malloc(bytes);
+        if (!next) return 1;
+        make_cycle(next, n);
+        chase(next, n);                       // warm-up: touch every slot once
+        double t0 = now_ns();
+        size_t end = chase(next, steps);
+        double t1 = now_ns();
+        printf("%8zu KB  %7.2f ns/load  (end %zu)\n", bytes >> 10, (t1 - t0) / steps, end);
+        free(next);
+    }
+    return 0;
+}
+```
+
+Hints, not answers:
+
+- For TODO 1, look up **Sattolo's algorithm**. It is the Fisher-Yates shuffle with one character changed, and it produces a permutation that is a single cycle (plain Fisher-Yates can produce many small cycles, and you would chase around a tiny loop that fits in L1). Apply it to an identity array `next[i] = i`.
+- You need random numbers up to 128 million. `rand()` is fine on both platforms here; a 64-bit xorshift is a nicer exercise.
+- Print `end`. If the result is never used, the compiler is allowed to delete your whole loop (you will do this on purpose in Break It).
+- Run it a couple of times. On the Spark, pin to a big core with `taskset -c <cpu> ./chase` using a CPU number from `lscpu -e`. macOS does not let you pin threads; a single busy thread usually lands on a performance core, but expect a little noise.
+- Want a smoother curve? Step by ×1.41 instead of ×2 (and round to a multiple of 8 bytes).
+
+Save the output of each machine to `chase_mac.txt` and `chase_spark.txt`.
+
+</Task>
+
+<Task id="t4" title="Measure RAM bandwidth with a big copy" agent="hands">
+
+Now the other number. Write `bw.c`: allocate two 1 GB buffers, write to every byte of both once (so the operating system actually gives you the memory; see [the virtual memory lesson](/lessons/virtual-memory/) for why that is needed), then time 10 calls of `memcpy(dst, src, 1 GB)`.
+
+- Report two numbers: bytes copied per second, and memory traffic per second. A copy *reads* 1 GB and *writes* 1 GB, so traffic is twice the bytes copied.
+- Use `now_ns()` from the previous task. Print a byte from `dst` at the end so the copies cannot be optimised away.
+
+This is one core. To see how far below the spec sheet one core sits, compare your traffic number to your Mac's spec bandwidth and to the Spark's 273 GB/s. Stretch: run the copy on 4 or 8 threads with `pthread_create`, each copying its own slice, and watch the total climb until it flattens.
+
+</Task>
+
+<Task id="t5" title="Measure the Spark's GPU: bandwidth and launch cost" agent="hands">
+
+On the Spark, the GPU is the thing that will actually read your model's weights, so measure what it sees. In PyTorch, write a script that:
+
+1. Allocates two 4 GB `uint8` tensors on `cuda`, copies one into the other once to warm up, then times 20 copies with `y.copy_(x)`. Call `torch.cuda.synchronize()` before starting and before stopping the clock: GPU calls return immediately and run in the background, so without it you are timing nothing. Report traffic as `2 × bytes × 20 / seconds`.
+2. Times 10,000 launches of a tiny operation (`z.add_(1)` on a 1-element tensor) with one `synchronize()` at the end. Divide to get the cost per launch.
+
+Write the first number next to the 273 GB/s spec; the gap between them is your real ceiling for lesson 5. The second number tells you why a model that runs thousands of tiny kernels per token can be slow even when the GPU is mostly idle.
+
+</Task>
+
+<Task id="t6" title="SSD: random vs sequential, without the page cache" agent="hands">
+
+The operating system keeps recently read file data in spare RAM, called the <Term w="page cache">The operating system's copy of recently read file data, kept in otherwise unused RAM. A second read of the same file usually never touches the disk.</Term>. If you do not get around it, you will measure RAM and call it an SSD. Getting around it differs by OS:
+
+- **macOS:** after opening the file, `fcntl(fd, F_NOCACHE, 1)` asks the OS not to cache your reads. Also run `sudo purge` after creating the test file, so pages that were cached when you wrote it are thrown away.
+- **Linux:** open with `O_DIRECT`, which skips the page cache entirely. The catch: the buffer, the offset and the size must all be aligned to the block size (4 KB is safe). An anonymous `mmap` is page-aligned, so it makes a good buffer.
+
+First, create a 4 GB test file of random bytes (this part is boilerplate):
+
+```python
+# make_file.py
+import os
+with open("testfile.bin", "wb") as f:
+    for _ in range(4096):
+        f.write(os.urandom(1 << 20))   # 4096 × 1 MB of real data, no holes
+```
+
+Then write `disk.py` with two measurements:
+
+1. **Random 4 KB reads, one at a time:** 2,000 reads at random 4 KB-aligned offsets. Time each with `time.perf_counter_ns()` and report the median and the 99th percentile.
+2. **Sequential reads:** read the whole file in 1 MB chunks, also bypassing the cache, and report GB/s.
+
+The shape of the platform-specific part:
+
+```python
+import os, sys, mmap, fcntl
+
+def open_uncached(path):
+    if sys.platform == "darwin":
+        fd = os.open(path, os.O_RDONLY)
+        fcntl.fcntl(fd, getattr(fcntl, "F_NOCACHE", 48), 1)   # 48 is F_NOCACHE on macOS
+    else:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECT)
+    return fd
+
+buf = mmap.mmap(-1, 1 << 20)   # page-aligned scratch buffer for O_DIRECT
+# Linux:  os.preadv(fd, [memoryview(buf)[:4096]], offset)
+# macOS:  os.pread(fd, 4096, offset)
+```
+
+Notice that Python is fine here, unlike for the caches. Python's overhead per call is around a microsecond, and an SSD read is tens of microseconds, so the interpreter is a small error. Knowing *when* overhead matters is the skill.
+
+</Task>
+
+<Task id="t7" title="Cross-check the disk with fio" agent="ok">
+
+`fio` is the standard disk benchmarking tool (`brew install fio`, `sudo apt install fio`). Use it to check your script, and to see queue depth in action:
+
+```bash
+# one read at a time (queue depth 1)
+fio --name=qd1 --filename=testfile.bin --rw=randread --bs=4k --direct=1 \
+    --ioengine=psync --runtime=10 --time_based
+
+# 32 reads in flight (Linux; on macOS try --ioengine=posixaio)
+fio --name=qd32 --filename=testfile.bin --rw=randread --bs=4k --direct=1 \
+    --ioengine=libaio --iodepth=32 --runtime=10 --time_based
+```
+
+Compare `IOPS` and the latency percentiles between the two runs. If `--direct=1` is refused on macOS, run `sudo purge` first and drop the flag; check `fio`'s docs for your version.
+
+</Task>
+
+<Task id="t8" title="Network: localhost, home server, far away" agent="hands">
+
+Three distances, three tools.
+
+```bash
+ping -c 20 127.0.0.1                        # never leaves the machine
+tailscale ping <home-server-name>           # says whether you go direct or via a relay
+ping -c 20 <home-server-tailscale-ip>
+# a far region: TCP connect time is about one round trip. Subtract DNS time.
+curl -so /dev/null -w 'dns %{time_namelookup}s  connect %{time_connect}s\n' https://s3.eu-central-1.amazonaws.com/
+curl -so /dev/null -w 'dns %{time_namelookup}s  connect %{time_connect}s\n' https://s3.ap-southeast-2.amazonaws.com/
+```
+
+Then write a tiny TCP echo pair in Python: a server that sends back whatever it receives, and a client that sends 1 byte and waits for the reply, 10,000 times on `127.0.0.1`. Report the median round trip. Compare it to `ping`: the difference is Python and the socket API on both ends.
+
+If `tailscale ping` reports going through a relay (it calls them DERP servers) rather than directly, the round trip will be much longer than the distance suggests. That is a fun one to chase down in [the Tailscale lesson](/lessons/ssh-and-tailscale/).
+
+</Task>
+
+<Task id="t9" title="Plot the staircase" agent="ok">
+
+Have an agent write a small matplotlib script that reads `chase_mac.txt` and `chase_spark.txt` and plots ns/load against array size, both machines on one chart, log scale on both axes, with vertical dashed lines at the cache sizes you found in the first task.
+
+</Task>
+
+<DoneWhen>
+
+- `chase` prints a clear staircase on both machines, and you can point at each step and name the cache level.
+- Every row of the Measure table has your number for the Mac and the Spark (or "n/a" with a reason).
+- You can say, without looking, your measured RAM latency, SSD random read latency, and how far below 273 GB/s the Spark's GPU copy landed.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Write your guess in each cell first, in brackets, then the real number next to it. The textbook column is a rough guide, not a target.
+
+| Rung | Textbook (approx) | Mac | Spark | Human scale (Mac, L1 = 1 s) |
+|---|---|---|---|---|
+| L1 hit (chase, small array) | ~1 ns | | | |
+| L2 hit | ~3-6 ns | | | |
+| L3 / system cache hit | ~10-40 ns | | | |
+| DRAM (chase, 1 GB array) | ~80-150 ns | | | |
+| Python function call | ~30-100 ns | | | |
+| Python dict lookup | ~15-50 ns | | | |
+| RAM copy traffic, one core | ~10-100 GB/s | | | |
+| GPU copy traffic | ≤ 273 GB/s (spec) | n/a | | n/a |
+| GPU kernel launch | ~2-10 µs | n/a | | n/a |
+| SSD random 4 KB, median | ~20-150 µs | | | |
+| SSD random 4 KB, p99 | a few × the median | | | |
+| SSD sequential | ~2-7 GB/s | | | |
+| `ping` localhost | ~10-100 µs | | | |
+| Python TCP echo, localhost | ~20-100 µs | | | |
+| Home server over Tailscale | ~1-5 ms (LAN), 10-50 ms (far or relayed) | | | |
+| Far region (connect minus DNS) | ~50-300 ms | | | |
+
+<Predict id="staircase">
+Before you plot: on your Mac, at what array sizes will the ns/load curve jump, and roughly how many nanoseconds will each plateau sit at? Use the sizes from the first task.
+<Fragment slot="answer">
+You should see flat stretches with ramps between them, one ramp per cache level running out:
+
+- Flat around **1 ns** while the array fits in L1 (up to ~128 KB on an Apple performance core, ~64 KB on the Spark's big cores).
+- A step up to **a few ns** until the array outgrows L2 (Apple shares a large L2, around 12-16 MB, per cluster of performance cores; the Spark's cores have a smaller private L2 and a shared L3).
+- On Apple, a short shelf in the **tens of ns** for the system-level cache, which is shared with the GPU.
+- Then a climb to **~100 ns or more** once the array is far bigger than any cache, and a slow rise beyond that, which is the TLB (below).
+
+The ramps are gradual, not cliffs, because caches do not evict perfectly and some of your array still hits as it outgrows a level. If the curve is flat everywhere, something is wrong; see Break It.
+</Fragment>
+</Predict>
+
+<Figure n="006" title="THE CACHE STAIRCASE (EXPECTED SHAPE)" caption="The shape your chase plot should have: flat while the array fits in a level, a ramp as it outgrows it. Where the steps sit depends on your chip; these are illustrative.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Log-log plot of nanoseconds per load against array size, showing plateaus for L1, L2, L3 and DRAM">
+  <line x1="60" y1="250" x2="620" y2="250" class="ink" stroke-width="1" />
+  <line x1="60" y1="30" x2="60" y2="250" class="ink" stroke-width="1" />
+  <line x1="60" y1="226" x2="620" y2="226" class="ink dash" stroke-width="0.5" opacity="0.4" />
+  <line x1="60" y1="148" x2="620" y2="148" class="ink dash" stroke-width="0.5" opacity="0.4" />
+  <line x1="60" y1="69" x2="620" y2="69" class="ink dash" stroke-width="0.5" opacity="0.4" />
+  <text x="52" y="230" text-anchor="end">1 NS</text>
+  <text x="52" y="152" text-anchor="end">10 NS</text>
+  <text x="52" y="73" text-anchor="end">100 NS</text>
+  <text x="60" y="268" text-anchor="middle">4 KB</text>
+  <text x="184" y="268" text-anchor="middle">64 KB</text>
+  <text x="309" y="268" text-anchor="middle">1 MB</text>
+  <text x="433" y="268" text-anchor="middle">16 MB</text>
+  <text x="558" y="268" text-anchor="middle">256 MB</text>
+  <text x="620" y="268" text-anchor="middle">1 GB</text>
+  <text x="340" y="290" text-anchor="middle">ARRAY SIZE (WORKING SET), LOG SCALE</text>
+  <text x="16" y="20">NS PER LOAD</text>
+  <line x1="205" y1="30" x2="205" y2="250" class="blue dash" stroke-width="1" />
+  <line x1="420" y1="30" x2="420" y2="250" class="blue dash" stroke-width="1" />
+  <line x1="476" y1="30" x2="476" y2="250" class="blue dash" stroke-width="1" />
+  <text x="208" y="42" class="blue-t">L1 SIZE</text>
+  <text x="380" y="42" class="blue-t" text-anchor="end">L2 SIZE</text>
+  <text x="480" y="42" class="blue-t">L3 SIZE</text>
+  <path d="M60 226 L196 226 C210 226 220 179 238 179 L408 179 C422 179 430 126 446 126 L466 126 C480 126 494 72 514 70 L620 54" class="blue" stroke-width="2" fill="none" />
+  <text x="110" y="216" class="strong">L1</text>
+  <text x="300" y="170" class="strong">L2</text>
+  <text x="430" y="116" class="strong">L3</text>
+  <text x="530" y="90" class="strong">DRAM</text>
+  <text x="530" y="104">+ TLB MISSES</text>
+</svg>
+</Figure>
+
+**What the numbers should look like, and why.**
+
+*The staircase.* The heights of the plateaus are the latencies of each level; the positions of the ramps are their sizes. If your L1 plateau ends at about the size `sysctl` or `lscpu` reported, you have just measured a cache with nothing but a stopwatch. The far right keeps rising slowly past the DRAM step. That is the <Term w="TLB">Translation lookaside buffer: a small cache of recent virtual-to-physical address translations. A miss means walking the page tables, which are themselves in memory.</Term> running out: every address your program uses has to be translated to a physical one, and with a huge random working set those translations miss too. Apple's 16 KB pages cover four times as much memory per entry as 4 KB pages, so the Mac may suffer this a little later.
+
+*Python.* The function call and dict lookup should land in the tens of nanoseconds: roughly an L3 hit, or a third to a half of a RAM read. That surprises people. It means a tight Python loop is "slow" in the same units as a cache miss, so for Python code, the interpreter is usually the first bottleneck, not memory. [Why is Python slow?](/lessons/python-speed/) takes that apart.
+
+*Bandwidth.* One core's copy traffic will be well under the spec-sheet number, often by a factor of 2-5. That is bytes-in-flight at work: one core cannot keep enough cache misses outstanding. The GPU copy on the Spark should get much closer to 273 GB/s but not reach it; somewhere around 70-90% of peak is typical for a good copy on most hardware, but your measurement is the number that counts. Whatever you got, divide it by 16 GB and you have a better tokens-per-second ceiling than the spec sheet gives you.
+
+*SSD.* Random 4 KB median should be tens of microseconds, maybe up to ~100 µs, with a p99 several times higher (the controller is occasionally busy with its own housekeeping). Sequential should be in GB/s. Divide sequential bandwidth by 4 KB and compare with 1 ÷ random latency: the gap, usually 20-100×, is exactly the queue-depth story. `fio` at queue depth 32 should close much of it.
+
+*Network.* `ping` on localhost should be tens of microseconds; your Python echo a bit more. The home server over Tailscale on the same Wi-Fi should be a few milliseconds (Wi-Fi itself adds jitter). The far regions should be close to what light in fiber predicts plus 30-60%: Frankfurt from the US West Coast is around 150 ms, Sydney around 150-200 ms. These are round trips; compute the light-speed floor from the distance and see how close the internet gets.
+
+## Break It
+
+**1. Make the loads independent.** Change `chase` to walk the array in order (`i = i + 1`) instead of following `next`, or in Python run `a[idx].sum()` with NumPy, where `idx` is a big random index array. The DRAM-sized runs suddenly cost a few nanoseconds per element instead of a hundred. Nothing about RAM changed. In order, the prefetcher fetches lines before you ask; with NumPy's gather, every load's address is known up front, so the core issues many misses at once and overlaps them. You moved from measuring latency to measuring bandwidth. Any benchmark that claims "RAM is 2 ns" has made this mistake.
+
+**2. Forget the page cache.** Run `disk.py` without `F_NOCACHE` or `O_DIRECT`, twice. The second run will report "SSD reads" of a microsecond or two: you are reading RAM. A sneakier version: make the test file with `truncate -s 4G` instead of writing random bytes. The file is all holes, the filesystem knows there is nothing stored there, and it hands back zeros without touching the drive. Both mistakes give you a dream SSD. The page cache is a big topic of its own in [What happens when you save a file?](/lessons/files-and-disks/).
+
+**3. Let the compiler win.** Delete `end` from the `printf` in `chase.c` and rebuild with `-O2`. You will likely see 0.00 ns per load. The compiler noticed the loop's result is never used and deleted it. Every microbenchmark has to make its result observable, or it measures nothing.
+
+**4. Time one thing at a time.** Time a single dict lookup with two `perf_counter_ns()` calls around it. You will get a number several times larger than `timeit`'s, and very noisy, because the timer call itself costs more than the thing you are timing. Measure many operations and divide, and check your timer's own cost by timing an empty region.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if an interviewer asked.
+
+1. **Roughly how long does it take to read from L1, RAM, an SSD, and a server in Europe, and how do they compare?**
+
+<details>
+<summary>Model answer</summary>
+
+L1 is about a nanosecond. RAM is about 100 ns, so a hundred times slower. A random SSD read is about 50-100 µs, another factor of roughly a thousand. A round trip to Europe from California is about 150 ms, another couple of thousand times. If an L1 hit took a second, RAM would be a couple of minutes, the SSD most of a day, and Europe about five years. The exact numbers vary by hardware; the ordering and the rough ratios do not.
+
+</details>
+
+2. **What is the difference between latency and bandwidth? Give an example where improving one does nothing.**
+
+<details>
+<summary>Model answer</summary>
+
+Latency is how long until the first byte arrives; bandwidth is how many bytes per second flow once it is moving. Time to move something is about latency plus size divided by bandwidth. A chatty API making hundreds of tiny calls to a server across an ocean is latency-bound: a faster internet plan changes nothing, because each call spends 150 ms waiting and almost no time transferring. Reading a 16 GB model out of memory is bandwidth-bound: lower memory latency would change nothing, because the 100 ns wait is a rounding error next to 59 ms of transfer.
+
+</details>
+
+3. **Back-of-envelope: a feature store must serve 50,000 lookups per second, each a random 1 KB record, from a 2 TB dataset. Can it come from SSD, or does it need RAM?**
+
+<details>
+<summary>Model answer</summary>
+
+One random SSD read takes about 80 µs. One at a time, that is about 12,500 reads per second, so a single thread doing blocking reads cannot keep up. But a good NVMe drive does hundreds of thousands of random reads per second if you keep enough in flight: by Little's law, 50,000/s × 80 µs = 4 reads outstanding on average, which is easy. So one SSD can do it, as long as the server issues reads concurrently (async, or a thread pool) instead of one by one. Leave headroom for p99, so maybe two drives or plan for 10-20 in flight.
+
+RAM would be 1,000× faster per lookup, but 2 TB does not fit in one normal machine: at 128 GB per box (like the Spark) you would need about 16 machines just to hold it, more with replicas. So the sensible design is SSD for the bulk, with the hot fraction of keys cached in RAM. If each request chains 10 dependent lookups, SSD adds about 1 ms per request; RAM would add about 1 µs. That chain length is what decides whether SSD is acceptable for latency, separately from whether it can keep up with throughput.
+
+</details>
+
+4. **Why does a CPU need caches at all, and why are they small?**
+
+<details>
+<summary>Model answer</summary>
+
+Because RAM takes about 100 ns and a core can do hundreds of operations in that time; without caches it would mostly sit waiting. Caches work because programs reuse recent data and use data next to what they just used, so keeping a small copy close by catches most requests. They are small because fast memory (SRAM, about six transistors per bit) takes a lot of chip area, and because bigger memories are inherently slower: longer wires, more address decoding. So you get a ladder: tiny and very fast, bigger and a bit slower, and so on out to RAM.
+
+</details>
+
+5. **Your Spark has ~273 GB/s of memory bandwidth on the spec sheet. Without running anything, how fast can it generate tokens for an 8B model in bf16? What if the model did not fit in memory and had to stream from the SSD?**
+
+<details>
+<summary>Model answer</summary>
+
+Each token needs every weight read once. 8 billion weights × 2 bytes = 16 GB. 16 GB ÷ 273 GB/s ≈ 59 ms per token, so at most about 17 tokens per second, and in practice somewhat less because you never hit the spec-sheet peak. From an SSD at ~7 GB/s it would be 16 ÷ 7 ≈ 2.3 s per token, under half a token per second. Same model, roughly 40× slower, purely from which pipe the bytes come through.
+
+</details>
+
+6. **Why can't a cloud provider sell you a 20 ms round trip from California to Europe?**
+
+<details>
+<summary>Model answer</summary>
+
+Light in fiber travels about 200,000 km per second, 20 cm per nanosecond. California to the Netherlands is about 8,800 km, so a round trip is about 17,600 km, which takes at least ~90 ms in a perfectly straight fiber. Real routes are longer and pass through routers, so ~140-150 ms is normal. The only way to go faster is to not make the trip: put a copy of the service or data closer to the user.
+
+</details>
+
+## Go Deeper
+
+- **Peter Norvig, *Teach Yourself Programming in Ten Years*** ([norvig.com/21-days.html](https://norvig.com/21-days.html)). The original table, near the end. Worth reading whole; it is short and still right.
+- **Jeff Dean, "Designs, Lessons and Advice from Building Large Distributed Systems"** (LADIS 2009 keynote). The "Numbers Everyone Should Know" slide in its natural habitat, followed by the back-of-envelope examples that show what the numbers are for.
+- **Ulrich Drepper, *What Every Programmer Should Know About Memory*** (2007, [akkadia.org/drepper/cpumemory.pdf](https://akkadia.org/drepper/cpumemory.pdf)). Long and dense. Read sections 2 (how DRAM works) and 3 (caches); his pointer-chasing graphs are the grown-up version of what you just built.
+- **Brendan Gregg, *Systems Performance*, 2nd edition** (2020), chapter 2. Where the human-scale latency table comes from, plus the methodology for measuring without fooling yourself. The disk and network chapters go deep on everything in this lesson's Build section.
+- **Colin Scott, "Latency Numbers Every Programmer Should Know"** (interactive page). A slider that shows how the classic numbers have changed by year. Its later years are extrapolated from trends, not measured, so treat it as a picture of the shape.
+- **John Hennessy and David Patterson, *Computer Architecture: A Quantitative Approach***, the memory hierarchy chapter. The textbook account of why caches are organised the way they are, with the famous CPU-vs-DRAM performance gap plot.
+- **Wm. A. Wulf and Sally A. McKee, "Hitting the Memory Wall: Implications of the Obvious"** (1995). A two-page paper that named the problem caches are fighting. Quick and memorable.
+- **Chips and Cheese** (chipsandcheese.com). Independent, measured deep dives into real chips, including Apple Silicon and Arm cores, with latency-vs-size plots like yours. The best place to check your staircase against someone else's.
+
+## Connections
+
+This lesson is the measuring stick for the rest of the opening chapter.
+
+- [Where do my variables live?](/lessons/stack-and-heap/) is about where things sit in memory; now you know what each location costs.
+- [Waiting vs working](/lessons/waiting-vs-working/) is the answer to "bytes in flight": how one program keeps many slow requests outstanding.
+- [Why ~17 tokens per second?](/lessons/bandwidth-bound/) is the latency-vs-bandwidth formula applied to your Spark, with your measured GPU bandwidth in place of the spec sheet.
+- [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) adds the network rung back in: time to first token is latency, tokens per second is throughput.
+- [How does it scale?](/lessons/back-of-envelope/) is this lesson's Explain It Back question 3, done properly and at length.

@@ -1,0 +1,279 @@
+---
+// Toy virtual memory: two processes' virtual pages mapped onto a handful of physical frames.
+// malloc only reserves addresses. Touching a reserved page faults and grabs a frame.
+// fork shares every frame read-only; the first write to a shared page copies it (copy-on-write).
+// When frames run out: with swap on, the least recently used private page goes to swap;
+// with swap off (or swap full), the OOM killer kills the process with the biggest RSS.
+---
+<div class="vmmap" data-fig="virtmem-mapper">
+  <svg viewBox="0 0 640 312" role="img" aria-label="Virtual pages of process A and process B mapped onto physical frames"></svg>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="malloc">malloc 2 pages (A)</button>
+    <button class="btn" type="button" data-act="touchA">Touch page (A)</button>
+    <button class="btn" type="button" data-act="fork">fork() A → B</button>
+    <button class="btn" type="button" data-act="touchB">Touch page (B)</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="swap" aria-pressed="false">Swap: off</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+  </div>
+  <p class="vmmap-read">
+    A: VSZ <span class="readout" data-r="vszA">0</span> RSS <span class="readout" data-r="rssA">0</span> ·
+    B: VSZ <span class="readout" data-r="vszB">-</span> RSS <span class="readout" data-r="rssB">-</span> ·
+    free frames <span class="readout" data-r="free">6</span> ·
+    swap <span class="readout" data-r="swap">0</span><br />
+    minor faults <span class="readout" data-r="minor">0</span> ·
+    major faults <span class="readout" data-r="major">0</span> ·
+    COW copies <span class="readout" data-r="cow">0</span> ·
+    OOM kills <span class="readout" data-r="oom">0</span>
+  </p>
+  <p class="vmmap-read vmmap-msg" data-r="msg">Start with malloc. Watch what happens to VSZ, RSS and the frames.</p>
+</div>
+
+<style>
+  .vmmap-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.7; }
+  .vmmap-msg { color: var(--ink); min-height: 3.4em; }
+  .vmmap .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+</style>
+
+<script>
+  type PState = 'none' | 'res' | 'map' | 'swp';
+  interface Page { s: PState; f: number; shared: boolean }
+  interface Proc { name: string; alive: boolean; pages: Page[] }
+  const NS = 'http://www.w3.org/2000/svg';
+  const NPAGES = 8;
+  const NFRAMES = 6;
+  const SWAP_SLOTS = 4;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="virtmem-mapper"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const btn = (k: string) => root.querySelector<HTMLButtonElement>(`[data-act="${k}"]`)!;
+
+    let procs: Proc[];
+    let refs: number[];
+    let lastUse: number[];
+    let clock = 0;
+    let swapOn = false;
+    let swapUsed = 0;
+    let stats = { minor: 0, major: 0, cow: 0, oom: 0 };
+    let flash: { p: number; i: number } | null = null;
+
+    const blank = (): Page[] => Array.from({ length: NPAGES }, () => ({ s: 'none' as PState, f: -1, shared: false }));
+
+    function reset() {
+      procs = [
+        { name: 'A', alive: true, pages: blank() },
+        { name: 'B', alive: false, pages: blank() },
+      ];
+      refs = Array(NFRAMES).fill(0);
+      lastUse = Array(NFRAMES).fill(0);
+      swapUsed = 0;
+      stats = { minor: 0, major: 0, cow: 0, oom: 0 };
+      flash = null;
+    }
+
+    const rss = (p: Proc) => (p.alive ? p.pages.filter((x) => x.s === 'map').length : 0);
+    const vsz = (p: Proc) => (p.alive ? p.pages.filter((x) => x.s !== 'none').length : 0);
+
+    function kill(pi: number) {
+      const p = procs[pi];
+      p.pages.forEach((pg) => {
+        if (pg.s === 'map') refs[pg.f]--;
+        if (pg.s === 'swp') swapUsed--;
+      });
+      p.alive = false;
+      p.pages = blank();
+      stats.oom++;
+    }
+
+    // Find a free frame for process `who`. May evict to swap, or invoke the OOM killer.
+    // Returns the frame, or -1 if `who` itself was killed.
+    function getFrame(who: number): { f: number; note: string } {
+      let free = refs.findIndex((c) => c === 0);
+      if (free >= 0) return { f: free, note: '' };
+      if (swapOn && swapUsed < SWAP_SLOTS) {
+        // evict the least recently used frame that only one page maps
+        let best = -1;
+        for (let f = 0; f < NFRAMES; f++) if (refs[f] === 1 && (best < 0 || lastUse[f] < lastUse[best])) best = f;
+        if (best >= 0) {
+          procs.forEach((p) => p.pages.forEach((pg) => {
+            if (pg.s === 'map' && pg.f === best) { pg.s = 'swp'; pg.f = -1; }
+          }));
+          refs[best] = 0;
+          swapUsed++;
+          return { f: best, note: `RAM full: kernel wrote frame F${best} out to swap to make room (slow disk write). ` };
+        }
+      }
+      // OOM: kill the alive process with the biggest RSS
+      let victim = -1;
+      procs.forEach((p, i) => { if (p.alive && (victim < 0 || rss(p) > rss(procs[victim]))) victim = i; });
+      const vname = procs[victim].name;
+      const vr = rss(procs[victim]);
+      kill(victim);
+      const note = `RAM ${swapOn ? 'and swap ' : ''}full: OOM killer sent SIGKILL to ${vname} (biggest RSS, ${vr} pages). `;
+      if (victim === who) return { f: -1, note };
+      free = refs.findIndex((c) => c === 0);
+      if (free < 0) { const again = getFrame(who); return { f: again.f, note: note + again.note }; }
+      return { f: free, note };
+    }
+
+    function touch(pi: number): string {
+      const p = procs[pi];
+      clock++;
+      // 1. a page that was reserved but never touched: zero-fill minor fault
+      let i = p.pages.findIndex((x) => x.s === 'res');
+      if (i >= 0) {
+        const { f, note } = getFrame(pi);
+        if (f < 0) return note + `${p.name} is dead.`;
+        refs[f] = 1; lastUse[f] = clock;
+        p.pages[i] = { s: 'map', f, shared: false };
+        stats.minor++; flash = { p: pi, i };
+        return note + `${p.name} touched VP${i}: page fault. The address was reserved but had no RAM, so the kernel zeroed frame F${f} and mapped it. Minor fault.`;
+      }
+      // 2. a page in swap: major fault, read it back
+      i = p.pages.findIndex((x) => x.s === 'swp');
+      if (i >= 0) {
+        swapUsed--;
+        p.pages[i].s = 'none';
+        const { f, note } = getFrame(pi);
+        if (f < 0) return note + `${p.name} is dead.`;
+        refs[f] = 1; lastUse[f] = clock;
+        p.pages[i] = { s: 'map', f, shared: false };
+        stats.major++; flash = { p: pi, i };
+        return note + `${p.name} touched VP${i}, which was in swap: major fault. The kernel read it back from disk into F${f}. Thousands of times slower than a minor fault.`;
+      }
+      // 3. a page shared with the other process after fork: copy-on-write
+      i = p.pages.findIndex((x) => x.s === 'map' && x.shared);
+      if (i >= 0) {
+        const old = p.pages[i].f;
+        if (refs[old] === 1) {
+          p.pages[i].shared = false; lastUse[old] = clock; flash = { p: pi, i };
+          stats.minor++;
+          return `${p.name} wrote VP${i}. It was marked read-only, but nobody else maps F${old} anymore, so the kernel just made it writable again. No copy.`;
+        }
+        const { f, note } = getFrame(pi);
+        if (f < 0) return note + `${p.name} is dead.`;
+        if (p.pages[i].s !== 'map') return note; // defensive
+        refs[old]--; refs[f] = 1; lastUse[f] = clock;
+        p.pages[i] = { s: 'map', f, shared: false };
+        procs.forEach((q) => q.pages.forEach((pg) => { if (pg.s === 'map' && pg.f === old && refs[old] === 1) pg.shared = false; }));
+        stats.minor++; stats.cow++; flash = { p: pi, i };
+        return note + `${p.name} wrote VP${i}, which was shared read-only: copy-on-write fault. The kernel copied F${old} into F${f}. Now each process has its own copy.`;
+      }
+      i = p.pages.findIndex((x) => x.s === 'map');
+      if (i >= 0) {
+        return `Every page ${p.name} has is already private and in RAM. Touching them costs no fault at all: the page table already says where they live. malloc more first.`;
+      }
+      return `${p.name} has no memory to touch. malloc first.`;
+    }
+
+    function act(k: string) {
+      let msg = '';
+      const A = procs[0], B = procs[1];
+      if (k === 'reset') { reset(); msg = 'Start with malloc. Watch what happens to VSZ, RSS and the frames.'; }
+      else if (k === 'swap') { swapOn = !swapOn; msg = swapOn ? `Swap on: ${SWAP_SLOTS} slots on disk. When RAM is full, cold pages get pushed there instead of killing anyone.` : 'Swap off: when RAM is full, the OOM killer is the only way out.'; }
+      else if (k === 'malloc') {
+        let n = 0;
+        A.pages.forEach((pg) => { if (n < 2 && pg.s === 'none') { pg.s = 'res'; n++; } });
+        flash = null;
+        msg = n ? `malloc returned instantly. A's VSZ grew by ${n} pages, its RSS didn't move, and no frame was used. The kernel only wrote down "these addresses are A's".` : 'A has used all 8 virtual pages in this toy. (A real 64-bit address space has billions of them.)';
+      }
+      else if (k === 'touchA') msg = touch(0);
+      else if (k === 'touchB') msg = touch(1);
+      else if (k === 'fork') {
+        B.alive = true;
+        B.pages = A.pages.map((pg) => ({ ...pg }));
+        A.pages.forEach((pg, i) => { if (pg.s === 'map') { pg.shared = true; B.pages[i].shared = true; refs[pg.f]++; } });
+        B.pages.forEach((pg) => { if (pg.s === 'swp') { pg.s = 'res'; } }); // toy: child re-faults swapped pages as fresh
+        flash = null;
+        msg = `fork() copied A's page table, not its memory. B has the same RSS as A, but no new frames were used: every frame is now shared and marked read-only in both.`;
+      }
+      r('msg').textContent = msg;
+      draw();
+    }
+
+    function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+      const e = document.createElementNS(NS, tag);
+      for (const [a, v] of Object.entries(attrs)) e.setAttribute(a, String(v));
+      if (text !== undefined) e.textContent = text;
+      svg.appendChild(e);
+      return e;
+    }
+
+    const PX = [16, 494];
+    const PW = 130;
+    const FX = 255, FW = 130;
+    const rowY = (i: number) => 40 + i * 32;
+    const fY = (f: number) => 72 + f * 32;
+
+    function draw() {
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      el('text', { x: PX[0], y: 22, class: 'strong' }, 'PROCESS A · VIRTUAL');
+      el('text', { x: FX, y: 22, class: 'strong' }, 'PHYSICAL RAM');
+      el('text', { x: PX[1], y: 22, class: 'strong' }, procs[1].alive ? 'PROCESS B · VIRTUAL' : 'B (NOT FORKED)');
+      el('text', { x: FX, y: 58, class: 'blue-t' }, `${NFRAMES} FRAMES`);
+
+      // links first, so boxes draw over them
+      procs.forEach((p, pi) => {
+        if (!p.alive) return;
+        p.pages.forEach((pg, i) => {
+          if (pg.s !== 'map') return;
+          const y1 = rowY(i) + 12, y2 = fY(pg.f) + 12;
+          const x1 = pi === 0 ? PX[0] + PW : PX[1];
+          const x2 = pi === 0 ? FX : FX + FW;
+          el('line', { x1, y1, x2, y2, class: pg.shared ? 'blue dash' : 'blue', 'stroke-width': 1.2 });
+        });
+      });
+
+      for (let f = 0; f < NFRAMES; f++) {
+        const owners = procs.filter((p) => p.alive && p.pages.some((pg) => pg.s === 'map' && pg.f === f)).map((p) => p.name);
+        const used = refs[f] > 0;
+        el('rect', { x: FX, y: fY(f), width: FW, height: 24, class: used ? (refs[f] > 1 ? 'fill-wash' : 'fill-paper') : 'fill-paper dash', 'stroke-width': 1 });
+        el('text', { x: FX + 8, y: fY(f) + 16, class: used ? 'strong' : '' }, `F${f}`);
+        el('text', { x: FX + FW - 8, y: fY(f) + 16, 'text-anchor': 'end' }, used ? (refs[f] > 1 ? 'SHARED ' + owners.join('+') : owners.join('')) : 'free');
+      }
+      el('text', { x: FX, y: fY(NFRAMES) + 18 }, `SWAP ${swapOn ? '▪'.repeat(swapUsed) + '▫'.repeat(SWAP_SLOTS - swapUsed) : 'OFF'}`);
+
+      procs.forEach((p, pi) => {
+        const x = PX[pi];
+        p.pages.forEach((pg, i) => {
+          const y = rowY(i);
+          const dead = !p.alive;
+          let cls = 'fill-paper dash';
+          let label = 'unused';
+          if (!dead && pg.s === 'res') { cls = 'fill-paper'; label = 'reserved'; }
+          if (!dead && pg.s === 'swp') { cls = 'fill-paper'; label = 'in swap'; }
+          if (!dead && pg.s === 'map') { cls = 'fill-wash'; label = pg.shared ? `→F${pg.f} R/O` : `→F${pg.f}`; }
+          const rect = el('rect', { x, y, width: PW, height: 24, class: cls, 'stroke-width': flash && flash.p === pi && flash.i === i ? 2.2 : 1 });
+          if (dead) rect.setAttribute('opacity', '0.45');
+          el('text', { x: x + 8, y: y + 16, class: !dead && pg.s !== 'none' ? 'strong' : '' }, `VP${i}`);
+          el('text', { x: x + PW - 8, y: y + 16, 'text-anchor': 'end', class: !dead && pg.s === 'map' ? 'blue-t' : '' }, label);
+        });
+      });
+
+      const A = procs[0], B = procs[1];
+      r('vszA').textContent = A.alive ? String(vsz(A)) : 'killed';
+      r('rssA').textContent = A.alive ? String(rss(A)) : '-';
+      r('vszB').textContent = B.alive ? String(vsz(B)) : '-';
+      r('rssB').textContent = B.alive ? String(rss(B)) : '-';
+      r('free').textContent = String(refs.filter((c) => c === 0).length);
+      r('swap').textContent = swapOn ? `${swapUsed}/${SWAP_SLOTS}` : 'off';
+      r('minor').textContent = String(stats.minor);
+      r('major').textContent = String(stats.major);
+      r('cow').textContent = String(stats.cow);
+      r('oom').textContent = String(stats.oom);
+      btn('malloc').disabled = !A.alive;
+      btn('touchA').disabled = !A.alive;
+      btn('fork').disabled = !A.alive || B.alive;
+      btn('touchB').disabled = !B.alive;
+      const sw = btn('swap');
+      sw.setAttribute('aria-pressed', String(swapOn));
+      sw.textContent = swapOn ? 'Swap: on' : 'Swap: off';
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-act]').forEach((b) => b.addEventListener('click', () => act(b.dataset.act!)));
+    reset();
+    draw();
+  });
+</script>

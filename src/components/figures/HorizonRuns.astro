@@ -1,0 +1,162 @@
+---
+// 24 simulated agent runs. Each step: correct with prob p. A mistake is fixed in place with prob r
+// (recovered), otherwise it is a live bug. Without verification a live bug dooms the run.
+// With verification on, every 5 steps a check catches a block containing a live bug with prob 0.9
+// and the block is redone (up to 3 attempts). A missed bug dooms the run silently.
+// Usage: <HorizonRuns />
+---
+<div class="hzr" data-fig="horizon-runs">
+  <div class="ctl">
+    <label>p <input type="range" min="0.80" max="0.995" step="0.005" value="0.95" data-in="p" /> <output data-out="p">0.950</output></label>
+    <label>r <input type="range" min="0" max="0.9" step="0.05" value="0" data-in="r" /> <output data-out="r">0.00</output></label>
+  </div>
+  <div class="ctl">
+    <span class="label">steps</span>
+    <button class="btn" data-n="10" aria-pressed="false">10</button>
+    <button class="btn" data-n="20" aria-pressed="true">20</button>
+    <button class="btn" data-n="40" aria-pressed="false">40</button>
+    <button class="btn" data-v aria-pressed="false">verify every 5</button>
+    <button class="btn" data-go>resample</button>
+  </div>
+
+  <svg viewBox="0 0 560 330" role="img" aria-label="Rows of squares, one row per simulated run, one square per step, marking mistakes, recoveries and failures">
+    <g data-layer="plot"></g>
+  </svg>
+
+  <dl class="hzr-out">
+    <div><dt class="label">Runs finished</dt><dd><span class="readout big" data-out="ok">-</span></dd></div>
+    <div><dt class="label">Predicted</dt><dd><span class="readout" data-out="pred">-</span></dd></div>
+    <div><dt class="label">Steps that were right</dt><dd><span class="readout" data-out="local">-</span></dd></div>
+  </dl>
+  <p class="hzr-key label">□ right · ▣ mistake, recovered · ■ fatal mistake · | check caught a bug, block redone</p>
+</div>
+
+<style>
+  .hzr svg { width: 100%; margin-top: 12px; }
+  .hzr .ctl { margin-top: 10px; }
+  .hzr-out { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px 18px; margin: 12px 0 0; }
+  .hzr-out div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .hzr-out dt { font-size: 10.5px; }
+  .hzr-out dd { margin: 2px 0 0; font-family: var(--mono); font-size: 13px; color: var(--ink-2); }
+  .hzr-out .big { font-size: 20px; }
+  .hzr-key { margin: 12px 0 0; font-size: 10.5px; line-height: 1.6; }
+  .hzr .fatal { fill: var(--warn); stroke: var(--warn); }
+  .hzr .dead { fill: none; stroke: var(--rule); }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const ROWS = 24, K = 5, CATCH = 0.9, M = 3;
+  type Cell = 'ok' | 'rec' | 'bug' | 'dead';
+
+  // simulate one block of L steps; returns cells and whether a live bug is in it
+  const runBlock = (L: number, p: number, r: number) => {
+    const cells: Cell[] = [];
+    let bug = false;
+    for (let i = 0; i < L; i++) {
+      if (Math.random() < p) cells.push('ok');
+      else if (Math.random() < r) cells.push('rec');
+      else { cells.push('bug'); bug = true; }
+    }
+    return { cells, bug };
+  };
+
+  const simulate = (n: number, p: number, r: number, verify: boolean) => {
+    const cells: Cell[] = [];
+    const redo: number[] = []; // step indices where a check caught a bug
+    let alive = true, attemptsRight = 0, attemptsAll = 0;
+    if (!verify) {
+      const b = runBlock(n, p, r);
+      b.cells.forEach((c) => { attemptsAll++; if (c === 'ok') attemptsRight++; });
+      let doomed = false;
+      b.cells.forEach((c) => { cells.push(doomed ? 'dead' : c); if (c === 'bug') doomed = true; });
+      alive = !doomed;
+    } else {
+      for (let i = 0; i < n && alive; i += K) {
+        const L = Math.min(K, n - i);
+        let done = false;
+        for (let a = 0; a < M && !done; a++) {
+          const b = runBlock(L, p, r);
+          b.cells.forEach((c) => { attemptsAll++; if (c === 'ok') attemptsRight++; });
+          if (!b.bug) { cells.push(...b.cells); done = true; }
+          else if (Math.random() < CATCH && a < M - 1) { redo.push(i); }
+          else { cells.push(...b.cells); alive = false; done = true; }
+        }
+      }
+      // grey out everything after the first live bug
+      let doomed = false;
+      for (let j = 0; j < n; j++) {
+        if (j >= cells.length) cells.push('dead');
+        else if (doomed) cells[j] = 'dead';
+        else if (cells[j] === 'bug') doomed = true;
+      }
+    }
+    return { cells, redo, alive, attemptsRight, attemptsAll };
+  };
+
+  const predict = (n: number, p: number, r: number, verify: boolean) => {
+    const q = p + (1 - p) * r;
+    if (!verify) return q ** n;
+    let s = 1;
+    for (let i = 0; i < n; i += K) {
+      const b = q ** Math.min(K, n - i), f = (1 - b) * CATCH;
+      s *= (b * (1 - f ** M)) / (1 - f);
+    }
+    return s;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="horizon-runs"]').forEach((root) => {
+    const q$ = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const inp = (k: string) => q$<HTMLInputElement>(`[data-in="${k}"]`);
+    const out = (k: string) => q$<HTMLElement>(`[data-out="${k}"]`);
+    const G = q$<SVGGElement>('[data-layer="plot"]');
+    const nBtns = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-n]'));
+    const vBtn = q$<HTMLButtonElement>('[data-v]');
+    let n = 20, verify = false;
+
+    const render = () => {
+      const p = Number(inp('p').value), r = Number(inp('r').value);
+      out('p').textContent = p.toFixed(3);
+      out('r').textContent = r.toFixed(2);
+      const x0 = 8, x1 = 520, y0 = 8, rowH = 13;
+      const cw = (x1 - x0) / n, sz = Math.min(cw - 2, 10);
+      G.replaceChildren();
+      let okRuns = 0, right = 0, all = 0;
+      for (let row = 0; row < ROWS; row++) {
+        const s = simulate(n, p, r, verify);
+        if (s.alive) okRuns++;
+        right += s.attemptsRight; all += s.attemptsAll;
+        const y = y0 + row * rowH;
+        s.cells.forEach((c, j) => {
+          const x = x0 + j * cw + (cw - sz) / 2;
+          const cls = c === 'ok' ? 'fill-paper' : c === 'rec' ? 'fill-wash' : c === 'bug' ? 'fatal' : 'dead';
+          G.appendChild(mk('rect', { x, y, width: sz, height: sz, class: cls, 'stroke-width': 1 }));
+        });
+        new Set(s.redo).forEach((i) => {
+          const x = x0 + (i + K) * cw - 1;
+          G.appendChild(mk('line', { x1: Math.min(x, x1), y1: y - 1, x2: Math.min(x, x1), y2: y + sz + 1, class: 'blue', 'stroke-width': 2 }));
+        });
+        G.appendChild(mk('text', { x: x1 + 10, y: y + 9, class: s.alive ? 'blue-t' : '' }, s.alive ? 'DONE' : 'FAIL'));
+      }
+      out('ok').textContent = `${okRuns} / ${ROWS}`;
+      out('pred').textContent = `${(ROWS * predict(n, p, r, verify)).toFixed(1)} / ${ROWS}`;
+      out('local').textContent = `${((100 * right) / all).toFixed(1)}%`;
+    };
+
+    nBtns.forEach((b) => b.addEventListener('click', () => {
+      n = Number(b.dataset.n);
+      nBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    vBtn.addEventListener('click', () => { verify = !verify; vBtn.setAttribute('aria-pressed', String(verify)); render(); });
+    q$('[data-go]').addEventListener('click', render);
+    root.querySelectorAll('input').forEach((i) => i.addEventListener('input', render));
+    render();
+  });
+</script>

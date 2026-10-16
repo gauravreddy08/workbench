@@ -1,0 +1,351 @@
+---
+// Flip the bits of a float and watch the value change. Formats: fp32, fp16, bf16, fp8 E4M3, fp8 E5M2.
+// Shows sign / exponent / mantissa, the decoded value (exactly, as a decimal), and a number line of
+// the representable values on either side, so the gap between neighbours is visible.
+// Usage: <FloatBitFlipper />
+---
+<div class="fbf" data-fig="float-bit-flipper">
+  <div class="ctl fbf-formats" role="group" aria-label="Format">
+    <button class="btn" type="button" data-fmt="fp32" aria-pressed="false">fp32</button>
+    <button class="btn" type="button" data-fmt="fp16" aria-pressed="false">fp16</button>
+    <button class="btn" type="button" data-fmt="bf16" aria-pressed="true">bf16</button>
+    <button class="btn" type="button" data-fmt="e4m3" aria-pressed="false">fp8 e4m3</button>
+    <button class="btn" type="button" data-fmt="e5m2" aria-pressed="false">fp8 e5m2</button>
+  </div>
+  <div class="fbf-legend">
+    <span><i class="sw s"></i>sign</span>
+    <span><i class="sw e"></i>exponent <b data-out="ebits"></b></span>
+    <span><i class="sw m"></i>mantissa <b data-out="mbits"></b></span>
+  </div>
+  <div class="fbf-bits" data-el="bits" aria-label="Bits, most significant first. Click to flip."></div>
+  <div class="fbf-formula" data-out="formula"></div>
+  <div class="fbf-value">
+    <span class="label">value</span>
+    <span class="readout" data-out="value"></span>
+  </div>
+  <div class="fbf-exact"><span class="label">exactly</span> <span data-out="exact"></span></div>
+  <svg viewBox="0 0 400 96" role="img" aria-label="Number line of the representable values next to the current value">
+    <line x1="16" y1="48" x2="384" y2="48" class="ink" stroke-width="1" />
+    <g data-layer="ticks"></g>
+    <text x="16" y="92" data-el="lo"></text>
+    <text x="384" y="92" text-anchor="end" data-el="hi"></text>
+    <text x="200" y="16" text-anchor="middle" class="blue-t" data-el="gap"></text>
+  </svg>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="down" aria-label="Next smaller representable value">− 1 step</button>
+    <button class="btn" type="button" data-act="up" aria-label="Next larger representable value">+ 1 step</button>
+    <label>type a number <input type="text" inputmode="decimal" value="0.1" data-in="num" size="9" /></label>
+    <button class="btn" type="button" data-act="set">Round it</button>
+  </div>
+  <div class="ctl">
+    <span>jump to</span>
+    <button class="btn" type="button" data-p="one">1</button>
+    <button class="btn" type="button" data-p="max">max</button>
+    <button class="btn" type="button" data-p="minn">min normal</button>
+    <button class="btn" type="button" data-p="mins">min subnormal</button>
+    <button class="btn" type="button" data-p="inf">inf / NaN</button>
+  </div>
+  <div class="ctl">
+    <span>kind <span class="readout" data-out="kind">-</span></span>
+    <span>hex <span class="readout" data-out="hex">-</span></span>
+    <span>gap to next <span class="readout" data-out="ulp">-</span></span>
+    <span>relative gap <span class="readout" data-out="rel">-</span></span>
+  </div>
+</div>
+
+<style is:global>
+  /* global because the bit buttons are created by the script (no scoped attribute); every class is fbf-prefixed */
+  .fbf svg { width: 100%; margin-top: 10px; }
+  .fbf-formats { margin-top: 0; }
+  .fbf-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin: 14px 0 8px; font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-2); }
+  .fbf-legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .fbf-legend b { font-weight: 400; color: var(--ink-3); }
+  .fbf-legend .sw { display: inline-block; width: 14px; height: 4px; }
+  .fbf .sw.s, .fbf-bit.s::after { background: var(--ink); }
+  .fbf .sw.e, .fbf-bit.e::after { background: var(--blue); }
+  .fbf .sw.m, .fbf-bit.m::after { background: var(--ink-3); }
+  .fbf-bits { display: grid; grid-template-columns: repeat(16, minmax(0, 1fr)); gap: 3px; }
+  .fbf-bits.n8 { grid-template-columns: repeat(8, minmax(0, 1fr)); max-width: 50%; }
+  .fbf-bit {
+    position: relative; min-width: 0; padding: 7px 0 9px; cursor: pointer;
+    font-family: var(--mono); font-size: 13px; line-height: 1;
+    background: var(--paper); color: var(--ink-2); border: 1px solid var(--rule);
+  }
+  .fbf-bit::after { content: ''; position: absolute; left: 2px; right: 2px; bottom: 2px; height: 3px; }
+  .fbf-bit[aria-pressed='true'] { background: var(--blue-fill); color: var(--ink); border-color: var(--blue); font-weight: 600; }
+  .fbf-bit:focus-visible { outline: 2px solid var(--blue); outline-offset: 1px; }
+  .fbf-formula { margin-top: 14px; font-family: var(--mono); font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .fbf-value { display: flex; gap: 12px; align-items: baseline; margin-top: 8px; }
+  .fbf-value .readout { font-size: 20px; overflow-wrap: anywhere; }
+  .fbf-exact { margin-top: 4px; font-family: var(--mono); font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .fbf input[type='text'] { width: 7.5em; font-family: var(--mono); font-size: 13px; background: var(--paper); color: var(--ink); border: 1px solid var(--rule); padding: 5px 7px; }
+  @media (max-width: 640px) {
+    .fbf-bit { font-size: 11px; padding: 6px 0 8px; }
+    .fbf-bits { gap: 2px; }
+    .fbf-bits.n8 { max-width: 100%; }
+  }
+</style>
+
+<script>
+  type Fmt = { name: string; E: number; M: number; fn: boolean };
+  const FMTS: Record<string, Fmt> = {
+    fp32: { name: 'fp32', E: 8, M: 23, fn: false },
+    fp16: { name: 'fp16', E: 5, M: 10, fn: false },
+    bf16: { name: 'bf16', E: 8, M: 7, fn: false },
+    e4m3: { name: 'fp8 e4m3', E: 4, M: 3, fn: true }, // "fn": no infinity, only S.1111.111 is NaN
+    e5m2: { name: 'fp8 e5m2', E: 5, M: 2, fn: false },
+  };
+  const NS = 'http://www.w3.org/2000/svg';
+  const nbits = (f: Fmt) => 1 + f.E + f.M;
+  const bias = (f: Fmt) => 2 ** (f.E - 1) - 1;
+  const emaxField = (f: Fmt) => 2 ** f.E - 1;
+
+  type Dec = { kind: string; value: number; sig: bigint; p: number; s: number; e: number; m: number };
+  // pattern is an unsigned integer holding the bits (fits in a JS number up to 32 bits)
+  const decode = (f: Fmt, pat: number): Dec => {
+    const s = Math.floor(pat / 2 ** (f.E + f.M)) % 2;
+    const e = Math.floor(pat / 2 ** f.M) % 2 ** f.E;
+    const m = pat % 2 ** f.M;
+    const sign = s ? -1 : 1;
+    const b = bias(f);
+    if (f.fn && e === emaxField(f) && m === 2 ** f.M - 1) return { kind: 'NaN', value: NaN, sig: 0n, p: 0, s, e, m };
+    if (!f.fn && e === emaxField(f)) {
+      return m === 0
+        ? { kind: 'infinity', value: sign * Infinity, sig: 0n, p: 0, s, e, m }
+        : { kind: 'NaN', value: NaN, sig: 0n, p: 0, s, e, m };
+    }
+    if (e === 0) {
+      const p = 1 - b - f.M;
+      return { kind: m === 0 ? 'zero' : 'subnormal', value: sign * m * 2 ** p, sig: BigInt(m), p, s, e, m };
+    }
+    const p = e - b - f.M;
+    const sig = 2 ** f.M + m;
+    return { kind: 'normal', value: sign * sig * 2 ** p, sig: BigInt(sig), p, s, e, m };
+  };
+
+  // exact decimal expansion of sig * 2^p
+  const exactDecimal = (sig: bigint, p: number, neg: boolean) => {
+    let str: string;
+    if (sig === 0n) str = '0';
+    else if (p >= 0) str = (sig << BigInt(p)).toString();
+    else {
+      const k = -p;
+      let digits = (sig * 5n ** BigInt(k)).toString();
+      if (digits.length <= k) digits = '0'.repeat(k - digits.length + 1) + digits;
+      const int = digits.slice(0, digits.length - k);
+      const frac = digits.slice(digits.length - k).replace(/0+$/, '');
+      str = frac ? `${int}.${frac}` : int;
+    }
+    if (str.length > 64) {
+      const m = str.match(/^0\.(0*)/);
+      const lead = m ? m[1].length : 0;
+      str = lead > 8 ? `0.(${lead} zeros)${str.slice(2 + lead, 2 + lead + 30)}…` : str.slice(0, 60) + '…';
+    }
+    return (neg ? '−' : '') + str;
+  };
+
+  const fmtNum = (v: number) => {
+    if (Number.isNaN(v)) return 'NaN';
+    if (!Number.isFinite(v)) return v > 0 ? '+inf' : '−inf';
+    if (v === 0) return Object.is(v, -0) ? '−0' : '0';
+    const a = Math.abs(v);
+    const s = a >= 1e6 || a < 1e-4 ? v.toExponential(6) : String(Number(v.toPrecision(8)));
+    return s.replace(/\.?0+e/, 'e').replace(/-/g, '−');
+  };
+  const sci = (v: number) => {
+    if (v === 0) return '0';
+    const s = v.toExponential(3).replace(/\.?0+e/, 'e');
+    return s.replace(/-/g, '−');
+  };
+
+  // largest finite magnitude pattern (sign bit clear)
+  const maxPat = (f: Fmt) => (f.fn ? 2 ** (f.E + f.M) - 2 : (emaxField(f) - 1) * 2 ** f.M + 2 ** f.M - 1);
+
+  // nearest representable value, round to nearest, ties to even
+  const encode = (f: Fmt, x: number): number => {
+    const signBit = 2 ** (f.E + f.M);
+    if (Number.isNaN(x)) return f.fn ? 2 ** (f.E + f.M) - 1 : emaxField(f) * 2 ** f.M + 1;
+    const neg = x < 0 || Object.is(x, -0);
+    const a = Math.abs(x);
+    if (f.name === 'fp32') {
+      const dv = new DataView(new ArrayBuffer(4));
+      dv.setFloat32(0, x);
+      return dv.getUint32(0);
+    }
+    const top = maxPat(f);
+    const topV = decode(f, top).value;
+    let mag: number;
+    if (a > topV) {
+      // halfway to the next binade step above max rounds up to inf; e4m3fn saturates (like most libraries)
+      const step = 2 ** (emaxField(f) - (f.fn ? 0 : 1) - bias(f) - f.M);
+      mag = f.fn || a < topV + step / 2 ? top : emaxField(f) * 2 ** f.M;
+    } else {
+      let lo = 0, hi = top;
+      while (hi - lo > 1) {
+        const mid = (lo + hi) >> 1;
+        if (decode(f, mid).value <= a) lo = mid; else hi = mid;
+      }
+      const vl = decode(f, lo).value, vh = decode(f, hi).value;
+      mag = a - vl < vh - a ? lo : a - vl > vh - a ? hi : lo % 2 === 0 ? lo : hi;
+      if (a === vh) mag = hi;
+    }
+    return (neg ? signBit : 0) + mag;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="float-bit-flipper"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+    const bitsEl = q<HTMLElement>('[data-el="bits"]');
+    const ticks = q<SVGGElement>('[data-layer="ticks"]');
+    const numIn = q<HTMLInputElement>('[data-in="num"]');
+    const fmtBtns = Array.from(root.querySelectorAll<HTMLButtonElement>('[data-fmt]'));
+    let f = FMTS.bf16;
+    let target = 0.1; // the number the reader asked for; format switches re-round this, not the rounded copy
+    let pat = encode(f, target);
+
+    const buildBits = () => {
+      bitsEl.replaceChildren();
+      const n = nbits(f);
+      bitsEl.classList.toggle('n8', n === 8);
+      for (let i = 0; i < n; i++) {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'fbf-bit ' + (i === 0 ? 's' : i <= f.E ? 'e' : 'm');
+        b.dataset.i = String(i);
+        b.addEventListener('click', () => {
+          const w = 2 ** (n - 1 - i);
+          const on = Math.floor(pat / w) % 2 === 1;
+          pat = on ? pat - w : pat + w;
+          target = decode(f, pat).value;
+          render();
+        });
+        bitsEl.appendChild(b);
+      }
+      out('ebits').textContent = `(${f.E})`;
+      out('mbits').textContent = `(${f.M})`;
+    };
+
+    const render = () => {
+      const n = nbits(f);
+      const d = decode(f, pat);
+      bitsEl.querySelectorAll<HTMLButtonElement>('.fbf-bit').forEach((b, i) => {
+        const on = Math.floor(pat / 2 ** (n - 1 - i)) % 2 === 1;
+        b.textContent = on ? '1' : '0';
+        b.setAttribute('aria-pressed', String(on));
+        b.setAttribute('aria-label', `bit ${n - 1 - i} (${i === 0 ? 'sign' : i <= f.E ? 'exponent' : 'mantissa'}): ${on ? 1 : 0}`);
+      });
+      const mBin = d.m.toString(2).padStart(f.M, '0');
+      const sgn = d.s ? '−' : '+';
+      const b = bias(f);
+      if (d.kind === 'normal') {
+        out('formula').textContent = `${sgn}1.${mBin}₂ × 2^(${d.e} − ${b}) = ${sgn}1.${mBin}₂ × 2^${String(d.e - b).replace('-', '−')}`;
+      } else if (d.kind === 'subnormal' || d.kind === 'zero') {
+        out('formula').textContent = `exponent field 0: no hidden 1. ${sgn}0.${mBin}₂ × 2^−${b - 1}`;
+      } else if (d.kind === 'infinity') {
+        out('formula').textContent = 'exponent all ones, mantissa 0: infinity';
+      } else {
+        out('formula').textContent = f.fn ? 'e4m3 has no infinity. This one pattern (all ones) means NaN.' : 'exponent all ones, mantissa not 0: NaN (not a number)';
+      }
+      out('value').textContent = fmtNum(d.value);
+      out('exact').textContent = Number.isFinite(d.value) ? exactDecimal(d.sig, d.p, d.s === 1) : '—';
+      out('kind').textContent = d.kind;
+      const hexLen = Math.ceil(n / 4);
+      out('hex').textContent = '0x' + pat.toString(16).toUpperCase().padStart(hexLen, '0');
+
+      // neighbours on the number line (same sign, by magnitude pattern)
+      const signW = 2 ** (f.E + f.M);
+      const mag = pat % signW;
+      const top = maxPat(f);
+      ticks.replaceChildren();
+      const setT = (k: string, t: string) => (q<SVGTextElement>(`[data-el="${k}"]`).textContent = t);
+      if (!Number.isFinite(d.value)) {
+        setT('lo', ''); setT('hi', ''); setT('gap', d.kind === 'NaN' ? 'NOT ON THE NUMBER LINE' : 'PAST THE END OF THE LINE');
+        out('ulp').textContent = '—'; out('rel').textContent = '—';
+        return;
+      }
+      const mags: number[] = [];
+      for (let k = mag - 4; k <= mag + 4; k++) if (k >= 0 && k <= top) mags.push(k);
+      const vals = mags.map((k) => decode(f, k).value);
+      const vmin = vals[0], vmax = vals[vals.length - 1];
+      const span = vmax - vmin || 1;
+      const X0 = 24, XW = 352;
+      const xs = (v: number) => X0 + ((v - vmin) / span) * XW;
+      mags.forEach((k, i) => {
+        const x = xs(vals[i]);
+        const cur = k === mag;
+        const t = document.createElementNS(NS, 'line');
+        t.setAttribute('x1', String(x)); t.setAttribute('x2', String(x));
+        t.setAttribute('y1', String(cur ? 30 : 40)); t.setAttribute('y2', String(cur ? 66 : 56));
+        t.setAttribute('class', cur ? 'blue' : 'ink');
+        t.setAttribute('stroke-width', cur ? '2' : '1');
+        ticks.appendChild(t);
+        if (cur) {
+          const lab = document.createElementNS(NS, 'text');
+          lab.setAttribute('x', String(Math.min(Math.max(x, 50), 350)));
+          lab.setAttribute('y', '78');
+          lab.setAttribute('text-anchor', 'middle');
+          lab.setAttribute('class', 'blue-t');
+          lab.textContent = fmtNum(Math.abs(d.value));
+          ticks.appendChild(lab);
+        }
+      });
+      setT('lo', fmtNum(vmin));
+      setT('hi', fmtNum(vmax));
+      const next = mag < top ? decode(f, mag + 1).value : NaN;
+      const gap = next - Math.abs(d.value);
+      setT('gap', Number.isFinite(gap) ? `NEIGHBOURS OF |x| · GAP ${sci(gap)}` : 'LARGEST FINITE VALUE');
+      out('ulp').textContent = Number.isFinite(gap) ? sci(gap) : '—';
+      out('rel').textContent = Number.isFinite(gap) && d.value !== 0 ? sci(gap / Math.abs(d.value)) : '—';
+    };
+
+    fmtBtns.forEach((btn) =>
+      btn.addEventListener('click', () => {
+        f = FMTS[btn.dataset.fmt!];
+        fmtBtns.forEach((b) => b.setAttribute('aria-pressed', String(b === btn)));
+        buildBits();
+        pat = encode(f, target);
+        render();
+      }),
+    );
+    q<HTMLButtonElement>('[data-act="up"]').addEventListener('click', () => {
+      const signW = 2 ** (f.E + f.M);
+      const neg = pat >= signW, mag = pat % signW;
+      if (!Number.isFinite(decode(f, pat).value)) return;
+      if (!neg) { if (mag < maxPat(f)) pat += 1; } else if (mag === 0) pat = 1; else pat -= 1;
+      target = decode(f, pat).value;
+      render();
+    });
+    q<HTMLButtonElement>('[data-act="down"]').addEventListener('click', () => {
+      const signW = 2 ** (f.E + f.M);
+      const neg = pat >= signW, mag = pat % signW;
+      if (!Number.isFinite(decode(f, pat).value)) return;
+      if (neg) { if (mag < maxPat(f)) pat += 1; } else if (mag === 0) pat = signW + 1; else pat -= 1;
+      target = decode(f, pat).value;
+      render();
+    });
+    const setNum = () => {
+      const x = Number(numIn.value.replace('−', '-').trim());
+      if (numIn.value.trim() === '' || Number.isNaN(x) && numIn.value.trim().toLowerCase() !== 'nan') return;
+      target = x;
+      pat = encode(f, x);
+      render();
+    };
+    q<HTMLButtonElement>('[data-act="set"]').addEventListener('click', setNum);
+    numIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') setNum(); });
+    root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const p = b.dataset.p;
+        if (p === 'one') pat = bias(f) * 2 ** f.M;
+        else if (p === 'max') pat = maxPat(f);
+        else if (p === 'minn') pat = 2 ** f.M;
+        else if (p === 'mins') pat = 1;
+        else pat = f.fn ? 2 ** (f.E + f.M) - 1 : emaxField(f) * 2 ** f.M;
+        target = decode(f, pat).value;
+        render();
+      }),
+    );
+
+    buildBits();
+    render();
+  });
+</script>

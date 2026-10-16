@@ -1,0 +1,268 @@
+---
+// Interactive: two models answer the same n questions. Sliders for n, the true gap, and how
+// correlated the two models' per-question results are. Top: each model's 95% CI on its own.
+// Bottom: the 95% CI of the difference, computed unpaired (from the two separate CIs) and paired
+// (from per-question differences). The button runs 1000 fake experiments at the current settings
+// and shows how often each method calls a win, and how often B "beats" A by 0.8 points or more.
+---
+<div class="spc" data-fig="stats-paired-ci">
+  <div class="spc-read">
+    <div><span class="label">A (true 70.0%)</span><span class="readout" data-o="a"></span></div>
+    <div><span class="label">B</span><span class="readout" data-o="b"></span></div>
+    <div><span class="label">Separate CIs</span><span class="readout" data-o="overlap"></span></div>
+    <div><span class="label">Paired CI of B − A</span><span class="readout" data-o="paired"></span></div>
+  </div>
+  <svg class="spc-main" viewBox="0 0 640 250" role="img" aria-label="Confidence intervals for model A and model B, and for their difference computed unpaired and paired"></svg>
+  <div class="ctl">
+    <label>Questions <input type="range" min="0" max="10" step="1" value="5" data-k="n" /><output></output></label>
+    <label>True gap <input type="range" min="0" max="10" step="1" value="6" data-k="d" /><output></output></label>
+    <label>Correlation <input type="range" min="0" max="95" step="5" value="70" data-k="r" /><output></output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="resample">New sample of questions</button>
+    <button class="btn" type="button" data-act="run">Run 1000 fake experiments</button>
+  </div>
+  <div class="spc-sim" data-sim hidden>
+    <svg class="spc-hist" viewBox="0 0 640 170" role="img" aria-label="Histogram of the observed difference across 1000 simulated experiments"></svg>
+    <div class="spc-read spc-read-sim">
+      <div><span class="label">Paired CI excludes 0</span><span class="readout" data-o="s-paired"></span></div>
+      <div><span class="label">Separate CIs don't overlap</span><span class="readout" data-o="s-sep"></span></div>
+      <div><span class="label">B ahead by ≥ 0.8 pts</span><span class="readout" data-o="s-08"></span></div>
+    </div>
+    <p class="spc-note" data-o="s-msg"></p>
+  </div>
+  <p class="spc-note">Model A is right on 70% of all possible questions, B on 70% plus the gap. "Correlation" is how much they tend to get the same questions right and wrong (two quantizations of one model: high; two unrelated models: lower). Every interval is 95%. Set the gap to 0 before running the fake experiments to see the false-positive rate.</p>
+</div>
+
+<style>
+  .spc-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 14px; border-bottom: 1px solid var(--rule); padding-bottom: 12px; margin-bottom: 10px; }
+  .spc-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .spc-read .label { font-size: 10px; }
+  .spc-read .readout { font-size: 15px; }
+  .spc-read-sim { border-bottom: 0; border-top: 1px solid var(--rule); padding-top: 10px; margin-top: 6px; }
+  .spc svg { width: 100%; }
+  .spc-sim { margin-top: 14px; }
+  .spc-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+  .spc .readout.no { color: var(--warn); }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const NS_LIST = [100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000, 10000];
+  const PA = 0.7;
+  const Z = 1.96;
+  const MAXN = 10000;
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Joint distribution of (A right?, B right?) with the requested correlation, clamped to be valid.
+  function joint(pb: number, rho: number) {
+    const cov = rho * Math.sqrt(PA * (1 - PA) * pb * (1 - pb));
+    let p11 = PA * pb + cov;
+    p11 = Math.min(p11, PA, pb);
+    p11 = Math.max(p11, PA + pb - 1, 0);
+    const p10 = PA - p11; // A right, B wrong
+    const p01 = pb - p11; // A wrong, B right
+    return { p11, p10, p01 };
+  }
+
+  // Count outcomes for n questions, using uniforms from u (common random numbers keep dragging smooth).
+  function counts(n: number, j: { p11: number; p10: number; p01: number }, draw: (i: number) => number) {
+    let n11 = 0, n10 = 0, n01 = 0;
+    const t1 = j.p11, t2 = t1 + j.p10, t3 = t2 + j.p01;
+    for (let i = 0; i < n; i++) {
+      const x = draw(i);
+      if (x < t1) n11++;
+      else if (x < t2) n10++;
+      else if (x < t3) n01++;
+    }
+    return { n11, n10, n01 };
+  }
+
+  function stats(n: number, c: { n11: number; n10: number; n01: number }) {
+    const a = (c.n11 + c.n10) / n;
+    const b = (c.n11 + c.n01) / n;
+    const seA = Math.sqrt((a * (1 - a)) / n);
+    const seB = Math.sqrt((b * (1 - b)) / n);
+    const d = (c.n01 - c.n10) / n;
+    const disc = (c.n01 + c.n10) / n;
+    const varD = Math.max(0, (disc - d * d) * n / (n - 1));
+    const seD = Math.sqrt(varD / n);
+    const seU = Math.sqrt(seA * seA + seB * seB);
+    return { a, b, seA, seB, d, seD, seU };
+  }
+
+  const pct = (x: number, k = 1) => (100 * x).toFixed(k) + '%';
+  const pts = (x: number, k = 1) => (Math.abs(x) < 1e-9 ? '' : x > 0 ? '+' : '−') + Math.abs(100 * x).toFixed(k);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="stats-paired-ci"]').forEach((root) => {
+    const main = root.querySelector<SVGSVGElement>('.spc-main')!;
+    const hist = root.querySelector<SVGSVGElement>('.spc-hist')!;
+    const simBox = root.querySelector<HTMLElement>('[data-sim]')!;
+    const inputs = Object.fromEntries(
+      [...root.querySelectorAll<HTMLInputElement>('input[data-k]')].map((i) => [i.dataset.k!, i]),
+    ) as Record<'n' | 'd' | 'r', HTMLInputElement>;
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    let seed = 11;
+    let u = new Float64Array(MAXN);
+    const refill = () => { const r = rng(seed); for (let i = 0; i < MAXN; i++) u[i] = r(); };
+    refill();
+
+    const params = () => {
+      const n = NS_LIST[+inputs.n.value];
+      const gap = +inputs.d.value * 0.005; // 0 .. 5 points in half-point steps
+      const rho = +inputs.r.value / 100;
+      return { n, gap, rho, pb: PA + gap };
+    };
+
+    // axis helpers
+    const accX = (p: number) => 40 + ((p - 0.55) / (0.95 - 0.55)) * 560;
+    const DMAX = 0.12;
+    const difX = (d: number) => 320 + (Math.max(-DMAX, Math.min(DMAX, d)) / DMAX) * 280;
+
+    function interval(y: number, lo: number, hi: number, mid: number, x: (v: number) => number, cls: string, label: string) {
+      const g = el('g', {});
+      const x0 = x(lo), x1 = x(hi), xm = x(mid);
+      g.append(el('line', { x1: x0, y1: y, x2: x1, y2: y, class: cls, 'stroke-width': 2 }));
+      g.append(el('line', { x1: x0, y1: y - 6, x2: x0, y2: y + 6, class: cls, 'stroke-width': 1.5 }));
+      g.append(el('line', { x1: x1, y1: y - 6, x2: x1, y2: y + 6, class: cls, 'stroke-width': 1.5 }));
+      g.append(el('circle', { cx: xm, cy: y, r: 4, style: cls === 'blue' ? 'fill:var(--blue)' : 'fill:var(--ink)' }));
+      g.append(el('text', { x: 10, y: y + 4, class: 'strong' }, label));
+      return g;
+    }
+
+    function draw() {
+      const { n, gap, rho, pb } = params();
+      inputs.n.nextElementSibling!.textContent = n.toLocaleString();
+      inputs.d.nextElementSibling!.textContent = (100 * gap).toFixed(1) + ' pts';
+      inputs.r.nextElementSibling!.textContent = rho.toFixed(2);
+      const j = joint(pb, rho);
+      const s = stats(n, counts(n, j, (i) => u[i]));
+
+      main.replaceChildren();
+      // accuracy axis
+      main.append(el('text', { x: 40, y: 16 }, 'ACCURACY, EACH MODEL ON ITS OWN'));
+      main.append(el('line', { x1: 40, y1: 104, x2: 600, y2: 104, class: 'ink', 'stroke-width': 1 }));
+      for (let p = 0.55; p <= 0.951; p += 0.05) {
+        const x = accX(p);
+        main.append(el('line', { x1: x, y1: 104, x2: x, y2: 109, class: 'ink', 'stroke-width': 1 }));
+        main.append(el('text', { x, y: 121, 'text-anchor': 'middle' }, Math.round(p * 100) + '%'));
+      }
+      const aLo = s.a - Z * s.seA, aHi = s.a + Z * s.seA, bLo = s.b - Z * s.seB, bHi = s.b + Z * s.seB;
+      const ovLo = Math.max(aLo, bLo), ovHi = Math.min(aHi, bHi);
+      if (ovHi > ovLo) {
+        main.append(el('rect', { x: accX(ovLo), y: 30, width: accX(ovHi) - accX(ovLo), height: 68, class: 'fill-wash dash', 'stroke-width': 1 }));
+        main.append(el('text', { x: (accX(ovLo) + accX(ovHi)) / 2, y: 96, 'text-anchor': 'middle', class: 'blue-t' }, 'OVERLAP'));
+      }
+      main.append(interval(48, aLo, aHi, s.a, accX, 'ink', 'A'));
+      main.append(interval(78, bLo, bHi, s.b, accX, 'blue', 'B'));
+
+      // difference axis
+      main.append(el('text', { x: 40, y: 146 }, 'B − A, IN POINTS'));
+      main.append(el('line', { x1: 40, y1: 222, x2: 600, y2: 222, class: 'ink', 'stroke-width': 1 }));
+      for (let d = -0.12; d <= 0.1201; d += 0.04) {
+        const x = difX(d);
+        main.append(el('line', { x1: x, y1: 222, x2: x, y2: 227, class: 'ink', 'stroke-width': 1 }));
+        main.append(el('text', { x, y: 240, 'text-anchor': 'middle' }, pts(d, 0)));
+      }
+      main.append(el('line', { x1: difX(0), y1: 152, x2: difX(0), y2: 222, class: 'ink dash', 'stroke-width': 1 }));
+      main.append(el('line', { x1: difX(gap), y1: 160, x2: difX(gap), y2: 222, class: 'blue dash', 'stroke-width': 1 }));
+      main.append(el('text', { x: difX(gap) + 4, y: 162, class: 'blue-t' }, 'TRUE'));
+      const uLo = s.d - Z * s.seU, uHi = s.d + Z * s.seU, pLo = s.d - Z * s.seD, pHi = s.d + Z * s.seD;
+      main.append(interval(176, uLo, uHi, s.d, difX, 'ink', 'UNPAIRED'));
+      main.append(interval(204, pLo, pHi, s.d, difX, 'blue', 'PAIRED'));
+
+      out('a').textContent = `${pct(s.a)} ± ${(100 * Z * s.seA).toFixed(1)}`;
+      out('b').textContent = `${pct(s.b)} ± ${(100 * Z * s.seB).toFixed(1)}`;
+      const ov = ovHi > ovLo;
+      out('overlap').textContent = ov ? 'overlap' : "don't overlap";
+      out('overlap').classList.toggle('no', ov);
+      const excl = pLo > 0 || pHi < 0;
+      out('paired').textContent = `${pts(s.d)} [${pts(pLo)}, ${pts(pHi)}]`;
+      out('paired').classList.toggle('no', !excl);
+    }
+
+    function runMany() {
+      const { n, gap, rho, pb } = params();
+      const j = joint(pb, rho);
+      const T = 1000;
+      const ds: number[] = [];
+      const sig: boolean[] = [];
+      let nPaired = 0, nSep = 0, n08 = 0;
+      const r = rng(seed * 7919 + n + Math.round(gap * 1000) + Math.round(rho * 100) * 13);
+      for (let t = 0; t < T; t++) {
+        const s = stats(n, counts(n, j, () => r()));
+        const pLo = s.d - Z * s.seD, pHi = s.d + Z * s.seD;
+        const isSig = pLo > 0 || pHi < 0;
+        if (isSig) nPaired++;
+        if (s.a + Z * s.seA < s.b - Z * s.seB || s.b + Z * s.seB < s.a - Z * s.seA) nSep++;
+        if (s.d >= 0.008 - 1e-9) n08++;
+        ds.push(s.d); sig.push(isSig);
+      }
+      // histogram
+      const sd = Math.sqrt(Math.max(1e-9, (j.p10 + j.p01 - gap * gap) / n));
+      const lo = gap - 4.2 * sd, hi = gap + 4.2 * sd;
+      const B = 41, w = (hi - lo) / B;
+      const all = new Array(B).fill(0), hit = new Array(B).fill(0);
+      ds.forEach((d, i) => {
+        const k = Math.max(0, Math.min(B - 1, Math.floor((d - lo) / w)));
+        all[k]++; if (sig[i]) hit[k]++;
+      });
+      const maxC = Math.max(...all, 1);
+      const hx = (d: number) => 30 + ((d - lo) / (hi - lo)) * 580;
+      hist.replaceChildren();
+      hist.append(el('text', { x: 30, y: 14 }, `OBSERVED B − A IN ${T} FAKE EXPERIMENTS (n = ${n.toLocaleString()})`));
+      hist.append(el('line', { x1: 30, y1: 136, x2: 610, y2: 136, class: 'ink', 'stroke-width': 1 }));
+      for (let k = 0; k < B; k++) {
+        const x = hx(lo + k * w), bw = Math.max(1, hx(lo + (k + 1) * w) - x - 1);
+        const h = (all[k] / maxC) * 104, hs = (hit[k] / maxC) * 104;
+        if (h > 0) hist.append(el('rect', { x, y: 136 - h, width: bw, height: h, class: 'fill-paper', 'stroke-width': 0.8 }));
+        if (hs > 0) hist.append(el('rect', { x, y: 136 - hs, width: bw, height: hs, class: 'fill-blue' }));
+      }
+      const mark = (d: number, label: string, cls: string, dy: number) => {
+        if (d < lo || d > hi) return;
+        hist.append(el('line', { x1: hx(d), y1: 24, x2: hx(d), y2: 140, class: cls + ' dash', 'stroke-width': 1 }));
+        hist.append(el('text', { x: hx(d) + 4, y: dy, class: cls === 'blue' ? 'blue-t' : '' }, label));
+      };
+      mark(0, '0', 'ink', 30);
+      mark(0.008, '+0.8', 'blue', 44);
+      const step = Math.pow(10, Math.floor(Math.log10((hi - lo) * 100 / 4))) / 100;
+      for (let t = Math.ceil(lo / step) * step; t <= hi; t += step) {
+        hist.append(el('text', { x: hx(t), y: 154, 'text-anchor': 'middle' }, pts(t, step < 0.01 ? 1 : 0)));
+      }
+      hist.append(el('text', { x: 610, y: 168, 'text-anchor': 'end', class: 'blue-t' }, 'FILLED = PAIRED TEST CALLS IT A WIN (OR LOSS)'));
+
+      out('s-paired').textContent = `${(nPaired / 10).toFixed(1)}%`;
+      out('s-sep').textContent = `${(nSep / 10).toFixed(1)}%`;
+      out('s-08').textContent = `${(n08 / 10).toFixed(1)}%`;
+      out('s-msg').textContent = gap === 0
+        ? `No true difference. The paired test still fires about 5% of the time: that is what "95%" means. But B looks at least 0.8 points better ${(n08 / 10).toFixed(0)}% of the time, purely by luck.`
+        : `B really is ${(100 * gap).toFixed(1)} points better. The paired test detects it ${(nPaired / 10).toFixed(0)}% of the time (its power). Comparing separate CIs detects it ${(nSep / 10).toFixed(0)}% of the time.`;
+      simBox.hidden = false;
+    }
+
+    Object.values(inputs).forEach((i) => {
+      i.addEventListener('input', draw);
+      i.addEventListener('change', () => { if (!simBox.hidden) runMany(); });
+    });
+    root.querySelector('[data-act="resample"]')!.addEventListener('click', () => { seed++; refill(); draw(); });
+    root.querySelector('[data-act="run"]')!.addEventListener('click', runMany);
+    draw();
+  });
+</script>

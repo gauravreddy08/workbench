@@ -1,0 +1,234 @@
+---
+// Laptop in a cafe, server at home, two NATs in between. Toggle between three ways to get
+// there (router port forward, Tailscale direct, Tailscale via DERP) and see the packet path,
+// what the packet looks like on the wire, and what each hop along the way can see.
+---
+<div class="sshp" data-fig="ssh-paths">
+  <div class="ctl sshp-modes" role="group" aria-label="Connection method">
+    <button class="btn" type="button" data-mode="fwd" aria-pressed="true">Port forward</button>
+    <button class="btn" type="button" data-mode="direct" aria-pressed="false">Tailscale direct</button>
+    <button class="btn" type="button" data-mode="derp" aria-pressed="false">Tailscale via DERP</button>
+  </div>
+
+  <svg viewBox="0 0 640 330" role="img" aria-label="Network path from a laptop behind a cafe NAT to a home server behind a home NAT">
+    <!-- zones -->
+    <rect x="8" y="150" width="226" height="142" class="ink dash" stroke-width="1" />
+    <text x="16" y="285">CAFE LAN 10.0.0.0/24</text>
+    <rect x="406" y="150" width="226" height="142" class="ink dash" stroke-width="1" />
+    <text x="414" y="166">HOME LAN 192.168.1.0/24</text>
+    <text x="320" y="166" text-anchor="middle">PUBLIC INTERNET</text>
+
+    <!-- paths (drawn under nodes) -->
+    <path data-p="direct" d="M 70 220 L 175 220 L 465 220 L 575 220" class="blue" stroke-width="2.5" fill="none" />
+    <path data-p="derp" d="M 70 220 L 175 220 L 175 70 L 320 70 L 465 70 L 465 220 L 575 220" class="blue" stroke-width="2.5" fill="none" />
+    <path data-p="scan" d="M 346 305 L 575 305 L 575 244" class="ink dash" stroke-width="1.5" fill="none" />
+    <path data-p="ctl1" d="M 40 200 L 40 74" class="ink dash" stroke-width="1" fill="none" />
+    <path data-p="ctl2" d="M 600 200 L 600 30 L 85 30 L 85 40" class="ink dash" stroke-width="1" fill="none" />
+
+    <!-- control plane -->
+    <g data-n="ctl">
+      <rect x="30" y="40" width="110" height="34" class="fill-paper" stroke-width="1" />
+      <text x="85" y="61" text-anchor="middle" class="strong">CONTROL</text>
+    </g>
+    <!-- DERP -->
+    <g data-n="derp">
+      <rect x="265" y="50" width="110" height="40" class="fill-paper" stroke-width="1" />
+      <text x="320" y="68" text-anchor="middle" class="strong">DERP RELAY</text>
+      <text x="320" y="82" text-anchor="middle">TCP 443</text>
+    </g>
+
+    <!-- laptop -->
+    <rect x="22" y="200" width="96" height="44" class="fill-paper" stroke-width="1.2" />
+    <text x="70" y="218" text-anchor="middle" class="strong">LAPTOP</text>
+    <text x="70" y="234" text-anchor="middle">10.0.0.23</text>
+    <!-- cafe NAT -->
+    <rect x="140" y="196" width="70" height="52" class="fill-wash" stroke-width="1.2" />
+    <text x="175" y="216" text-anchor="middle" class="strong">CAFE</text>
+    <text x="175" y="230" text-anchor="middle">NAT</text>
+    <text x="175" y="262" text-anchor="middle">198.51.100.7</text>
+    <!-- home NAT -->
+    <rect x="430" y="196" width="70" height="52" class="fill-wash" stroke-width="1.2" />
+    <text x="465" y="216" text-anchor="middle" class="strong">HOME</text>
+    <text x="465" y="230" text-anchor="middle">ROUTER</text>
+    <text x="465" y="262" text-anchor="middle">203.0.113.9</text>
+    <!-- server -->
+    <rect x="526" y="200" width="98" height="44" class="fill-paper" stroke-width="1.2" />
+    <text x="575" y="218" text-anchor="middle" class="strong">SERVER</text>
+    <text x="575" y="234" text-anchor="middle" data-srvip>192.168.1.50</text>
+
+    <!-- scanner -->
+    <rect x="250" y="292" width="96" height="30" class="fill-paper" stroke-width="1" />
+    <text x="298" y="311" text-anchor="middle" class="strong">SCAN BOTS</text>
+    <g data-n="block">
+      <line x1="447" y1="296" x2="483" y2="314" class="ink" stroke-width="2" />
+      <line x1="483" y1="296" x2="447" y2="314" class="ink" stroke-width="2" />
+      <text x="492" y="309">DROPPED</text>
+    </g>
+
+    <circle r="5" class="fill-blue" data-dot cx="70" cy="220" />
+  </svg>
+
+  <div class="sshp-wire">
+    <span class="label">On the cafe wire</span>
+    <div class="sshp-layers" data-wire></div>
+  </div>
+  <div class="ctl">
+    <span>Port 22 reachable from internet: <span class="readout" data-open></span></span>
+    <span>Path cost: <span class="readout" data-cost></span></span>
+  </div>
+  <dl class="sshp-hops" data-hops></dl>
+</div>
+
+<style>
+  .sshp svg { width: 100%; }
+  .sshp-modes { margin-top: 0; margin-bottom: 12px; }
+  .sshp-wire { margin-top: 12px; }
+  .sshp-layers { display: flex; flex-wrap: wrap; gap: 0; margin-top: 6px; font-family: var(--mono); font-size: 11px; }
+  .sshp-layers span { border: 1px solid var(--ink-3); padding: 4px 7px; margin: 0 -1px -1px 0; background: var(--paper); color: var(--ink-2); }
+  .sshp-layers span.enc { background: var(--blue-fill); border-color: var(--blue); color: var(--blue); }
+  .sshp-layers span.inner { border-style: dashed; }
+  .sshp-hops { margin: 14px 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 8px 14px; font-size: 15px; line-height: 1.45; }
+  .sshp-hops dt { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--blue); padding-top: 3px; }
+  .sshp-hops dd { margin: 0; color: var(--ink-2); }
+  @media (max-width: 520px) {
+    .sshp-hops { grid-template-columns: 1fr; gap: 2px; }
+    .sshp-hops dd { margin-bottom: 8px; }
+  }
+</style>
+
+<script>
+  type Mode = 'fwd' | 'direct' | 'derp';
+  type Spec = {
+    path: 'direct' | 'derp';
+    srv: string;
+    open: string;
+    cost: string;
+    wire: [string, boolean, boolean][]; // label, encrypted, inner
+    hops: [string, string][];
+  };
+  const SPEC: Record<Mode, Spec> = {
+    fwd: {
+      path: 'direct',
+      srv: '192.168.1.50',
+      open: 'YES',
+      cost: 'direct',
+      wire: [['IP 10.0.0.23 → 203.0.113.9', false, false], ['TCP → :22', false, false], ['SSH (encrypted)', true, false]],
+      hops: [
+        ['Cafe Wi-Fi', 'A TCP connection from you to your home IP on port 22. The SSH version line ("SSH-2.0-OpenSSH_...") goes by in plain text, then only encrypted bytes, their sizes and timing.'],
+        ['Home router', 'A rule you wrote: anything arriving at 203.0.113.9:22 goes to 192.168.1.50:22. It forwards your packets, and everyone else’s.'],
+        ['Server', 'sshd sees you, and also every bot on the internet that tries port 22. Your logs fill with failed logins.'],
+        ['Scan bots', 'Can reach sshd directly: guess passwords, try exploits against whatever version you run.'],
+      ],
+    },
+    direct: {
+      path: 'direct',
+      srv: '100.101.102.103',
+      open: 'NO',
+      cost: 'direct (+ ~32 B/packet)',
+      wire: [['IP 10.0.0.23 → 203.0.113.9', false, false], ['UDP', false, false], ['WireGuard (encrypted)', true, false], ['IP 100.x → 100.x', true, true], ['TCP :22', true, true], ['SSH', true, true]],
+      hops: [
+        ['Cafe Wi-Fi', 'UDP packets between you and your home IP. Encrypted blobs. It cannot tell this is SSH, or even which port inside.'],
+        ['Home router', 'No forwarding rule. It lets these UDP packets in only because the server sent UDP to your address first (the hole punch).'],
+        ['Control', 'Swapped public keys and candidate addresses before the connection. Sees none of the traffic.'],
+        ['Server', 'tailscaled decrypts the WireGuard packet; sshd sees an ordinary TCP connection from your laptop’s 100.x address.'],
+        ['Scan bots', 'Nothing answers. Unsolicited packets hit the router and are dropped.'],
+      ],
+    },
+    derp: {
+      path: 'derp',
+      srv: '100.101.102.103',
+      open: 'NO',
+      cost: 'detour via relay',
+      wire: [['IP 10.0.0.23 → DERP', false, false], ['TCP :443', false, false], ['TLS', true, false], ['WireGuard (encrypted)', true, true], ['SSH ...', true, true]],
+      hops: [
+        ['Cafe Wi-Fi', 'An HTTPS connection to a Tailscale relay server. Looks like web traffic. Works even where UDP is blocked.'],
+        ['DERP relay', 'Which device key is sending to which, packet sizes and timing. It cannot decrypt: it never has the WireGuard private keys.'],
+        ['Home router', 'Only the server’s own outgoing connection to the relay. Nothing inbound to forward.'],
+        ['Server', 'Same as direct: WireGuard decrypted, sshd sees your 100.x address. Just slower.'],
+        ['Scan bots', 'Nothing answers.'],
+      ],
+    },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="ssh-paths"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const paths = {
+      direct: svg.querySelector<SVGPathElement>('[data-p="direct"]')!,
+      derp: svg.querySelector<SVGPathElement>('[data-p="derp"]')!,
+      scan: svg.querySelector<SVGPathElement>('[data-p="scan"]')!,
+    };
+    const ctlLines = [...svg.querySelectorAll<SVGPathElement>('[data-p^="ctl"]')];
+    const ctlNode = svg.querySelector<SVGGElement>('[data-n="ctl"]')!;
+    const derpNode = svg.querySelector<SVGGElement>('[data-n="derp"]')!;
+    const block = svg.querySelector<SVGGElement>('[data-n="block"]')!;
+    const dot = svg.querySelector<SVGCircleElement>('[data-dot]')!;
+    const srvIp = svg.querySelector<SVGTextElement>('[data-srvip]')!;
+    const wire = root.querySelector<HTMLElement>('[data-wire]')!;
+    const hops = root.querySelector<HTMLElement>('[data-hops]')!;
+    const openEl = root.querySelector<HTMLElement>('[data-open]')!;
+    const costEl = root.querySelector<HTMLElement>('[data-cost]')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let raf = 0;
+    let active: SVGPathElement = paths.direct;
+
+    function show(el: Element, on: boolean, dim = 0.12) {
+      el.setAttribute('opacity', on ? '1' : String(dim));
+    }
+
+    function set(mode: Mode) {
+      const s = SPEC[mode];
+      btns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === mode)));
+      active = paths[s.path];
+      show(paths.direct, s.path === 'direct', 0.1);
+      show(paths.derp, s.path === 'derp', 0.1);
+      show(derpNode, mode === 'derp', 0.35);
+      const ts = mode !== 'fwd';
+      ctlLines.forEach((l) => show(l, ts, 0.1));
+      show(ctlNode, ts, 0.35);
+      // scanner reaches the server only through the port forward
+      paths.scan.setAttribute('d', ts ? 'M 346 305 L 445 305' : 'M 346 305 L 575 305 L 575 244');
+      show(block, ts, 0);
+      srvIp.textContent = s.srv;
+      openEl.textContent = s.open;
+      costEl.textContent = s.cost;
+      wire.replaceChildren(...s.wire.map(([t, enc, inner]) => {
+        const sp = document.createElement('span');
+        sp.textContent = t;
+        if (enc) sp.classList.add('enc');
+        if (inner) sp.classList.add('inner');
+        return sp;
+      }));
+      hops.replaceChildren(...s.hops.flatMap(([k, v]) => {
+        const dt = document.createElement('dt'); dt.textContent = k;
+        const dd = document.createElement('dd'); dd.textContent = v;
+        return [dt, dd];
+      }));
+      if (reduce) placeDot(1);
+    }
+
+    function placeDot(f: number) {
+      const L = active.getTotalLength();
+      const p = active.getPointAtLength(L * f);
+      dot.setAttribute('cx', String(p.x));
+      dot.setAttribute('cy', String(p.y));
+    }
+
+    function loop(t: number) {
+      placeDot(((t / 2600) % 1));
+      raf = requestAnimationFrame(loop);
+    }
+
+    btns.forEach((b) => b.addEventListener('click', () => set(b.dataset.mode as Mode)));
+    set('fwd');
+    if (!reduce) {
+      const io = new IntersectionObserver((es) => {
+        es.forEach((e) => {
+          cancelAnimationFrame(raf);
+          if (e.isIntersecting) raf = requestAnimationFrame(loop);
+        });
+      });
+      io.observe(root);
+    }
+  });
+</script>

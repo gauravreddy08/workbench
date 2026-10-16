@@ -1,0 +1,279 @@
+---
+// Training memory calculator: pick a model, optimizer, precision recipe, batch, sequence length,
+// checkpointing and attention kernel; see a stacked bar of the five training buckets against
+// H100 (80 GB) and DGX Spark (128 GB) lines, plus the largest batch that fits on each.
+// Usage: <TrainMemCalculator />
+---
+<div class="tmc" data-fig="trainmem-calc">
+  <div class="tmc-row">
+    <span class="label">Model</span>
+    <div class="tmc-btns" data-group="model">
+      <button class="btn" type="button" data-v="g124">GPT-2 124M</button>
+      <button class="btn" type="button" data-v="g774">GPT-2 774M</button>
+      <button class="btn" type="button" data-v="g1558">GPT-2 XL 1.56B</button>
+      <button class="btn" type="button" data-v="l1b" aria-pressed="true">Llama 3.2 1B</button>
+      <button class="btn" type="button" data-v="l8b">Llama 3.1 8B</button>
+    </div>
+  </div>
+  <div class="tmc-row">
+    <span class="label">Optimizer</span>
+    <div class="tmc-btns" data-group="opt">
+      <button class="btn" type="button" data-v="adam" aria-pressed="true">AdamW</button>
+      <button class="btn" type="button" data-v="adam8">AdamW 8-bit</button>
+      <button class="btn" type="button" data-v="adafactor">Adafactor</button>
+      <button class="btn" type="button" data-v="sgdm">SGD + momentum</button>
+    </div>
+  </div>
+  <div class="tmc-row">
+    <span class="label">Precision</span>
+    <div class="tmc-btns" data-group="prec">
+      <button class="btn" type="button" data-v="fp32">FP32</button>
+      <button class="btn" type="button" data-v="amp">AMP autocast</button>
+      <button class="btn" type="button" data-v="mixed" aria-pressed="true">BF16 + FP32 master</button>
+      <button class="btn" type="button" data-v="bf16">Pure BF16</button>
+    </div>
+  </div>
+  <div class="ctl">
+    <label>batch <input type="range" min="0" max="8" step="1" value="3" data-in="b" /> <output data-out="b">8</output></label>
+    <label>seq len <input type="range" min="0" max="7" step="1" value="3" data-in="s" /> <output data-out="s">2048</output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-tog="ckpt" aria-pressed="false">Checkpointing</button>
+    <button class="btn" type="button" data-tog="flash" aria-pressed="true">Fused attention</button>
+  </div>
+
+  <dl class="tmc-sum">
+    <div><dt class="label">States / param</dt><dd class="readout" data-out="bpp">-</dd></div>
+    <div><dt class="label">Model states</dt><dd class="readout" data-out="states">-</dd></div>
+    <div><dt class="label">Activations</dt><dd class="readout" data-out="act">-</dd></div>
+    <div><dt class="label">Total peak</dt><dd class="readout" data-out="total">-</dd></div>
+  </dl>
+
+  <div class="tmc-chart">
+    <div class="tmc-track" data-out="track"></div>
+    <div class="tmc-axis" data-out="axis"></div>
+  </div>
+
+  <div class="tmc-legend" aria-hidden="true">
+    <span><i class="sw w"></i>weights</span>
+    <span><i class="sw m"></i>fp32 master / cast cache</span>
+    <span><i class="sw g"></i>gradients</span>
+    <span><i class="sw o"></i>optimizer states</span>
+    <span><i class="sw a"></i>activations</span>
+    <span><i class="sw l"></i>logits + loss</span>
+    <span><i class="sw r"></i>runtime</span>
+  </div>
+  <p class="tmc-fit" data-out="fit"></p>
+  <p class="tmc-note" data-out="note"></p>
+</div>
+
+<style is:global>
+  /* global because the bar segments are built in JS; every class is tmc- prefixed */
+  .tmc-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-bottom: 10px; }
+  .tmc-row > .label { width: 80px; flex: none; font-size: 10.5px; }
+  .tmc-btns { display: flex; flex-wrap: wrap; gap: 6px; }
+  .tmc-btns .btn, .tmc .ctl .btn { padding: 5px 9px; font-size: 10.5px; }
+  .tmc .ctl { margin-top: 10px; }
+  .tmc-sum { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px 16px; margin: 18px 0 8px; }
+  .tmc-sum div { border-top: 1px solid var(--rule); padding-top: 5px; }
+  .tmc-sum dt { font-size: 10px; }
+  .tmc-sum dd { margin: 2px 0 0; font-size: 14px; }
+  .tmc-chart { position: relative; margin-top: 14px; padding-top: 42px; }
+  .tmc-track { position: relative; display: flex; height: 26px; border: 1px solid var(--ink); background: var(--paper); }
+  .tmc-track span.seg { height: 100%; flex: none; }
+  .tmc-track .w { background: var(--blue); }
+  .tmc-track .m { background: var(--blue-2); }
+  .tmc-track .g { background: var(--blue-fill); border-left: 1px solid var(--blue); }
+  .tmc-track .o { background: repeating-linear-gradient(90deg, var(--blue) 0 1.5px, var(--blue-fill) 1.5px 5px); }
+  .tmc-track .a { background: var(--paper-2); border-left: 1px solid var(--ink-2); }
+  .tmc-track .l { background: repeating-linear-gradient(135deg, var(--ink-3) 0 1.5px, transparent 1.5px 5px); }
+  .tmc-track .r { background: var(--ink-3); }
+  .tmc-line { position: absolute; top: -42px; bottom: -6px; width: 0; border-left: 2px solid var(--ink); }
+  .tmc-line.os { border-left: 1px dashed var(--ink-2); }
+  .tmc-line b { position: absolute; top: 0; left: 4px; font-family: var(--mono); font-size: 10px; font-weight: 600; letter-spacing: 0.04em; color: var(--ink); white-space: nowrap; }
+  .tmc-line.h b { top: 13px; }
+  .tmc-line.os b { top: 26px; font-weight: 400; color: var(--ink-2); }
+  .tmc-line.flip b { left: auto; right: 4px; }
+  .tmc-line.over { border-left-color: var(--warn); }
+  .tmc-line.over b { color: var(--warn); }
+  .tmc-axis { position: relative; height: 18px; font-family: var(--mono); font-size: 10px; color: var(--ink-3); }
+  .tmc-axis span { position: absolute; top: 4px; transform: translateX(-50%); }
+  .tmc-axis span:first-child { transform: none; }
+  .tmc-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+  .tmc-legend .sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border: 1px solid var(--ink-3); vertical-align: -1px; }
+  .tmc-legend .sw.w { background: var(--blue); border-color: var(--blue); }
+  .tmc-legend .sw.m { background: var(--blue-2); border-color: var(--blue-2); }
+  .tmc-legend .sw.g { background: var(--blue-fill); border-color: var(--blue); }
+  .tmc-legend .sw.o { background: repeating-linear-gradient(90deg, var(--blue) 0 1.5px, var(--blue-fill) 1.5px 4px); border-color: var(--blue); }
+  .tmc-legend .sw.a { background: var(--paper-2); }
+  .tmc-legend .sw.l { background: repeating-linear-gradient(135deg, var(--ink-3) 0 1.5px, transparent 1.5px 4px); }
+  .tmc-legend .sw.r { background: var(--ink-3); }
+  .tmc-fit { margin: 14px 0 0; font-family: var(--mono); font-size: 11.5px; line-height: 1.6; color: var(--ink-2); }
+  .tmc-fit .bad { color: var(--warn); font-weight: 600; }
+  .tmc-fit .good { color: var(--ok); font-weight: 600; }
+  .tmc-note { margin: 10px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const GiB = 2 ** 30;
+  type Model = { name: string; params: number; h: number; L: number; heads: number; V: number; C: number };
+  // Shapes from the public configs; GPT-2 counts checked with transformers on the meta device.
+  // C = bytes of saved activations per token per layer, per unit of hidden size, at 2 bytes per value
+  // (Korthikanti et al. 2022 give 34 for a GPT-style block with dropout; Llama blocks have a wider
+  // SwiGLU MLP and no dropout, so they land higher, roughly 4 + 10 + 8 x I/h). Approximate: measure it.
+  const MODELS: Record<string, Model> = {
+    g124: { name: 'GPT-2 124M', params: 124_439_808, h: 768, L: 12, heads: 12, V: 50257, C: 34 },
+    g774: { name: 'GPT-2 774M', params: 774_030_080, h: 1280, L: 36, heads: 20, V: 50257, C: 34 },
+    g1558: { name: 'GPT-2 XL', params: 1_557_611_200, h: 1600, L: 48, heads: 25, V: 50257, C: 34 },
+    l1b: { name: 'Llama 3.2 1B', params: 1_235_814_400, h: 2048, L: 16, heads: 32, V: 128256, C: 46 },
+    l8b: { name: 'Llama 3.1 8B', params: 8_030_261_248, h: 4096, L: 32, heads: 32, V: 128256, C: 42 },
+  };
+  // Bytes per parameter for each precision recipe.
+  // w = the weights the model computes with; master = extra fp32 copy (or autocast's bf16 cast cache);
+  // g = gradients; sv = bytes per optimizer-state value; act = bytes per activation value.
+  const PREC: Record<string, { w: number; master: number; g: number; sv: number; act: number; name: string }> = {
+    fp32: { w: 4, master: 0, g: 4, sv: 4, act: 4, name: 'FP32' },
+    amp: { w: 4, master: 2, g: 4, sv: 4, act: 2, name: 'AMP' },
+    mixed: { w: 2, master: 4, g: 2, sv: 4, act: 2, name: 'BF16 + FP32 master' },
+    bf16: { w: 2, master: 0, g: 2, sv: 2, act: 2, name: 'pure BF16' },
+  };
+  // Optimizer state bytes per parameter, given the recipe's bytes per state value.
+  const OPT: Record<string, { bytes: (sv: number) => number; name: string }> = {
+    adam: { bytes: (sv) => 2 * sv, name: 'AdamW' },
+    adam8: { bytes: () => 2.004, name: 'AdamW 8-bit' }, // two 1-byte states + one fp32 scale per 2048 values
+    adafactor: { bytes: () => 0.005, name: 'Adafactor' }, // factored row/column statistics, no momentum
+    sgdm: { bytes: (sv) => sv, name: 'SGD + momentum' },
+  };
+  const RUNTIME = 1.5; // GiB: CUDA context and library workspaces. Approximate; measure it.
+  const SPARK = 128, SPARK_OS = 10, H100 = 79.6; // GiB. The Spark's OS share is an assumption.
+  const BATCH = [1, 2, 4, 8, 16, 32, 64, 128, 256];
+  const SEQ = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768];
+  const g = (x: number) => (x >= 100 ? x.toFixed(0) : x >= 10 ? x.toFixed(1) : x.toFixed(2));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="trainmem-calc"]').forEach((root) => {
+    const st = { model: 'l1b', opt: 'adam', prec: 'mixed', b: 3, s: 3, ckpt: false, flash: true };
+    const q = <T extends Element>(sel: string) => root.querySelector<T>(sel)!;
+    const out = (k: string) => q<HTMLElement>(`[data-out="${k}"]`);
+
+    // Activation bytes for ONE sequence (batch 1) of length s; everything scales linearly in batch.
+    const actPerSeq = (m: Model, actB: number, s: number, ckpt: boolean, flash: boolean) => {
+      const k = actB / 2; // the C constants assume 2-byte activations
+      const perLayer = s * m.h * m.C * k + (flash ? 0 : 5 * m.heads * s * s * k); // + score/softmax/dropout, s^2
+      const layers = ckpt ? m.L * 2 * s * m.h * k + perLayer : m.L * perLayer; // keep inputs, rebuild one layer
+      const logits = s * m.V * (actB + 8); // logits, fp32 copy for the loss, its gradient (approximate)
+      return { layers, logits };
+    };
+
+    const render = () => {
+      const m = MODELS[st.model];
+      const p = PREC[st.prec];
+      const o = OPT[st.opt];
+      const b = BATCH[st.b], s = SEQ[st.s];
+      const per = { w: p.w, m: p.master, g: p.g, o: o.bytes(p.sv) };
+      const bpp = per.w + per.m + per.g + per.o;
+      const a1 = actPerSeq(m, p.act, s, st.ckpt, st.flash);
+      const parts: [string, number][] = [
+        ['w', (m.params * per.w) / GiB],
+        ['m', (m.params * per.m) / GiB],
+        ['g', (m.params * per.g) / GiB],
+        ['o', (m.params * per.o) / GiB],
+        ['a', (b * a1.layers) / GiB],
+        ['l', (b * a1.logits) / GiB],
+        ['r', RUNTIME],
+      ];
+      const states = (m.params * bpp) / GiB;
+      const act = (b * (a1.layers + a1.logits)) / GiB;
+      const total = states + act + RUNTIME;
+
+      out('b').textContent = String(b);
+      out('s').textContent = String(s);
+      out('bpp').textContent = `${Number.isInteger(bpp) ? bpp : bpp.toFixed(1)} B`;
+      out('states').textContent = `${g(states)} GiB`;
+      out('act').textContent = `${g(act)} GiB`;
+      out('total').textContent = `${g(total)} GiB`;
+
+      const max = Math.max(140, total * 1.08);
+      const pct = (x: number) => `${(100 * Math.min(x, max)) / max}%`;
+      const track = out('track');
+      track.replaceChildren();
+      for (const [cls, v] of parts) {
+        if (v <= 0) continue;
+        const sp = document.createElement('span');
+        sp.className = `seg ${cls}`;
+        sp.style.width = pct(v);
+        track.appendChild(sp);
+      }
+      const lines: [string, number, string][] = [
+        ['H100 80 GB', H100, 'h'],
+        [`SPARK ${SPARK}`, SPARK, ''],
+        [`−OS ~${SPARK_OS}`, SPARK - SPARK_OS, 'os'],
+      ];
+      for (const [label, at, cls] of lines) {
+        const ln = document.createElement('span');
+        const frac = at / max;
+        ln.className = `tmc-line ${cls}${frac > 0.8 ? ' flip' : ''}${total > at && cls !== 'os' ? ' over' : ''}`;
+        ln.style.left = pct(at);
+        const t = document.createElement('b');
+        t.textContent = label;
+        ln.appendChild(t);
+        track.appendChild(ln);
+      }
+      const axis = out('axis');
+      axis.replaceChildren();
+      const stepG = max > 600 ? 200 : max > 300 ? 100 : 50;
+      for (let x = 0; x <= max; x += stepG) {
+        const t = document.createElement('span');
+        t.style.left = pct(x);
+        t.textContent = x === 0 ? '0 GiB' : String(x);
+        axis.appendChild(t);
+      }
+
+      // Largest batch that fits: fixed part + b * per-sequence part <= capacity.
+      const perSeq = (a1.layers + a1.logits) / GiB;
+      const fixed = states + RUNTIME;
+      const fitTxt = (name: string, cap: number) => {
+        if (fixed > cap) return `${name}: <span class="bad">model states alone do not fit</span> (${g(fixed)} of ${g(cap)} GiB)`;
+        const mb = Math.floor((cap - fixed) / perSeq);
+        const ok = total <= cap;
+        const v = ok ? '<span class="good">FITS</span>' : '<span class="bad">OOM</span>';
+        return `${name}: ${v} · largest batch at seq ${s}: ${mb < 1 ? '<span class="bad">0</span>' : mb}`;
+      };
+      out('fit').innerHTML = `${fitTxt('H100', H100)}<br />${fitTxt('Spark (after OS)', SPARK - SPARK_OS)}`;
+
+      let note: string;
+      const actShare = act / (states + act);
+      if (states > SPARK - SPARK_OS)
+        note = `${g(states)} GiB before a single activation. Full fine-tuning this model at ${bpp.toFixed(bpp % 1 ? 1 : 0)} bytes per parameter needs more than one machine: shard the states (ZeRO / FSDP), shrink them (8-bit, Adafactor, pure BF16), or train an adapter instead (LoRA).`;
+      else if (!st.flash && s >= 2048)
+        note = `Textbook attention keeps a heads × seq × seq score matrix per layer for backward. Turn fused attention back on and watch the activation bar shrink, most at long sequences.`;
+      else if (actShare > 0.6)
+        note = `Activations are ${Math.round(actShare * 100)}% of the bill: here the batch and sequence length cost more than the model. Checkpointing or a smaller micro-batch with gradient accumulation are the levers.`;
+      else if (st.opt === 'adam' && st.prec !== 'bf16')
+        note = `The optimizer's two running averages (${g((m.params * per.o) / GiB)} GiB) cost ${per.o / per.w}× the weights you compute with. Try AdamW 8-bit or Adafactor.`;
+      else note = `Model states dominate. Every byte per parameter you remove here is worth ${g(m.params / GiB)} GiB.`;
+      out('note').textContent = note;
+    };
+
+    root.querySelectorAll<HTMLElement>('[data-group]').forEach((grp) => {
+      const key = grp.dataset.group as 'model' | 'opt' | 'prec';
+      grp.querySelectorAll<HTMLButtonElement>('button').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          grp.querySelectorAll('button').forEach((x) => x.setAttribute('aria-pressed', String(x === btn)));
+          st[key] = btn.dataset.v!;
+          render();
+        });
+      });
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-tog]').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const k = btn.dataset.tog as 'ckpt' | 'flash';
+        st[k] = !st[k];
+        btn.setAttribute('aria-pressed', String(st[k]));
+        render();
+      });
+    });
+    q<HTMLInputElement>('[data-in="b"]').addEventListener('input', (e) => { st.b = Number((e.target as HTMLInputElement).value); render(); });
+    q<HTMLInputElement>('[data-in="s"]').addEventListener('input', (e) => { st.s = Number((e.target as HTMLInputElement).value); render(); });
+    render();
+  });
+</script>

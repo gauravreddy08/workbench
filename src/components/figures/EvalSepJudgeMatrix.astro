@@ -1,0 +1,134 @@
+---
+// Confusion matrix for a judge grading a model's answers, as expected counts out of 1,000.
+// Knobs: the model's true accuracy, and how much of the model's error the judge shares.
+// Presets are illustrative, not measurements. Usage: <EvalSepJudgeMatrix />
+---
+<div class="esj" data-fig="evalsep-judge">
+  <div class="esj-btns" role="group" aria-label="Who grades">
+    <button class="btn" type="button" data-p="self" aria-pressed="true">Same model</button>
+    <button class="btn" type="button" data-p="family" aria-pressed="false">Bigger sibling</button>
+    <button class="btn" type="button" data-p="other" aria-pressed="false">Different strong model</button>
+    <button class="btn" type="button" data-p="verifier" aria-pressed="false">Program (verifier)</button>
+  </div>
+  <svg viewBox="0 0 640 250" role="img" aria-label="Two by two table of true correctness against judge verdict, with counts out of 1000"></svg>
+  <div class="ctl">
+    <label>model accuracy <input type="range" min="10" max="95" step="1" value="55" data-k="acc" /> <output data-o="acc">55%</output></label>
+    <label>shared blind spot <input type="range" min="0" max="100" step="1" value="70" data-k="s" /> <output data-o="s">70%</output></label>
+  </div>
+  <p class="esj-read">
+    true accuracy <span class="readout" data-r="true">-</span> ·
+    judge says <span class="readout" data-r="meas">-</span> ·
+    wrong answers approved <span class="readout" data-r="far">-</span>
+  </p>
+  <p class="esj-note" data-r="note"></p>
+</div>
+
+<style>
+  .esj-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .esj-btns .btn { padding: 5px 9px; font-size: 10.5px; }
+  .esj .ctl label { flex-wrap: wrap; }
+  .esj-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+  .esj-note { margin: 8px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  // s = share of the model's wrong answers the judge also believes are right (shared blind spot)
+  // c = chance the judge catches a wrong answer it does NOT share
+  // tpr = chance the judge approves a correct answer
+  type Preset = { s: number; c: number; tpr: number; note: string };
+  const P: Record<string, Preset> = {
+    self: { s: 0.7, c: 0.5, tpr: 0.95, note: 'The same weights that produced a wrong answer usually find it convincing. Most of its mistakes come straight back as YES, so the judge reports a number far above the truth.' },
+    family: { s: 0.4, c: 0.7, tpr: 0.93, note: 'Same training data, same habits, more capacity. It catches the shallow slips, but the mistakes that come from what the family never learned still sail through.' },
+    other: { s: 0.1, c: 0.85, tpr: 0.92, note: 'Different data, different training, so its errors are mostly not the model\'s errors. Still imperfect, but the bias is small, and you can measure it against human labels and correct for it.' },
+    verifier: { s: 0, c: 1, tpr: 1, note: 'A program that checks the answer against ground truth (exact match, unit tests, a calculator). It shares nothing with the model, so the table is clean. Only possible when "correct" can be computed.' },
+  };
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="evalsep-judge"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const accIn = root.querySelector<HTMLInputElement>('[data-k="acc"]')!;
+    const sIn = root.querySelector<HTMLInputElement>('[data-k="s"]')!;
+    const out = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    let preset = 'self';
+
+    function draw() {
+      const p = P[preset];
+      const a = Number(accIn.value) / 100;
+      const s = Number(sIn.value) / 100;
+      out('acc').textContent = `${Math.round(a * 100)}%`;
+      out('s').textContent = `${Math.round(s * 100)}%`;
+      const N = 1000;
+      const right = Math.round(N * a);
+      const wrong = N - right;
+      const far = s + (1 - s) * (1 - p.c); // wrong answers that get a YES
+      const tp = Math.round(right * p.tpr);
+      const fn = right - tp;
+      const fp = Math.round(wrong * far);
+      const tn = wrong - fp;
+      const meas = (tp + fp) / N;
+
+      svg.replaceChildren();
+      const x0 = 190, y0 = 46, cw = 200, ch = 80;
+      svg.append(el('text', { x: x0 + cw / 2, y: 22, 'text-anchor': 'middle', class: 'strong' }, 'JUDGE SAYS YES'));
+      svg.append(el('text', { x: x0 + cw * 1.5, y: 22, 'text-anchor': 'middle', class: 'strong' }, 'JUDGE SAYS NO'));
+      svg.append(el('text', { x: x0 - 12, y: y0 + ch / 2 - 4, 'text-anchor': 'end', class: 'strong' }, 'ANSWER RIGHT'));
+      svg.append(el('text', { x: x0 - 12, y: y0 + ch / 2 + 12, 'text-anchor': 'end' }, `${right} of 1000`));
+      svg.append(el('text', { x: x0 - 12, y: y0 + ch * 1.5 - 4, 'text-anchor': 'end', class: 'strong' }, 'ANSWER WRONG'));
+      svg.append(el('text', { x: x0 - 12, y: y0 + ch * 1.5 + 12, 'text-anchor': 'end' }, `${wrong} of 1000`));
+
+      const cells = [
+        { i: 0, j: 0, n: tp, t: 'CORRECT YES', hot: false },
+        { i: 0, j: 1, n: fn, t: 'UNFAIR NO', hot: false },
+        { i: 1, j: 0, n: fp, t: 'FALSE APPROVAL', hot: true },
+        { i: 1, j: 1, n: tn, t: 'CAUGHT', hot: false },
+      ];
+      for (const c of cells) {
+        const x = x0 + c.j * cw, y = y0 + c.i * ch;
+        svg.append(el('rect', { x, y, width: cw, height: ch, class: 'fill-paper', 'stroke-width': 1.2 }));
+        // fill bar proportional to the count, so the eye can compare cells
+        const frac = c.n / N;
+        if (frac > 0) {
+          const bar = el('rect', { x: x + 1, y: y + ch - 1 - (ch - 2) * Math.min(1, frac * 1.6), width: cw - 2, height: (ch - 2) * Math.min(1, frac * 1.6) });
+          bar.setAttribute('style', c.hot ? 'fill:var(--blue);opacity:0.35' : 'fill:var(--blue-fill)');
+          svg.append(bar);
+        }
+        svg.append(el('text', { x: x + cw / 2, y: y + 36, 'text-anchor': 'middle', class: c.hot ? 'strong blue-t' : 'strong', 'font-size': 20 }, String(c.n)));
+        svg.append(el('text', { x: x + cw / 2, y: y + 58, 'text-anchor': 'middle', class: c.hot ? 'blue-t' : '' }, c.t));
+      }
+      // measured vs true bars
+      const by = 222, bw = 400;
+      svg.append(el('text', { x: x0 - 12, y: by - 2, 'text-anchor': 'end' }, 'TRUE'));
+      svg.append(el('text', { x: x0 - 12, y: by + 18, 'text-anchor': 'end' }, 'MEASURED'));
+      svg.append(el('rect', { x: x0, y: by - 12, width: bw, height: 12, class: 'fill-paper', 'stroke-width': 1 }));
+      svg.append(el('rect', { x: x0, y: by - 12, width: bw * a, height: 12, class: 'fill-wash', 'stroke-width': 1 }));
+      svg.append(el('rect', { x: x0, y: by + 8, width: bw, height: 12, class: 'fill-paper', 'stroke-width': 1 }));
+      svg.append(el('rect', { x: x0, y: by + 8, width: bw * meas, height: 12, class: 'fill-blue' }));
+
+      r('true').textContent = `${(a * 100).toFixed(0)}%`;
+      r('meas').textContent = `${(meas * 100).toFixed(1)}%`;
+      r('far').textContent = `${(far * 100).toFixed(0)}%`;
+      r('note').textContent = p.note;
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((b) => {
+      b.addEventListener('click', () => {
+        preset = b.dataset.p!;
+        root.querySelectorAll<HTMLButtonElement>('[data-p]').forEach((o) => o.setAttribute('aria-pressed', String(o === b)));
+        sIn.value = String(Math.round(P[preset].s * 100));
+        sIn.disabled = preset === 'verifier';
+        draw();
+      });
+    });
+    accIn.addEventListener('input', draw);
+    sIn.addEventListener('input', draw);
+    draw();
+  });
+</script>

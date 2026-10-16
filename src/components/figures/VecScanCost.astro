@@ -1,0 +1,96 @@
+---
+// Back-of-envelope for brute-force search: how many bytes must be read and how many multiply-adds
+// done to answer one query by checking every vector, and how long the memory read alone takes.
+// Usage: <VecScanCost />
+---
+<div class="vsc" data-fig="vec-scan">
+  <div class="ctl">
+    <label>vectors <input type="range" min="5" max="10" step="0.1" value="8" data-k="n" /><output data-o="n">100M</output></label>
+  </div>
+  <div class="ctl">
+    <span>dims</span>
+    <button class="btn" type="button" data-d="384" aria-pressed="false">384</button>
+    <button class="btn" type="button" data-d="768" aria-pressed="true">768</button>
+    <button class="btn" type="button" data-d="1536" aria-pressed="false">1536</button>
+  </div>
+  <div class="ctl">
+    <span>stored as</span>
+    <button class="btn" type="button" data-b="4" aria-pressed="true">fp32</button>
+    <button class="btn" type="button" data-b="2" aria-pressed="false">fp16</button>
+    <button class="btn" type="button" data-b="1" aria-pressed="false">int8</button>
+    <button class="btn" type="button" data-b="pq" aria-pressed="false">PQ 96 B</button>
+  </div>
+  <div class="ctl">
+    <span>machine</span>
+    <button class="btn" type="button" data-m="spark" aria-pressed="true">DGX Spark</button>
+    <button class="btn" type="button" data-m="h100" aria-pressed="false">H100</button>
+  </div>
+  <svg viewBox="0 0 360 112" role="img" aria-label="Bar comparing index size with the machine's memory">
+    <text x="0" y="16" class="strong">INDEX SIZE VS MEMORY</text>
+    <rect x="0" y="28" width="360" height="26" class="fill-paper" stroke-width="1" />
+    <rect x="0" y="28" width="0" height="26" class="fill-blue" data-el="bar" />
+    <line x1="0" y1="22" x2="0" y2="60" class="ink" stroke-width="1.5" data-el="cap" />
+    <text x="0" y="76" data-el="capt"></text>
+    <text x="0" y="104" class="blue-t" data-el="verdict"></text>
+  </svg>
+  <div class="ctl">
+    <span>index <span class="readout" data-out="size"></span></span>
+    <span>multiply-adds / query <span class="readout" data-out="flops"></span></span>
+    <span>read time / query <span class="readout" data-out="time"></span></span>
+    <span>max queries / s, one at a time <span class="readout" data-out="qps"></span></span>
+  </div>
+</div>
+
+<style>
+  .vsc svg { width: 100%; max-width: 460px; margin-top: 14px; }
+</style>
+
+<script>
+  // Spec-sheet numbers: DGX Spark 128 GB LPDDR5x at ~273 GB/s; H100 SXM 80 GB HBM3 at ~3.35 TB/s.
+  const MACH = { spark: { mem: 128e9, bw: 273e9, name: 'SPARK 128 GB' }, h100: { mem: 80e9, bw: 3350e9, name: 'H100 80 GB' } };
+  const fmt = (x: number) => {
+    const u: [number, string][] = [[1e12, 'T'], [1e9, 'G'], [1e6, 'M'], [1e3, 'k']];
+    for (const [v, s] of u) if (x >= v) return `${(x / v).toFixed(x / v < 10 ? 1 : 0)}${s}`;
+    return x.toFixed(0);
+  };
+  const bytes = (b: number) => (b >= 1e12 ? `${(b / 1e12).toFixed(2)} TB` : b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${(b / 1e6).toFixed(0)} MB`);
+  const time = (s: number) => (s >= 1 ? `${s.toFixed(2)} s` : s >= 1e-3 ? `${(s * 1e3).toFixed(1)} ms` : `${(s * 1e6).toFixed(0)} µs`);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="vec-scan"]').forEach((root) => {
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    let n = 1e8, d = 768, b: number | 'pq' = 4, m: 'spark' | 'h100' = 'spark';
+    const render = () => {
+      const per = b === 'pq' ? 96 : d * b;
+      const total = n * per;
+      const mc = MACH[m];
+      const t = total / mc.bw;
+      q<HTMLOutputElement>('[data-o="n"]').textContent = fmt(n);
+      q('[data-out="size"]').textContent = `${bytes(total)} (${per} B each)`;
+      q('[data-out="flops"]').textContent = b === 'pq' ? `${fmt(n * 96)} lookups` : fmt(n * d);
+      q('[data-out="time"]').textContent = time(t);
+      q('[data-out="qps"]').textContent = (1 / t) >= 10 ? (1 / t).toFixed(0) : (1 / t).toFixed(2);
+      // bar: scale so the larger of (index, memory) fills ~90%
+      const W = 340, scale = W / Math.max(total, mc.mem) ;
+      q('[data-el="bar"]').setAttribute('width', String(Math.min(360, total * scale)));
+      const capx = mc.mem * scale;
+      q('[data-el="cap"]').setAttribute('x1', String(capx));
+      q('[data-el="cap"]').setAttribute('x2', String(capx));
+      const ct = q<SVGTextElement>('[data-el="capt"]');
+      ct.setAttribute('x', String(Math.min(capx, 356)));
+      ct.setAttribute('text-anchor', capx > 200 ? 'end' : 'start');
+      ct.textContent = `${mc.name} ▲`;
+      q('[data-el="verdict"]').textContent = total > mc.mem
+        ? `DOES NOT FIT: ${(total / mc.mem).toFixed(1)}× THE MEMORY`
+        : `FITS, BUT EVERY QUERY READS ALL ${bytes(total)}`;
+    };
+    q<HTMLInputElement>('[data-k="n"]').addEventListener('input', (e) => { n = Math.round(10 ** Number((e.target as HTMLInputElement).value)); render(); });
+    const group = (attr: string, set: (v: string) => void) => root.querySelectorAll<HTMLButtonElement>(`[data-${attr}]`).forEach((btn) => btn.addEventListener('click', () => {
+      root.querySelectorAll(`[data-${attr}]`).forEach((x) => x.setAttribute('aria-pressed', String(x === btn)));
+      set(btn.getAttribute(`data-${attr}`)!); render();
+    }));
+    group('d', (v) => (d = Number(v)));
+    group('b', (v) => (b = v === 'pq' ? 'pq' : Number(v)));
+    group('m', (v) => (m = v as 'spark' | 'h100'));
+    render();
+  });
+</script>

@@ -1,0 +1,89 @@
+---
+import Base from '../../layouts/Base.astro';
+import { allLessons, findLesson } from '../../data/curriculum';
+
+const modules = import.meta.glob<any>('../../lessons/*.mdx', { eager: true });
+const bySlug: Record<string, any> = {};
+for (const [p, m] of Object.entries(modules)) bySlug[p.split('/').pop()!.replace('.mdx', '')] = m;
+
+export function getStaticPaths() {
+  return allLessons.map((l) => ({ params: { slug: l.slug } }));
+}
+
+const { slug } = Astro.params;
+const lesson = findLesson(slug!)!;
+const mod = bySlug[slug!];
+const Content = mod?.default;
+const headings: { depth: number; slug: string; text: string }[] = mod?.getHeadings?.().filter((h: any) => h.depth === 2) ?? [];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+
+const i = allLessons.findIndex((l) => l.slug === slug);
+const prev = allLessons[i - 1];
+const next = allLessons[i + 1];
+const idx = lesson.track.lessons.findIndex((l) => l.slug === slug) + 1;
+
+const prompt = `Write the Workbench lesson "${lesson.slug}" (${lesson.title}) following CLAUDE.md in this repo. Track: ${lesson.track.title}. Question: ${lesson.question} Build: ${lesson.build}`;
+---
+<Base title={`${lesson.title.replace(/\.$/, '')} · Workbench`} description={lesson.question}>
+  <main class="lesson-grid">
+    <aside class="lesson-rail">
+      {headings.length > 0 && (
+        <>
+          <span class="label">On this page</span>
+          <ol>{headings.map((h) => <li><a href={`#${h.slug}`}>{h.text}</a></li>)}</ol>
+        </>
+      )}
+    </aside>
+    <header class="lesson-head">
+      <div class="kicker">
+        <a class="label" href={`${base}#track-${lesson.track.id}`} style="color:var(--blue)">{String(lesson.track.n).padStart(2, '0')} · {lesson.track.title}</a>
+        <span class="label">Lesson {lesson.track.n}.{idx}</span>
+        {!Content && <span class="label" style="color:var(--warn)">Not written yet</span>}
+      </div>
+      <h1>{lesson.title}</h1>
+      <p class="question">{lesson.question}</p>
+    </header>
+    <div class="lesson-head-rule ticks"></div>
+    <article class="prose">
+      {Content ? <Content /> : (
+        <>
+          <p>This lesson is on the map but not written yet. Lessons get written when you reach them, so they can build on what you measured in earlier ones.</p>
+          <dl class="stub-card">
+            <dt>Why it matters</dt><dd>{lesson.why}</dd>
+            <dt>What you will build</dt><dd>{lesson.build}</dd>
+            {lesson.source && (<><dt>Source</dt><dd>{lesson.source}</dd></>)}
+          </dl>
+          <div class="copybox">
+            <span class="label">Ask Claude to write it</span>
+            <pre id="prompt">{prompt}</pre>
+            <button class="btn" type="button" id="copy">Copy prompt</button>
+          </div>
+        </>
+      )}
+    </article>
+    <nav class="lesson-foot">
+      {prev ? <a href={`${base}/lessons/${prev.slug}`}><span class="label">← Previous</span><span class="t">{prev.title}</span></a> : <span />}
+      {next && <a href={`${base}/lessons/${next.slug}`} style="text-align:right"><span class="label">Next →</span><span class="t">{next.title}</span></a>}
+    </nav>
+  </main>
+  <script>
+    import { saveProgress } from '../../lib/db';
+    const btn = document.getElementById('copy');
+    btn?.addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(document.getElementById('prompt')!.textContent!); btn.textContent = 'Copied'; } catch {}
+    });
+    // mark lesson visited, highlight current section in rail
+    try {
+      const slug = location.pathname.replace(/\/$/, '').split('/').pop();
+      if (document.querySelector('.prose h2') && localStorage.getItem(`wb:visited:${slug}`) !== '1') saveProgress(`wb:visited:${slug}`, '1');
+    } catch {}
+    const links = [...document.querySelectorAll<HTMLAnchorElement>('.lesson-rail a')];
+    const secs = links.map((a) => document.getElementById(decodeURIComponent(a.hash.slice(1)))).filter(Boolean) as HTMLElement[];
+    const onScroll = () => {
+      let cur = 0;
+      secs.forEach((s, i) => { if (s.getBoundingClientRect().top < 140) cur = i; });
+      links.forEach((a, i) => a.classList.toggle('active', i === cur));
+    };
+    if (secs.length) { addEventListener('scroll', onScroll, { passive: true }); onScroll(); }
+  </script>
+</Base>

@@ -1,0 +1,711 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import StackFrames from '../components/figures/StackFrames.astro';
+import StackListVsArray from '../components/figures/StackListVsArray.astro';
+
+## Today
+
+- Draw a running program's memory from memory: code, globals, heap, memory-mapped regions, stack, and say which way each grows.
+- Explain what a function call physically does to the stack, why that makes the stack fast, and why it is small.
+- Explain what the heap is for, who cleans it up in C, CPython, and Rust, and what fragmentation is.
+- Predict, within 20%, how much RAM a Python list, dict, or numpy array of N numbers will take, and say where a PyTorch tensor's numbers actually live.
+- Find a memory leak in a Python program with `tracemalloc` instead of guessing.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (you need the L1-vs-RAM gap). A C compiler (`cc` works on macOS and the Spark), Python 3.12+, numpy. About 3 hours with the builds.
+
+## The Problem
+
+In the diagnostic you said: "Stack is first in, first out. Heap is like this tree, which is sorted."
+
+Both halves are wrong, and in a very normal way. The words are doing it to you. "Stack" sounds like a line of things waiting, and "heap" is also the name of a tree you studied in an algorithms course. So let's clear both up before anything else, because everything later in this track sits on top of them.
+
+**The stack is last in, first out.** Think of a stack of plates. You put a plate on top, and the plate you take off is the one you put on most recently. Nobody pulls the bottom plate out. First-in-first-out is a **queue**: the line at a coffee shop, where whoever arrived first gets served first.
+
+<Figure n="001" title="LIFO VS FIFO" caption="The stack is the plates. The queue is the coffee line. A function call stack only ever touches its top plate.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A stack of four plates with push and pop at the top, next to a queue where items enter one end and leave the other">
+  <defs>
+    <marker id="sh-a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <line x1="70" y1="196" x2="250" y2="196" class="ink" stroke-width="1.5" />
+  <rect x="90" y="170" width="140" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="160" y="185" text-anchor="middle">1 · main()</text>
+  <rect x="90" y="144" width="140" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="160" y="159" text-anchor="middle">2 · sum(3)</text>
+  <rect x="90" y="118" width="140" height="22" class="fill-paper" stroke-width="1.2" />
+  <text x="160" y="133" text-anchor="middle">3 · sum(2)</text>
+  <rect x="90" y="92" width="140" height="22" class="fill-wash" stroke-width="1.2" />
+  <text x="160" y="107" text-anchor="middle" class="blue-t">4 · sum(1) newest</text>
+  <line x1="125" y1="34" x2="125" y2="84" class="blue" stroke-width="1.3" marker-end="url(#sh-a1)" />
+  <text x="118" y="30" text-anchor="end" class="blue-t">PUSH</text>
+  <line x1="195" y1="84" x2="195" y2="34" class="blue" stroke-width="1.3" marker-end="url(#sh-a1)" />
+  <text x="202" y="30" class="blue-t">POP</text>
+  <text x="160" y="218" text-anchor="middle" class="strong">STACK · LAST IN, FIRST OUT</text>
+
+  <line x1="320" y1="20" x2="320" y2="210" class="ink dash" stroke-width="1" />
+
+  <rect x="380" y="100" width="46" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="403" y="119" text-anchor="middle">1</text>
+  <rect x="430" y="100" width="46" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="453" y="119" text-anchor="middle">2</text>
+  <rect x="480" y="100" width="46" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="503" y="119" text-anchor="middle">3</text>
+  <rect x="530" y="100" width="46" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="553" y="119" text-anchor="middle">4</text>
+  <line x1="628" y1="115" x2="584" y2="115" class="blue" stroke-width="1.3" marker-end="url(#sh-a1)" />
+  <text x="606" y="96" text-anchor="middle" class="blue-t">IN</text>
+  <line x1="374" y1="115" x2="338" y2="115" class="blue" stroke-width="1.3" marker-end="url(#sh-a1)" />
+  <text x="356" y="96" text-anchor="middle" class="blue-t">OUT</text>
+  <text x="403" y="150" text-anchor="middle">oldest</text>
+  <text x="553" y="150" text-anchor="middle">newest</text>
+  <text x="478" y="218" text-anchor="middle" class="strong">QUEUE · FIRST IN, FIRST OUT</text>
+</svg>
+</Figure>
+
+**The memory heap has nothing to do with the heap data structure.** The tree you are thinking of, where every parent is smaller than its children, is a <Term w="binary heap">A tree stored in an array where each parent is smaller (or larger) than its children, so the smallest item is always at the root. Used for priority queues and heapsort.</Term>. The "heap" in "stack and heap" is just a big region of memory where a program asks for chunks at runtime. It is not sorted. It is not a tree. Inside, it is closer to a parking lot with gaps in it.
+
+The shared name is an accident of history. J. W. J. Williams named the tree "heap" in 1964 when he published heapsort. Around the same time, language designers started calling the pool of runtime memory "the heap" (ALGOL 68 even had a `HEAP` keyword for it), in the everyday sense of "a pile of stuff". As far as anyone can tell, nobody chose the clash on purpose. Two communities picked the same ordinary English word.
+
+That fixes the vocabulary. The real question is the one under it: when your code says `x = 5`, or `scores = [0.0] * 50_000_000`, or `t = torch.zeros(4096, 4096)`, **where in the machine do those bytes go**, who decides, and who cleans up? You need this for three very practical things: why a list "should" be 400 MB but is 2 GB, why deep recursion dies, and why a long-running process slowly eats all your RAM.
+
+<Origin year="1960" title="Recursion needed somewhere to put the calls">
+
+Early machines had no stack. FORTRAN II (1958), the first FORTRAN with subroutines, gave each one one fixed spot in memory for its return address and its variables. That works until a function calls itself: the second call overwrites the first call's return address, and the program can never find its way home. So early FORTRAN simply did not allow recursion.
+
+Then ALGOL 60 required recursion. In 1960 Edsger Dijkstra published "Recursive Programming", showing how to implement it: keep the calls' data in a pile in memory, add a block on top when a function is called, remove it when it returns. Friedrich Bauer and Klaus Samelson had patented the same last-in-first-out idea in 1957 (they called it the "Kellerprinzip", the cellar principle). Once the idea won, hardware followed: almost every CPU since has a dedicated register that points at the top of this pile. That pile is the stack.
+
+</Origin>
+
+## The Idea
+
+### A process's memory, drawn as one long strip
+
+When you run a program, the operating system gives it a <Term w="process">A running program plus everything the OS keeps for it: its memory, open files, and at least one thread executing its code. Lesson 3 is all about these.</Term>. Each process gets its own <Term w="address space">The range of memory addresses a process can use, numbered from 0 up to a very large number. Each process has its own, so address 0x1000 in one program is unrelated to 0x1000 in another.</Term>: one long strip of numbered bytes. On a 64-bit machine the numbers go up to about 2<sup>47</sup> or 2<sup>48</sup> (hundreds of terabytes), far more than the RAM you have. That is fine, because the addresses are not real RAM locations. They are <Term w="virtual addresses">Addresses your program sees. The CPU and OS translate them to real RAM locations behind the scenes, page by page. A later lesson on virtual memory covers how.</Term>, and only the parts actually in use get backed by real memory. For today, treat the strip as real and don't worry about the translation.
+
+The strip is divided into regions with different jobs. This is the classic picture, from low addresses at the bottom to high at the top:
+
+<Figure n="002" title="ADDRESS SPACE" caption="One process's memory. The stack starts high and grows down; the heap starts low and grows up; shared libraries and big allocations land in the mapped region between. Example addresses are a typical Linux x86-64 run." wide>
+<svg viewBox="0 0 780 500" role="img" aria-label="Address space diagram: kernel at top, then stack growing down, free space, memory-mapped region, free space, heap growing up, globals, code, and unmapped address zero at the bottom">
+  <defs>
+    <marker id="sh-a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="360" y="14" text-anchor="middle" class="strong">HIGH ADDRESSES</text>
+  <rect x="250" y="22" width="220" height="40" class="ink dash" stroke-width="1" />
+  <text x="360" y="46" text-anchor="middle">KERNEL · OFF LIMITS</text>
+  <rect x="250" y="62" width="220" height="64" class="fill-wash" stroke-width="1.3" />
+  <text x="360" y="90" text-anchor="middle" class="strong">STACK</text>
+  <text x="360" y="108" text-anchor="middle">frames, one per call</text>
+  <line x1="360" y1="128" x2="360" y2="166" class="blue" stroke-width="1.3" marker-end="url(#sh-a2)" />
+  <text x="372" y="152" class="blue-t">grows down</text>
+  <rect x="250" y="126" width="220" height="70" class="ink dash" stroke-width="1" fill="none" />
+  <rect x="250" y="196" width="220" height="64" class="fill-paper" stroke-width="1.3" />
+  <text x="360" y="224" text-anchor="middle" class="strong">MEMORY-MAPPED</text>
+  <text x="360" y="242" text-anchor="middle">libs, big mallocs, files</text>
+  <rect x="250" y="260" width="220" height="70" class="ink dash" stroke-width="1" fill="none" />
+  <line x1="360" y1="332" x2="360" y2="294" class="blue" stroke-width="1.3" marker-end="url(#sh-a2)" />
+  <text x="372" y="310" class="blue-t">grows up</text>
+  <rect x="250" y="330" width="220" height="56" class="fill-wash" stroke-width="1.3" />
+  <text x="360" y="355" text-anchor="middle" class="strong">HEAP</text>
+  <text x="360" y="372" text-anchor="middle">malloc, Python objects</text>
+  <rect x="250" y="386" width="220" height="36" class="fill-paper" stroke-width="1.3" />
+  <text x="360" y="408" text-anchor="middle" class="strong">GLOBALS</text>
+  <rect x="250" y="422" width="220" height="36" class="fill-paper" stroke-width="1.3" />
+  <text x="360" y="444" text-anchor="middle" class="strong">CODE</text>
+  <rect x="250" y="458" width="220" height="18" class="ink dash" stroke-width="1" />
+  <text x="360" y="471" text-anchor="middle">0x0 · unmapped (NULL)</text>
+  <text x="360" y="494" text-anchor="middle" class="strong">LOW ADDRESSES</text>
+
+  <text x="236" y="98" text-anchor="end">locals, return addresses</text>
+  <text x="236" y="164" text-anchor="end">free (not backed by RAM)</text>
+  <text x="236" y="232" text-anchor="end">libc, libpython, numpy .so</text>
+  <text x="236" y="298" text-anchor="end">free</text>
+  <text x="236" y="362" text-anchor="end">memory you ask for at runtime</text>
+  <text x="236" y="408" text-anchor="end">int g = 42;</text>
+  <text x="236" y="444" text-anchor="end">machine code for main()</text>
+
+  <text x="484" y="46">0xffff8000... (kernel)</text>
+  <text x="484" y="80" class="blue-t">0x7ffd8a3c1e40  local</text>
+  <text x="484" y="224">0x7f3a9c000000  libc</text>
+  <text x="484" y="362" class="blue-t">0x55d4c5a132a0  malloc</text>
+  <text x="484" y="408">0x55d4c3a04010  global</text>
+  <text x="484" y="444">0x55d4c3a01149  main</text>
+</svg>
+</Figure>
+
+Bottom to top:
+
+- **Code** (often called the <Term w="text segment">The region holding the program's machine instructions. Read-only and executable, so a bug can't overwrite the code.</Term>): the compiled instructions. Read-only.
+- **Globals**: variables that exist for the whole run, like `int g = 42;` at the top of a C file. Their size is known before the program starts, so the loader sets aside exactly that much.
+- **Heap**: memory the program asks for while it runs, in sizes nobody knew in advance. It sits just above the globals and can grow upward.
+- **Memory-mapped region**: where the OS places shared libraries (`libc`, `libpython`, numpy's compiled code), files you map into memory, and, on Linux, any single allocation bigger than about 128 KB (glibc's default threshold). Technically this is heap memory too (you asked for it at runtime), it just comes from a different place.
+- **Stack**: starts near the top and grows **down**, toward lower addresses. One block per function call that hasn't returned yet.
+- Address 0 and the area around it is deliberately left unmapped, so following a <Term w="null pointer">A pointer whose value is 0, used to mean "points at nothing". Reading through it crashes immediately because nothing is mapped at address 0. That crash is on purpose.</Term> crashes loudly instead of silently reading garbage.
+
+Two warnings about this picture. First, it is a model. Real layouts vary: on macOS on Apple Silicon you will see the stack sitting *below* the big heap region, and on ARM64 Linux (your Spark) the numbers start with `0xaaaa...` and `0xffff...` instead of `0x55...` and `0x7f...`. The roles are the same. Second, the base addresses change every run, on purpose. That is <Term w="ASLR">Address Space Layout Randomization: the OS shifts where the stack, heap, libraries, and code land each time a program starts, so an attacker can't hardcode addresses. On by default on Linux and macOS.</Term>. You will see it in the build.
+
+### The stack: one frame per unfinished call
+
+Here is the stack's whole job. When a function is called, it needs somewhere to keep its local variables, and the CPU needs to remember where to jump back to when it returns. That bundle is called a <Term w="stack frame">The block of stack memory for one function call: its local variables, the return address, and a few saved registers. Created when the call starts, thrown away when it returns.</Term>.
+
+Calling a function **pushes** a frame on top. Returning **pops** it. Because a function always finishes before the function that called it does, the most recent frame is always the first to go. That is exactly last-in-first-out, and it is why the plates are the right picture.
+
+A frame typically holds:
+
+- the function's local variables (when they don't fit in registers),
+- the <Term w="return address">The address of the instruction to jump back to when this function returns: the spot in the caller right after the call. On ARM64 it arrives in a register (x30, the link register) and is saved to the frame if the function calls anything itself.</Term>,
+- the caller's frame pointer, so the chain of frames can be walked (that walk is literally what a stack trace is),
+- any registers the function needs to borrow and restore.
+
+The CPU keeps one register, the <Term w="stack pointer">A CPU register (rsp on x86-64, sp on ARM64) holding the address of the current top of the stack. Pushing a frame moves it down; popping moves it back up.</Term>, pointing at the current top. Step through it:
+
+<Predict id="sum-depth">
+
+The figure below runs `sum(3)`, which calls `sum(2)`, which calls `sum(1)`, which calls `sum(0)`. At the deepest point, how many frames are on the stack, counting `main`? And when `sum(1)` finishes, which frame is on top?
+
+<Fragment slot="answer">
+
+Five: `main`, `sum(3)`, `sum(2)`, `sum(1)`, `sum(0)`. The deepest point is right when `sum(0)` is running. When `sum(1)` returns, its frame is popped and `sum(2)` is on top again, resuming exactly where it left off, with its own `n = 2` untouched. Each call has its own copy of `n` because each call has its own frame.
+
+</Fragment>
+</Predict>
+
+<Figure n="003" title="CALL STACK, STEP BY STEP" caption="Each call pushes a frame (shown below the previous one, because the stack grows toward lower addresses). Each return pops one. Watch the stack pointer: that one number is the entire bookkeeping. Frame size of 32 bytes is illustrative." wide>
+<StackFrames />
+</Figure>
+
+Notice the drawing direction. The "top" of the stack, the newest frame, is drawn at the *bottom* because it is at the lowest address. Plates stacked upside down from the ceiling. Every diagram you'll see in a systems book does this, and it trips everyone up once.
+
+### Why the stack is fast
+
+Allocating a frame is one instruction: subtract the frame size from the stack pointer. On ARM64 that is literally `sub sp, sp, #32`. Freeing it is one instruction: add it back. There is no searching for free space, no bookkeeping, no lock. The compiler knew every function's frame size when it compiled the program.
+
+The second reason is the one from [How slow is slow?](/lessons/latency-numbers/). The top of the stack is the memory your program touched a few nanoseconds ago. It is almost always sitting in the <Term w="L1 cache">The smallest, fastest memory on the CPU core, around 32-128 KB per core, readable in about 1 ns. Main RAM is roughly 100x slower to reach.</Term>. Calling a function reuses the same few hundred bytes of stack over and over, so locals cost about 1 ns to touch instead of the ~100 ns of a trip to RAM. Stack memory is the hottest memory you have.
+
+### Why the stack is small
+
+The price for that speed is rigidity. The stack's size is reserved up front when the thread starts, and a frame's size must be known at compile time.
+
+On Linux, the main thread's stack is 8 MB by default. Check yours:
+
+```bash
+ulimit -s     # prints 8192 on most Linux boxes (KB), 8176 on macOS
+```
+
+8 MB is plenty for normal code: a typical frame is tens to hundreds of bytes, so you could nest calls tens of thousands deep. It is nothing for data. If you write `double big[2000000];` as a local in C, that's 16 MB on the stack, and the program dies.
+
+When the stack pointer walks past the end of the reserved region, it hits a <Term w="guard page">An unmapped page placed just past the end of the stack. Touching it causes an immediate crash instead of letting the stack silently overwrite whatever memory sits next to it.</Term>, and the OS kills the program with a <Term w="segmentation fault">The crash you get when a program touches memory it has no right to. The OS sends signal SIGSEGV (number 11), and the shell shows exit code 139 = 128 + 11.</Term>. That is a <Term w="stack overflow">Running out of stack space, almost always from recursion that goes too deep or a huge local array. The name of the website comes from this.</Term>.
+
+One more thing to file away for lesson 3. **Every thread gets its own stack.** That has to be true: each thread is running its own chain of function calls, so each needs its own pile of plates. On Linux, extra threads get the same 8 MB default; on macOS, extra threads get only 512 KB. But all threads in a process share **one** heap. That single fact explains most of what goes wrong with threads, which is where [Processes, threads and the GIL](/lessons/processes-threads-gil/) picks up.
+
+### The heap: memory that outlives the function
+
+The stack can't handle two common needs:
+
+1. Data whose size you only learn at runtime. How many rows are in this file? How long is this user's query?
+2. Data that must outlive the function that made it. A function that loads a model and returns it can't keep the weights in its own frame, because the frame is gone the moment it returns.
+
+For both, you ask the heap. In C that means `malloc`:
+
+```c
+float *scores = malloc(n * sizeof(float));  // "give me n*4 bytes, somewhere"
+// ... use scores[0..n-1], return it, pass it around ...
+free(scores);                                // "I'm done, take it back"
+```
+
+`malloc` is a library function (an <Term w="allocator">The code that manages the heap: hands out chunks on request, takes them back, and tracks which parts are free. glibc's malloc, jemalloc, and mimalloc are common ones. CPython and PyTorch have their own on top.</Term>) that keeps a map of which parts of the heap are in use. When you ask for 400 bytes, it finds a free gap of at least 400 bytes, marks it used, and hands you its address. When the heap runs out of gaps, the allocator asks the OS for more: it either extends the heap upward or, for big requests, maps a fresh region. Both are <Term w="system calls">Requests from your program to the operating system kernel, like "give me more memory" or "read this file". Each costs from a few hundred nanoseconds to many microseconds, far more than a normal function call.</Term>.
+
+This is why the heap is slower than the stack. A `malloc` on the fast path is roughly tens of nanoseconds, not one instruction, and much more when it has to go to the OS. Worse, heap objects end up wherever there was a gap, so related data is often scattered, which means cache misses when you walk through it. Neither cost is a disaster once. Both are a disaster a hundred million times in a loop.
+
+### Fragmentation: free but useless
+
+Because chunks are freed in random order, the heap develops holes.
+
+<Figure n="004" title="FRAGMENTATION" caption="Seven blocks are free, but the largest hole is two blocks. A request for four contiguous blocks can't be served from here, so the allocator has to grow the heap.">
+<svg viewBox="0 0 640 200" role="img" aria-label="A row of sixteen heap blocks, some used and some free, with a four-block request below that does not fit any hole">
+  <text x="64" y="40" class="strong">HEAP (16 BLOCKS)</text>
+  <rect x="64" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="96" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="128" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="160" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="192" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="224" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="256" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="288" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="320" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="352" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="384" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="416" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="448" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <rect x="480" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="512" y="52" width="32" height="34" class="fill-paper" stroke-width="1" />
+  <rect x="544" y="52" width="32" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="144" y="104" text-anchor="middle">hole 2</text>
+  <text x="240" y="104" text-anchor="middle">hole 2</text>
+  <text x="368" y="104" text-anchor="middle">hole 1</text>
+  <text x="496" y="104" text-anchor="middle">hole 2</text>
+  <rect x="64" y="132" width="128" height="34" class="blue dash" stroke-width="1.3" />
+  <text x="128" y="153" text-anchor="middle" class="blue-t">malloc(4 blocks)</text>
+  <line x1="200" y1="149" x2="236" y2="149" class="ink" stroke-width="1" />
+  <text x="244" y="153">no hole fits · 7 free, largest is 2</text>
+  <rect x="420" y="178" width="12" height="12" class="fill-wash" stroke-width="1" />
+  <text x="438" y="188">used</text>
+  <rect x="486" y="178" width="12" height="12" class="fill-paper" stroke-width="1" />
+  <text x="504" y="188">free</text>
+</svg>
+</Figure>
+
+<Term w="Fragmentation">Free memory broken into many small holes, so a large request can't be served even though the total free space is big enough. The process's memory use grows even though it isn't "using" more.</Term> is why a long-running server's memory can creep up even when it isn't leaking: it frees as much as it allocates, but into holes too small to reuse. Allocators fight this by grouping chunks into size classes (all 32-byte objects together, all 64-byte objects together), which is exactly what CPython's allocator does.
+
+### Who frees the heap?
+
+Stack memory cleans itself up: the pop is the cleanup. Heap memory has no such moment. Someone has to decide "nobody needs this anymore". Languages differ mainly in who that someone is.
+
+- **C: you.** Every `malloc` needs exactly one `free`. Forget it and you have a <Term w="memory leak">Memory that's still allocated but that nothing will ever use again, so it can never be reused. The process grows until something kills it.</Term>. Free it twice, or use it after freeing, and you corrupt the allocator's map. A large fraction of real-world security bugs are exactly this.
+- **CPython: counting, plus a sweeper for loops.** Every object carries a count of how many references point at it. When the count drops to zero, the object is freed right then. A separate <Term w="cycle collector">CPython's garbage collector. It runs every so often, finds groups of objects that only point at each other (a cycle) with nothing outside pointing in, and frees them. Reference counting alone can never free a cycle.</Term> handles the case counting can't: two objects that point at each other.
+- **Rust: the compiler.** Every heap value has exactly one owner, and the compiler inserts the free at the point the owner goes out of scope. No counting at runtime, no collector, and use-after-free won't compile.
+
+### Python: everything is on the heap
+
+Now the part that changes how you read Python code. **In CPython, every value is an object on the heap. Variables are not boxes that hold values. They are names that point at objects.**
+
+When you write `x = 1000`, CPython allocates an int object on the heap, then makes the name `x` point at it. `y = x` doesn't copy anything; it makes a second name point at the same object. `id(x)` gives you that object's identity, which in CPython is literally its memory address.
+
+Every CPython object starts with the same header: a <Term w="reference count">A number stored inside every CPython object counting how many references point at it. Assignment adds one; a name going away subtracts one; at zero, the object is freed immediately.</Term> (8 bytes) and a pointer to its type (8 bytes). A small int adds 8 bytes of size info and one 4-byte "digit" (CPython stores big ints as a list of 30-bit chunks). That's 28 bytes to store the number 1000, which as a raw machine integer fits in 8.
+
+<Figure n="005" title="NAMES AND OBJECTS" caption="Top: two names, one object. Middle: a list is an array of pointers to objects scattered across the heap; a numpy array is one contiguous run of raw numbers. Bottom: what that costs at scale." wide>
+<svg viewBox="0 0 780 380" role="img" aria-label="Names x and y pointing at one int object; below, a Python list pointing to scattered int objects compared with a numpy array pointing to one contiguous buffer">
+  <defs>
+    <marker id="sh-a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="22" class="strong">NAMES (IN A FRAME)</text>
+  <text x="300" y="22" class="strong">OBJECTS (ON THE HEAP)</text>
+  <rect x="40" y="38" width="64" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="72" y="56" text-anchor="middle">x</text>
+  <rect x="40" y="82" width="64" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="72" y="100" text-anchor="middle">y</text>
+  <line x1="104" y1="52" x2="296" y2="66" class="blue" stroke-width="1.2" marker-end="url(#sh-a3)" />
+  <line x1="104" y1="96" x2="296" y2="80" class="blue" stroke-width="1.2" marker-end="url(#sh-a3)" />
+  <rect x="300" y="40" width="220" height="64" class="fill-wash" stroke-width="1.3" />
+  <text x="312" y="58" class="strong">int object · 28 B</text>
+  <text x="312" y="76">refcount 2 · type → int</text>
+  <text x="312" y="94">size 1 · digit 1000</text>
+  <text x="540" y="76">x = 1000; y = x</text>
+
+  <line x1="20" y1="134" x2="760" y2="134" class="ink dash" stroke-width="1" />
+
+  <text x="20" y="160" class="strong">LIST OF INT</text>
+  <rect x="20" y="172" width="70" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="190" text-anchor="middle">list obj</text>
+  <line x1="90" y1="186" x2="116" y2="186" class="blue" stroke-width="1.2" marker-end="url(#sh-a3)" />
+  <rect x="120" y="172" width="52" height="28" class="fill-paper" stroke-width="1.2" />
+  <rect x="172" y="172" width="52" height="28" class="fill-paper" stroke-width="1.2" />
+  <rect x="224" y="172" width="52" height="28" class="fill-paper" stroke-width="1.2" />
+  <rect x="276" y="172" width="52" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="146" y="190" text-anchor="middle">ptr</text>
+  <text x="198" y="190" text-anchor="middle">ptr</text>
+  <text x="250" y="190" text-anchor="middle">ptr</text>
+  <text x="302" y="190" text-anchor="middle">ptr</text>
+  <text x="224" y="166" text-anchor="middle">8 B each</text>
+  <line x1="146" y1="200" x2="80" y2="282" class="blue" stroke-width="1" marker-end="url(#sh-a3)" />
+  <line x1="198" y1="200" x2="262" y2="318" class="blue" stroke-width="1" marker-end="url(#sh-a3)" />
+  <line x1="250" y1="200" x2="160" y2="252" class="blue" stroke-width="1" marker-end="url(#sh-a3)" />
+  <line x1="302" y1="200" x2="320" y2="262" class="blue" stroke-width="1" marker-end="url(#sh-a3)" />
+  <rect x="40" y="284" width="80" height="26" class="fill-wash" stroke-width="1" />
+  <text x="80" y="301" text-anchor="middle">int 7</text>
+  <rect x="222" y="320" width="80" height="26" class="fill-wash" stroke-width="1" />
+  <text x="262" y="337" text-anchor="middle">int 3</text>
+  <rect x="120" y="254" width="80" height="26" class="fill-wash" stroke-width="1" />
+  <text x="160" y="271" text-anchor="middle">int 9</text>
+  <rect x="280" y="264" width="80" height="26" class="fill-wash" stroke-width="1" />
+  <text x="320" y="281" text-anchor="middle">int 1</text>
+  <text x="20" y="372">8 B pointer + ~32 B object, scattered</text>
+
+  <line x1="400" y1="150" x2="400" y2="360" class="ink dash" stroke-width="1" />
+
+  <text x="430" y="160" class="strong">NUMPY INT64</text>
+  <rect x="430" y="172" width="210" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="442" y="190">ndarray obj · ~112 B</text>
+  <text x="442" y="207">shape, dtype, strides, data*</text>
+  <line x1="535" y1="216" x2="535" y2="262" class="blue" stroke-width="1.2" marker-end="url(#sh-a3)" />
+  <rect x="430" y="266" width="52" height="30" class="fill-wash" stroke-width="1.2" />
+  <rect x="482" y="266" width="52" height="30" class="fill-wash" stroke-width="1.2" />
+  <rect x="534" y="266" width="52" height="30" class="fill-wash" stroke-width="1.2" />
+  <rect x="586" y="266" width="52" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="456" y="285" text-anchor="middle">7</text>
+  <text x="508" y="285" text-anchor="middle">3</text>
+  <text x="560" y="285" text-anchor="middle">9</text>
+  <text x="612" y="285" text-anchor="middle">1</text>
+  <text x="534" y="316" text-anchor="middle">8 B each, side by side</text>
+  <text x="430" y="372">raw numbers, one contiguous buffer</text>
+</svg>
+<StackListVsArray />
+</Figure>
+
+So a Python list of a million ints is really two things: one array of a million 8-byte pointers (8 MB) and a million separate int objects, each 28 bytes. Naive math: 8 + 28 = 36 MB. Measured with `tracemalloc` on CPython 3.12+, 64-bit, you'll see about **40 MB**, because CPython's small-object allocator hands out memory in 16-byte steps and rounds each 28-byte int up to 32. A numpy `int64` array of the same million numbers is **8 MB** plus a ~100-byte header, all in one block. Five times smaller, and the numbers sit next to each other, so the CPU's cache and prefetcher can stream through them instead of chasing a pointer per element.
+
+(Exact sizes change across CPython versions: in 3.10, `sys.getsizeof(0)` was 24; from 3.11 on it's 28. Treat every number here as "CPython 3.12+, 64-bit" and check your own with the build below.)
+
+Two subtleties you'll trip on:
+
+- CPython keeps one shared object for each int from -5 to 256, made at startup. `[0] * 1_000_000` is a million pointers to the *same* zero, so it costs 8 MB, not 40. Only distinct, larger ints each get their own object.
+- `sys.getsizeof(a_list)` reports the list object and its pointer array only (8 MB for a million items), not the objects the pointers point at. It's a shallow number. `tracemalloc` sees everything that was allocated.
+
+The slider at the bottom of Figure 005 lets you feel the scale. The bytes per element are `tracemalloc` measurements on CPython 3.12+, 64-bit (dark: the pointer; light: the object it points at). A list built with `append()` can be up to about 12% bigger, because lists over-allocate so that appends stay cheap.
+
+### The CPython frame stack vs the C stack
+
+Python has a call stack too: you see it every time you read a traceback. But it isn't simply the C stack from the address-space diagram.
+
+CPython is a C program. When it runs your Python function, it keeps a small record for that call: which function, which line, the local variable slots (pointers to objects, of course). Since CPython 3.11, those records live in a chunk of memory the interpreter allocates **on the heap**, and a Python function calling another Python function no longer makes the C code recurse. The C stack stays flat.
+
+But plenty of things still recurse in C. `repr` of a deeply nested list, `json.dumps`, `pickle`, comparisons, and every C extension that calls back into Python each push real C frames. Those can still overflow the real 8 MB stack and segfault the whole interpreter.
+
+That's why CPython has a <Term w="recursion limit">A cap on how deep Python calls can nest (default 1000; see sys.getrecursionlimit). Exceeding it raises RecursionError instead of crashing the process.</Term>. Historically, every Python call used real C stack, and 1,000 calls deep was comfortably under 8 MB, so the limit turned a crash into a catchable `RecursionError`. Today it's mostly a guard against runaway recursion, and newer versions (3.12+) add a separate check for C-level depth. You can raise it with `sys.setrecursionlimit`, but on an old Python that just lets you segfault instead of getting an error. You'll do exactly that in the build.
+
+### Reference counting and `del`
+
+`del x` does not delete an object. It deletes the **name** `x`, which drops the object's reference count by one. If that was the last reference, the object is freed immediately. If anything else still points at it (another name, a list, a cache, a closure, a traceback you stored), it stays alive.
+
+This is most "Python memory leaks" in practice. Not a bug in Python. Some long-lived container (a module-level dict used as a cache, a list of results you meant to clear, a logger holding references) keeps growing, and every object it points at is pinned in memory forever.
+
+The other source is cycles. If `a.other = b` and `b.other = a`, both counts stay at 1 even after you delete every name, and only the cycle collector can free them. Normally it runs on its own. Some teams turn it off for speed (Instagram famously did, in 2017), and then cycles never get freed.
+
+### Where a PyTorch tensor lives
+
+A tensor is the same story with one more layer.
+
+<Figure n="006" title="TENSOR ANATOMY" caption="The Python Tensor object is small. The numbers live in a Storage, on the CPU heap or in GPU memory. A view like t[10:] is a new small object pointing into the same storage.">
+<svg viewBox="0 0 700 260" role="img" aria-label="Names t and v point to small Python tensor objects, each with its own shape and offset, both pointing at one shared storage that owns the data buffer on CPU or GPU">
+  <defs>
+    <marker id="sh-a4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="20" y="40" width="44" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="42" y="58" text-anchor="middle">t</text>
+  <rect x="20" y="150" width="44" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="42" y="168" text-anchor="middle">v</text>
+  <line x1="64" y1="54" x2="104" y2="54" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <line x1="64" y1="164" x2="104" y2="164" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <rect x="108" y="30" width="150" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="118" y="50" class="strong">TENSOR (PY OBJ)</text>
+  <text x="118" y="68">small, fixed size</text>
+  <rect x="108" y="140" width="150" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="118" y="160" class="strong">TENSOR (PY OBJ)</text>
+  <text x="118" y="178">v = t[10:]</text>
+  <line x1="258" y1="54" x2="284" y2="54" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <line x1="258" y1="164" x2="284" y2="164" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <rect x="288" y="30" width="160" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="298" y="50">shape (1000, 1000)</text>
+  <text x="298" y="68">offset 0</text>
+  <rect x="288" y="140" width="160" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="298" y="160">shape (990, 1000)</text>
+  <text x="298" y="178">offset 10000</text>
+  <line x1="448" y1="58" x2="490" y2="94" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <line x1="448" y1="160" x2="490" y2="122" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <rect x="494" y="84" width="190" height="48" class="fill-paper" stroke-width="1.3" />
+  <text x="504" y="104" class="strong">STORAGE</text>
+  <text x="504" y="122">4,000,000 B · 2 users</text>
+  <line x1="589" y1="132" x2="589" y2="186" class="blue" stroke-width="1.2" marker-end="url(#sh-a4)" />
+  <rect x="494" y="190" width="190" height="48" class="fill-wash" stroke-width="1.3" />
+  <text x="504" y="210" class="strong">DATA BUFFER</text>
+  <text x="504" y="228">CPU heap  or  GPU memory</text>
+  <text x="20" y="232">float32, 1000 x 1000</text>
+  <text x="20" y="250">= 4 MB of numbers, once</text>
+</svg>
+</Figure>
+
+`t = torch.zeros(1000, 1000)` creates a small Python object (the tensor), which holds the shape, the <Term w="strides">How many elements to skip to move one step along each dimension. Changing strides and offset lets a view reshape or slice data without copying it.</Term>, the dtype, the device, and a pointer to a **storage**. The storage owns the actual 4 MB buffer of floats. On CPU, that buffer is a heap allocation, like numpy's. With `device="cuda"`, it lives in GPU memory, allocated through PyTorch's own CUDA allocator.
+
+Slices and `.view()` make a new small tensor object pointing into the same storage with a different offset or strides. That's why they are free, and why modifying a view modifies the original.
+
+The CUDA side has its own version of "the heap". PyTorch's <Term w="caching allocator">PyTorch's GPU-memory manager. It grabs big blocks from the CUDA driver and reuses them for new tensors instead of returning them, because asking the driver is slow. Freed memory stays reserved for PyTorch.</Term> keeps freed GPU blocks for reuse instead of giving them back to the driver. So after `del big_tensor`, `nvidia-smi` doesn't go down. `torch.cuda.memory_allocated()` (live tensors) does; `torch.cuda.memory_reserved()` (what PyTorch is holding) doesn't. Same idea as `malloc` keeping freed chunks for later.
+
+On your DGX Spark there's a twist: the CPU and GPU share one physical pool of memory (128 GB of LPDDR5x, per the spec sheet) instead of the GPU having its own separate memory chips. CPU-heap tensors and CUDA tensors still come from different allocators, and `.to("cuda")` still makes a second copy in a different allocation. What changes is that there's no PCIe bus between them, and both draw from the same 128 GB. When you budget memory on the Spark, CPU-side data and GPU-side tensors come out of one shared number. (Exactly how NVIDIA exposes shared or managed memory on GB10 is worth checking in their docs before you rely on zero-copy tricks.)
+
+## Build It
+
+Make a working folder, e.g. `~/workbench/stack-and-heap/`. Do the C tasks on both your Mac and the Spark if you can; the differences are part of the lesson.
+
+<Task id="t1" title="Map your own address space in C" agent="hands">
+
+Write `where.c` that prints the address of each of these, one per line, with a label:
+
+- `main` itself (code),
+- a global `int g = 42;`,
+- a local in `main`,
+- a small `malloc(64)` block and a big `malloc(1 << 20)` (1 MB) block,
+- a local inside a recursive function `deeper(int depth)` that calls itself 3 times and prints at each level.
+
+Shape and hints:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int g = 42;
+
+void deeper(int depth) {
+    int x = depth;
+    // print depth and &x, then recurse while depth < 3
+}
+
+int main(void) {
+    // print (void *)main, &g, a local's address, the two malloc results
+    // then call deeper(1)
+}
+```
+
+Print addresses with `%p` and cast to `(void *)`. Compile with `cc -O0 where.c -o where` (`-O0` stops the compiler from keeping locals only in registers). Run it three times.
+
+On a Mac (Apple Silicon), you should see something shaped like this:
+
+```text
+code (main)  0x100a20560
+global       0x100a28000
+heap small   0x101249180
+heap 1MB     0x7bac800000
+local main   0x16f3de3e8
+depth 1 local   0x16f3de388
+depth 2 local   0x16f3de358
+depth 3 local   0x16f3de328
+```
+
+</Task>
+
+<Predict id="addr-order">
+
+Before you run it: which local will have the lower address, `depth 1` or `depth 3`? By about how much? And will the numbers be the same on the second run?
+
+<Fragment slot="answer">
+
+`depth 3` is lower, because each call's frame is placed below its caller's: the stack grows down. The gap is one frame, typically tens of bytes (48 bytes, `0x30`, in the run above). The numbers change every run because of ASLR, but the *gaps* between them stay the same, since the layout inside each region is fixed by the compiler.
+
+</Fragment>
+</Predict>
+
+<Task id="t2" title="Blow the C stack on purpose" agent="hands">
+
+Write `boom.c`: a recursive function `f(int n)` that has a 1 KB local array (`char pad[1024];`), writes `n` into it so the compiler can't remove it, prints `n` every 1,000 calls (with `fflush(stdout)` so output survives the crash), and calls `f(n + 1)` forever. Use the array in the return value so the call isn't turned into a loop.
+
+Before running it, write down how deep you think it gets, using `ulimit -s`.
+
+Then:
+
+```bash
+cc -O0 boom.c -o boom
+./boom; echo "exit code $?"
+ulimit -s            # note it
+ulimit -s 16384      # double it, this shell only (macOS caps this at 65520)
+./boom; echo "exit code $?"
+```
+
+Read the error. Look up why the exit code is 139.
+
+</Task>
+
+<Task id="t3" title="Find where Python's recursion really breaks" agent="hands">
+
+In Python, write a recursive `depth(n)` that returns `0 if n == 0 else 1 + depth(n - 1)`.
+
+1. Call `depth(5000)` with the default limit. Read the `RecursionError` and the traceback length.
+2. `sys.setrecursionlimit(10**6)` and call `depth(500_000)`. On 3.11+, this should *succeed*: pure Python frames live on the heap. Check peak memory with `resource.getrusage(resource.RUSAGE_SELF).ru_maxrss` (bytes on macOS, kilobytes on Linux).
+3. Now make the C stack recurse instead. Keep the high limit, build a deeply nested list (`x = []`, then a million times `x = [x]`), and call `repr(x)`.
+
+If you have an older Python around (`uv python install 3.10` works), run step 2 and 3 there too.
+
+</Task>
+
+<Task id="t4" title="Weigh Python objects" agent="hands">
+
+Write `weigh.py` that answers each question with a measured number. Use `sys.getsizeof` for single objects and `tracemalloc` for totals:
+
+```python
+import sys, tracemalloc, array
+import numpy as np
+
+def traced(make):
+    """Return bytes allocated by make(), keeping the result alive."""
+    tracemalloc.start()
+    obj = make()
+    cur, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return cur, obj
+```
+
+1. `sys.getsizeof` of `0`, `1`, `2**30`, `10**20`, `1.0`, `""`, `"a"`, `[]`, `()`, `{}`. Explain the jump at `2**30`.
+2. Total bytes for one million distinct ints as a `list`, as `array.array("q")`, and as `np.arange(..., dtype=np.int64)`. Compare `sys.getsizeof(the_list)` to the traced number and explain the difference.
+3. `[0] * 1_000_000` vs `list(range(1_000_000))`. Why different?
+4. `a = 256; b = 256; a is b` and the same for `int("1000")` twice. Why?
+5. `dict` mapping a million ints to floats. Bytes per entry?
+
+</Task>
+
+<Task id="t5" title="Look inside a tensor on the Spark" agent="explain">
+
+On the Spark (any machine with PyTorch works for the CPU half), check each claim in the tensor section:
+
+- `t = torch.zeros(1000, 1000)`: compare `t.element_size() * t.nelement()` with `t.untyped_storage().nbytes()`.
+- `v = t[10:]`: confirm `v.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()`, and that `v.data_ptr() - t.data_ptr()` is `10 * 1000 * 4`. Then `v[0, 0] = 7` and look at `t[10, 0]`.
+- On CUDA: allocate a 1 GB tensor, then `del` it. Print `torch.cuda.memory_allocated()` and `torch.cuda.memory_reserved()` before and after, and watch `nvidia-smi` in another terminal. Then call `torch.cuda.empty_cache()`.
+
+If any method name has changed in your PyTorch version, the docs for `torch.Tensor` and `torch.cuda` memory management will have the current one.
+
+</Task>
+
+<Task id="t6" title="Hunt a leak with tracemalloc" agent="hands">
+
+Here is a small fake reranking service with two leaks in it. The code is given (the bugs are the point); the hunting is yours.
+
+```python
+# leaky.py
+import gc, tracemalloc
+
+_score_cache = {}
+
+class Request:
+    def __init__(self, query, docs):
+        self.query = query
+        self.docs = docs
+        self.on_done = lambda: self.finish()   # refers back to self
+        self.buf = bytearray(4096)             # some per-request scratch space
+
+    def finish(self):
+        pass
+
+def score(query, doc):
+    key = (query, doc)
+    if key not in _score_cache:
+        _score_cache[key] = [float(len(doc))] * 64   # "expensive" score features
+    return _score_cache[key][0]
+
+def handle(i):
+    req = Request(f"q{i}", [f"doc{i}-{j}" for j in range(20)])
+    return sorted(req.docs, key=lambda d: score(req.query, d))
+
+if __name__ == "__main__":
+    gc.disable()   # "for speed"
+    for i in range(20_000):
+        handle(i)
+```
+
+Your job, without reading the code for the answer first:
+
+1. Add `tracemalloc.start(10)`, take a snapshot after 1,000 requests and another after 20,000, and print the top 5 lines of `snap2.compare_to(snap1, "lineno")`.
+2. For each top line, explain *who still holds a reference* to that memory and why the count never reaches zero.
+3. Fix each leak minimally (one is a cache with no bound, one is a cycle that only the collector could free). Re-run and show the growth is gone.
+
+</Task>
+
+<DoneWhen>
+
+- You've seen the stack grow downward in your own output, on at least one machine, and seen ASLR move the base.
+- You've crashed C with a stack overflow, read exit code 139, and changed how deep it got with `ulimit -s`.
+- You've seen both a clean `RecursionError` and a hard crash or "stack overflow" error from C-level recursion in Python.
+- Your `weigh.py` prints list vs array vs numpy totals, and you can explain each number to within a few bytes per element.
+- Your leak hunt shows two leaks found by `tracemalloc`, both fixed, with before/after numbers.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in from your own runs:
+
+| Measurement | Mac | Spark | Expected |
+|---|---|---|---|
+| `ulimit -s` | | | 8176 (macOS) / 8192 (Linux) |
+| Gap between `depth` locals | | | tens of bytes |
+| Max depth, `boom.c`, default stack | | | ~7,000-8,000 |
+| Max depth, `boom.c`, doubled stack | | | about 2x |
+| `depth(500_000)` peak RSS | | | ~100 MB on 3.14 |
+| 1M ints, `list` (traced) | | | ~40 MB |
+| 1M ints, `np.int64` | | | 8.0 MB |
+| 1M int→float `dict` (traced) | | | ~100 MB |
+| Leak growth per 1,000 requests, before fix | | | your number |
+
+Why those numbers:
+
+- **`boom.c` depth.** Each frame is a bit over 1 KB (the array plus return address, saved registers, alignment). 8 MB ÷ ~1.1 KB ≈ 7,000-ish. On my Mac it printed 7,000 and died before 8,000. Double the stack, double the depth: the stack is a fixed-size region, nothing more.
+- **Python recursion.** At 500,000 deep, each Python frame plus its int objects costs on the order of 100-200 bytes of heap. ~100 MB of peak RSS on CPython 3.14 for half a million frames. That memory is the "stack", it just isn't *the* stack.
+- **List vs numpy.** 8 B pointer + 32 B object vs 8 B raw. Five times. For floats it's 8 + 24 = 32 vs 8, four times.
+- **Dict.** About 100 bytes per int→float pair: the hash table (hash, key pointer, value pointer, an index, and spare room so the table never gets too full) is roughly 40 bytes, then a 32-byte int and a 24-byte float (rounded to 32).
+
+If any number is off by more than ~20%, figure out why before moving on. The likely suspects: a different Python version, small-int caching, or a list built with `append` (over-allocated).
+
+## Break It
+
+**Return a pointer to a local.** In C, write `int *make(void) { int x = 1234; return &x; }`, print `*make()`, then call some other function that has a few locals, then print it again. The compiler warns you. The first print may even work; the second shows garbage (on my Mac, `1234` then `1`). The frame was popped, the next call reused the same bytes. This is the clearest possible demonstration that stack memory has no life beyond its call, and why the heap exists.
+
+**Double free.** `free(p); free(p);` The allocator notices its own map is corrupt and kills the process: on Linux glibc prints `free(): double free detected in tcache 2` and aborts; on my Mac it died silently with exit code 133 (a trap). Then compile with `-fsanitize=address` and run again: AddressSanitizer names the exact line of each `free`. Use ASan any time you write C or build a C extension.
+
+**`del` that frees nothing.** Make a 500 MB numpy array, put it in a list too, then `del` the name and check RSS. Nothing changes: the list still holds a reference. Clear the list and it drops instantly. Do the same with a tensor captured in a lambda, or stored on `self` in a training loop, and you've reproduced the most common "my notebook ran out of memory" bug.
+
+**Recursion limit as a crash.** On Python 3.10, `sys.setrecursionlimit(10**6)` and run `depth(200_000)`. No `RecursionError`. Just a segfault (exit 139) with no Python traceback at all, because back then each Python call used real C stack. Raising the limit removed the guardrail without making the road wider.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview.
+
+1. What is a stack frame, what's in it, and why is allocating one so much cheaper than calling `malloc`?
+
+<details>
+<summary>Model answer</summary>
+
+A frame is the block of memory for one function call that hasn't returned yet: its locals, the address to return to, and saved registers. The compiler knows its size ahead of time, so creating it is one instruction that moves the stack pointer, and destroying it is moving it back. It's also always in L1 cache because it's the memory you just used. `malloc` has to search for a free chunk of the right size, update bookkeeping, sometimes take a lock, and occasionally ask the OS for more memory; and the chunk it returns may be anywhere, so touching it may be a cache miss.
+
+</details>
+
+2. Why can't you just put everything on the stack?
+
+<details>
+<summary>Model answer</summary>
+
+Three reasons. Size: the stack is a fixed region, 8 MB by default, so large data won't fit. Lifetime: a frame disappears when its function returns, so anything that must outlive the call (a loaded model, a result you return, a cache) needs to live elsewhere. Unknown size: a frame's size is fixed at compile time, but plenty of data's size is only known at runtime. The heap handles all three, at the cost of speed and of someone having to free it.
+
+</details>
+
+3. In CPython, what actually happens with `a = [1000, 2000]; b = a; del a`?
+
+<details>
+<summary>Model answer</summary>
+
+Two int objects and a list object are created on the heap. The list holds two pointers to the ints. The name `a` points at the list (refcount 1). `b = a` makes a second name point at the same list (refcount 2); nothing is copied. `del a` removes the name `a` and drops the count to 1. The list and the ints stay alive because `b` still points at them. Only when the last reference goes does the count hit zero and CPython free it immediately, which in turn drops the ints' counts.
+
+</details>
+
+4. You load 50 million `(id, score)` pairs into a Python dict. Roughly how much RAM, and how would you shrink it?
+
+<details>
+<summary>Model answer</summary>
+
+About 100 bytes per pair on 64-bit CPython: roughly 40 for the hash-table slot and index, 32 for the int key object, 24-32 for the float. 50M × 100 B ≈ 5 GB, and the dict briefly needs more while it resizes (it doubles its table). The numbers themselves are only 12 bytes of information (8-byte id, 4-byte float32 score). Shrink it by storing two numpy arrays: `ids` as int64, sorted, and `scores` as float32, aligned with them. That's 50M × 12 B = 600 MB, about 8x smaller, and lookups become `np.searchsorted` (binary search, still fast) or vectorized over a whole batch. If ids are dense integers 0..N, skip the ids entirely and index `scores[id]`: 200 MB.
+
+</details>
+
+5. Lesson 3 preview: two threads in one process each call a recursive function. Which memory is shared and which isn't?
+
+<details>
+<summary>Model answer</summary>
+
+Each thread has its own stack, so each has its own frames, locals, and return addresses; one thread's recursion can't stomp on the other's. Both threads share the code, the globals, and the heap. So two threads appending to the same list, or updating the same dict, are touching the same heap objects at the same time, which is the root of every thread-safety problem (and part of why CPython has the GIL).
+
+</details>
+
+## Go Deeper
+
+- **Randal Bryant and David O'Hallaron, *Computer Systems: A Programmer's Perspective* (CS:APP), §3.7 "Procedures" and §9.9 "Dynamic Memory Allocation".** The canonical treatment of stack frames at the instruction level and of how `malloc` really works, including writing your own. If you read one thing, read this.
+- **Remzi and Andrea Arpaci-Dusseau, *Operating Systems: Three Easy Pieces*, chapters "The Abstraction: Address Spaces", "Interlude: Memory API", and "Free-Space Management".** Free online at [pages.cs.wisc.edu/~remzi/OSTEP](https://pages.cs.wisc.edu/~remzi/OSTEP/). Short, funny, and exactly at the level of this lesson; the free-space chapter is the best plain explanation of fragmentation.
+- **Ned Batchelder, "Facts and Myths about Python Names and Values" (PyCon 2015).** [nedbatchelder.com/text/names1.html](https://nedbatchelder.com/text/names1.html). The definitive explanation of names pointing at objects. Watch the talk once and you'll never be confused by aliasing again.
+- **Python docs, "Memory Management" (C API) and the `tracemalloc` module.** [docs.python.org/3/c-api/memory.html](https://docs.python.org/3/c-api/memory.html) and [docs.python.org/3/library/tracemalloc.html](https://docs.python.org/3/library/tracemalloc.html). The first explains pymalloc and the raw/object allocator layers; the second has worked leak-hunting recipes.
+- **Ulrich Drepper, "What Every Programmer Should Know About Memory" (2007).** Long and dense, but sections 3 and 6 explain why contiguous data (numpy) beats pointer-chasing (lists) in hardware terms. Pairs with [Why is NumPy 100x faster?](/lessons/cpu-caches/).
+- **PyTorch docs, "CUDA semantics", memory management section.** [pytorch.org/docs/stable/notes/cuda.html](https://pytorch.org/docs/stable/notes/cuda.html). How the caching allocator works, `memory_allocated` vs `memory_reserved`, and the knobs for fragmentation on the GPU.
+- **Edsger W. Dijkstra, "Recursive Programming", *Numerische Mathematik* 2 (1960).** The paper from the Origin box. Six pages, readable, and you get to watch the stack being invented.
+- **Instagram Engineering, "Dismissing Python Garbage Collection at Instagram" (2017).** A real production story about refcounting, the cycle collector, and copy-on-write memory; a good bridge into lesson 3.
+
+## Connections
+
+- Builds on [How slow is slow?](/lessons/latency-numbers/): the stack is fast because it lives in L1; scattered heap objects are slow because they don't.
+- Unlocks [Processes, threads and the GIL](/lessons/processes-threads-gil/): one stack per thread, one shared heap per process.
+- The address-space picture gets its real mechanism in [Virtual memory and the OOM killer](/lessons/virtual-memory/), and the list-vs-numpy gap gets its full explanation in [Why is NumPy 100x faster?](/lessons/cpu-caches/) and [Why is Python slow?](/lessons/python-speed/).
+- The bytes-per-element habit you built here is the same one [How much memory does a model need?](/lessons/memory-math/) uses for weights and KV caches.

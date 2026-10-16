@@ -1,0 +1,120 @@
+---
+// Interactive: c users fire requests at once. Naive server = one at a time (a staircase).
+// "Batched" is a preview of the batching lesson: everyone shares each decode step.
+// Same illustrative rates as BaselineTimeline: prefill 60 ms floor / 3,000 tok/s, decode 13 tok/s.
+---
+<div class="bq" data-fig="baseline-queue">
+  <svg viewBox="0 0 480 100" role="img" aria-label="Gantt chart of concurrent requests on the server"></svg>
+  <div class="bq-read">
+    <div><span class="label">TTFT · median</span><span class="readout" data-o="p50"></span></div>
+    <div><span class="label">TTFT · worst</span><span class="readout" data-o="max"></span></div>
+    <div><span class="label">Throughput · all users</span><span class="readout" data-o="tput"></span></div>
+    <div><span class="label">Per user</span><span class="readout" data-o="per"></span></div>
+  </div>
+  <div class="ctl">
+    <label>Users at once <input type="range" min="1" max="16" step="1" value="4" data-k="c" /><output></output></label>
+    <span class="bq-group">
+      <button class="btn" type="button" data-mode="naive" aria-pressed="true">Naive: one at a time</button>
+      <button class="btn" type="button" data-mode="batch" aria-pressed="false">Batched (preview)</button>
+    </span>
+  </div>
+  <p class="bq-note">Each request: 256 prompt tokens, 256 output tokens. Dashed line = waiting. Solid blue = prefill. Light blue = decode.</p>
+</div>
+
+<style>
+  .bq-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px 16px; border-top: 1px solid var(--rule); padding-top: 12px; margin-top: 8px; }
+  .bq-read > div { display: flex; flex-direction: column; gap: 2px; }
+  .bq-read .label { font-size: 10px; }
+  .bq-read .readout { font-size: 18px; }
+  .bq-group { display: flex; flex-wrap: wrap; gap: 8px; }
+  .bq-note { font-family: var(--mono); font-size: 10.5px; line-height: 1.5; color: var(--ink-3); margin: 12px 0 0; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const P = 256, O = 256;
+  const PF1 = Math.max(60, (P / 3000) * 1000); // ms, one prompt
+  const ITL1 = 1000 / 13; // ms per token at batch 1
+
+  const fmt = (ms: number) =>
+    ms < 1000 ? `${Math.round(ms)} ms` : ms < 60000 ? `${(ms / 1000).toFixed(1)} s` : `${(ms / 60000).toFixed(1)} min`;
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text) e.textContent = text;
+    return e;
+  }
+
+  type Req = { wait: number; pf: number; dec: number };
+
+  function plan(c: number, mode: string): Req[] {
+    if (mode === 'naive') {
+      const service = PF1 + (O - 1) * ITL1;
+      return Array.from({ length: c }, (_, i) => ({ wait: i * service, pf: PF1, dec: (O - 1) * ITL1 }));
+    }
+    // batched: one prefill for all prompts (compute-bound, so it scales with total tokens),
+    // then shared decode steps that get a little slower as the batch grows (still bandwidth-bound).
+    const pf = Math.max(60, ((c * P) / 3000) * 1000);
+    const step = ITL1 * (1 + 0.03 * (c - 1));
+    return Array.from({ length: c }, () => ({ wait: 0, pf, dec: (O - 1) * step }));
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="baseline-queue"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const slider = root.querySelector<HTMLInputElement>('[data-k="c"]')!;
+    const modeBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const out = (k: string) => root.querySelector(`[data-o="${k}"]`)!;
+    let mode = 'naive';
+
+    function render() {
+      const c = +slider.value;
+      const reqs = plan(c, mode);
+      const naiveEnd = plan(c, 'naive').reduce((m, r) => Math.max(m, r.wait + r.pf + r.dec), 0);
+      const batchEnd = plan(c, 'batch').reduce((m, r) => Math.max(m, r.wait + r.pf + r.dec), 0);
+      const tMax = Math.max(naiveEnd, batchEnd);
+      const rowH = 13, top = 6;
+      const h = top + c * rowH + 26;
+      svg.setAttribute('viewBox', `0 0 480 ${h}`);
+      svg.replaceChildren();
+      const x0 = 34, x1 = 470, w = x1 - x0;
+      const X = (ms: number) => x0 + (ms / tMax) * w;
+
+      reqs.forEach((r, i) => {
+        const y = top + i * rowH;
+        svg.appendChild(el('text', { x: 0, y: y + 8, style: 'font-size:9px' }, `U${i + 1}`));
+        if (r.wait > 0)
+          svg.appendChild(el('line', { x1: x0, y1: y + 5, x2: X(r.wait), y2: y + 5, style: 'stroke:var(--ink-3);stroke-width:1;stroke-dasharray:3 3' }));
+        svg.appendChild(el('rect', { x: X(r.wait), y, width: Math.max(1, X(r.wait + r.pf) - X(r.wait)), height: 9, style: 'fill:var(--blue)' }));
+        svg.appendChild(
+          el('rect', { x: X(r.wait + r.pf), y, width: Math.max(1, X(r.wait + r.pf + r.dec) - X(r.wait + r.pf)), height: 9, style: 'fill:var(--blue-fill);stroke:var(--blue);stroke-width:0.8' }),
+        );
+      });
+      const ay = top + c * rowH + 6;
+      svg.appendChild(el('line', { x1: x0, y1: ay, x2: x1, y2: ay, style: 'stroke:var(--ink-3);stroke-width:1' }));
+      svg.appendChild(el('text', { x: x0, y: ay + 14 }, '0'));
+      svg.appendChild(el('text', { x: x1, y: ay + 14, 'text-anchor': 'end' }, fmt(tMax)));
+
+      const ttfts = reqs.map((r) => r.wait + r.pf).sort((a, b) => a - b);
+      const median = c % 2 ? ttfts[(c - 1) / 2] : (ttfts[c / 2 - 1] + ttfts[c / 2]) / 2;
+      const end = reqs.reduce((m, r) => Math.max(m, r.wait + r.pf + r.dec), 0);
+      const tput = (c * O) / (end / 1000);
+      const per = (O - 1) / (reqs[0].dec / 1000);
+      out('p50').textContent = fmt(median);
+      out('max').textContent = fmt(ttfts[c - 1]);
+      out('tput').textContent = `${tput.toFixed(1)} tok/s`;
+      out('per').textContent = `${per.toFixed(1)} tok/s`;
+      slider.nextElementSibling!.textContent = String(c);
+    }
+
+    slider.addEventListener('input', render);
+    modeBtns.forEach((b) =>
+      b.addEventListener('click', () => {
+        mode = b.dataset.mode!;
+        modeBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+        render();
+      }),
+    );
+    render();
+  });
+</script>

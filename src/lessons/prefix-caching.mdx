@@ -1,0 +1,642 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import PrefixReserve from '../components/figures/PrefixReserve.astro';
+import PrefixBlockTable from '../components/figures/PrefixBlockTable.astro';
+import PrefixHashChain from '../components/figures/PrefixHashChain.astro';
+import PrefixRadix from '../components/figures/PrefixRadix.astro';
+import PrefixPool from '../components/figures/PrefixPool.astro';
+
+## Today
+
+- Put a byte count on the KV cache of one request, and explain why giving every request a max-length slab of memory wastes most of the GPU.
+- Explain PagedAttention: fixed-size blocks, a block table per sequence, and why it is the same trick as virtual memory pages.
+- Explain how blocks get shared, inside one request (parallel samples, beam search, with copy-on-write) and across requests (prefix caching: a hash per block, looked up like a dictionary).
+- Build a block-hashed prefix cache into your server: hashing, lookup, reference counts, LRU and TTL eviction. Measure TTFT on a shared 2,000-token system prompt and hit rate against cache size.
+- Say exactly what prefix caching speeds up (time to first token) and what it does not (each decode step), and how the same idea becomes cache-aware routing and the "prompt caching" line on an API bill.
+
+Prerequisites: [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server, harness and `SCOREBOARD.md`) and [Virtual memory and the OOM killer](/lessons/virtual-memory/) (pages, page tables, copy-on-write). It helps to have read [The KV cache, by hand](/lessons/kv-cache/) and [Batching](/lessons/batching/), but this lesson recaps what it needs. Time: one evening for the idea and the cache, one for wiring it in and measuring.
+
+## The Problem
+
+Your agent has a system prompt. Tool descriptions, rules, a few worked examples: about 2,000 tokens, and it never changes. Each step of the agent sends that same system prompt, plus the conversation so far, plus one new line.
+
+Watch what your server does with it. Every request, it runs prefill over all 2,000 tokens of system prompt, computes exactly the same keys and values it computed a second ago, uses them for one answer, and throws them away. From the [baseline lesson](/lessons/baseline-vs-fireworks/) you have a rough number for this: prefill of 2,000 tokens on the Spark is on the order of a second. So every agent step pays about a second of time to first token to rediscover something it already knew.
+
+It gets worse with chat. Turn 10 of a conversation resends turns 1 to 9. The prompt grows every turn, and the work your server repeats grows with it.
+
+And there is a second, quieter problem, about memory. When you batch requests (the next step after the naive server), each one needs room for its KV cache. How much room? You don't know how long the answer will be. So the obvious design reserves room for the longest possible one. Most requests use a fraction of it. The GPU fills up with reserved, empty memory, and you can fit far fewer users than the hardware could hold.
+
+Both problems have the same fix: stop treating a request's KV cache as one private, contiguous lump. Cut it into small fixed-size blocks, keep a table of where each block lives, and let requests point at the same block when their tokens are the same.
+
+<Origin year="2023" title="Operating systems, again">
+
+In 2023 a group at UC Berkeley (Woosuk Kwon, Zhuohan Li and colleagues in Ion Stoica's lab) measured how existing LLM servers used GPU memory. Their paper reports that only 20 to 38 percent of the memory reserved for KV caches actually held tokens. The rest was reserved for tokens that might come later, or stranded in gaps between reservations. Memory, not compute, capped how many requests a GPU could serve at once.
+
+Their fix came straight out of an operating systems textbook. Since the 1960s, operating systems have given each process the illusion of one big contiguous memory while actually storing it in small fixed-size pages, scattered anywhere in RAM, tracked by a page table. They did the same for attention and called it PagedAttention. The system around it, vLLM, came out in June 2023, and the paper appeared at SOSP that fall, reporting 2 to 4 times the throughput of the systems it compared against at the same latency.
+
+Once the KV cache was made of named, shareable blocks, reusing blocks *across* requests was a short step. vLLM added automatic prefix caching. In January 2024 the SGLang team (Lianmin Zheng, Ying Sheng and others at LMSYS) published RadixAttention, which keeps every cached prefix in a tree. Within months the idea reached the APIs: DeepSeek, Anthropic (August 2024) and OpenAI (October 2024) all started charging less for input tokens their servers already had cached.
+
+</Origin>
+
+## The Idea
+
+### How big is one request's KV cache?
+
+Recap. A transformer layer turns each token into a query, a key and a value. To produce the next token, the new token's query is compared against the keys of *every* earlier token, and the matching values are mixed together. The <Term w="KV cache">The stored keys and values of every token processed so far, for every layer. Kept so that each new token only computes its own K and V instead of recomputing everyone's.</Term> keeps those keys and values around, so each decode step only computes one new token's worth.
+
+Now the bytes, for Llama 3.1 8B in bf16. It has 32 layers. It uses <Term w="grouped-query attention">GQA. Many query heads share a smaller set of key/value heads. Llama 3.1 8B has 32 query heads but only 8 KV heads, which cuts the KV cache 4 times.</Term> with 8 key/value heads, each 128 numbers wide. Per token:
+
+```text
+2 (K and V) × 32 layers × 8 heads × 128 dims × 2 bytes = 131,072 bytes = 128 KiB per token
+```
+
+So a 2,000-token system prompt is about 256 MiB of KV cache. A full 128k-token context is 16 GiB, the same size as the weights. [How much memory does a model need?](/lessons/memory-math/) does this carefully; for today, remember **128 KiB per token**, and that one prompt's KV is hundreds of megabytes.
+
+<Predict id="reserve-waste">
+
+You batch 16 users on the Spark. To be safe, each request reserves KV room for 8,192 tokens. In practice the average request ends at about 1,000 tokens of prompt plus answer. How much memory is reserved, how much holds real data, and what fraction is wasted?
+
+<Fragment slot="answer">
+
+Reserved: 16 × 8,192 tokens × 128 KiB = 16 GiB. Used: 16 × 1,000 × 128 KiB ≈ 2 GiB. About 87% of the reservation is empty. On a data-center GPU with 80 GB of memory, 16 GB of weights and 64 GB for KV, that rule fits 64 users when the real data would fit about 500. The waste is the reason "how many users fit" comes out so small.
+
+</Fragment>
+
+</Predict>
+
+### Reserving the worst case
+
+There are three ways memory gets wasted when each sequence gets one contiguous slab:
+
+- **Reserved for later.** Room for tokens that haven't been generated yet, and may never be, because the answer stops early.
+- <Term w="internal fragmentation">Memory handed out but not used, inside an allocation. A sequence that reserved 8,192 slots and used 1,000 wastes 7,192 inside its own slab.</Term>. The leftover inside a slab when the answer does stop early.
+- <Term w="external fragmentation">Free memory split into gaps that are each too small to use. Enough free space in total, but no single hole big enough for the next request.</Term>. Gaps between slabs. When requests of different sizes come and go, free memory ends up in holes, and a new request that needs one big contiguous slab can't fit in any of them.
+
+<Figure n="001" title="SLABS VS BLOCKS" caption="Top: each sequence reserves a contiguous slab for its maximum length. Most of each slab is empty, and the leftover free space is one hole too small for a third sequence. Bottom: the same sequences in 16-token blocks placed anywhere. The only waste is the unfilled end of each sequence's last block.">
+
+<PrefixReserve />
+
+</Figure>
+
+You have seen this exact problem before. In [Virtual memory](/lessons/virtual-memory/), physical RAM is cut into 4 KiB frames and every process gets a <Term w="page table">A per-process map from virtual page numbers to physical frames. The CPU's MMU walks it on every memory access (with the TLB as a cache) so a process can treat scattered frames as one contiguous range.</Term> that maps its pages to frames anywhere. No process needs a contiguous chunk of physical RAM. A frame is handed out only when a page is first touched. Pages can be shared between processes, and copied only when someone writes.
+
+PagedAttention is that, for KV caches.
+
+### PagedAttention: pages for attention
+
+Cut the KV memory into fixed-size <Term w="KV blocks">Fixed-size chunks of KV cache memory, each holding the keys and values of a fixed number of tokens (16 by default in vLLM) for every layer. The unit of allocation, sharing and eviction.</Term>, each holding the keys and values for 16 tokens (vLLM's default). For Llama 3.1 8B a block is 16 × 128 KiB = 2 MiB. At startup, the server allocates one big pool of blocks with whatever memory is left after the weights, and keeps a list of the free ones.
+
+Each sequence then has a <Term w="block table">A small array per sequence: entry i is the physical block that holds the sequence's tokens 16i to 16i+15. The KV-cache version of a page table.</Term>. Logical block 0 (tokens 0 to 15) lives in physical block 7; logical block 1 (tokens 16 to 31) in physical block 1; and so on. When a sequence fills its last block, the server grabs any free block and appends one entry to the table. No reservation in advance, no need for neighbours.
+
+The part that needed new code is the attention computation itself. The usual attention kernel assumes a sequence's keys sit in one contiguous tensor. The PagedAttention kernel takes the block table as an extra input and, for each block of keys, looks up where it lives before reading it. That costs a little indirection per block, the same deal the CPU makes with page tables. In return, memory waste drops to less than one block per sequence: the paper reports under 4%.
+
+The translation is direct:
+
+| Virtual memory | PagedAttention |
+|---|---|
+| process | sequence (one request, or one sample of it) |
+| page (4 KiB) | KV block (16 tokens) |
+| physical frame | physical block in the KV pool |
+| page table | block table |
+| lazy allocation on first touch | allocate a block when the last one fills |
+| shared pages after `fork`, copy-on-write | shared blocks, copy-on-write |
+
+### Sharing inside one request
+
+Once a sequence is a list of pointers, two sequences can point at the same block.
+
+The first place this pays off is <Term w="parallel sampling">Asking for several independent answers to one prompt (the `n` parameter in OpenAI-style APIs). All samples start from the same prompt, so their prompt KV is identical.</Term>. Ask for four samples of a 2,000-token prompt and the naive server stores four identical copies of 256 MiB of prompt KV. With blocks, all four block tables point at the same prompt blocks, and each block carries a <Term w="reference count">A counter on a shared object: how many users currently point at it. Incremented when someone starts using it, decremented when they stop. At zero, nobody needs it.</Term> of 4.
+
+What happens when a sample writes? The prompt's last block is usually only partly full: 2,000 tokens is 125 full blocks exactly, but a 2,008-token prompt leaves 8 tokens in block 125 and 8 empty slots. Each sample's first generated token wants to go into those empty slots, and each sample generates a *different* token. They can't all write into one shared block.
+
+So the server does what the kernel does after `fork`: <Term w="copy-on-write">Sharing a block read-only and copying it only at the moment one of the sharers needs to write to it. Only the blocks that actually differ get duplicated.</Term>. Before a sample writes into a block whose reference count is above 1, the server copies that block to a fresh one, points the sample's table at the copy, and drops the old block's count by one. Every full prompt block stays shared forever.
+
+<Figure n="002" title="BLOCK TABLES, SHARED BLOCKS" caption="Two samples of one 40-token prompt. Logical blocks 0 and 1 of both samples point at the same physical blocks (P7, P1), each with reference count 2. Logical block 2 was partly prompt, partly output: when sample 2 first wrote to it, the server copied P3 into P5.">
+
+<PrefixBlockTable />
+
+</Figure>
+
+<Term w="beam search">A decoding method that keeps the k most likely partial answers at every step, extends each, and keeps the best k again. Beams constantly split and die, so they share long common histories.</Term> is the extreme case. Beams branch off each other constantly, so their histories overlap almost entirely. With reference counts, a beam that dies just decrements its blocks' counts; a block whose count reaches zero goes back to the free list. The paper reports large memory savings for beam search from this sharing alone.
+
+<Predict id="n4-memory">
+
+Prompt: 2,008 tokens. You ask for n = 4 samples of 256 tokens each, with 16-token blocks and Llama 3.1 8B. How many blocks does the naive approach (four private copies) use, and how many does PagedAttention with sharing use?
+
+<Fragment slot="answer">
+
+Each sample holds 2,008 + 256 = 2,264 tokens, which is 141.5 blocks, so 142. Four private copies: 568 blocks, about 1.1 GiB.
+
+Shared: the prompt's 125 full blocks (2,000 tokens) are stored once. The partly filled block 125 holds the last 8 prompt tokens. On their first writes, three samples each copy it (the last one left, now at reference count 1, writes into the original), so 4 blocks. After that, each sample's remaining 248 tokens fill 15.5 more blocks, so 16 each. Total 125 + 4 + 4 × 16 = 193 blocks, about 386 MiB. A third of the memory, for identical results.
+
+</Fragment>
+
+</Predict>
+
+### Sharing across requests: prefix caching
+
+Here is the leap. Within one request, the samples share a prompt because they *are* the same prompt. But two different requests from two different users can share a prompt too: the same system prompt, the same few-shot examples, the same document, the same conversation history.
+
+Can request B reuse request A's KV blocks? Only for a <Term w="prefix">The first n tokens of a sequence. Two prompts share a prefix of length n if their first n tokens are identical.</Term>, and here is why. The key and value for token *i* at layer 2 depend on the output of layer 1 at token *i*, which, through attention, depends on every token *before* it. And with <Term w="RoPE">Rotary position embeddings. Each key is rotated by an angle that depends on its position, so the same word at position 5 and at position 500 has different keys.</Term>, each key also depends on its position. So token *i*'s KV is a function of tokens 0 to *i*, at positions 0 to *i*. Nothing after it matters, because of the <Term w="causal mask">The rule in decoder attention that a token may only attend to itself and tokens before it, never after. It is why generation works left to right.</Term>. Nothing else does either.
+
+That gives a crisp rule: **if two prompts agree on their first n tokens, their KV for those n tokens is identical.** Not similar. Identical, up to floating-point rounding. Request B can skip prefill for those n tokens and only run the rest.
+
+<Predict id="middle-chunk">
+
+A RAG app builds prompts as: system prompt, then a retrieved document, then the question. Two requests use the same system prompt and the same document, but the document appears after a different date line in each ("Today is Oct 14" vs "Today is Oct 15"), which sits between the system prompt and the document. How much can prefix caching reuse for the second request?
+
+<Fragment slot="answer">
+
+Only up to the date line. The document's tokens are identical, but they come after a token that differs, so their keys and values differ: each document token attended to a different date. The cache matches the longest identical *prefix*, and the prefix ends at the first differing token. Moving the date line to the end of the prompt (after the document) would make the whole system prompt and document reusable. Prompt layout decides your hit rate. Systems that try to reuse chunks in the middle of a prompt (CacheBlend and others) exist, but they have to recompute part of the attention to correct for the different past, and the results are approximate.
+
+</Fragment>
+
+</Predict>
+
+### Naming a block: the hash chain
+
+To reuse a block, the server needs to find it. It needs a name for "the KV of these 16 tokens, given everything before them", which it can compute from the new request's tokens alone, without running the model.
+
+vLLM's answer: hash each full block together with the hash of the block before it.
+
+```text
+key_0 = H(root,  tokens 0-15)
+key_1 = H(key_0, tokens 16-31)
+key_2 = H(key_1, tokens 32-47)
+```
+
+Because each key includes the previous key, key_2 depends on tokens 0 to 47, exactly like the KV it names. The same 16 tokens after a different past get a different key. It is the same chaining idea as a git commit hash, which covers the parent commit's hash and so the whole history.
+
+<Figure n="003" title="THE HASH CHAIN" caption="Each full block's key is a hash of its tokens and the previous block's key. Request 2 computes keys h1, h2, h3, finds them in the cache, and stops at its first miss. The partial tail block is never cached: it isn't finished, and its key would change as soon as one more token arrived.">
+
+<PrefixHashChain />
+
+</Figure>
+
+The cache is then just a <Term w="hash table">A dictionary: a structure that finds a value from its key in roughly constant time, by turning the key into an array position. Python's dict is one.</Term> from key to physical block. A <Term w="cache lookup">Asking a cache "do you have this?" and getting back either the stored thing (a hit) or nothing (a miss), in which case you compute it yourself.</Term> for a new request:
+
+1. Tokenize the prompt. Cut it into full 16-token blocks; ignore the partial tail.
+2. Compute the keys left to right.
+3. Walk them: if key_0 is in the table, that's a hit; try key_1; keep going until the first miss. Everything after the first miss is a miss even if it happens to be in the table, because a block is only usable if every block before it is too. (In practice, with chained keys, a later block can't be present without its parents unless they were evicted.)
+4. Point the request's block table at the hit blocks. Run prefill only on the tokens after them.
+
+One catch: the model has to run on *at least one* prompt token, because the last prompt position's output is what produces the first new token. If the entire prompt is cached, the server still recomputes the last token. vLLM does exactly this.
+
+A few details matter in production, and each is a good interview answer:
+
+- **What else goes into the key.** Anything that changes the KV besides the tokens: which LoRA adapter is active, the hashes of any images in the prompt, and, for multi-tenant servers, a per-tenant salt (more below). vLLM's design docs list these as "extra keys" mixed into each block's hash.
+- **Collisions.** If two different prefixes ever hash to the same key, the second request silently gets the first request's KV and produces garbage that looks plausible. With a 256-bit cryptographic hash like SHA-256 this effectively never happens by accident. With a fast 64-bit hash an attacker who can choose prompts might find one on purpose. vLLM added a SHA-256 option for this reason; check its docs for the current default.
+- **Timing leaks.** A cache hit is faster. If users share a cache, someone could send a guess at another user's prompt and time the response to learn whether it was cached. Salting the hash per tenant (each user only ever hits their own entries, plus explicitly public ones like a shared system prompt) closes this. vLLM accepts a `cache_salt` per request for exactly this; check the current API.
+
+### The tree version: RadixAttention
+
+A hash table knows "this block exists". It doesn't know the *shape* of what is cached: which prefixes branch from which. SGLang's <Term w="RadixAttention">SGLang's prefix cache. Stores all cached prefixes as a radix tree whose edges are runs of tokens, so the longest cached prefix of a new prompt is found by walking down the tree.</Term> keeps that shape explicitly as a <Term w="radix tree">A compressed prefix tree (trie). Each edge is labelled with a run of tokens rather than one token, and a node exists only where two cached sequences branch apart.</Term>.
+
+<Figure n="004" title="A RADIX TREE OF PREFIXES" caption="Two system prompts, each with conversations hanging off them. A running request pins every node on its path (ref count). Eviction removes the oldest leaf with ref 0 first, so shared stems like SYS PROMPT A survive while their one-off branches go.">
+
+<PrefixRadix />
+
+</Figure>
+
+Lookup is walking down from the root, matching tokens, as far as they agree. Insertion is adding or splitting an edge. The tree gives two things the flat table doesn't make easy:
+
+- **Evict leaves first.** A leaf is a suffix only one conversation used. A node near the root is shared by everything below it. Evicting the least recently used *leaf* keeps the valuable shared stems. SGLang does exactly that: LRU over leaves whose reference count is zero.
+- **Schedule by prefix.** When many requests are waiting, the scheduler can see which ones share long cached prefixes and run them together, before the shared nodes get evicted. SGLang calls this cache-aware scheduling.
+
+vLLM's flat hash table gets close to the first point with a trick you will build yourself: when a request finishes, it puts the request's blocks onto the free list *tail first*, so the end of a chain is always older than its head and gets evicted first. Same effect, no tree.
+
+### Eviction: who leaves when the pool is full
+
+The pool is finite. A cache that never forgets would eventually hold every prefix ever seen and have no room for running requests. So when a request needs a new block and the free list is empty, something cached has to go. Three rules decide what.
+
+**Rule 1: never evict a block in use.** A block a running request points at holds part of that request's attention context. Free it and hand it to someone else, and the running request reads another request's keys on its next step. That is not a slow request; it is a wrong one. So a block can be evicted only when its reference count is zero: nobody running is using it. If every block is pinned, the new request waits. (In vLLM, a running request can also be *preempted*: its blocks freed and recomputed later, a deliberate choice rather than eviction.)
+
+**Rule 2: among unpinned blocks, evict the least recently used.** <Term w="LRU">Least recently used: when full, evict the item whose last use is oldest. Bets that what was used recently will be used again soon.</Term> is the default because traffic is bursty: the system prompt that served a request a second ago will probably serve another one in the next second. It is cheap to implement too: an ordered list of unpinned blocks, move a block to the back when it is released, pop from the front to evict.
+
+**Rule 3 (optional): drop anything idle longer than a TTL.** A <Term w="TTL">Time to live: how long an entry may stay in a cache without being used. After that it is treated as gone, even if nothing else needed its space.</Term> answers a different question from LRU. LRU answers "who leaves when we are *full*?" TTL answers "how long may an idle thing *stay*?" A pure LRU cache that is never under pressure keeps a prefix from last Tuesday forever. A TTL frees that memory on a schedule, which matters when the memory could be doing something else (more concurrent requests), or when the cache is a promise to a customer who is paying for it. Hits refresh the timer, so a prompt in steady use never expires.
+
+Now play with it. Sixteen blocks of 16 tokens. Prompt A and prompt B are system prompts of four blocks each. The chat turn reuses A and grows one block of history per turn. The one-off prompt is five blocks nobody will ever send again.
+
+<Figure n="005" title="A KV POOL WITH PREFIX CACHING" caption="Requests pin their blocks while running (shaded, ref above 0). Finish all releases them: they stay cached at ref 0 until evicted. Blue outline: a hit. Black outline: computed just now. Try: A, A (all hits). Then chat turns. Then several one-offs without finishing, until a request has to wait. Then switch on TTL and advance the clock." wide>
+
+<PrefixPool />
+
+</Figure>
+
+Things to notice:
+
+- **A, then A again.** Four hits, 64 prompt tokens of prefill skipped. The second request costs nothing but the tail.
+- **Chat turns.** Each turn hits the system prompt *and every earlier turn*, and computes only one new block. That is why chat and agent loops are where prefix caching shines: the reusable prefix grows every turn.
+- **One-off prompts.** They fill the pool with blocks that will never be hit again and push out useful ones. A real server sees plenty of these. Cache pollution is the main reason hit rates fall short of what the workload "should" give.
+- **Send one-offs without pressing Finish.** Eventually every block is pinned and a new request can't start at all. Reference counts are doing their job: nothing in use was evicted.
+- **Evictions take tails first.** When A was idle and space was needed, A3 went before A0. The next A request still hits A0 to A2.
+- **TTL.** Advance the clock and idle blocks expire even with empty slots all around. A hit refreshes the timer.
+
+### What it buys: TTFT, not decode
+
+<Predict id="ttft-decode">
+
+On the Spark, a request has a 2,000-token cached system prompt plus a 50-token new question, and generates 256 tokens. Cold, TTFT was about a second and decode ran at about 13 tokens per second. With the prefix cached, roughly what TTFT and what decode speed do you expect?
+
+<Fragment slot="answer">
+
+TTFT drops to roughly the cost of prefilling 50 tokens. A forward pass over a few dozen tokens is dominated by reading the 16 GB of weights once, about 60 ms at spec-sheet bandwidth, plus Python overhead and the cost of assembling the cached KV. Something like 100 to 200 ms, instead of about a second.
+
+Decode speed doesn't change. Each decode step still reads all the weights and still attends over all 2,050+ cached tokens; the cache didn't make any of those tokens disappear, it only avoided *recomputing* them once. The end-to-end time for 256 tokens drops by the TTFT saving (about 0.8 s out of about 20 s), which is why caching barely shows up on a long-answer benchmark and dominates on short-answer agent steps.
+
+</Fragment>
+
+</Predict>
+
+The precise statement: prefix caching skips prefill compute for the cached tokens. Prefill is the compute-bound phase, its cost grows with prompt length, and it is most of TTFT for long prompts. Decode is the bandwidth-bound phase from [Why ~17 tokens per second?](/lessons/bandwidth-bound/): each step reads the weights plus the KV, and none of that changes.
+
+There are two indirect wins on a busy batched server. Prefill that doesn't run frees compute for other requests, so throughput goes up when prompts are long and shared. And shared blocks are stored once, so more concurrent requests fit in the pool. On a one-at-a-time server like yours today, you will only see the TTFT win.
+
+### Many replicas: cache-aware routing
+
+Run eight replicas of your server behind a load balancer. Each replica has its own KV pool, and its own cache. Round robin sends turn 2 of a conversation to a different replica than turn 1 seven times out of eight. The prefix is recomputed, and now seven replicas waste pool space on copies of it.
+
+You met the fix in [Load balancers and state](/lessons/load-balancing/): <Term w="cache-aware routing">Routing each request to the replica most likely to already hold its prompt prefix, while still avoiding overloaded replicas.</Term>. The simple version hashes something stable (the conversation ID, or the first few blocks of the prompt) and uses consistent hashing so the same prefix keeps landing on the same replica. The better version, used by SGLang's router, keeps an approximate radix tree of what each replica has been sent, routes to the longest match, and falls back to the least-loaded replica when the match is overloaded. Pure affinity is dangerous: one hugely popular system prompt would send everyone to one GPU.
+
+This is a sticky session, and it is fine, because it is a cache. If the replica dies, the next request goes elsewhere and pays the prefill. Nothing is lost but time.
+
+### The productized version: API prompt caching
+
+Every major LLM API now sells this mechanism back to you as a line item. Under the hood it is the same idea: the provider keeps the KV for your prefix somewhere (GPU memory, and for some providers host memory or disk) and skips prefill when your next request starts with the same tokens. What changes is the contract, because now someone is paying.
+
+- **Anthropic** makes it explicit. You mark the end of the reusable part of the prompt with a `cache_control` breakpoint (up to 4 per request), or set it at the top level to let the API place it. The default TTL is 5 minutes, refreshed every time the entry is read; a 1-hour TTL is available. Writing the cache costs more than normal input (1.25× for the 5-minute TTL, 2× for 1 hour), reading it costs about a tenth (less on some newer models). There is a model-dependent minimum length below which nothing is cached. The response's `usage` shows `cache_creation_input_tokens` and `cache_read_input_tokens`. Check the prompt caching docs for current numbers.
+- **OpenAI** makes it automatic. Prompts above a minimum length (1,024 tokens at launch) are cached without any flag, matched in increments, and the cached part is billed at a discount. Entries typically last minutes of inactivity, longer off-peak, with a longer-retention option on some models. `usage.prompt_tokens_details.cached_tokens` tells you how many hit. There is a `prompt_cache_key` parameter that influences routing, which is cache-aware routing exposed to the customer. Check their prompt caching guide for current details.
+- **Fireworks and other open-model hosts** document prompt caching too. That matters for your scoreboard: some of Fireworks' TTFT on repeated prompts may already have been cache hits. Look for a cached-tokens field in their `usage`.
+
+Why do APIs use TTLs when your server will mostly use LRU? Because an API is a promise. "Your cache lives 5 minutes after the last use" is something a customer can plan around and a provider can budget memory for. "Your cache lives until something more popular pushes it out" is neither. The write premium pays for holding the memory; the read discount is the prefill compute you didn't burn.
+
+The habits that make API caching work are the same ones that make your server's cache work: put stable content first (tools, system prompt, examples), volatile content last (the date, the user's question), and never put a timestamp or request ID at the top.
+
+## Build It
+
+You are adding a prefix cache to the server from the [baseline lesson](/lessons/baseline-vs-fireworks/). If you already rewrote it for [batching](/lessons/batching/), the cache plugs in the same way; reference counts start mattering for real once requests overlap.
+
+An honest note before you start. Real engines share blocks *in place*: the attention kernel reads the cached blocks directly through the block table, with no copying. Hugging Face's `generate` expects each request's KV as ordinary contiguous tensors. So your version stores each cached block as its own small tensors, and on a hit *copies* the hit blocks into a fresh cache for the request. That costs a copy of the cached prefix per request (about 256 MiB for a 2,000-token prompt, a few milliseconds of memory bandwidth plus Python overhead), and during a request the prefix lives in memory twice. You get the hashing, the lookup, the reference counting and the eviction exactly right, and the TTFT win; you do not get PagedAttention's memory sharing. That is the trade.
+
+```text
+inference/
+  prefix_cache.py          # new: the cache (yours)
+  test_prefix_cache.py     # new: the spec
+  server_naive.py          # gains a cache, behind PREFIX_CACHE=1
+  bench.py                 # records cached_tokens
+  prompts/shared_2k.jsonl  # new
+  prompts/multi_prefix_zipf.jsonl, multi_prefix_rr.jsonl   # new
+```
+
+<Task id="t1" title="Shared-prefix prompt sets" agent="ok">
+
+Three prompt files in the format your harness already reads. Boilerplate; let an agent write the generator, and check token counts with the model's tokenizer.
+
+- `shared_2k.jsonl`: one system prompt of about 2,000 tokens (tool descriptions, rules and a few worked examples, like a real agent's), and 50 lines that each pair it with a different short user question.
+- `multi_prefix_zipf.jsonl`: 8 different system prompts of about 2,000 tokens each, 400 requests. Pick each request's system prompt with a seeded random choice weighted 1, 1/2, 1/3, ..., 1/8 (a <Term w="Zipf distribution">A popularity curve where the k-th most popular item is used about 1/k as often as the most popular. Real traffic (web pages, words, prompts) often looks like this: a few hot items and a long tail.</Term>), and give each a different question.
+- `multi_prefix_rr.jsonl`: the same 8 prompts, 400 requests, in strict rotation: 1, 2, ..., 8, 1, 2, ...
+
+Make sure the system prompt is the very first thing in each request (no date line above it), so the shared prefix really is a prefix.
+
+</Task>
+
+<Task id="t2" title="Write the cache" agent="hands">
+
+One file, `prefix_cache.py`, with no model code in it at all, so you can test it in a second. Here is the shape:
+
+```python
+# prefix_cache.py: block-hashed prefix cache. Knows nothing about the model.
+import hashlib, threading, time
+from collections import OrderedDict
+from dataclasses import dataclass
+
+
+@dataclass
+class Block:
+    key: bytes          # chained hash: names this block AND everything before it
+    kv: object          # per layer (K, V) for these B tokens; opaque to the cache
+    ref: int = 0        # running requests using it right now
+    last_used: float = 0.0
+
+
+class PrefixCache:
+    def __init__(self, block_size=16, max_blocks=1024, ttl_s=None, salt=b"", clock=time.monotonic):
+        self.B, self.max_blocks, self.ttl = block_size, max_blocks, ttl_s
+        self.root = hashlib.sha256(b"prefix-cache|" + salt).digest()
+        self.blocks: dict[bytes, Block] = {}
+        self.free_lru: OrderedDict[bytes, None] = OrderedDict()  # ref == 0 only, oldest first
+        self.lock = threading.Lock()
+        self.clock = clock
+        self.stats = dict(lookups=0, hit_blocks=0, miss_blocks=0, evicted=0, expired=0)
+
+    def hash_blocks(self, ids: list[int]) -> list[bytes]:
+        """One key per FULL block: key_i = sha256(key_(i-1) + bytes of the block's token ids)."""
+
+    def lookup(self, keys: list[bytes], max_hit: int) -> list[Block]:
+        """Longest cached prefix, at most max_hit blocks. Sweep expired blocks first.
+        Pin each returned block: ref += 1, and take it off free_lru if it was there."""
+
+    def insert(self, key: bytes, kv) -> bool:
+        """Store a block the current request just computed, pinned (ref = 1).
+        Evict until there is room. Return False (don't cache it) if everything is pinned."""
+
+    def release(self, blocks: list[Block]) -> None:
+        """The request is done with these. ref -= 1; stamp last_used; any block reaching
+        ref 0 goes to the BACK of free_lru. Think hard about the order you do this in."""
+
+    def _evict_one(self) -> bool:
+        """Drop the front of free_lru. False if free_lru is empty."""
+
+    def sweep(self, now=None) -> None:
+        """TTL: drop unpinned blocks idle longer than ttl_s. They are at the front of free_lru."""
+```
+
+Hints:
+
+- Turn token ids into bytes with `array("i", ids).tobytes()` (from the standard `array` module) or `struct.pack`. Any fixed encoding works, as long as it is the same every time. Don't use Python's built-in `hash()`: it is randomized per process for strings and only 64 bits.
+- `free_lru` holds only unpinned blocks, which makes eviction O(1): pinned blocks are simply not in it. When a block is hit, it leaves `free_lru`; when its count drops to 0, it rejoins at the back.
+- The order in `release` decides whether heads or tails get evicted first. One of the tests checks it. Figure 005 behaves the right way.
+- `max_hit` exists so the server can keep at least one prompt token uncached.
+- Under TTL, `free_lru` is ordered by release time, and `last_used` is stamped at release, so expired blocks are always at the front. The sweep can stop at the first block that is still alive.
+- One lock around each public method is enough. Don't call `lookup` from inside `insert` (deadlock).
+
+Your spec is this test file. Take it as is; it is the definition of done:
+
+```python
+# test_prefix_cache.py   run: python -m pytest -q
+from prefix_cache import PrefixCache
+
+
+class Clock:
+    def __init__(self): self.t = 0.0
+    def __call__(self): return self.t
+
+
+def fill(c, ids):
+    """Simulate one request: look up, insert what was missing, finish."""
+    keys = c.hash_blocks(ids)
+    hit = c.lookup(keys, max_hit=len(keys))
+    new = [c.blocks[k] for k in keys[len(hit):] if c.insert(k, kv=None)]
+    c.release(hit + new)
+    return len(hit), len(keys)
+
+
+def test_hash_chain():
+    c = PrefixCache(block_size=4)
+    a = c.hash_blocks([1, 2, 3, 4, 5, 6, 7, 8, 9])
+    b = c.hash_blocks([1, 2, 3, 4, 5, 6, 7, 0])
+    assert len(a) == 2                       # the partial tail is not a block
+    assert a[0] == b[0] and a[1] != b[1]
+    x = c.hash_blocks([9, 9, 9, 9, 5, 6, 7, 8])
+    assert x[1] != a[1]                      # same tokens, different past, different key
+
+
+def test_hit_after_insert():
+    c = PrefixCache(block_size=4)
+    assert fill(c, list(range(12))) == (0, 3)
+    assert fill(c, list(range(12))) == (3, 3)
+    assert fill(c, list(range(8)) + [99] * 4) == (2, 3)
+
+
+def test_pinned_blocks_are_never_evicted():
+    c = PrefixCache(block_size=4, max_blocks=2)
+    keys = c.hash_blocks(list(range(8)))
+    for k in keys:
+        assert c.insert(k, kv=None)          # pinned (ref 1), never released
+    other = c.hash_blocks([7] * 4)
+    assert c.insert(other[0], kv=None) is False
+    assert all(k in c.blocks for k in keys)
+
+
+def test_lru_evicts_tails_first():
+    c = PrefixCache(block_size=4, max_blocks=3)
+    fill(c, list(range(12)))                 # one chain of 3 blocks, then released
+    fill(c, [50] * 4)                        # needs 1 block, so one must go
+    keys = c.hash_blocks(list(range(12)))
+    assert keys[0] in c.blocks and keys[1] in c.blocks and keys[2] not in c.blocks
+
+
+def test_ttl():
+    clk = Clock()
+    c = PrefixCache(block_size=4, ttl_s=300, clock=clk)
+    fill(c, list(range(8)))
+    clk.t = 200; assert fill(c, list(range(8)))[0] == 2   # hit, and the timer restarts
+    clk.t = 450; assert fill(c, list(range(8)))[0] == 2   # idle 250 s: still alive
+    clk.t = 800; assert fill(c, list(range(8)))[0] == 0   # idle 350 s: expired
+```
+
+I wrote a reference implementation against these tests on a Mac (about 70 lines) and all five pass, so they are consistent with each other. Write yours without looking for one.
+
+</Task>
+
+<Task id="t3" title="Wire it into the server" agent="review">
+
+Three helpers touch Hugging Face's cache internals, and that API has moved between versions. These were checked against transformers 5.20 (where `DynamicCache` has `.layers`, each with `.keys` and `.values` of shape `[batch, kv_heads, seq, head_dim]`); older 4.x versions used `cache.key_cache[i]` and `cache.value_cache[i]`. Take them as boilerplate, and check your version's docs on "KV cache strategies" if they fail:
+
+```python
+import torch
+from transformers import DynamicCache
+
+
+def layer_kv(cache):
+    """[(K, V)] per layer, each [batch, kv_heads, seq, head_dim]."""
+    if hasattr(cache, "layers"):
+        return [(l.keys, l.values) for l in cache.layers]
+    return list(zip(cache.key_cache, cache.value_cache))  # older transformers
+
+
+def slice_block(kv, i, B):
+    """Copy out block i. clone() matters: a slice is a view that keeps the whole tensor alive."""
+    return [(k[:, :, i * B:(i + 1) * B].clone(), v[:, :, i * B:(i + 1) * B].clone()) for k, v in kv]
+
+
+def build_cache(blocks):
+    """A fresh DynamicCache holding the hit blocks, concatenated along the sequence axis."""
+    c = DynamicCache()
+    for li in range(len(blocks[0].kv)):
+        c.update(torch.cat([b.kv[li][0] for b in blocks], dim=2),
+                 torch.cat([b.kv[li][1] for b in blocks], dim=2), li)
+    return c
+```
+
+The wiring is yours. Inside `events()`, under the GPU lock:
+
+```python
+# ids = inputs["input_ids"][0].tolist()
+# keys = cache.hash_blocks(ids)
+# hit = cache.lookup(keys, max_hit=(len(ids) - 1) // cache.B)    # leave >= 1 token to compute
+# past = build_cache(hit) if hit else DynamicCache()
+# generate(**inputs, past_key_values=past, ...)   # in the thread, as before
+#    generate sees the full input_ids, notices past already covers the first len(hit)*B tokens,
+#    and only prefills the rest. It also fills `past` in place with every new token.
+# after join:
+#    kv = layer_kv(past); new = []
+#    for i in range(len(hit), len(keys)): if cache.insert(keys[i], slice_block(kv, i, B)): new.append(...)
+#    cache.release(hit + new)          # in a finally: block, so an exception can't leak pins
+# usage gains "prompt_tokens_details": {"cached_tokens": len(hit) * B}
+```
+
+Plus: environment variables `PREFIX_CACHE` (0 or 1), `CACHE_BLOCKS`, `CACHE_TTL_S`; a `GET /cache_stats` endpoint that returns `cache.stats` and the current block count; and a log line per request with hit blocks out of total.
+
+Check on the Mac first, with a tiny model (`HuggingFaceTB/SmolLM2-135M-Instruct` works) on CPU in fp32: the same prompt with the cache off and on must give **identical greedy output**. I ran this check: a 742-token prompt with 720 tokens from cache produced the same 20 tokens as a cold run, with first-token time going from 339 ms to 58 ms on this Mac's CPU. On the Spark in bf16 you may see outputs diverge after many tokens: prefilling 50 tokens on top of a cache runs different kernel shapes than prefilling 2,050 at once, and bf16 rounding differs slightly. Compare the first 32 tokens, and if they differ early, suspect a bug (positions, a missing block, the wrong `max_hit`) before blaming rounding.
+
+What this version does not cache: the *generated* tokens. Turn 2 of a chat resends turn 1's answer as part of the prompt; your cache will miss on it because you only stored prompt blocks. vLLM caches generated blocks too. It's a good extension, with a trap: the chat template may tokenize the answer slightly differently from how it was generated, and then the keys don't match. Measure before assuming.
+
+</Task>
+
+<Task id="t4" title="Teach the harness about hits" agent="review">
+
+In `one_request`, read `usage.prompt_tokens_details.cached_tokens` (missing means 0) and store it in each record. In the summary, report TTFT p50 separately for requests with `cached_tokens > 0` and with 0, plus the overall token hit rate: total cached tokens over total prompt tokens.
+
+Then a small `sweep_cache.sh` that, for each `CACHE_BLOCKS` in 64, 128, 256, 512, 1024, 2048, restarts the server, waits for `/health`, runs `bench.py` at c = 1 on one multi-prefix file with `--max-tokens 16`, and saves the results with the capacity in the metadata. Restarting is the point: each run starts from a cold cache.
+
+</Task>
+
+<DoneWhen>
+
+- All five tests pass.
+- On the Mac with a tiny model, cache on and cache off produce identical greedy output, and the log shows hits on the second request.
+- On the Spark, the second request of `shared_2k.jsonl` reports about 2,000 cached tokens, and `/cache_stats` agrees.
+- Results for cache off, cache on, and the capacity sweep are in `results/`, and `SCOREBOARD.md` has a new row.
+
+</DoneWhen>
+
+## Measure
+
+### TTFT on a shared system prompt
+
+Run `shared_2k.jsonl` at c = 1, `--max-tokens 256 --ignore-eos`, once with `PREFIX_CACHE=0` and once with `PREFIX_CACHE=1`. Then once against Fireworks.
+
+| run | TTFT, first request | TTFT p50, rest | cached tokens p50 | tok/s p50 | e2e p50 |
+|---|---|---|---|---|---|
+| Spark, cache off | | | 0 | | |
+| Spark, cache on | | | | | |
+| Fireworks | | | (if reported) | | |
+
+What to expect, and why:
+
+- **Cache off:** every request pays full prefill. The first and the rest look the same, around the second-or-so you estimated for 2,000 tokens in the baseline lesson. Divide 2 × 8 billion × 2,050 by your measured TTFT to get your effective compute rate again.
+- **Cache on, first request:** the same as cache off, plus a little for slicing and storing 128 blocks.
+- **Cache on, the rest:** roughly a single pass over the weights plus overhead. My expectation is somewhere around 100 to 200 ms; measure it. The ratio should be large, similar in spirit to the 339 ms to 58 ms I measured on the Mac with a tiny model.
+- **tok/s:** the same in both runs, within noise. If cache-on decode is noticeably slower, check that you didn't leave the KV in a strange layout or dtype.
+- **e2e:** shorter by exactly the TTFT saving and no more.
+
+Then account for the hit overhead. Time `build_cache` on its own: 128 blocks × 32 layers is about 8,000 small tensors concatenated, roughly 256 MiB of copying. If it costs tens of milliseconds, try 64-token blocks: four times fewer pieces, at the cost of coarser matching. That trade (block size against match granularity and bookkeeping) is a real tuning knob in vLLM too.
+
+### Hit rate against cache size
+
+Run the sweep on both multi-prefix files. Each 2,000-token prompt needs 128 blocks, and each request's unique question adds about 3 more blocks, so all 8 prompts need about 1,024 blocks. For Llama 3.1 8B at 2 MiB per block, that is 2 GiB.
+
+| CACHE_BLOCKS | memory (8B, bf16) | hit rate, Zipf | hit rate, round robin | TTFT p50 |
+|---|---|---|---|---|
+| 64 | 128 MiB | | | |
+| 128 | 256 MiB | | | |
+| 256 | 512 MiB | | | |
+| 512 | 1 GiB | | | |
+| 1,024 | 2 GiB | | | |
+| 2,048 | 4 GiB | | | |
+
+<Predict id="hit-curve">
+
+For the round-robin file (8 prompts in strict rotation, each needing 128 blocks), sketch hit rate against capacity. What happens at 512 blocks, which holds 4 of the 8 prompts?
+
+<Fragment slot="answer">
+
+Zero. Not half: zero. With LRU, by the time prompt 1 comes back, the 7 others have been used more recently, and 512 blocks only hold about 4 prompts' worth, so prompt 1 is always the one that got evicted. Every request evicts the prompt that is about to come back next. This is the classic LRU failure on a cyclic access pattern bigger than the cache. Hit rate jumps from 0 to nearly the maximum only when the cache holds the whole cycle. The Zipf file degrades gracefully instead, because its hot prompts are reused before they age out.
+
+</Fragment>
+
+</Predict>
+
+Before you run it on the Spark, here is what a pure-Python simulation of this exact workload gives, using a reference implementation of the cache from Task 2 (2,000 requests, 2,048-token prompts plus 50 unique tokens, 16-token blocks). Your measurements should land close to these, since the cache logic is the same; the model only adds time.
+
+| CACHE_BLOCKS | Zipf (simulated) | round robin (simulated) |
+|---|---|---|
+| 64 | 0.09 | 0.00 |
+| 128 | 0.18 | 0.00 |
+| 256 | 0.36 | 0.00 |
+| 512 | 0.62 | 0.00 |
+| 1,024 | 0.93 | 0.81 |
+| 2,048 | 0.97 | 0.97 |
+
+The ceiling is 2,048 / 2,098 ≈ 0.976, because the unique question at the end of every prompt can never hit. Notice that even at 64 blocks the Zipf file gets some hits: tail-first eviction keeps the *heads* of the hottest prompt, and a partial prefix is still a prefix.
+
+Plot TTFT p50 against hit rate. It should be close to a straight line from full-prefill TTFT at 0 to the warm TTFT at 1, because TTFT is roughly a fixed cost plus a per-uncached-token cost.
+
+### The scoreboard row
+
+Your scoreboard's main columns (short prompts, c = 1) barely move: those prompts share almost nothing. That is the honest result, and worth writing down. Put the real effect in the notes:
+
+```markdown
+| date | spark | prefix cache, 16-tok blocks, LRU (+TTL) | (short prompts: ~unchanged) | ~unchanged | ~unchanged | shared 2k sys prompt TTFT p50: ___ ms off → ___ ms on; Zipf-8 hit rate ___ at 1,024 blocks (2 GiB) |
+```
+
+## Break It
+
+**Put a timestamp at the top.** Add `Current time: {now}` as the first line of the system prompt and rerun `shared_2k.jsonl`. The hit rate drops to zero: the very first block differs, so every key after it differs. Move the line to the end of the prompt and the hits come back. Every API's prompt caching guide warns about exactly this, because it is the most common way people silently lose their cache.
+
+**Release blocks head first.** Change `release` to put blocks on the free list in order, head before tail. `test_lru_evicts_tails_first` fails. Rerun the sweep in simulation: at 256 blocks the Zipf hit rate falls from about 0.36 to 0.18, and the round-robin file at 1,024 blocks falls from 0.81 to 0.00. Evicting a head block makes every block after it unreachable (lookup stops at the first miss), but those orphans still occupy the pool until LRU reaches them. One line, half the hit rate.
+
+**Store views instead of copies.** Remove `.clone()` from `slice_block`. Everything still works, and memory climbs request after request. A slice of a tensor is a view: it points into the original storage, so each cached 16-token block keeps the request's *entire* KV tensor alive (prompt plus generated tokens, every layer). Watch the process's memory with the cache sized at 1,024 blocks; it grows far past 2 GiB. The same bug exists in plain Python with NumPy slices. It is why "cache size in blocks" is not the same as "cache size in bytes" unless you are careful.
+
+**Use a tiny hash.** Replace SHA-256 with something that keeps only 16 bits of the key. With 65,536 possible keys and thousands of blocks, collisions start within minutes of the multi-prefix run, and some requests get another prompt's KV. Look at the outputs: they are fluent and wrong, a model confidently answering a question nobody asked, with no error anywhere. This is why a cache key must be collision-resistant, and why cache bugs are the worst kind of bug: they return an answer.
+
+## Explain It Back
+
+Answer each out loud before opening it.
+
+<details>
+<summary>What is PagedAttention, and what problem does it solve?</summary>
+
+Each request's KV cache grows by about 128 KiB per token for an 8B model, and you don't know in advance how long a request will get. The simple design reserves a contiguous slab for the maximum length, which wastes most of the memory: the unused tail of each slab, and gaps between slabs too small for a new request. PagedAttention does what operating systems do with virtual memory. The KV pool is cut into fixed-size blocks of, say, 16 tokens, and each sequence has a block table mapping its logical blocks to physical blocks anywhere in the pool. Blocks are allocated only when the previous one fills, so waste is under one block per sequence. The attention kernel reads keys and values through the block table. The result is that many more sequences fit in memory at once, so the batch is bigger and throughput goes up; and because a block is just a pointer, sequences can share blocks.
+
+</details>
+
+<details>
+<summary>How does automatic prefix caching find reusable KV, and why is it exact?</summary>
+
+A token's key and value depend only on the tokens before it and its position, because attention is causal. So two prompts that share their first n tokens have identical KV for those n tokens. The server cuts each prompt into full blocks and gives each block a key: a hash of its tokens plus the key of the block before it, so a key names the entire prefix up to that block. Lookup computes the keys for a new prompt and walks them left to right in a hash table until the first miss. The hit blocks are reused and prefill runs only on the rest, plus at least the last token. It is exact up to floating-point rounding, as long as everything else that affects KV (model, adapter, images) is part of the key and the hash doesn't collide.
+
+</details>
+
+<details>
+<summary>LRU vs TTL vs reference counts: what does each one decide?</summary>
+
+Reference counts decide what *may* be evicted: a block that a running request is using has a count above zero and must never be evicted, or that request starts reading someone else's KV. LRU decides *which* unpinned block goes when the pool is full: the one unused for longest, betting that recent prefixes will be reused soon. And with tail-first ordering, the ends of chains go before the heads. TTL decides how long an idle block may stay *even when there's room*: it frees memory on a schedule and makes the cache's lifetime something you can promise, which is why APIs (5 minutes, refreshed on every hit) use it. A server under constant pressure is effectively all LRU; a TTL matters when it isn't.
+
+</details>
+
+<details>
+<summary>Prefix caching made TTFT 8× faster. Why didn't tokens per second change?</summary>
+
+Caching skips prefill for the cached tokens: the compute-heavy step that processes the prompt, which dominates TTFT on long prompts. Decode is a different phase: each new token needs one forward pass that reads all the weights, plus attention over the whole context. The cached tokens are still in the context and are still read every step; we only avoided computing them a second time. Decode on the Spark is limited by memory bandwidth, and the bytes per step are unchanged. So the gain is a fixed amount of time saved per request, large for short answers and agent steps, small relative to long generations. On a batched server there are indirect gains: prefill compute freed for other requests, and shared blocks leaving room for more requests.
+
+</details>
+
+<details>
+<summary>How does prefix caching scale to 50 replicas and a million users?</summary>
+
+Each replica has its own cache, so the first question is routing. With random or round-robin routing, a conversation's next turn lands on a replica that has its prefix only 1 time in 50, and the effective cache is each replica's memory duplicating everyone's popular prefixes. Cache-aware routing sends requests to the replica that most likely holds the longest prefix (consistent hashing on the conversation ID or the first blocks, or a per-replica prefix tree like SGLang's router), with a fallback to the least-loaded replica so one hot system prompt can't melt one GPU. Then capacity: work out the hot set. If 1,000 active conversations each hold 8,000 tokens at 128 KiB per token, that is about 1 TB of KV, far more than GPU memory. So you rely on Zipf-like reuse (a few system prompts are very hot), eviction of the long tail, and possibly a second tier in host memory or SSD for the warm middle, which is roughly what API providers' longer TTLs imply. The numbers to know: KV bytes per token, the size of the hot set, and how fast prefill recomputes a miss.
+
+</details>
+
+## Go Deeper
+
+- **Kwon et al., "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023).** The vLLM paper. Sections 3 and 4 are the memory-waste measurements and the block table design; the sharing and copy-on-write parts are short and clear.
+- **vLLM documentation, "Automatic Prefix Caching" (design docs).** How the block hash is built (parent hash, tokens, extra keys), how the free queue is ordered for eviction, and the current options for hashing and cache salts. Read this right after building yours and compare.
+- **Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs" (NeurIPS 2024), and the LMSYS blog post "Fast and Expressive LLM Inference with RadixAttention and SGLang" (January 2024).** The radix tree cache, leaf-first LRU, and cache-aware scheduling, with benchmarks on agent and few-shot workloads.
+- **Gim et al., "Prompt Cache: Modular Attention Reuse for Low-Latency Inference" (MLSys 2024).** Goes past prefixes, reusing cached attention for prompt modules that appear in different positions, and shows what you have to give up to do it.
+- **Anthropic docs, "Prompt caching."** Breakpoints, the 5-minute and 1-hour TTLs, pricing, minimum lengths, and a list of what invalidates a cache. The cleanest description of a TTL cache as a product.
+- **OpenAI docs, "Prompt caching" guide.** The automatic version: thresholds, retention, `cached_tokens`, and `prompt_cache_key` for routing.
+- **Hugging Face transformers docs, "KV cache strategies"** (the cache classes and the prefix-reuse example). The API your server uses; check here first when `DynamicCache` changes.
+- **Arpaci-Dusseau and Arpaci-Dusseau, *Operating Systems: Three Easy Pieces*, chapters on paging and "Beyond Physical Memory: Policies."** Page tables, LRU and its approximations, and why LRU fails on loops bigger than the cache: the same curve as your round-robin sweep.
+
+## Connections
+
+This lesson builds on [Virtual memory](/lessons/virtual-memory/) (pages, page tables, copy-on-write: the same ideas, one level up), [Load balancers and state](/lessons/load-balancing/) (cache-aware routing is a sticky session that is safe because it's a cache), and the server and harness from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/).
+
+It connects forward to [Caching and Redis](/lessons/caching/), where the same questions (what is the key, how long does it live, what happens when it's stale) come up for ordinary application data; to [How much memory does a model need?](/lessons/memory-math/), where KV bytes per token decide how big the pool can be; and to [Inside vLLM and SGLang](/lessons/serving-engines/), where you will find the block manager and radix tree you just built, in production form.

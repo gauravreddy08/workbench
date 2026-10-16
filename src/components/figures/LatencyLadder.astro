@@ -1,0 +1,224 @@
+---
+// The latency ladder: every rung on one log scale, with a toggle between real
+// time and "human scale" (an L1 cache hit stretched to one second, i.e. x1e9).
+// All numbers are approximate and hardware-dependent; the range is shown on tap.
+type Kind = 'hw' | 'you';
+type Rung = { name: string; ns: number; range: string; kind: Kind; note: string };
+
+const rungs: Rung[] = [
+  { name: 'One CPU clock tick', ns: 0.3, range: '0.25-0.35 ns at 3-4 GHz', kind: 'hw', note: 'The heartbeat. Everything else is counted in these.' },
+  { name: 'L1 cache hit', ns: 1, range: '0.7-1.5 ns (3-5 ticks)', kind: 'hw', note: 'Data already sitting in the tiny cache inside the core.' },
+  { name: 'L2 cache hit', ns: 4, range: '3-6 ns', kind: 'hw', note: 'A bigger cache, a little farther from the core.' },
+  { name: 'L3 / system cache hit', ns: 15, range: '10-40 ns', kind: 'hw', note: 'The last cache before main memory, shared by many cores.' },
+  { name: 'Python dict lookup', ns: 25, range: '15-50 ns (small, warm dict)', kind: 'you', note: 'Mostly interpreter work: hashing, bytecode dispatch, reference counts.' },
+  { name: 'Python function call', ns: 50, range: '30-100 ns (CPython 3.11+)', kind: 'you', note: 'Building a frame and jumping into it. Already slower than an L3 hit.' },
+  { name: 'Main memory (DRAM)', ns: 100, range: '80-150 ns', kind: 'hw', note: 'A cache miss all the way out to RAM. The most important rung to remember.' },
+  { name: 'GPU kernel launch', ns: 5e3, range: '2-10 µs from PyTorch', kind: 'you', note: 'The CPU telling the GPU to start one small job. Why tiny ops on a GPU are slow.' },
+  { name: 'Localhost round trip', ns: 3e4, range: '10-100 µs', kind: 'hw', note: 'A packet to your own machine and back, through the kernel network stack.' },
+  { name: 'Read 1 MB from RAM', ns: 5e4, range: '10-100 µs (one core)', kind: 'hw', note: 'Sequential: limited by bandwidth, not latency.' },
+  { name: 'SSD random 4 KB read', ns: 8e4, range: '20-150 µs (NVMe)', kind: 'hw', note: 'One read, nothing else in flight. Flash has to sense a whole page of cells.' },
+  { name: 'Same-datacenter round trip', ns: 2e5, range: '50-500 µs', kind: 'hw', note: 'The wire is short. Switches, NICs and software stacks are the cost.' },
+  { name: 'Read 1 MB from SSD', ns: 2.5e5, range: '0.15-1 ms', kind: 'hw', note: 'Sequential: a few GB/s once it is flowing.' },
+  { name: 'Hard disk seek', ns: 5e6, range: '3-10 ms', kind: 'hw', note: 'A metal arm moving and a platter spinning into place. Why old tables look so grim.' },
+  { name: 'Same-region internet trip', ns: 1e7, range: '5-30 ms', kind: 'hw', note: 'Your laptop to a server in a nearby city, over the public internet.' },
+  { name: 'Spark: read all 16 GB of an 8B model', ns: 5.9e7, range: '≥ 59 ms (spec-sheet floor)', kind: 'you', note: '16 GB ÷ 273 GB/s. One decode step must do this. See lesson 5.' },
+  { name: 'US coast-to-coast round trip', ns: 7e7, range: '60-80 ms', kind: 'hw', note: 'About 4,000 km each way. Distance starts to dominate.' },
+  { name: 'California ↔ Europe round trip', ns: 1.5e8, range: '130-170 ms', kind: 'hw', note: 'Light in fiber needs ~90 ms for this even on a perfectly straight cable.' },
+  { name: 'LLM API: time to first token', ns: 5e8, range: '0.2-2 s (more for long prompts)', kind: 'you', note: 'Network, queueing, and the model reading your whole prompt first.' },
+];
+
+const LO = -1; // log10(ns) at the left edge (0.1 ns)
+const HI = 9.5; // right edge (~3 s)
+const pct = (ns: number) => (((Math.log10(ns) - LO) / (HI - LO)) * 100).toFixed(2);
+const r = (x: number) => (x < 10 ? x.toFixed(1).replace(/\.0$/, '') : String(Math.round(x)));
+
+function real(ns: number) {
+  if (ns < 1e3) return `${r(ns)} ns`;
+  if (ns < 1e6) return `${r(ns / 1e3)} µs`;
+  if (ns < 1e9) return `${r(ns / 1e6)} ms`;
+  return `${r(ns / 1e9)} s`;
+}
+// Human scale: multiply by 1e9, so the number of ns becomes the number of seconds.
+function human(sec: number) {
+  if (sec < 60) return `${r(sec)} s`;
+  const min = sec / 60;
+  if (min < 60) return `${r(min)} min`;
+  const h = min / 60;
+  if (h < 48) return `${r(h)} hours`;
+  const d = h / 24;
+  if (d < 60) return `${r(d)} days`;
+  const mo = d / 30.44;
+  if (mo < 24) return `${r(mo)} months`;
+  return `${r(d / 365.25)} years`;
+}
+const ticks = [1, 1e3, 1e6, 1e9];
+---
+<div class="ll" data-fig="latency-ladder">
+  <div class="ctl ll-ctl" role="group" aria-label="Time scale">
+    <button class="btn" type="button" data-mode="real" aria-pressed="true">Real time</button>
+    <button class="btn" type="button" data-mode="human" aria-pressed="false">Human scale: L1 = 1 s</button>
+  </div>
+
+  <div class="ll-grid ll-axis" aria-hidden="true">
+    <span class="ll-name"></span>
+    <span class="ll-track">
+      {ticks.map((t) => (
+        <span class="ll-tick" style={`left:${pct(t)}%`} data-real={real(t)} data-human={human(t)}>{real(t)}</span>
+      ))}
+    </span>
+    <span class="ll-val"></span>
+  </div>
+
+  <ol class="ll-rows">
+    {rungs.map((g, i) => (
+      <li>
+        <button
+          type="button"
+          class:list={['ll-grid', 'll-row', `k-${g.kind}`, { on: i === 6 }]}
+          data-name={g.name}
+          data-real={real(g.ns)}
+          data-human={human(g.ns)}
+          data-range={g.range}
+          data-note={g.note}
+          data-ns={g.ns}
+        >
+          <span class="ll-name">{g.name}</span>
+          <span class="ll-track"><span class="ll-bar" style={`width:${pct(g.ns)}%`}></span></span>
+          <span class="ll-val">{real(g.ns)}</span>
+        </button>
+      </li>
+    ))}
+  </ol>
+
+  <div class="ll-legend">
+    <span><i class="sw hw"></i>Hardware</span>
+    <span><i class="sw you"></i>Things your code does</span>
+  </div>
+
+  <div class="ll-detail" aria-live="polite">
+    <div class="ll-d-name">Main memory (DRAM)</div>
+    <div class="ll-d-time readout">100 ns · range 80-150 ns</div>
+    <div class="ll-d-ratio">100× an L1 hit · 1× a RAM access</div>
+    <div class="ll-d-note">A cache miss all the way out to RAM. The most important rung to remember.</div>
+  </div>
+</div>
+
+<style>
+  .ll { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .ll-ctl { margin-top: 0; margin-bottom: 14px; }
+  .ll-rows { list-style: none; margin: 0; padding: 0; }
+  .ll-rows li { margin: 0; }
+  .ll-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 15em) minmax(0, 1fr) 6.2em;
+    gap: 10px;
+    align-items: center;
+  }
+  .ll-row {
+    width: 100%;
+    background: none;
+    border: 0;
+    border-bottom: 1px dotted var(--rule);
+    padding: 4px 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ll-row:hover .ll-name, .ll-row:focus-visible .ll-name, .ll-row.on .ll-name { color: var(--blue); }
+  .ll-row:focus-visible { outline: 1px solid var(--blue); outline-offset: 1px; }
+  .ll-row.on { background: var(--blue-wash); }
+  .ll-name { line-height: 1.3; letter-spacing: 0.02em; }
+  .ll-track {
+    position: relative;
+    height: 14px;
+    background-image: linear-gradient(to right, var(--rule) 1px, transparent 1px);
+    background-size: calc(100% / 10.5) 100%;
+  }
+  .ll-bar {
+    position: absolute; left: 0; top: 2px; bottom: 2px;
+    background: var(--blue-fill);
+    border: 1px solid var(--blue);
+    transition: width 0.3s;
+  }
+  .k-you .ll-bar { background: var(--blue); }
+  .ll-val { text-align: right; color: var(--ink); font-weight: 600; white-space: nowrap; }
+  .ll-axis { margin-bottom: 4px; }
+  .ll-axis .ll-track { height: 16px; background: none; }
+  .ll-tick {
+    position: absolute; top: 0;
+    transform: translateX(-50%);
+    font-size: 10.5px; color: var(--ink-3); white-space: nowrap;
+  }
+  .ll-tick:last-child { transform: translateX(-85%); }
+  .ll-legend { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 12px; font-size: 11px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; }
+  .ll-legend span { display: flex; align-items: center; gap: 6px; }
+  .sw { display: inline-block; width: 14px; height: 9px; border: 1px solid var(--blue); }
+  .sw.hw { background: var(--blue-fill); }
+  .sw.you { background: var(--blue); }
+  .ll-detail {
+    margin-top: 14px; padding: 12px 14px;
+    border: 1px solid var(--blue); background: var(--paper);
+    min-height: 7.5em;
+  }
+  .ll-d-name { color: var(--ink); font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; }
+  .ll-d-time { margin-top: 4px; }
+  .ll-d-ratio { margin-top: 2px; color: var(--ink-2); }
+  .ll-d-note { margin-top: 6px; font-family: var(--serif); font-size: 15px; color: var(--ink-2); line-height: 1.45; }
+  @media (max-width: 640px) {
+    .ll-grid { grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px; }
+    .ll-row .ll-track { grid-column: 1 / -1; grid-row: 2; }
+    .ll-axis { grid-template-columns: 1fr; }
+    .ll-axis .ll-name, .ll-axis .ll-val { display: none; }
+    .ll-tick:first-child { transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) { .ll-bar { transition: none; } }
+</style>
+
+<script>
+  const fmtRatio = (x: number) =>
+    x >= 1e6 ? `${(x / 1e6).toFixed(x >= 1e7 ? 0 : 1)} million×`
+    : x >= 1e3 ? `${Math.round(x).toLocaleString('en-US')}×`
+    : x >= 10 ? `${Math.round(x)}×`
+    : `${x.toFixed(1).replace(/\.0$/, '')}×`;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="latency-ladder"]').forEach((root) => {
+    const modeBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const rows = [...root.querySelectorAll<HTMLButtonElement>('.ll-row')];
+    const ticks = [...root.querySelectorAll<HTMLElement>('.ll-tick')];
+    const dName = root.querySelector<HTMLElement>('.ll-d-name')!;
+    const dTime = root.querySelector<HTMLElement>('.ll-d-time')!;
+    const dRatio = root.querySelector<HTMLElement>('.ll-d-ratio')!;
+    const dNote = root.querySelector<HTMLElement>('.ll-d-note')!;
+    let mode: 'real' | 'human' = 'real';
+    let current = rows.find((r) => r.classList.contains('on')) ?? rows[0];
+
+    const show = (row: HTMLButtonElement) => {
+      current = row;
+      rows.forEach((r) => r.classList.toggle('on', r === row));
+      const d = row.dataset;
+      const ns = Number(d.ns);
+      dName.textContent = d.name ?? '';
+      dTime.textContent = mode === 'real'
+        ? `${d.real} · range ${d.range}`
+        : `${d.human} (real: ${d.real}, range ${d.range})`;
+      dRatio.textContent = `${fmtRatio(ns / 1)} an L1 hit · ${fmtRatio(ns / 100)} a RAM access`;
+      dNote.textContent = d.note ?? '';
+    };
+
+    const setMode = (m: 'real' | 'human') => {
+      mode = m;
+      modeBtns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.mode === m)));
+      rows.forEach((r) => { r.querySelector('.ll-val')!.textContent = r.dataset[m] ?? ''; });
+      ticks.forEach((t) => { t.textContent = t.dataset[m] ?? ''; });
+      show(current);
+    };
+
+    modeBtns.forEach((b) => b.addEventListener('click', () => setMode(b.dataset.mode as 'real' | 'human')));
+    rows.forEach((r) => {
+      r.addEventListener('click', () => show(r));
+      r.addEventListener('mouseenter', () => show(r));
+      r.addEventListener('focus', () => show(r));
+    });
+  });
+</script>

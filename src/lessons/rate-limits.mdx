@@ -1,0 +1,878 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import RateGoodput from '../components/figures/RateGoodput.astro';
+import RateBucket from '../components/figures/RateBucket.astro';
+
+## Today
+
+- Explain exactly what happens to a server that accepts everything when more work arrives than it can do, and why "it stays busy but nobody gets an answer" is the normal way it fails.
+- Protect a server three ways: a bounded queue that sheds load, a token-bucket rate limiter, and deadlines so it stops doing work nobody is waiting for.
+- Compare fixed window, sliding window, token bucket and leaky bucket limiters, and pick one on purpose.
+- Write a client that backs off with jitter, honours `429` and `Retry-After`, and doesn't join a retry storm. Know what a circuit breaker is for.
+- Explain why your own scripts get `429`s from Claude or OpenAI even when you're "under the limit", and how to write a client that never does.
+
+Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (async servers, the fake LLM, Little's Law, the semaphore). Rough time: one evening to read, one to build. Everything runs on your Mac; nothing in the main build costs money.
+
+## The Problem
+
+You're building training data for the cross-encoder. 20,000 query-document pairs, and you want Claude to judge each one's relevance. You learned last lesson that async makes this one line:
+
+```python
+results = await asyncio.gather(*(judge(q, d) for q, d in pairs))
+```
+
+Within a second, the console fills with `429 Too Many Requests`. The SDK retries each one twice, quietly, then gives up and raises `RateLimitError`. So you wrap the call in `try`/`except` and `await asyncio.sleep(1)` before trying again. Now it doesn't crash. It just comes in waves: a second of furious activity, a second of silence, a wall of `429`s, silence, a wall. Twenty minutes later it's 30% done. You are, as far as you can tell, well under your per-minute limit.
+
+Now flip the picture. Your reranking service at work handles 300 requests a second at 40 ms each. Someone starts a backfill job that sends 600 a second. You'd expect the service to slow down: maybe everything takes twice as long. Instead, p99 goes to the client timeout, then the median does, then the dashboard shows the service at 100% CPU, doing a huge amount of work, while *zero* requests succeed. The backfill job and every real user time out together. When the backfill stops, the service stays broken for another minute.
+
+Both are the same problem seen from two ends. A system that has no way to say "slow down" doesn't slow down. It falls over, and it takes everyone with it.
+
+<Origin year="1986" title="The Internet's first congestion collapse">
+
+In October 1986, the link between Lawrence Berkeley Lab and UC Berkeley, 400 yards apart, dropped from 32,000 bits per second to 40. Not because a cable broke. Every computer on the network was doing exactly what it was told: when a packet wasn't acknowledged in time, send it again. But packets weren't being acknowledged because the routers' queues were full, and resending them filled the queues further. The network was flat out, carrying almost nothing but copies of packets that had already been given up on. John Nagle had predicted this two years earlier and given it a name: congestion collapse.
+
+Van Jacobson and Michael Karels fixed it (their 1988 paper "Congestion Avoidance and Control" is still worth reading) by teaching TCP to treat a lost packet as a signal to *send less*: start slow, grow carefully, halve on loss, and back off retransmissions exponentially. Every idea in this lesson (shedding, backpressure, backoff, jitter) is that same lesson rediscovered at a higher layer: when you're overloaded, the most important thing is to stop making it worse.
+
+</Origin>
+
+## The Idea
+
+### What overload actually does
+
+Take the fake LLM server from last lesson and make it a little more realistic. It has a GPU that can run 8 requests at once (an `asyncio.Semaphore(8)`), and each request takes 100 ms. So its <Term w="capacity">The most work a system can complete per second, no matter how much you send it. Here: 8 at a time, 100 ms each, so 80 requests per second.</Term> is 8 / 0.1 s = 80 requests per second.
+
+Now send it 120 requests per second, steadily, and have each client give up after 1 second (a <Term w="timeout">How long a client waits for an answer before giving up. Every real client has one, even if it's the default buried in a library.</Term>). Walk through what happens, second by second.
+
+Every second, 120 arrive and 80 finish. The other 40 have to wait somewhere. In an async server that "somewhere" is the line of coroutines waiting on the semaphore, a <Term w="queue">A line of work waiting its turn. Here it's the coroutines blocked on the semaphore, but it can be a list, a socket buffer, or a Kafka topic.</Term> with no limit on its length. After 1 s it holds 40 requests. After 5 s, 200. After 10 s, 400.
+
+How long does a new arrival wait? By [Little's Law](/lessons/waiting-vs-working/), wait = queue length / rate it drains = 400 / 80 = 5 seconds at the 10-second mark. Latency isn't "twice as slow". It grows *without bound*, linearly in time, for as long as the overload lasts. There is no new steady state to settle into: if more arrives than leaves, the line grows forever.
+
+Then the timeout kicks in, and this is the part that turns slow into broken. Once the wait passes 1 second (here, after about 1.8 s), every client gives up before its turn. But the server doesn't know that. The coroutine is still in the line. When it reaches the front, the server does the full 100 ms of GPU work and sends the answer to a closed connection. The server is 100% busy. Every answer is late. That's the difference between two words that sound the same:
+
+- <Term w="throughput">How much work the server completes per second, whether or not anyone wanted it by then.</Term>: still 80 per second, flat out.
+- <Term w="goodput">How much *useful* work completes per second: answers that reached a client who was still waiting. The number that matters.</Term>: zero.
+
+<Figure n="001" title="AN UNPROTECTED SERVER AT 1.5× CAPACITY" caption="Arrivals exceed capacity by 40 a second, and the excess has nowhere to go but an unbounded queue. Wait time grows with the queue. Once it passes the client's timeout, every answer the server produces arrives after the client has left: full throughput, zero goodput. The queue also holds memory for every waiting request.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Requests flow into an unbounded queue in front of an 8-slot server; answers go to clients who already timed out">
+  <defs>
+    <marker id="rate-a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" class="fill-blue" /></marker>
+    <marker id="rate-a1i" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" style="fill:var(--ink)" /></marker>
+  </defs>
+  <text x="10" y="96" class="strong">ARRIVALS</text>
+  <text x="10" y="112">120 / S</text>
+  <line x1="10" y1="128" x2="70" y2="128" class="blue" stroke-width="1.5" marker-end="url(#rate-a1)" />
+  <rect x="80" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="98" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="116" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="134" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="152" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="170" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="188" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="206" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <text x="248" y="133" text-anchor="middle" class="blue-t">· · ·</text>
+  <rect x="276" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="294" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="312" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="330" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <rect x="348" y="118" width="14" height="20" class="fill-wash" stroke-width="1" />
+  <line x1="80" y1="104" x2="362" y2="104" class="ink" stroke-width="1" />
+  <line x1="80" y1="100" x2="80" y2="108" class="ink" stroke-width="1" />
+  <line x1="362" y1="100" x2="362" y2="108" class="ink" stroke-width="1" />
+  <text x="221" y="94" text-anchor="middle" class="strong">QUEUE: NO LIMIT · GROWS 40 / S</text>
+  <text x="221" y="78" text-anchor="middle">AT 10 S: 400 WAITING · WAIT = 400 / 80 = 5 S</text>
+  <text x="221" y="162" text-anchor="middle">MEMORY HELD FOR EVERY ONE</text>
+  <line x1="364" y1="128" x2="396" y2="128" class="ink" stroke-width="1.2" marker-end="url(#rate-a1i)" />
+  <rect x="400" y="70" width="112" height="116" class="fill-paper" stroke-width="1.2" />
+  <text x="456" y="90" text-anchor="middle" class="strong">SERVER</text>
+  <rect x="414" y="100" width="38" height="14" class="fill-blue" />
+  <rect x="460" y="100" width="38" height="14" class="fill-blue" />
+  <rect x="414" y="118" width="38" height="14" class="fill-blue" />
+  <rect x="460" y="118" width="38" height="14" class="fill-blue" />
+  <rect x="414" y="136" width="38" height="14" class="fill-blue" />
+  <rect x="460" y="136" width="38" height="14" class="fill-blue" />
+  <rect x="414" y="154" width="38" height="14" class="fill-blue" />
+  <rect x="460" y="154" width="38" height="14" class="fill-blue" />
+  <text x="456" y="204" text-anchor="middle">8 SLOTS × 100 MS</text>
+  <text x="456" y="220" text-anchor="middle" class="strong">= 80 / S, 100% BUSY</text>
+  <line x1="512" y1="128" x2="548" y2="128" class="ink" stroke-width="1.2" marker-end="url(#rate-a1i)" />
+  <rect x="552" y="96" width="82" height="64" class="fill-paper dash" stroke-width="1" />
+  <text x="593" y="116" text-anchor="middle" class="strong">CLIENT</text>
+  <text x="593" y="132" text-anchor="middle">GAVE UP</text>
+  <text x="593" y="148" text-anchor="middle">AT 1 S</text>
+  <text x="593" y="184" text-anchor="middle" class="blue-t">GOODPUT 0</text>
+</svg>
+</Figure>
+
+I ran exactly this on a MacBook (you'll repeat it in Build It): FastAPI, 8 slots, 100 ms each, a 10-second flood, 1-second client timeout. At 80 per second, everything succeeded with p99 of 156 ms. At 120 per second, 216 of 1,200 requests succeeded and the server was still chewing through 300 abandoned requests after the last client had gone home. At 240 per second, 112 of 2,400 succeeded, about 1,500 dead requests were still queued after the run, and the server process had grown by about 19 MB holding them.
+
+<Predict id="collapse-curve">
+You send this server (capacity 80/s, clients time out at 1 s) a constant 120 requests per second. After 10 seconds, goodput was about 22 per second. What will it be if the overload lasts 60 seconds instead of 10? And what's the server's CPU doing the whole time?
+<Fragment slot="answer">
+
+About 3.6 per second, and the server is 100% busy the whole time.
+
+Only the requests that arrive before the queue's wait passes the timeout ever succeed. The wait reaches 0.9 s (1 s timeout minus 0.1 s of work) once the queue holds 72 requests, which at 40 extra per second takes 1.8 s. So about 120 × 1.8 = 216 requests succeed, *no matter how long the overload lasts*. Spread over 10 s that's 21.6 per second (exactly what I measured). Spread over 60 s it's 3.6. In steady state, goodput is zero.
+
+This is the trap: the longer the overload, the worse the average, and the server looks perfectly healthy by CPU.
+
+</Fragment>
+</Predict>
+
+Here's the whole curve. The ink line is the unprotected server; the dots are my measurements. Drag the overload duration out to a minute and watch the ink curve collapse toward zero. Then lengthen the client timeout: it buys a little, briefly, and changes nothing in the long run.
+
+<Figure n="002" title="GOODPUT VS OFFERED LOAD" caption="Below capacity both servers are the same. Above it, the unprotected server's goodput falls off a cliff and keeps falling the longer the overload lasts, while it stays 100% busy. A server that refuses the excess keeps delivering its full 80 per second however hard you push. Measured dots are from 10-second runs with a 1-second client timeout." wide>
+
+<RateGoodput />
+
+</Figure>
+
+That shape, where pushing more load in gets *less* useful work out, is <Term w="congestion collapse">When a system under overload spends its capacity on work that no longer matters (expired requests, retransmits, retries), so useful output falls as offered load rises.</Term>. It's not a bug in FastAPI or asyncio. Any system with an unbounded queue and impatient clients does it. Threads, processes, Go, Rust, a Postgres connection pool, a support phone line: all the same.
+
+Note what *didn't* happen: the server didn't crash. Last lesson's diagnostic said you thought sync servers "crash" under load. They mostly don't. They do something worse: they keep running and stop being useful.
+
+### Say no early: load shedding
+
+The blue line in Figure 002 is a server that does one extra thing: before putting a request in the line, it checks how long the line is. If 16 requests are already waiting (16 / 80 = 200 ms of work), it answers immediately with `503 Service Unavailable` and does nothing else. That's <Term w="load shedding">Deliberately rejecting some requests, early and cheaply, when you're over capacity, so the ones you accept still finish in time.</Term>, and the 16 is a <Term w="bounded queue">A queue with a maximum length. When it's full, new work is rejected (or the producer is made to wait) instead of the queue growing.</Term>.
+
+Rejecting costs almost nothing: no GPU slot, no 100 ms, a few dozen bytes of response. So the server spends its whole capacity on requests that will finish in time. In my run at 240 requests per second, the shedding server returned 816 successes and 1,584 fast `503`s, and every success had p99 latency around 300 ms (100 ms of work plus up to 200 ms of queue). At 480 per second, still 816 successes. Goodput stuck at capacity, which is the best any server can do.
+
+It feels wrong to turn away work while you're trying to serve people. But the choice under overload is never "serve everyone" vs "serve some". It's "serve some, quickly, and tell the rest right away" vs "serve nobody, slowly". A fast no is a gift: the client can retry later, try another replica, or show the user an error in 5 ms instead of a spinner for 30 seconds.
+
+A few refinements, all of which you'll see in real systems:
+
+- **How big should the queue be?** Size it in *time*, not items. A queue is only useful if the requests in it can still finish before their clients give up. With a 1 s timeout and 80/s capacity, anything over about 70 is pure harm. Most production queues are far too long, because a long queue looks harmless in testing.
+- **Deadlines.** Even with a bounded queue, a request can wait long enough to be dead when it gets its turn. So record when each request arrived, and when it reaches the front, check: has it already waited longer than the client will? If so, drop it without doing the work. Better still, the client sends its deadline along (gRPC does this with every call), and every layer checks it.
+- **Which requests to drop.** Dropping the newest arrival (what you'll build) is simplest. Under sustained overload, serving the newest first and dropping the oldest can do better, since the oldest are the most likely to be dead already. Facebook's "Fail at Scale" (Go Deeper) describes switching their queues to last-in-first-out under overload, and using queue *delay* rather than length as the signal, an idea borrowed from the CoDel algorithm for network routers.
+- **Shed by priority.** A user's interactive request matters more than the backfill job. Real systems tag requests with a priority and shed the cheap ones first.
+
+### Backpressure: passing "slow down" upstream
+
+Shedding answers "no". Sometimes you'd rather answer "wait". Your batch job doesn't want its requests thrown away; it wants to send them as fast as the server can take them, and no faster. Making the producer slow down to match the consumer is <Term w="backpressure">When a slow consumer makes its producer slow down, instead of letting work pile up without bound between them. The "pressure" pushes back up the pipe.</Term>.
+
+You've already used it twice without the name. TCP does it automatically: every receiver advertises how much buffer space it has left (its <Term w="receive window">The number of bytes a TCP receiver says it can still accept. When it hits zero, the sender's kernel stops sending until the receiver reads some data.</Term>), and when the server stops reading from a socket, the client's `send()` eventually blocks. And last lesson's `asyncio.Semaphore(64)` was backpressure inside one program: the 65th task waits to start instead of piling onto the upstream.
+
+The general rule: **every queue in a pipeline should be bounded, and a full queue should push back on whoever feeds it**, either by blocking them (wait) or rejecting them (shed). Then a slow GPU at the bottom makes the reranker's queue fill, which makes it return `503`s or slow its reads, which makes the gateway's queue fill, which makes the batch job's semaphore hold more tasks waiting. Nothing grows without limit anywhere. Every component can say how much memory it will use in the worst case.
+
+<Figure n="003" title="BACKPRESSURE THROUGH A PIPELINE" caption="Work flows right. Each stage has a bounded queue in front of it, so when the GPU at the end slows down, the queues fill one by one from right to left and each stage pushes back on the one before it. The signal changes form at each hop (a semaphore that won't release, a 429 or 503, a TCP window that's full), but it's the same message: slow down.">
+<svg viewBox="0 0 640 210" role="img" aria-label="Four pipeline stages, each with a small bounded queue; forward arrows carry work, backward arrows carry slow-down signals">
+  <defs>
+    <marker id="rate-a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" style="fill:var(--ink)" /></marker>
+    <marker id="rate-a3b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="10" y="70" width="110" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="94" text-anchor="middle" class="strong">BATCH JOB</text>
+  <text x="65" y="110" text-anchor="middle">semaphore(64)</text>
+  <rect x="180" y="70" width="110" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="235" y="94" text-anchor="middle" class="strong">GATEWAY</text>
+  <text x="235" y="110" text-anchor="middle">rate limit</text>
+  <rect x="350" y="70" width="110" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="405" y="94" text-anchor="middle" class="strong">RERANKER</text>
+  <text x="405" y="110" text-anchor="middle">queue max 16</text>
+  <rect x="520" y="70" width="110" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="575" y="94" text-anchor="middle" class="strong">GPU</text>
+  <text x="575" y="110" text-anchor="middle">8 slots</text>
+  <rect x="150" y="84" width="8" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="160" y="84" width="8" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="320" y="84" width="8" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="330" y="84" width="8" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="490" y="84" width="8" height="28" class="fill-blue" />
+  <rect x="500" y="84" width="8" height="28" class="fill-blue" />
+  <line x1="120" y1="50" x2="176" y2="50" class="ink" stroke-width="1.2" marker-end="url(#rate-a3)" />
+  <line x1="290" y1="50" x2="346" y2="50" class="ink" stroke-width="1.2" marker-end="url(#rate-a3)" />
+  <line x1="460" y1="50" x2="516" y2="50" class="ink" stroke-width="1.2" marker-end="url(#rate-a3)" />
+  <text x="320" y="24" text-anchor="middle" class="strong">WORK →</text>
+  <line x1="516" y1="146" x2="464" y2="146" class="blue dash" stroke-width="1.2" marker-end="url(#rate-a3b)" />
+  <line x1="346" y1="146" x2="294" y2="146" class="blue dash" stroke-width="1.2" marker-end="url(#rate-a3b)" />
+  <line x1="176" y1="146" x2="124" y2="146" class="blue dash" stroke-width="1.2" marker-end="url(#rate-a3b)" />
+  <text x="490" y="168" text-anchor="middle" class="blue-t">SLOTS FULL</text>
+  <text x="320" y="168" text-anchor="middle" class="blue-t">503 / TCP FULL</text>
+  <text x="150" y="168" text-anchor="middle" class="blue-t">429 + RETRY-AFTER</text>
+  <text x="320" y="198" text-anchor="middle" class="strong">← SLOW DOWN</text>
+</svg>
+</Figure>
+
+The one thing that breaks backpressure is an unbounded buffer anywhere in the chain. It absorbs the pressure, so the signal never reaches the producer, and you're back to Figure 001 at that hop. Classic hiding places: `asyncio.Queue()` with no `maxsize`, a list you `append` to, a message broker with no retention limit, a thread pool executor's internal work queue (Python's `ThreadPoolExecutor` queue is unbounded), and an HTTP client pool that silently queues requests waiting for a free connection.
+
+### Rate limiting: who gets the capacity
+
+Shedding protects the server from *total* load. It doesn't care who the load comes from. If your backfill job sends 95% of the traffic, it gets 95% of the successes, and real users get the leftovers. To share capacity fairly you need to count per client: a <Term w="rate limiter">Something that counts requests (or tokens, or bytes) per client over time and rejects or delays the ones over that client's allowance.</Term>, keyed by API key, user, or IP address.
+
+The question is how to count "per second". There are four classic answers, and the differences matter.
+
+<Figure n="004" title="FOUR WAYS TO COUNT" caption="Fixed windows are cheap but let through twice the limit across a boundary. Sliding windows fix that by always looking back exactly one window from now. A token bucket saves up unused allowance to a cap and spends it on bursts. A leaky bucket used as a queue smooths any input into a constant output rate, at the cost of delay.">
+<svg viewBox="0 0 640 430" role="img" aria-label="Four rate limiting algorithms shown as timelines">
+  <text x="10" y="20" class="strong">1 · FIXED WINDOW</text>
+  <text x="630" y="20" text-anchor="end">LIMIT 5 PER WINDOW</text>
+  <line x1="40" y1="70" x2="620" y2="70" class="ink" stroke-width="1" />
+  <line x1="40" y1="34" x2="40" y2="78" class="ink dash" stroke-width="1" />
+  <line x1="330" y1="34" x2="330" y2="78" class="ink dash" stroke-width="1" />
+  <line x1="620" y1="34" x2="620" y2="78" class="ink dash" stroke-width="1" />
+  <text x="185" y="44" text-anchor="middle">WINDOW 1: COUNT 5 ✓</text>
+  <text x="475" y="44" text-anchor="middle">WINDOW 2: COUNT 5 ✓</text>
+  <rect x="290" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="298" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="306" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="314" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="322" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="336" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="344" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="352" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="360" y="54" width="3" height="16" class="fill-blue" />
+  <rect x="368" y="54" width="3" height="16" class="fill-blue" />
+  <text x="330" y="92" text-anchor="middle" class="blue-t">10 IN A BLINK: 2× THE LIMIT</text>
+
+  <text x="10" y="126" class="strong">2 · SLIDING WINDOW</text>
+  <text x="630" y="126" text-anchor="end">LOOK BACK ONE WINDOW FROM NOW</text>
+  <line x1="40" y1="176" x2="620" y2="176" class="ink" stroke-width="1" />
+  <rect x="290" y="146" width="290" height="36" class="fill-wash" stroke-width="1" style="opacity:0.6" />
+  <text x="580" y="196" text-anchor="middle" class="strong">NOW</text>
+  <line x1="580" y1="140" x2="580" y2="182" class="blue" stroke-width="1.5" />
+  <rect x="100" y="160" width="3" height="16" class="fill-blue" />
+  <rect x="190" y="160" width="3" height="16" class="fill-blue" />
+  <rect x="300" y="160" width="3" height="16" class="fill-blue" />
+  <rect x="320" y="160" width="3" height="16" class="fill-blue" />
+  <rect x="420" y="160" width="3" height="16" class="fill-blue" />
+  <rect x="500" y="160" width="3" height="16" class="fill-blue" />
+  <rect x="560" y="160" width="3" height="16" class="fill-blue" />
+  <text x="435" y="142" text-anchor="middle">5 INSIDE → NEXT ONE WAITS</text>
+  <text x="40" y="214">LOG: KEEP EVERY TIMESTAMP · COUNTER: PREV × OVERLAP + CURRENT</text>
+
+  <text x="10" y="248" class="strong">3 · TOKEN BUCKET</text>
+  <text x="630" y="248" text-anchor="end">REFILL r / S · HOLDS AT MOST b</text>
+  <path d="M40 262 L40 312 L90 312 L90 262" class="ink" stroke-width="1.2" />
+  <rect x="41" y="282" width="48" height="29" class="fill-blue" />
+  <text x="65" y="330" text-anchor="middle">TOKENS</text>
+  <line x1="120" y1="306" x2="620" y2="306" class="ink" stroke-width="1" />
+  <rect x="140" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="146" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="152" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="158" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="164" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="170" y="290" width="3" height="16" class="ink" stroke-width="1" />
+  <rect x="176" y="290" width="3" height="16" class="ink" stroke-width="1" />
+  <rect x="320" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="420" y="290" width="3" height="16" class="fill-blue" />
+  <rect x="520" y="290" width="3" height="16" class="fill-blue" />
+  <text x="160" y="282" text-anchor="middle">BURST: SPEND SAVINGS</text>
+  <text x="182" y="324">EMPTY → 429</text>
+  <text x="470" y="282" text-anchor="middle">STEADY: 1 TOKEN EACH</text>
+
+  <text x="10" y="358" class="strong">4 · LEAKY BUCKET (AS A QUEUE)</text>
+  <text x="630" y="358" text-anchor="end">DRAINS AT A CONSTANT RATE</text>
+  <line x1="40" y1="406" x2="230" y2="406" class="ink" stroke-width="1" />
+  <rect x="60" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="66" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="72" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="150" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="160" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="200" y="390" width="3" height="16" class="fill-blue" />
+  <path d="M250 376 L290 376 L280 412 L260 412 Z" class="fill-wash" stroke-width="1" />
+  <text x="270" y="426" text-anchor="middle">QUEUE</text>
+  <line x1="310" y1="406" x2="620" y2="406" class="ink" stroke-width="1" />
+  <rect x="330" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="380" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="430" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="480" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="530" y="390" width="3" height="16" class="fill-blue" />
+  <rect x="580" y="390" width="3" height="16" class="fill-blue" />
+  <text x="135" y="380" text-anchor="middle">LUMPY IN</text>
+  <text x="465" y="380" text-anchor="middle">EVEN OUT (LATER)</text>
+</svg>
+</Figure>
+
+**Fixed window.** Keep one counter per client per minute (key `user42:2026-10-15T14:07`). Increment on each request; reject if over the limit; let it expire after the minute. One integer of state, trivially cheap. The flaw is the boundary: a client can send the full limit in the last second of one window and the full limit again in the first second of the next, so 2× the limit in two seconds. And everyone's counters reset at the same instant, so clients that hit the limit all come back together at the top of the minute.
+
+**Sliding window log.** Keep the timestamp of every request in the last window. To decide, drop timestamps older than one window and count the rest. Exact, no boundary problem, but it stores one entry per request: a limit of 10,000 per minute means up to 10,000 timestamps per client.
+
+**Sliding window counter.** The cheap approximation of the log that Cloudflare popularised: keep this window's count and the previous window's count, and estimate "requests in the last minute" as `previous × (fraction of previous window still in view) + current`. Two integers, and in practice very close to exact, because it assumes the previous window's requests were spread evenly.
+
+**Token bucket.** The one you'll build. Imagine a bucket that holds at most `b` tokens and has `r` tokens dripping in every second. Each request takes one token. No token, no entry. Two knobs, and they mean two different things: the <Term w="refill rate">How many tokens per second drip into the bucket. This is the long-run average rate a client can sustain.</Term> sets the long-run average, and the <Term w="burst size">The bucket's capacity: the most tokens it can hold. How many requests a client can send back to back after being quiet for a while.</Term> sets how lumpy that average is allowed to be. A client that's been quiet can fire `b` requests instantly; a client that's been busy gets exactly `r` per second. Over any stretch of time `T`, it can never get more than `b + r × T` through.
+
+It needs only two numbers of state per client (tokens left and when you last updated), and you don't need a background timer dripping tokens in: when a request arrives, compute how many tokens *would* have dripped in since last time, add them (capped at `b`), and then decide. That's called lazy refill, and it's the whole trick. A variant called <Term w="GCRA">Generic Cell Rate Algorithm. A token bucket rewritten to store a single timestamp, the "theoretical arrival time" of the next allowed request, instead of a token count. From ATM networking; used by several Redis rate limiters.</Term> squeezes it down to one timestamp.
+
+**Leaky bucket.** Confusingly, this name means two things. As a *meter* (a bucket that fills with each request and leaks at a constant rate; reject if it would overflow) it's the token bucket upside down and behaves identically. As a *queue* (requests go in a queue that is drained at exactly `r` per second) it's different: it never rejects bursts within the queue's size, it *delays* them, and its output is perfectly smooth. Network routers use that to shape traffic. For an API it mostly means adding latency, which is why APIs use the meter.
+
+Play with the token bucket. Start with steady arrivals at 6 per second against a refill of 4. Then switch to bursts and shrink the burst size until it hurts.
+
+<Figure n="005" title="TOKEN BUCKET" caption="The line is how many tokens are in the bucket; it climbs at the refill rate to the burst cap and drops by one for every request let through. Filled ticks got in, hollow ones got a 429. Steady traffic above the refill rate drains the savings and then gets rejected at exactly the excess rate. Bursts are fine as long as the bucket is deeper than the burst, even when the average is well under the limit." wide>
+
+<RateBucket />
+
+</Figure>
+
+Notice the spike pattern: average about 5 per second, bucket refill 4, burst 10. The spike of 30 gets about 10 through and 20 rejected, even though over the whole 10 seconds the client barely exceeded the average. A token bucket doesn't care about your average; it cares about your *burst*. Hold that thought for the LLM section.
+
+| Algorithm | State per client | Allows bursts? | Weakness |
+| --- | --- | --- | --- |
+| Fixed window | 1 counter | Up to 2× at boundaries | Boundary spikes; synchronized resets |
+| Sliding log | 1 timestamp per request | No | Memory grows with the limit |
+| Sliding counter | 2 counters | Slightly | Approximate |
+| Token bucket | 2 numbers | Yes, up to `b`, on purpose | Two knobs to explain to users |
+| Leaky bucket (queue) | a queue | Absorbs them as delay | Adds latency; needs its own bound |
+
+### Saying no in HTTP
+
+When you reject, say so in a way machines understand. Two status codes do almost all the work:
+
+- `429 Too Many Requests` (defined in RFC 6585, 2012): *you* are over *your* limit. Other clients are fine. The fix is on the client side: send slower.
+- `503 Service Unavailable`: the *server* is overloaded or down, for everyone. Not your fault, but please back off too.
+
+Both can carry a `Retry-After` header: either a number of seconds or a date, telling the client the earliest time a retry has a chance. A token bucket knows this exactly: if you need one token and have 0.3, the wait is `(1 − 0.3) / r` seconds. Many APIs also send headers describing the limit and what's left of it, so a polite client can slow down *before* it gets rejected. There's an IETF draft to standardise these (`RateLimit` and `RateLimit-Policy` headers), but today every provider names them differently; you'll see Anthropic's below.
+
+### The client side: retries, backoff, and jitter
+
+Now the other half of the problem. The client got a `429` or `503`, or a timeout. Should it retry?
+
+Usually yes: most failures under load are transient, and a retry a little later will succeed. But retries are load. Here's the danger in one line of arithmetic. Your reranker is overloaded and failing. Every client retries 3 times (4 attempts total). The server now receives up to 4× its original load, from the same users, at exactly the moment it can least handle it. Worse, stack layers: if the batch job retries 3 times, the gateway retries each of those 3 times, and the reranker's client to the GPU service retries 3 times, then one user request can become 4 × 4 × 4 = 64 attempts at the bottom. That's a <Term w="retry storm">When retries add so much load to an already struggling service that it can't recover, even after the original problem has gone away.</Term>, and it's the most common way a small blip turns into a long outage.
+
+Three rules make retries safe.
+
+**1. Back off exponentially.** Don't retry immediately. Wait `base`, then `2 × base`, then `4 × base`, up to some cap: `delay = min(cap, base × 2^attempt)`. That's <Term w="exponential backoff">Waiting longer after each failed attempt, typically doubling each time, so a struggling service sees fewer and fewer retries the longer it struggles.</Term>. Each failure makes you more patient, so the harder the server is struggling, the less you add to it.
+
+**2. Add jitter.** Exponential backoff alone has a nasty failure mode. Suppose 400 clients all fail at the same moment (a server restarts, a cache expires, a deploy, a fixed-window limit resets). With pure backoff they all wait exactly 100 ms and retry *together*. The server, which could have handled them spread out, sees 400 at once again, admits 24, rejects the rest, and they all wait exactly 200 ms and come back together again. They stay in lockstep forever. The fix is <Term w="jitter">Randomness added to a retry delay so that clients that failed at the same moment don't retry at the same moment.</Term>: wait a *random* time between 0 and the backoff (`delay = random.uniform(0, min(cap, base × 2^attempt))`, called "full jitter" in Marc Brooker's classic AWS post). Ethernet solved the same problem this way in the 1970s: two machines whose packets collided each waited a random number of slots, doubling the range after every collision.
+
+**3. Bound the total.** A maximum number of attempts, a total deadline, and ideally a <Term w="retry budget">A cap on retries as a fraction of normal traffic, for example "retries may add at most 10% to my request rate". Once the budget is spent, failures fail immediately instead of being retried.</Term>: retries may add at most, say, 10% to your request rate. gRPC's retry throttling is exactly this, implemented as a token bucket on the client. And only retry the right things: `429`, `503`, `529`, timeouts and connection errors, yes. `400 Bad Request`, no: it will fail the same way every time.
+
+And obviously: if the server sent `Retry-After`, don't retry before it. (But add a little jitter on top. If the server tells 400 clients "retry after 1 second", you've just recreated the lockstep.)
+
+<Predict id="jitter">
+400 clients fire one request each at the same instant at the shedding server (capacity 80/s, queue of 16). Rejected clients retry with exponential backoff: base 100 ms, doubling, capped at 5 s. Perfect scheduling would finish everyone in 400 / 80 = 5 seconds. How long until the last client succeeds without jitter? With full jitter?
+<Fragment slot="answer">
+
+On my Mac: **about 52 seconds without jitter** (3,323 attempts) and **about 7.5 seconds with full jitter** (2,384 attempts). I ran each twice; the no-jitter run took 52-57 s both times, the jittered one 7.2-7.5 s.
+
+Without jitter, each wave of retries arrives within a few milliseconds. The server can admit about 24 at once (8 running plus 16 queued), so each wave gets roughly 24 through and the rest go back to waiting, in lockstep. Once the backoff hits the 5 s cap, there's one wave every 5 s, each admitting a couple of dozen, and the server sits idle between waves. Jitter spreads each wave over its whole backoff window, so the server stays busy and nearly everyone gets in within a few windows.
+
+</Fragment>
+</Predict>
+
+<Figure n="006" title="RETRY STORM, MEASURED" caption="Requests sent to the server per 250 ms, for 400 clients that all failed at once. Without jitter, retries arrive in synchronized spikes far above what the server can take (dashed line), with idle gaps between: 779 more attempts happened after the 15 seconds shown. With full jitter, the same backoff schedule turns into a smooth decaying stream and everyone is done in 7.5 seconds.">
+<svg viewBox="0 0 650 300" role="img" aria-label="Bar charts of retry attempts over time, with and without jitter">
+  <text x="40" y="32" class="strong">NO JITTER · TALL BARS CLIPPED</text>
+  <text x="630" y="32" text-anchor="end">3,323 ATTEMPTS · LAST DONE AT 51.9 s</text>
+  <line x1="40" y1="130" x2="630" y2="130" class="ink" stroke-width="1" />
+  <line x1="40" y1="115.0" x2="630" y2="115.0" class="blue dash" stroke-width="1" />
+  <rect x="40.5" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="50.3" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="70.0" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="99.5" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="109.3" y="101.5" width="8.8" height="28.5" class="fill-blue" />
+  <rect x="158.5" y="116.5" width="8.8" height="13.5" class="fill-blue" />
+  <rect x="168.3" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="286.3" y="68.5" width="8.8" height="61.5" class="fill-blue" />
+  <rect x="296.2" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="483.0" y="104.5" width="8.8" height="25.5" class="fill-blue" />
+  <rect x="492.8" y="40.0" width="8.8" height="90.0" class="fill-blue" />
+  <text x="40" y="172" class="strong">FULL JITTER</text>
+  <text x="630" y="172" text-anchor="end">2,384 ATTEMPTS · LAST DONE AT 7.5 s</text>
+  <line x1="40" y1="270" x2="630" y2="270" class="ink" stroke-width="1" />
+  <line x1="40" y1="255.0" x2="630" y2="255.0" class="blue dash" stroke-width="1" />
+  <rect x="40.5" y="180.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="50.3" y="180.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="60.2" y="180.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="70.0" y="180.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="79.8" y="180.0" width="8.8" height="90.0" class="fill-blue" />
+  <rect x="89.7" y="205.5" width="8.8" height="64.5" class="fill-blue" />
+  <rect x="99.5" y="228.8" width="8.8" height="41.2" class="fill-blue" />
+  <rect x="109.3" y="233.2" width="8.8" height="36.8" class="fill-blue" />
+  <rect x="119.2" y="229.5" width="8.8" height="40.5" class="fill-blue" />
+  <rect x="129.0" y="229.5" width="8.8" height="40.5" class="fill-blue" />
+  <rect x="138.8" y="245.2" width="8.8" height="24.8" class="fill-blue" />
+  <rect x="148.7" y="254.2" width="8.8" height="15.7" class="fill-blue" />
+  <rect x="158.5" y="256.5" width="8.8" height="13.5" class="fill-blue" />
+  <rect x="168.3" y="255.8" width="8.8" height="14.2" class="fill-blue" />
+  <rect x="178.2" y="258.0" width="8.8" height="12.0" class="fill-blue" />
+  <rect x="188.0" y="261.0" width="8.8" height="9.0" class="fill-blue" />
+  <rect x="197.8" y="258.0" width="8.8" height="12.0" class="fill-blue" />
+  <rect x="207.7" y="261.0" width="8.8" height="9.0" class="fill-blue" />
+  <rect x="217.5" y="259.5" width="8.8" height="10.5" class="fill-blue" />
+  <rect x="227.3" y="259.5" width="8.8" height="10.5" class="fill-blue" />
+  <rect x="237.2" y="265.5" width="8.8" height="4.5" class="fill-blue" />
+  <rect x="247.0" y="264.8" width="8.8" height="5.2" class="fill-blue" />
+  <rect x="266.7" y="269.2" width="8.8" height="0.8" class="fill-blue" />
+  <rect x="276.5" y="267.0" width="8.8" height="3.0" class="fill-blue" />
+  <rect x="286.3" y="268.5" width="8.8" height="1.5" class="fill-blue" />
+  <rect x="296.2" y="265.5" width="8.8" height="4.5" class="fill-blue" />
+  <rect x="306.0" y="268.5" width="8.8" height="1.5" class="fill-blue" />
+  <rect x="325.7" y="268.5" width="8.8" height="1.5" class="fill-blue" />
+  <text x="40.0" y="290" text-anchor="middle">0 s</text>
+  <text x="236.7" y="290" text-anchor="middle">5 s</text>
+  <text x="433.3" y="290" text-anchor="middle">10 s</text>
+  <text x="630.0" y="290" text-anchor="middle">15 s</text>
+
+  <text x="636" y="112" text-anchor="end" class="blue-t">SERVER CAN TAKE ~20</text>
+</svg>
+</Figure>
+
+### Circuit breakers
+
+Backoff is about being polite to a struggling service. A <Term w="circuit breaker">A wrapper around calls to a dependency that, after too many recent failures, stops calling it at all for a while and fails immediately instead, then lets a few test calls through to see if it has recovered.</Term> is for when it's clearly down. Named after the electrical kind (and popularised by Michael Nygard's book *Release It!*), it has three states:
+
+- **Closed** (normal): calls go through. Count recent failures.
+- **Open**: the failure rate passed a threshold (say, more than 50% of the last 20 calls). For the next 30 seconds, don't call at all. Fail instantly, or serve a fallback (a cached answer, a cheaper model, a "try again later").
+- **Half-open**: after the cool-down, let one or a few trial calls through. If they succeed, close the circuit. If they fail, open it again.
+
+Why bother, if you already back off? Two reasons. First, it takes your load off the dependency completely, which gives it room to recover. Second, and less obvious, it protects *you*. If every call to a dead service waits 10 seconds for a timeout, then every request handler that touches it holds a slot, a connection and memory for 10 seconds. By Little's Law, at 100 req/s that's 1,000 stuck requests, and now *your* service is the one in Figure 001. Failing fast keeps the failure from spreading upstream. It's backpressure for broken dependencies.
+
+### Distributed rate limiting
+
+Everything so far kept the token bucket in one Python dictionary in one process. Run `uvicorn --workers 4`, or four containers behind a load balancer, and each process has its own dictionary. A client limited to 70 per second now gets 70 per second *per process*, up to 280. You'll see this in Break It.
+
+The standard fix is to keep the buckets somewhere every process can reach: <Term w="Redis">An in-memory key-value server. Fast (a round trip on a local network is well under a millisecond), single-threaded per command, and it can run small Lua scripts atomically.</Term>. Each request does one round trip to Redis to take a token. The catch is the classic race: if two processes both read "tokens = 1", both decide yes, and both write "tokens = 0", you let two through. So the read-refill-decide-write must happen atomically, and the standard way is a small Lua script, which Redis runs as one indivisible step (the same idea as the lock around read-add-write in the [threads lesson](/lessons/processes-threads-gil/)). Use Redis's own clock inside the script (`redis.call('TIME')`) so that servers whose clocks disagree slightly don't fight.
+
+The design decisions that matter:
+
+- **Latency.** Every request now pays a network round trip. On the same machine or rack it's tens to hundreds of microseconds; across regions it's tens of milliseconds, which is why global limits are usually split into per-region budgets.
+- **What if Redis is down?** Fail open (let everything through, unprotected) or fail closed (reject everything, an outage you caused). Most systems fail open for rate limits, because a rate limiter that takes down the service it protects is worse than no limiter, and keep a crude local per-process limit as a backstop.
+- **Approximate is fine.** You can batch: each process takes 50 tokens from Redis at a time and hands them out locally. Fewer round trips, slightly less precise. Stripe's well-known post describes running several limiters (per-user request rate, concurrent requests, and a server-wide load shedder) backed by Redis.
+
+### LLM APIs: requests, tokens, and why your scripts get 429s
+
+Now back to your 20,000 relevance judgments. LLM providers limit you on more than one axis, because a request's cost depends almost entirely on how many tokens it has. Anthropic's documentation (as of October 2026; check the current page) limits each model class on three:
+
+- **RPM**, requests per minute.
+- **ITPM**, input tokens per minute. For most models only *uncached* input tokens count; tokens read from the prompt cache don't. So a long, repeated system prompt with caching on costs you almost nothing against this limit.
+- **OTPM**, output tokens per minute, counted as tokens are actually generated (not your `max_tokens`).
+
+OpenAI does the same thing with requests per minute and tokens per minute (its headers are named `x-ratelimit-limit-requests`, `x-ratelimit-remaining-tokens` and so on). And here's the sentence in Anthropic's docs that explains your waves: the API uses the token bucket algorithm, so capacity is continuously replenished rather than reset each minute, and a limit of 60 RPM "might be enforced as 1 request per second", so short bursts can trigger 429s even when you're under the per-minute number. You just played with this in Figure 005. A per-minute limit is a refill rate. The burst size is something much smaller, and `asyncio.gather` over 20,000 coroutines is the deepest burst there is.
+
+So your script's story, in this lesson's words:
+
+1. `gather` fires thousands of requests in the first second. The bucket's burst is tiny compared to that. Almost all get `429`.
+2. The SDK retries each one (both Anthropic's and OpenAI's Python SDKs default to 2 retries, with exponential backoff and honouring `retry-after`). Thousands of retries, closely synchronized because they all failed together. Most fail again.
+3. You added `sleep(1)` and retry: no exponential growth, no jitter. Every failed request comes back exactly one second later, together. That's Figure 006's top panel. The waves you saw were lockstep retries.
+4. Meanwhile, each request also spends input tokens. If your prompt is 3,000 tokens and uncached, ITPM is probably the limit you're actually hitting, not RPM.
+
+Anthropic's responses tell you where you stand on every call: `anthropic-ratelimit-requests-remaining`, `anthropic-ratelimit-input-tokens-remaining`, `anthropic-ratelimit-output-tokens-remaining`, each with matching `-limit` and `-reset` headers, plus `retry-after` on a `429`. Two other errors are worth knowing apart. `529 overloaded_error` means *Anthropic* is overloaded, for everyone: the `503` of this lesson, not your fault, back off and retry. And a `429` whose `error.details.error_code` is `enforced_spend_limit_reached` means you've hit your monthly spend cap; it carries no `retry-after`, and retrying won't help until the cap resets or you raise it. The docs also mention "acceleration limits": a sudden sharp ramp-up in an organisation's usage can be limited on its own, so ramp traffic up gradually.
+
+A well-behaved client is just this lesson pointed outward:
+
+- **Cap concurrency** with a semaphore (from last lesson). By Little's Law, concurrency ≈ rate × latency: if requests take 5 s and you're allowed 600 per minute (10/s), about 50 in flight is the most that can help.
+- **Pace yourself with your own token bucket**, client-side, for each limit you care about. For tokens, estimate each request's input tokens before sending (the `count_tokens` endpoint is exact; about 4 characters per token is a rough rule for English) and take that many from an ITPM bucket, *waiting* rather than failing when it's empty. This is the leaky-bucket-as-a-queue idea: you smooth your own traffic so the server never has to reject it.
+- **Read the headers** and slow down when `remaining` gets low, before you're rejected.
+- **On `429`, `529`, timeouts and connection errors, retry** with capped exponential backoff, full jitter, at least `retry-after`, and a bounded number of attempts. Don't retry `400`s.
+- **Use prompt caching** for the shared prefix. Cached input tokens mostly don't count against ITPM.
+- **If you don't need the answers now, don't use the real-time API.** The Message Batches API takes up to 100,000 requests per batch with its own separate limits, runs them asynchronously, and costs half as much. For 20,000 offline relevance judgments, that's the right tool. It's backpressure handled by someone else.
+
+## Build It
+
+Everything goes in `~/workbench/ratelimit/`. The server is the fake LLM from last lesson with a GPU-slot semaphore. You'll break it, then protect it three ways, then write the client.
+
+<Task id="t0" title="Set up: the unprotected server and a load generator" agent="ok">
+
+```bash
+mkdir -p ~/workbench/ratelimit && cd ~/workbench/ratelimit
+uv venv && source .venv/bin/activate
+uv pip install fastapi uvicorn httpx
+ulimit -n 8192   # macOS defaults to 256 open files; every connection is one
+```
+
+The server: 8 slots, 100 ms each, so 80 requests per second. It counts how many requests are waiting and how many it finished, so you can see what it does after clients leave.
+
+```python
+# server.py
+import asyncio, math, os, time
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
+
+SLOTS, WORK_S = 8, 0.1                 # capacity = 8 / 0.1 = 80 req/s
+MODE = os.environ.get("MODE", "none")  # none | shed | bucket
+app = FastAPI()
+gpu = asyncio.Semaphore(SLOTS)
+stats = {"finished": 0, "waiting": 0, "max_waiting": 0, "shed": 0, "limited": 0}
+
+@app.get("/stats")
+async def get_stats():
+    return stats
+
+@app.get("/generate")
+async def generate():
+    # Task 2 and 3 add checks here, before the request joins the line.
+    stats["waiting"] += 1
+    stats["max_waiting"] = max(stats["max_waiting"], stats["waiting"])
+    try:
+        await gpu.acquire()
+    finally:
+        stats["waiting"] -= 1
+    try:
+        await asyncio.sleep(WORK_S)    # pretend to run the model
+        stats["finished"] += 1
+    finally:
+        gpu.release()
+    return {"text": "hello"}
+```
+
+Run it with `uvicorn server:app --port 8000 --log-level warning --backlog 4096`. Restart it between experiments so leftover queued work doesn't leak into the next run.
+
+The load generator is **open-loop**: it sends at a fixed rate no matter how slowly the server answers, the way real users do (they don't wait for each other). A closed-loop generator ("N workers, each sends, waits, sends again") automatically slows down when the server does, which hides exactly the effect you're trying to see. The [p99 lesson](/lessons/tail-latency/) calls that mistake coordinated omission.
+
+```python
+# flood.py — usage: python flood.py <req_per_sec> [seconds]
+import asyncio, sys, time
+from collections import Counter
+import httpx
+
+URL = "http://127.0.0.1:8000"
+
+async def main(rate: float, seconds: float, timeout: float = 1.0):
+    # httpx's default pool caps you at 100 connections and queues the rest
+    # inside the client: an unbounded queue of its own. Remove the cap.
+    limits = httpx.Limits(max_connections=None, max_keepalive_connections=None)
+    results = []
+    async with httpx.AsyncClient(limits=limits, timeout=timeout) as c:
+        async def one():
+            t0 = time.perf_counter()
+            try:
+                r = await c.get(URL + "/generate")
+                results.append((r.status_code, time.perf_counter() - t0))
+            except httpx.TimeoutException:
+                results.append(("timeout", time.perf_counter() - t0))
+        tasks, start = [], time.perf_counter()
+        for i in range(int(rate * seconds)):
+            delay = start + i / rate - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            tasks.append(asyncio.create_task(one()))
+        await asyncio.gather(*tasks)
+        after = (await c.get(URL + "/stats")).json()
+    ok = sorted(lat for s, lat in results if s == 200)
+    p99 = ok[int(0.99 * (len(ok) - 1))] * 1000 if ok else float("nan")
+    print(f"offered {rate:.0f}/s  goodput {len(ok)/seconds:.1f}/s  "
+          f"{dict(Counter(s for s, _ in results))}  p99 {p99:.0f} ms  "
+          f"server: finished {after['finished']}, still waiting {after['waiting']}")
+
+asyncio.run(main(float(sys.argv[1]), float(sys.argv[2]) if len(sys.argv) > 2 else 10))
+```
+
+</Task>
+
+<Task id="t1" title="Flood it and record the collapse" agent="hands">
+
+Before running anything, fill in the Prediction column of the first table in Measure using Figure 002.
+
+Run `flood.py` at 60, 80, 100, 120, 160 and 240 requests per second, restarting the server each time. For each, record goodput, how many timed out, p99 of the successes, and the server's "still waiting" count when the flood ends.
+
+Then watch the dead work directly. After the 240/s run, poll the server for a few seconds:
+
+```bash
+for i in 1 2 3 4 5; do curl -s localhost:8000/stats; echo; sleep 1; done
+```
+
+Every client is gone. Is `finished` still going up? Write down how long the server keeps working for nobody.
+
+Finally, measure memory. `ps -o rss= -p $(pgrep -f "uvicorn server:app")` gives the server's resident memory in KB. Record it before the 240/s flood and right after. Divide the difference by the number of waiting requests: that's roughly what one queued request costs.
+
+</Task>
+
+<Task id="t2" title="Write a token bucket and return 429" agent="hands">
+
+Write the limiter in its own file. No background thread, no timer: refill lazily when a request arrives.
+
+```python
+# bucket.py
+import time
+
+class TokenBucket:
+    def __init__(self, rate: float, burst: float):
+        """rate: tokens added per second. burst: the most tokens the bucket can hold.
+        Start full."""
+        ...
+
+    def try_take(self, n: float = 1.0) -> tuple[bool, float]:
+        """Add the tokens that dripped in since the last call (capped at burst),
+        then take n if there are enough.
+        Returns (allowed, seconds until n tokens would be available)."""
+        ...
+
+class KeyedLimiter:
+    """One TokenBucket per client key, created on first use."""
+    def __init__(self, rate: float, burst: float): ...
+    def try_take(self, key: str, n: float = 1.0) -> tuple[bool, float]: ...
+```
+
+Hints:
+
+- Use `time.monotonic()`, never `time.time()`. Wall-clock time can jump backwards when the clock syncs, and your bucket would mint or destroy tokens.
+- The wait for `n` tokens when you have `t` is `(n - t) / rate`.
+- In `server.py`, when `MODE == "bucket"`, read the client key from a header (`request.headers.get("x-api-key", "anon")`; add `request: Request` to the handler's parameters, with `from fastapi import Request`). If the bucket says no, return `JSONResponse(..., status_code=429, headers={"Retry-After": str(math.ceil(wait))})` and bump `stats["limited"]`.
+- Is this safe without a lock? In asyncio, yes, as long as there's no `await` between reading and writing the bucket: nothing else can run in between on one event loop. With threads, you'd need a lock (exactly the race from the threads lesson).
+
+Test it first with a tiny script: `TokenBucket(rate=5, burst=10)`, call `try_take()` 15 times in a tight loop and print the results (you should get 10 yes, then 5 no, each with a wait of about 0.2 s; why are the waits all the same?). Then sleep 1 s and try again: how many tokens came back? Then run `flood.py` against `MODE=bucket` with `rate=70, burst=20`.
+
+</Task>
+
+<Task id="t3" title="Add a bounded queue that sheds, and drop dead work" agent="hands">
+
+Two changes to `generate()` when `MODE` is `shed` or `bucket`.
+
+**Shed at the door.** Before incrementing `waiting`, check it. If `stats["waiting"] >= MAX_WAITING`, return `503` with `Retry-After: 1` immediately and bump `stats["shed"]`. Start with `MAX_WAITING = 16`.
+
+**Drop dead work at the front.** Record `arrived = time.monotonic()` at the top of the handler. Right after `await gpu.acquire()`, if the request has waited longer than `DEADLINE_S` (say 0.8 s, a bit less than the client's timeout), release the slot and return `503` without doing the 100 ms of work.
+
+```python
+MAX_WAITING = int(os.environ.get("MAX_WAITING", "16"))
+DEADLINE_S = 0.8
+
+@app.get("/generate")
+async def generate(request: Request):
+    arrived = time.monotonic()
+    # 1. bucket check (MODE == "bucket")      -> 429 + Retry-After
+    # 2. queue-length check (shed or bucket)  -> 503 + Retry-After
+    # 3. wait for a slot, as before
+    # 4. deadline check after acquiring       -> release, 503
+    # 5. do the work, release, return
+    ...
+```
+
+Rerun the flood sweep with `MODE=shed`. Then try `MAX_WAITING=1000` with the deadline check off, and again with it on. Which one protects goodput, the queue limit or the deadline? (You need at least one. Think about why.)
+
+</Task>
+
+<Task id="t4" title="A client that backs off with jitter, then a retry storm" agent="hands">
+
+Write the retry logic as a reusable function.
+
+```python
+# retry.py
+import asyncio, random
+import httpx
+
+RETRYABLE = {429, 500, 502, 503, 504, 529}
+
+def backoff_delay(attempt: int, base: float, cap: float, jitter: bool) -> float:
+    """attempt 0 -> up to base, 1 -> up to 2*base, ... capped at cap.
+    With jitter: a uniform random delay in [0, that]. Without: exactly that."""
+    ...
+
+async def call_with_retries(c: httpx.AsyncClient, url: str, *, max_tries: int = 12,
+                            base: float = 0.1, cap: float = 5.0, jitter: bool = True,
+                            honor_retry_after: bool = True, on_attempt=None) -> httpx.Response:
+    """GET url. On a retryable status, timeout or connection error, sleep and retry.
+    If the response has Retry-After (seconds) and honor_retry_after, sleep at least
+    that long, plus a little jitter. Call on_attempt() just before each attempt
+    (the harness uses it to record when attempts happen). Raise after max_tries."""
+    ...
+```
+
+Now the harness. It warms up one connection per client first, because macOS's listen queue is capped at 128 pending connections (`sysctl kern.ipc.somaxconn`) whatever `--backlog` says; 400 brand-new connections at once would get dropped by the kernel and retried a second later by TCP itself, which muddies the experiment. (The kernel shedding load at the door: same idea, one layer down.)
+
+```python
+# storm.py — usage: python storm.py 400 jitter|nojitter
+import asyncio, sys, time
+from collections import Counter
+import httpx
+from retry import call_with_retries
+
+async def client(i, go, sends, jitter):
+    async with httpx.AsyncClient(timeout=30) as c:
+        await asyncio.sleep(i * 0.003)
+        await c.get("http://127.0.0.1:8000/stats")   # open the connection early
+        await go.wait()
+        await call_with_retries(c, "http://127.0.0.1:8000/generate", jitter=jitter,
+                                honor_retry_after=False,
+                                on_attempt=lambda: sends.append(time.perf_counter() - go.t0))
+        return time.perf_counter() - go.t0
+
+async def main(n, jitter):
+    go, sends = asyncio.Event(), []
+    tasks = [asyncio.create_task(client(i, go, sends, jitter)) for i in range(n)]
+    await asyncio.sleep(n * 0.003 + 1)
+    go.t0 = time.perf_counter(); go.set()           # everyone fires at once
+    done = await asyncio.gather(*tasks)
+    per = Counter(int(s * 4) for s in sends)
+    print(f"attempts {len(sends)}  last done {max(done):.1f}s  ideal {n * 0.1 / 8:.1f}s")
+    print("sends per 250ms:", [per.get(k, 0) for k in range(int(max(sends) * 4) + 1)][:60])
+
+asyncio.run(main(int(sys.argv[1]), sys.argv[2] == "jitter"))
+```
+
+Run it against `MODE=shed` with and without jitter. Then flip `honor_retry_after=True`. The server says `Retry-After: 1` to everyone. Predict first: what does a fixed `Retry-After` do to 400 synchronized clients if you don't add jitter on top?
+
+</Task>
+
+<Task id="t5" title="A well-behaved LLM client" agent="review">
+
+Build the client you should have used for the 20,000 judgments. Shape:
+
+```python
+# llm_client.py
+import asyncio, time
+
+class AsyncTokenBucket:
+    """Like TokenBucket, but take(n) waits until n tokens are available instead of
+    refusing. If n > burst, treat it as burst (otherwise it would wait forever)."""
+    def __init__(self, rate: float, burst: float): ...
+    async def take(self, n: float) -> None: ...
+
+class PoliteClient:
+    def __init__(self, sdk_client, *, max_in_flight: int, rpm: int, itpm: int):
+        self.sem = asyncio.Semaphore(max_in_flight)
+        self.requests = AsyncTokenBucket(rate=rpm / 60, burst=...)   # small burst!
+        self.input_tokens = AsyncTokenBucket(rate=itpm / 60, burst=...)
+
+    async def create(self, **params):
+        """Estimate input tokens, wait on both buckets, then call under the semaphore.
+        Retry 429 / 529 / timeouts with full-jitter backoff, at least retry-after.
+        Log anthropic-ratelimit-*-remaining from the response headers."""
+        ...
+```
+
+Notes:
+
+- Build it against your local server first. Have `MODE=bucket` stand in for the provider, and make your client's limits slightly *below* the server's: you should see zero 429s. That's the goal: a client that never gets rejected because it never sends faster than it's allowed.
+- The Anthropic and OpenAI SDKs already retry (default `max_retries=2`). Decide whether to keep that and add pacing on top, or set `max_retries=0` and own the retries yourself. Don't stack both blindly, or you've built the 4 × 3 retry multiplication from the Idea section. To read response headers, the Python SDKs expose a raw-response variant of each call (`with_raw_response`); check the SDK docs for the exact usage in your version.
+- Then, if you want, point it at the real API for 50 small requests (`max_tokens` around 50, a short prompt; it costs cents) and print the `anthropic-ratelimit-*` headers as they change. Your actual limits are on the Console's Limits page. Use the model your team uses; the lesson doesn't depend on which.
+
+Have an agent review it for: unbounded queues hiding anywhere, retries that aren't jittered, retrying non-retryable errors, and a burst size that defeats the point.
+
+</Task>
+
+<Task id="t6" title="Optional: a shared limiter in Redis" agent="explain">
+
+`brew install redis`, run `redis-server`, and `uv pip install redis`. Move the bucket into Redis so that `uvicorn --workers 4` shares one limit. The core is a Lua script that does the refill-decide-write in one atomic step:
+
+```lua
+-- KEYS[1] = bucket key; ARGV[1] = rate/s, ARGV[2] = burst, ARGV[3] = tokens wanted
+local t = redis.call('TIME')                    -- {seconds, microseconds}, Redis's clock
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
+local rate, burst, n = tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
+local b = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
+local tokens = tonumber(b[1]) or burst
+local ts = tonumber(b[2]) or now
+-- your part: refill (capped at burst), decide, subtract if allowed,
+-- HSET the new tokens and ts, set an expiry so idle keys disappear,
+-- and return {allowed (1 or 0), wait in milliseconds}
+```
+
+Load it once with redis-py's `register_script` (check the redis-py docs for the async client's spelling) and call it per request. An agent can explain Lua or redis-py errors, but write the script yourself. Then decide, and write down: if Redis is unreachable, does your server fail open or closed?
+
+</Task>
+
+<DoneWhen>
+
+- You have numbers for the unprotected server at six load levels, and you watched it finish work for clients who had already left.
+- Your token bucket returns `429` with a correct `Retry-After`, and goodput under a flood stays near the configured rate.
+- With shedding on, goodput stays near 80/s at 240 and 480 offered, and successful p99 stays bounded.
+- You've seen the retry storm with and without jitter and can explain the difference in one sentence.
+- You can say how your LLM client decides when to send, and why it never gets a 429 from your local server.
+
+</DoneWhen>
+
+## Measure
+
+**Collapse vs shedding.** Fill this in (restart the server between rows):
+
+| Offered (req/s) | Prediction (goodput) | Unprotected goodput | Timeouts | Still waiting at end | Shed goodput | Shed p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 60 | | | | | | |
+| 80 | | | | | | |
+| 100 | | | | | | |
+| 120 | | | | | | |
+| 160 | | | | | | |
+| 240 | | | | | | |
+| 480 | | | | | | |
+
+For reference, my runs on an M-series MacBook (Python 3.14, FastAPI 0.143, uvicorn 0.54; 10-second floods, 1-second client timeout). Yours will differ in the details, not the shape.
+
+| Offered | Unprotected goodput | Timeouts | Shed goodput (queue 16) | Shed p99 |
+| --- | --- | --- | --- | --- |
+| 60 | 60.0 | 0 | 60.0 | 105 ms |
+| 80 | 80.0 | 0 | not run | not run |
+| 100 | 35.2 | 648 of 1,000 | 81.0 | 303 ms |
+| 120 | 21.6 | 984 of 1,200 | 81.0 | 306 ms |
+| 160 | 14.4 | 1,456 of 1,600 | not run | not run |
+| 240 | 11.2 | 2,288 of 2,400 | 81.6 | 303 ms |
+| 480 | not run | not run | 81.6 | 302 ms |
+
+What to notice:
+
+**The unprotected numbers match a one-line model.** Only requests arriving in the first `C × (T − S) / (λ − C)` seconds succeed (C = 80, timeout T = 1 s, work S = 0.1 s, λ = offered). At 120/s that's 1.8 s, so 216 successes, and I measured exactly 216. At 160/s: 0.9 s, so 144, measured 144. When a model predicts a measurement this precisely, you understand the mechanism. That model is what Figure 002 draws.
+
+**The p99 of the successes looks fine** in the collapsed runs (under 1 s), because only requests that beat the timeout count as successes. A dashboard that shows only successful-request latency will look reasonable while 90% of requests fail. Always graph errors and timeouts next to latency.
+
+**Dead work.** At 240/s, about 1,500 requests were still queued when the flood ended. At 80 per second, that's almost 20 more seconds of the server working for nobody. This is the "stays broken after the backfill stops" from The Problem. Memory grew by about 19 MB for those 1,500, roughly 10-30 KB per waiting request across my runs. Scale that: a real service at 10,000 req/s, overloaded by 2× for one minute, queues 600,000 requests. At 20 KB each that's 12 GB, and now it's an out-of-memory crash too.
+
+**Shedding pins goodput at capacity** (81 rather than 80 because the requests still queued when sending stops finish just afterwards and get counted), and p99 at 100 ms of work plus 200 ms of maximum queue wait.
+
+**Token bucket** (`rate=70, burst=20`, plus shedding): at 100/s offered I got 719 successes in 10 s, and at 240/s, 717. The bound is `burst + rate × time = 20 + 70 × 10 = 720`. The limiter is the tightest constraint, and it's exact.
+
+**Retry storm.** Fill in:
+
+| Clients | Jitter | Retry-After honoured | Attempts | Last success | Prediction |
+| --- | --- | --- | --- | --- | --- |
+| 400 | no | no | | | |
+| 400 | full | no | | | |
+| 400 | no | yes | | | |
+| 400 | full | yes | | | |
+
+Mine, without Retry-After: no jitter 3,323-3,516 attempts and 52-57 s; full jitter about 2,370 attempts and 7.2-7.5 s, against an ideal of 5 s. I didn't measure the Retry-After rows; work out what should happen before you run them.
+
+## Break It
+
+**1. Four workers, four limits.** Run the `bucket` server with `uvicorn server:app --workers 4` and flood it at 400/s. Each worker process has its own `KeyedLimiter` dictionary, and the kernel spreads connections among them, so your 70/s limit becomes roughly 280/s, while each process also has its own 8-slot "GPU". (Measure it; it should be close to 4×.) This is the per-process problem from Distributed rate limiting, and the reason task 6 exists. In production the same thing happens with replicas behind a load balancer.
+
+**2. The retry amplifier.** Change `flood.py` so that on a timeout or `503` it immediately retries, up to 3 times, with no backoff. Run it at 100/s against the unprotected server and print the attempts per second the server actually receives. You offered 1.25× capacity; the server sees a lot more, and it never recovers until the flood stops. Then add backoff with jitter and a retry budget (retries at most 10% of first attempts) and run again.
+
+**3. A bounded queue that's too big.** Set `MAX_WAITING=2000` with the deadline check off. Technically bounded. Flood at 240/s: you're back to collapse, because 2,000 requests is 25 seconds of work and every client times out long before then. A bound only helps if the work inside it can finish in time. That's why you size queues in seconds.
+
+**4. Ignore the client's timeout.** Set the client timeout in `flood.py` to 30 s and rerun the unprotected 120/s flood. Now every request "succeeds", and the script's goodput number looks perfect. Look at p99: about 5 seconds, and it would keep growing for as long as the flood lasted. The overload didn't go away; every user is just waiting longer and longer. Real users don't wait 30 s, they hit refresh, which is a retry with no backoff. Timeouts aren't the problem, they're what makes the problem visible.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. A service normally handles 300 req/s. A batch job pushes it to 600. Why does it end up serving zero useful requests instead of just getting slower?</summary>
+
+Because more arrives than it can finish, so the excess waits in a queue that grows by 300 requests every second. Wait time is queue length divided by drain rate, so latency grows without limit for as long as the overload lasts. Once the wait passes the clients' timeout, every client gives up before its turn, but the server doesn't know and does the work anyway, sending answers to closed connections. Throughput stays at 300/s while goodput falls to zero. And retries from those timed-out clients add more load. Even when the batch job stops, the server has to chew through the backlog of dead requests before it serves anyone again.
+
+</details>
+
+<details>
+<summary>2. What's the difference between load shedding, backpressure and rate limiting?</summary>
+
+Load shedding protects the server from total overload: when it's past capacity, reject the excess quickly (a cheap 503) so the work it does accept finishes in time. Backpressure makes the producer slow down to match the consumer, by blocking it or rejecting it, using bounded queues at every stage so nothing piles up without limit. Rate limiting decides how capacity is shared: it counts per client (API key, user) and rejects or delays each client's requests beyond its allowance, so one heavy client can't starve the rest. A real system uses all three: per-client limits at the edge, bounded queues with shedding inside, and well-behaved clients that respond to the pushback.
+
+</details>
+
+<details>
+<summary>3. Explain a token bucket. Why does a "600 RPM" limit still reject your script that sends 500 requests in its first second?</summary>
+
+A bucket holds up to `b` tokens and refills at `r` per second. Each request takes a token; with none left it's rejected (and the server can say exactly how long until the next token). The refill rate is the sustainable average; the bucket size is how big a burst you can send after being idle. A "600 RPM" limit is a refill rate of 10 per second, but the burst size can be much smaller than 600: Anthropic's docs say a per-minute limit may be enforced over shorter intervals. So 500 at once empties the bucket immediately and the rest are rejected, even though you'd be under 600 for the minute. The fix is to pace your own sends with a client-side bucket and a concurrency cap, not to fire everything and rely on retries.
+
+</details>
+
+<details>
+<summary>4. Why exponential backoff, and why is jitter necessary on top of it?</summary>
+
+Backoff makes each failed client wait longer after every failure, so a struggling server receives less and less retry load the longer it struggles, instead of being hammered by immediate retries (which can multiply load several times over, and multiply again across layers). Jitter fixes synchronization: clients that failed at the same moment would otherwise retry at exactly the same moments, arriving in spikes the server can't absorb with idle gaps between. A random delay within the backoff window spreads them out. In my test, 400 synchronized clients took 52 s to all succeed without jitter and 7.5 s with full jitter, against an ideal of 5 s. Even a server's `Retry-After` should get jitter added, or it re-synchronizes everyone.
+
+</details>
+
+<details>
+<summary>5. Your API runs on 20 replicas and you need a per-customer limit of 1,000 req/s. How do you build it, and how does it scale?</summary>
+
+A per-process limiter would let each customer have 1,000 per replica, 20,000 total, so the buckets need to be shared. Put them in Redis, keyed by customer, with the refill-decide-write in one atomic Lua script using Redis's clock. Each request costs one Redis round trip (sub-millisecond in the same datacenter). At high volume, cut round trips by having each replica take tokens in batches (say 50 at a time) and hand them out locally, trading a bit of precision. One Redis instance handles very roughly 100,000 simple operations per second (measure yours with `redis-benchmark`), so shard keys across several instances when traffic grows past that; one customer's key always lands on the same shard. Across regions, give each region its own share of the budget rather than paying cross-region latency per request. Decide failure mode up front: usually fail open with a crude local limit as backstop, because a limiter outage shouldn't become a full outage.
+
+</details>
+
+## Go Deeper
+
+- **Van Jacobson and Michael J. Karels, "Congestion Avoidance and Control"** (SIGCOMM 1988). The fix for the 1986 collapse: slow start, backing off on loss, exponential retransmit backoff. Short, readable, and the origin of every idea here.
+- **Marc Brooker, "Exponential Backoff And Jitter"** (AWS Architecture Blog, 2015) and his Amazon Builders' Library article **"Timeouts, retries, and backoff with jitter"**. The simulations behind "full jitter", and the clearest writing on retries anywhere.
+- **Google, _Site Reliability Engineering_, chapters "Handling Overload" and "Addressing Cascading Failures"** (free at [sre.google/books](https://sre.google/books/)). Per-client limits, retry budgets, criticality, deadline propagation, and how overload spreads between services.
+- **Ben Maurer, "Fail at Scale"** (ACM Queue, 2015). How Facebook keeps queues short: controlled delay, adaptive LIFO, and concurrency limits.
+- **Paul Tarjan, "Scaling your API with rate limiters"** (Stripe blog, 2017). The four limiters Stripe runs, including a load shedder, with Redis-based token buckets.
+- **Michael Nygard, _Release It!_** (Pragmatic Bookshelf). Where the circuit breaker, bulkhead and timeout patterns were named, with war stories. Martin Fowler's short "CircuitBreaker" article is a good ten-minute version.
+- **Anthropic, "Rate limits"** in the Claude API docs ([platform.claude.com/docs/en/api/rate-limits](https://platform.claude.com/docs/en/api/rate-limits)). RPM, ITPM, OTPM, cache-aware limits, every response header. Read alongside the "Errors" page for 429 vs 529.
+- **RFC 6585** (defines `429 Too Many Requests`) and **RFC 9110, HTTP Semantics** (`503` and `Retry-After`). Short and precise.
+
+## Connections
+
+This lesson builds on [Waiting vs working](/lessons/waiting-vs-working/): the semaphore you used there to protect someone else's API is the same bounded-concurrency idea, and Little's Law is how you size queues and concurrency here. The atomic Lua script is the [threads lesson](/lessons/processes-threads-gil/)'s read-add-write race, moved to a network server.
+
+It sets up [p99 and load testing](/lessons/tail-latency/), where the hockey stick of latency against load gets measured properly, and where open-loop load generation and coordinated omission matter even more. [Load balancers and state](/lessons/load-balancing/) is where the per-replica limiter problem comes from, and [Queues and logs](/lessons/queues/) is what you reach for when work really should wait (a durable queue with a bounded consumer, which is backpressure that survives a restart). On the ML side, [Batching](/lessons/batching/) is what an inference server does with the queue in front of its GPU instead of shedding it.

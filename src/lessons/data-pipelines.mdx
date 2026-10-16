@@ -1,0 +1,720 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import DataFunnel from '../components/figures/DataFunnel.astro';
+import DataMinHash from '../components/figures/DataMinHash.astro';
+import DataLSHCurve from '../components/figures/DataLSHCurve.astro';
+import DataPacking from '../components/figures/DataPacking.astro';
+
+## Today
+
+- Turn a raw Wikipedia dump into fixed-length token shards a trainer can read at full speed, and say what every stage in between is for.
+- Explain the quality filters real datasets use (C4, Gopher, FineWeb), both the hand-written rules and the model-based kind, and why each one exists.
+- Explain MinHash and LSH in plain words: how you find near-duplicate documents among millions without comparing every pair.
+- Decontaminate a training set against an eval set, pack documents into sequences, and pick an attention mask, a shuffle and a file format on purpose.
+- Measure where the time goes in a data pipeline, and measure what cleaning buys you: two tiny-LM runs, same token budget, raw vs clean.
+
+Prerequisites: [Threads, processes and the GIL](/lessons/processes-threads-gil/) (every stage here is CPU-bound Python, so you will be using worker processes), and ideally [Tokenizers](/lessons/tokenizers/) and [Train a small LM](/lessons/tiny-lm/), since the last task trains two of them. Rough time: one evening for the pipeline, one more for the two training runs.
+
+## The Problem
+
+You trained your [tiny LM](/lessons/tiny-lm/) on Wikipedia. You sample from it, and it writes this:
+
+```text
+The city is in the north of the country. {{cite web|url=http://www.|title=Population
+|accessdate=2009}} [[Category:Cities in
+```
+
+The model learned exactly what you showed it. You showed it Wikipedia's *source code*: <Term w="wikitext">The markup language Wikipedia articles are written in. Double square brackets make links, double curly braces call templates, and HTML-like tags hold references and tables.</Term>, with its citation templates, its category tags and its tables. A good chunk of your token budget went into teaching a 30M-parameter model to close curly braces.
+
+So you strip the markup and train again. Now it's better, but some samples are suspiciously fluent: whole sentences, word for word, about French villages. Simple English Wikipedia has thousands of near-identical stubs ("Omiécourt is a former commune. It is in Hauts-de-France in the Somme department in north France."), and the model has memorised the template. And your validation loss looks great, partly because some of your "held-out" articles share whole paragraphs with articles in the training set.
+
+None of this is a modelling problem. You could swap in a fancier architecture and every one of these would still be there. The Anthropic research engineer posting that sent you here phrases the job as "making Wikipedia data fit in a format a model can easily consume", and adds that a lot of training "is about understanding the data". This lesson is that job, end to end, on a real dump, with a stopwatch on every stage.
+
+<Origin year="2019-2024" title="From 'scrape the web' to 'the data is the model'">
+
+GPT-2 (2019) was trained on WebText: pages linked from Reddit posts with at least 3 karma, a crude but effective quality filter (a human found it worth sharing). Then Google's T5 paper (Raffel et al., released 2019, published 2020) did something unusual: it published its cleaning rules. **C4**, the "Colossal Clean Crawled Corpus", took one month of Common Crawl and kept only lines ending in punctuation, dropped pages with fewer than five sentences, pages containing "lorem ipsum" or a curly brace, and pages with a word from a bad-words list, and deduplicated repeated three-sentence spans. The paper showed that the cleaned data beat the unfiltered crawl.
+
+**The Pile** (EleutherAI, 2020) went the other way: 825 GiB from 22 hand-picked sources (PubMed, arXiv, GitHub, books, Wikipedia...), on the theory that diverse, curated sources beat the raw web. DeepMind's **Gopher** paper (2021) published a set of simple quality rules for web text that everyone still copies. **RefinedWeb** (2023, built for the Falcon models) argued that web data alone, filtered and deduplicated hard enough, could match curated mixtures. And **FineWeb** (Penedo et al., 2024) from Hugging Face released 15 trillion tokens plus, unusually, the ablations behind every pipeline decision, and showed that a small classifier trained to score "educational value" (FineWeb-Edu) could beat much larger datasets on knowledge benchmarks.
+
+The arc of those five years: model architectures converged, and the datasets became the thing that separated good models from bad ones.
+
+</Origin>
+
+## The Idea
+
+### Garbage in, confidently out
+
+A language model is a machine that learns to predict the next token of whatever you feed it. That sounds obvious, but follow it through. It doesn't learn "English" or "facts". It learns *the distribution of your training data*. Every quirk of that data becomes something the model spends capacity predicting:
+
+- Markup it never needs to write.
+- Boilerplate (cookie banners, navigation menus, "This article is a stub. You can help Wikipedia by expanding it.") that it will happily reproduce.
+- Duplicates, which act like a hidden learning-rate multiplier on whatever got duplicated: a document that appears 1,000 times gets 1,000 times the gradient, and the model memorises it instead of generalising.
+- Your test questions, if they leaked in, which make your evals lie.
+
+Three things make data the lever. **Capacity is finite**: a small model can only learn so much, so every parameter spent on curly braces is one not spent on grammar. **Tokens are the budget**: at a fixed compute budget you train on a fixed number of tokens, so cleaning means each token teaches more. And **the effects are large**: in the FineWeb ablations, swapping the data (same model, same tokens) moves benchmark scores as much as a big jump in model size.
+
+### The shape of a pipeline
+
+Every serious text pipeline is roughly the same assembly line. Stages near the top decide *what counts as text*. Stages in the middle decide *what to keep*. Stages at the bottom decide *how to store it so a GPU never waits*.
+
+<Figure n="001" title="THE ASSEMBLY LINE" caption="Every stage either changes documents (extract, normalize, scrub), throws documents away (filters, dedup, decontam), or changes the format (tokenize, pack, shard). The order matters: cheap filters first, so expensive ones see fewer documents.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Pipeline stages from acquisition to training shards">
+  <text x="10" y="20" class="blue-t">1 · WHAT COUNTS AS TEXT</text>
+  <rect x="10" y="30" width="110" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="52" text-anchor="middle" class="strong">ACQUIRE</text>
+  <text x="65" y="68" text-anchor="middle">xml.bz2 dump</text>
+  <rect x="140" y="30" width="110" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="195" y="52" text-anchor="middle" class="strong">EXTRACT</text>
+  <text x="195" y="68" text-anchor="middle">wikitext → text</text>
+  <rect x="270" y="30" width="110" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="325" y="52" text-anchor="middle" class="strong">NORMALIZE</text>
+  <text x="325" y="68" text-anchor="middle">NFC, spaces</text>
+  <line x1="120" y1="54" x2="138" y2="54" class="ink" stroke-width="1.2" />
+  <line x1="250" y1="54" x2="268" y2="54" class="ink" stroke-width="1.2" />
+  <text x="10" y="112" class="blue-t">2 · WHAT TO KEEP</text>
+  <rect x="10" y="122" width="96" height="48" class="fill-wash" stroke-width="1.2" />
+  <text x="58" y="144" text-anchor="middle" class="strong">LANG ID</text>
+  <text x="58" y="160" text-anchor="middle">english?</text>
+  <rect x="116" y="122" width="96" height="48" class="fill-wash" stroke-width="1.2" />
+  <text x="164" y="144" text-anchor="middle" class="strong">QUALITY</text>
+  <text x="164" y="160" text-anchor="middle">rules, model</text>
+  <rect x="222" y="122" width="96" height="48" class="fill-wash" stroke-width="1.2" />
+  <text x="270" y="144" text-anchor="middle" class="strong">DEDUP</text>
+  <text x="270" y="160" text-anchor="middle">exact, near</text>
+  <rect x="328" y="122" width="96" height="48" class="fill-wash" stroke-width="1.2" />
+  <text x="376" y="144" text-anchor="middle" class="strong">PII</text>
+  <text x="376" y="160" text-anchor="middle">scrub emails</text>
+  <rect x="434" y="122" width="96" height="48" class="fill-wash" stroke-width="1.2" />
+  <text x="482" y="144" text-anchor="middle" class="strong">DECONTAM</text>
+  <text x="482" y="160" text-anchor="middle">vs eval set</text>
+  <line x1="106" y1="146" x2="114" y2="146" class="ink" stroke-width="1.2" />
+  <line x1="212" y1="146" x2="220" y2="146" class="ink" stroke-width="1.2" />
+  <line x1="318" y1="146" x2="326" y2="146" class="ink" stroke-width="1.2" />
+  <line x1="424" y1="146" x2="432" y2="146" class="ink" stroke-width="1.2" />
+  <text x="10" y="204" class="blue-t">3 · HOW TO STORE IT</text>
+  <rect x="10" y="214" width="110" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="236" text-anchor="middle" class="strong">TOKENIZE</text>
+  <text x="65" y="252" text-anchor="middle">in parallel</text>
+  <rect x="140" y="214" width="110" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="195" y="236" text-anchor="middle" class="strong">PACK</text>
+  <text x="195" y="252" text-anchor="middle">fixed-length rows</text>
+  <rect x="270" y="214" width="110" height="48" class="fill-paper" stroke-width="1.2" />
+  <text x="325" y="236" text-anchor="middle" class="strong">SHARD</text>
+  <text x="325" y="252" text-anchor="middle">+ shuffle</text>
+  <rect x="400" y="214" width="130" height="48" class="fill-blue" />
+  <text x="465" y="236" text-anchor="middle" class="strong" style="fill:var(--paper)">TRAINER</text>
+  <text x="465" y="252" text-anchor="middle" style="fill:var(--paper)">reads uint16 rows</text>
+  <line x1="120" y1="238" x2="138" y2="238" class="ink" stroke-width="1.2" />
+  <line x1="250" y1="238" x2="268" y2="238" class="ink" stroke-width="1.2" />
+  <line x1="380" y1="238" x2="398" y2="238" class="ink" stroke-width="1.2" />
+  <path d="M380 54 L560 54 L560 100 L58 100 L58 120" class="ink dash" stroke-width="1" fill="none" />
+  <path d="M530 146 L580 146 L580 192 L65 192 L65 212" class="ink dash" stroke-width="1" fill="none" />
+  <text x="560" y="286" text-anchor="end">DOCUMENTS IN · TOKEN SHARDS OUT</text>
+</svg>
+</Figure>
+
+We'll go through each stage on a real input: the Simple English Wikipedia dump. It's the same format as the full English one, but about 20 times smaller, so a full pass takes minutes on a laptop instead of hours.
+
+### Acquisition: what a dump actually is
+
+Wikimedia publishes dumps at `dumps.wikimedia.org`, roughly twice a month. The file you want is `simplewiki-latest-pages-articles.xml.bz2`. When I fetched it (October 2026) it was **358 MB** compressed and **1.71 GB** of XML once decompressed. Inside are **562,214 pages**, but only **285,478** are real articles. Another **115,214** are <Term w="redirect">A page that only says "go to page X", like "USA" pointing to "United States". It has no text of its own.</Term>s, and the rest are templates, categories, help pages and other <Term w="namespace">Wikipedia's way of sorting pages by kind. Namespace 0 is articles; others hold talk pages, user pages, templates, categories and so on. Each page in the XML has an ns field.</Term>s you don't want.
+
+Each page looks like this (trimmed):
+
+```xml
+<page>
+  <title>Paris</title>
+  <ns>0</ns>
+  <id>3618</id>
+  <revision>
+    <text>{{Infobox settlement | name = Paris | population_total = 2,102,650 ...}}
+'''Paris''' is the [[capital city]] of [[France]].&lt;ref&gt;{{cite web|...}}&lt;/ref&gt; ...
+[[Category:Capitals in Europe]]</text>
+  </revision>
+</page>
+```
+
+Two practical facts. First, the file is one giant XML document, so you can't load it with a normal parser: you stream it, handling one `<page>` at a time and throwing it away. Python's `xml.etree.ElementTree.iterparse` does this, as long as you call `elem.clear()` after each page so memory doesn't grow. Second, it's <Term w="bzip2">A compression format that squeezes text well but decompresses slowly, a few tens of MB per second per core.</Term>-compressed, and bzip2 is slow to undo. On my M4 Pro, just decompressing the file took **77 CPU-seconds**, and a full streaming pass that also parsed the XML took about **100 seconds** on one core. That's your floor before any real work.
+
+The shortcut is Hugging Face's `wikimedia/wikipedia` dataset, which ships pre-extracted plain text as <Term w="Parquet">A column-oriented file format: values of one column are stored together and compressed, so reading one column of a big table is fast. The standard for tabular data at rest.</Term> files, one config per language and dump date (something like `20231101.simple`; check the dataset card for the current names). Use it when you just need text. Do it from the XML at least once, because extraction is where most of the decisions, and most of the time, live.
+
+### Extraction: from markup to text
+
+Wikitext is a programming language that happens to contain prose. Here's what has to go, and what has to stay.
+
+<Figure n="002" title="WIKITEXT ANATOMY" caption="Links keep their visible text. Templates, references, tables, files and categories are removed whole. The tricky part is that all of these nest: a reference contains a template, a table cell contains a link, a template argument contains another template.">
+<svg viewBox="0 0 640 290" role="img" aria-label="A wikitext source with templates, links, references and categories, and the clean text extracted from it">
+  <rect x="10" y="10" width="380" height="270" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="30" class="strong">SOURCE (WIKITEXT)</text>
+  <rect x="20" y="42" width="360" height="22" class="fill-wash dash" stroke-width="1" />
+  <text x="26" y="57">&#123;&#123;Infobox river | name = Seine | ...&#125;&#125;</text>
+  <text x="26" y="86">'''The Seine''' is a</text>
+  <rect x="164" y="74" width="98" height="18" class="fill-wash" stroke-width="1" />
+  <text x="168" y="86">[[river]]</text>
+  <text x="26" y="106">in</text>
+  <rect x="48" y="94" width="140" height="18" class="fill-wash" stroke-width="1" />
+  <text x="52" y="106">[[France|northern France]]</text>
+  <text x="196" y="106">.</text>
+  <rect x="20" y="118" width="360" height="22" class="fill-wash dash" stroke-width="1" />
+  <text x="26" y="133">&lt;ref&gt;&#123;&#123;cite web|url=...|title=...&#125;&#125;&lt;/ref&gt;</text>
+  <text x="26" y="160">It flows through [[Paris]].</text>
+  <rect x="20" y="170" width="360" height="44" class="fill-wash dash" stroke-width="1" />
+  <text x="26" y="186">&#123;| class="wikitable"</text>
+  <text x="26" y="204">| Length || 777 km |&#125;</text>
+  <rect x="20" y="222" width="360" height="22" class="fill-wash dash" stroke-width="1" />
+  <text x="26" y="237">[[File:Seine.jpg|thumb|The Seine]]</text>
+  <rect x="20" y="250" width="360" height="22" class="fill-wash dash" stroke-width="1" />
+  <text x="26" y="265">[[Category:Rivers of France]]</text>
+  <rect x="420" y="80" width="210" height="100" class="fill-paper" stroke-width="1.2" />
+  <text x="432" y="100" class="strong">OUTPUT (PLAIN TEXT)</text>
+  <text x="432" y="124">The Seine is a river in</text>
+  <text x="432" y="140">northern France.</text>
+  <text x="432" y="160">It flows through Paris.</text>
+  <line x1="390" y1="100" x2="418" y2="120" class="blue" stroke-width="1.2" />
+  <text x="432" y="206" class="blue-t">SOLID BOX: KEEP THE</text>
+  <text x="432" y="222" class="blue-t">VISIBLE TEXT</text>
+  <text x="432" y="244">DASHED BOX: DROP</text>
+  <text x="432" y="260">THE WHOLE THING</text>
+</svg>
+</Figure>
+
+The pieces, with their real names:
+
+- <Term w="templates">Wikitext functions, written in double curly braces, that expand into boxes, citations, dates or other pages' content. Infoboxes, citations and navigation boxes are all templates.</Term>: `{{...}}`. Infoboxes, citations, "this article is a stub" banners. Almost all of them are dropped. A few (date and unit templates like `{{convert|777|km}}`) do produce visible text, and you lose a little by dropping them. That's a deliberate trade.
+- **Links**: `[[target|shown text]]` becomes `shown text`; `[[Paris]]` becomes `Paris`.
+- **References**: `<ref>...</ref>`, the footnotes. Drop them.
+- **Tables**: `{| ... |}`. Tables flattened to text are a mess of numbers and pipes; most pipelines drop them.
+- **Files and categories**: `[[File:...]]`, `[[Category:...]]`. Drop.
+- **Bold, italics, headings**: `'''bold'''` becomes `bold`, `== History ==` becomes `History`.
+
+You can do this with regexes, but nesting breaks regexes fast (a reference inside a template inside a table). Two libraries do it properly: `mwparserfromhell` parses wikitext into a tree that you can walk and edit, and `wikiextractor` is the classic command-line tool that turns a whole dump into text files. Real wikitext will still surprise you; you'll find leftovers and fix them by looking at samples, which is the actual skill.
+
+Here is the first big number of the lesson. Tokenized with GPT-2's tokenizer, the raw wikitext of all 285,478 articles was **373 million tokens**. The extracted text was **69 million**. Over 80% of the tokens in Wikipedia's source are markup: infoboxes, citation templates, tables, references. (Markup also tokenizes badly, about 2.8 characters per token against 4.3 for prose, which inflates it further.) And extraction was by far the most expensive stage: a full parse tree per article is slow in Python. Hold on to that; it's in the Measure section.
+
+### Normalization: making equal text equal
+
+The same visible string can be stored as different bytes. "café" can be four code points (`c a f é`) or five (`c a f e` plus a "combining acute accent"). They look identical, compare unequal, hash differently, and tokenize differently. <Term w="Unicode normalization">Rewriting text into one canonical byte form so that strings that look the same are the same. NFC composes characters (e + accent becomes é); NFD decomposes them.</Term> fixes this. Use <Term w="NFC">Normalization Form C (canonical composition). The form most text on the web already uses, and the safe default for training data. Python: unicodedata.normalize("NFC", s).</Term>. (There's also NFKC, which additionally folds look-alikes like the "ﬁ" ligature into "fi" and full-width digits into normal ones. It's more aggressive and changes meaning occasionally; C4-style pipelines usually stick to NFC.)
+
+Then whitespace: collapse runs of spaces and tabs, turn non-breaking spaces into normal ones, strip each line, and collapse three or more newlines into two. Keep single and double newlines, though. Paragraph breaks are real structure, and the model should learn them.
+
+Normalization matters most for the next stages: dedup compares hashes, and a stray non-breaking space makes two identical documents look different.
+
+### Language ID
+
+Simple English Wikipedia is, unsurprisingly, almost all English. A web crawl is not. <Term w="language identification">Guessing which language a text is in. Usually a tiny, fast classifier trained on character n-grams, which returns a language label and a confidence.</Term> is the first filter in nearly every web pipeline. The standard tool is fastText's `lid.176` model (Facebook, 2017): 176 languages, a model under 1 MB in its compressed form, and fast enough to run on billions of documents. FineWeb keeps a document if fastText says English with probability at least 0.65; C4 used a different detector and kept pages at 0.99.
+
+On Simple English Wikipedia it removed **4,084 articles (1.4%)**, and reading them is instructive: most are English. "Lys, Pyrénées-Atlantiques is a commune of the Pyrénées-Atlantiques département in the southwestern part of France." scored 0.0 for English, because one short sentence that's half French place names looks French to a character-n-gram model. Language ID is unreliable on short text full of names. On the web, where it removes a large fraction of everything, that error rate is acceptable. On a curated English corpus you'd lower the threshold or skip short documents. Measure before trusting.
+
+### Quality filtering: rules first
+
+Now the hard question. What is "good" text? Nobody has a definition, so pipelines use proxies, starting with simple rules that catch obvious junk. The Gopher paper's rules are the ones everyone copies. Paraphrasing them:
+
+| Rule | Keep the document if... | What it catches |
+| --- | --- | --- |
+| Length | 50 to 100,000 words | Stubs, error pages, and giant data dumps |
+| Mean word length | 3 to 10 characters | Lists of numbers; base64 blobs; URL soup |
+| Symbols | fewer than 1 `#` or `...` per 10 words | Hashtag spam, truncated previews |
+| Bullets and ellipses | under 90% of lines start with a bullet; under 30% end in `...` | Navigation menus, listicles, teasers |
+| Alphabetic words | at least 80% of words contain a letter | Tables of numbers, code, coordinates |
+| Stop words | at least 2 of "the, be, to, of, and, that, have, with" | Text that isn't really sentences |
+| Repetition | not too many duplicate lines, paragraphs, or repeated n-grams | Spam, templated pages, "click here" ×50 |
+
+C4's rules are in the same spirit: lines must end in a terminal punctuation mark, lines need at least three words, pages need at least five sentences, lines mentioning JavaScript (the "please enable JavaScript" warnings) are dropped, and any page with "lorem ipsum" or a curly brace goes. (The curly-brace rule is why C4 contains almost no code.) Every rule throws out some good text along with the bad. The question is always the trade, and you only find out by training on the result.
+
+<Term w="stop words">The most common little words in a language (the, of, and, to). Real sentences are full of them; lists, tables and keyword spam aren't, so their absence is a strong junk signal.</Term> are a nice example of a rule that looks silly and works: real prose is full of them, junk isn't.
+
+One rule deserves special care on Wikipedia: **length**. Simple English Wikipedia has a huge number of stubs, one or two sentences long. They're not wrong, they just teach little, and many of them are templated (hold that thought for dedup). A 50-word minimum removes a large share of documents but a small share of tokens, because short documents are, well, short. You'll see that asymmetry in the funnel below.
+
+### Quality filtering: a model as the judge
+
+Rules catch junk. They can't tell a mediocre forum post from a great textbook paragraph, because both pass every rule. The modern answer is to train a small <Term w="quality classifier">A cheap model that reads a document and outputs a quality score. Trained on examples labelled good or bad, by humans, by a reference corpus, or by a bigger LLM.</Term> and keep documents it scores highly.
+
+The older version (GPT-3, 2020) trained a classifier to tell Common Crawl pages from a "known good" reference set (WebText, books, Wikipedia), then kept web pages that looked like the reference. FineWeb-Edu made it sharper. They asked Llama-3-70B-Instruct to rate about 450,000 web pages from 0 to 5 for "educational value for primary to grade school students", then trained a small regression head on top of a sentence-embedding model to predict those ratings, and ran *that* cheap model on all 15 trillion tokens. Keeping pages scoring 3 or more left about 1.3 trillion tokens, which trained models noticeably better on knowledge and reasoning benchmarks like MMLU and ARC.
+
+Two cautions. A classifier filter is a taste, and you inherit the judge's taste (FineWeb-Edu is great for "school knowledge" and not obviously better for, say, conversation or code). And the classifier can't be the same thing you evaluate with, or you're grading your own homework. On Wikipedia the classifier stage matters less (it's all encyclopedic already), so the build uses rules only and leaves the classifier as an extension.
+
+### Deduplication, exact
+
+The cheapest dedup: hash each normalized document (SHA-1 or anything fast and wide enough to make collisions irrelevant) and keep the first document per hash. One pass, one set of 20-byte hashes. Ten million documents is a 200 MB set; that's fine on one machine.
+
+Exact dedup catches mirror copies and reposts. On the web that's a lot. On Wikipedia it's almost nothing: 186 articles in my run, mostly pairs like "Amenia (town), New York" and "Amenia (CDP), New York", or three Japanese footballers whose one-line articles became identical once their infoboxes were stripped. The real problem is documents that are 95% the same.
+
+### Deduplication, near: MinHash
+
+Here's the scene. Simple English Wikipedia has thousands of articles generated from one template: French communes, Italian municipalities, asteroids, US counties. Each differs from the others by a name and a number or two. They're not exact duplicates, so hashing misses them. But to the model they're the same lesson repeated thousands of times.
+
+To catch them you need a notion of *similar*, and you need it at scale. First the notion. Turn each document into a set of <Term w="shingles">Overlapping runs of k consecutive words (or characters) from a document. "the cat sat on" with k=3 gives "the cat sat" and "cat sat on". Two documents that share most of their shingles share most of their text.</Term>: every run of k consecutive words. Then compare two documents by <Term w="Jaccard similarity">For two sets: the size of their overlap divided by the size of their union. 1 means identical sets, 0 means nothing in common.</Term>: shared shingles divided by total distinct shingles. Two template stubs that differ in one name share most of their shingles; two unrelated articles share almost none.
+
+Now the scale problem. 285,000 documents means about 40 billion pairs. Comparing every pair's shingle sets is hopeless, and for the 100-million-document web it's absurd. MinHash is the trick that makes it cheap, and it's genuinely beautiful.
+
+**The trick.** Imagine taking *every possible shingle in the world* and shuffling them into one random order. For each document, write down which of its shingles comes first in that order. Call it the document's "min". Now ask: what's the chance two documents have the same min?
+
+Look at the union of their two shingle sets. Whichever shingle of the union comes first in the random order is equally likely to be any of them. If it's one they share, both documents report it as their min, and they match. If it belongs to only one of them, they don't. So:
+
+**P(same min) = shared shingles / all shingles = Jaccard similarity.**
+
+That's it. One random shuffle gives you a coin that lands "match" with probability exactly equal to the similarity. Flip it with 128 different random shuffles and the fraction of matches estimates the Jaccard similarity, with an error of about `sqrt(J(1-J)/k)`. And you can't really shuffle every shingle in the world, so you use a hash function instead: hash each shingle with a seeded hash, and take the smallest value. A different seed is a different "shuffle". The list of 128 minimums is the document's <Term w="MinHash signature">A short fixed-length list of numbers (say 128) summarising a document's shingle set. The fraction of positions where two signatures agree estimates the two documents' Jaccard similarity.</Term>.
+
+Play with it. Start with the template stubs, then change a few words, then drag k down to 4 and press "New random hashes" a few times.
+
+<Figure n="003" title="MINHASH BY HAND" caption="Each cell is one hash function: a random ordering of shingles. A cell fills when both documents' first shingle in that ordering is the same one, which happens with probability equal to their Jaccard similarity. With small k the estimate jumps around; with k = 128 it's usually within about 0.05 of the truth." wide>
+
+<DataMinHash />
+
+</Figure>
+
+<Predict id="minhash-error">
+Two documents have true Jaccard similarity 0.54. You compute MinHash signatures with k = 16, and then again with k = 128. Roughly how far off do you expect each estimate to be?
+<Fragment slot="answer">
+
+Each hash function is a coin flip that matches with probability J, so the estimate is an average of k coin flips. Its standard deviation is `sqrt(J(1-J)/k)`. With J = 0.54: k = 16 gives about **±0.12**, k = 128 gives about **±0.044**. I checked with datasketch over 100 random seeds: the measured spreads were 0.129 (k=16), 0.062 (k=64), 0.044 (k=128), 0.029 (k=256), right on the formula. Eight times the hashes buys you sqrt(8) ≈ 2.8 times the precision. That square root is why people stop at 100-250 hashes.
+
+</Fragment>
+</Predict>
+
+### LSH: never comparing most pairs
+
+Signatures make each comparison cheap (128 numbers instead of thousands of shingles), but there are still 40 billion pairs. The second trick, <Term w="locality-sensitive hashing">LSH. A way of hashing items so that similar items are likely to land in the same bucket and dissimilar ones aren't. Then you only compare items that share a bucket.</Term>, avoids looking at most of them.
+
+Cut each 128-number signature into **b bands** of **r rows** each (say 9 bands of 13 numbers). For each band, hash its r numbers into a bucket. Two documents become a <Term w="candidate pair">Two documents that landed in the same bucket for at least one band, so they're worth checking properly. Everything else is assumed not similar and never compared.</Term> if they collide in *any* band. Only candidates get compared.
+
+Why does that work? For a pair with similarity s, one band matches only if all r of its rows match: probability s<sup>r</sup>. The pair escapes detection only if *every* band fails: (1 − s<sup>r</sup>)<sup>b</sup>. So:
+
+**P(candidate) = 1 − (1 − s<sup>r</sup>)<sup>b</sup>**
+
+That function is an S-curve with a fairly sharp step at about (1/b)<sup>1/r</sup>. Below the step, pairs almost never become candidates. Above it, they almost always do. Choosing b and r chooses where the step sits.
+
+<Figure n="004" title="THE LSH S-CURVE" caption="Probability that a pair with a given Jaccard similarity lands in a shared bucket, for b bands of r rows. More rows per band push the step right (stricter). More bands pull it left and make it sharper. The dashed step is the ideal filter you're approximating.">
+
+<DataLSHCurve />
+
+</Figure>
+
+Two real settings to compare. `datasketch`'s `MinHashLSH(threshold=0.8, num_perm=128)` picks 9 bands of 13 rows, which catches a 0.9-similar pair 93% of the time and a 0.8-similar pair only 40% of the time (its threshold is placed to balance false positives against false negatives, not to catch everything at 0.8). FineWeb used 112 hashes in 14 bands of 8 rows with 5-word shingles: a 0.75-similar pair gets caught about 77% of the time. Each bucket lookup is a dictionary access, so the whole thing is roughly linear in the number of documents.
+
+Once you have candidate pairs, you either trust them or verify them (compare signatures, or even the real shingle sets), then group documents into clusters of near-duplicates (a <Term w="union-find">A tiny data structure that merges items into groups as you discover "these two belong together", and can tell you any item's group quickly.</Term> is perfect) and keep one per cluster.
+
+<Predict id="dedup-wiki">
+Wikipedia is curated by humans. What fraction of Simple English Wikipedia articles do you expect MinHash (Jaccard ≥ 0.8 on 5-word shingles) to flag as near-duplicates of another article? 0.1%? 1%? 10%?
+<Fragment slot="answer">
+
+Run on its own over the extracted text, near-dedup removed **13,468 documents, 4.7%**, from 1,355 clusters holding 14,823 articles. The biggest clusters are exactly the bot-written stubs: 688 French communes in one department, 518 in another, 447 in a third. A typical pair, word for word apart from the names: "Gagyapáti is a village in Encs District in Borsod-Abaúj-Zemplén County, Hungary. In 2024, 33 people lived there." and the same sentence for Litka. Humans curate Wikipedia, but bots and templates write a lot of it.
+
+Then the twist. With the length filter on first, near-dedup removed only **56** more documents. The stubs were short, so the length filter had already thrown almost all of them out. Filters overlap, and the order you run them in decides which one "gets the credit". On web crawls dedup removes far more, because there, long pages get copied too.
+
+</Fragment>
+</Predict>
+
+One subtle FineWeb finding is worth knowing. They expected deduplicating across all 96 Common Crawl snapshots at once to be best. It wasn't: deduplicating each snapshot separately trained better models. Global dedup removed a lot of *good* content that genuinely appears in many crawls (because it's good), and the surviving uniques skewed toward junk. Dedup is a tool, not a virtue; measure it.
+
+### PII scrubbing
+
+Training data can contain <Term w="PII">Personally identifiable information. Email addresses, phone numbers, street addresses, ID numbers: things that point to a real person.</Term>, and models can memorise and repeat it. The baseline is regexes for emails, phone numbers and IP addresses, replacing each match with a placeholder (`<EMAIL>`, or a fixed dummy address) rather than deleting the document. Bigger pipelines add named-entity models. Encyclopedia text has little real PII by design, yet my two naive regexes (an email pattern and a "10+ digits with separators" phone pattern) fired **66,207 times in 5,000 articles**. Almost none were phone numbers: they were population figures, sports statistics, date ranges and ISBNs. A phone regex loose enough to catch every phone format eats every long number. Look at what it matches before you let it rewrite your data.
+
+### Decontamination
+
+You'll evaluate the model on some held-out text or benchmark. If any of that text is in the training set, the eval measures memorisation, and you'll believe a lie. <Term w="contamination">When test or benchmark examples (or near-copies of them) appear in the training data, so a model can score well by memorising instead of generalising.</Term> is easy to cause on Wikipedia: many benchmarks are *built* from Wikipedia (SQuAD, Natural Questions, TriviaQA contexts), and articles quote each other.
+
+The standard check is <Term w="n-gram overlap">Two texts share an n-gram if some run of n consecutive words appears in both. With n around 8 to 13, a shared n-gram is very unlikely to be coincidence.</Term>. Collect every 13-word sequence in your eval set into a hash set. For each training document, check whether any of its 13-grams is in the set. If so, drop it (or drop just the overlapping region). GPT-3's paper used 13-grams; other papers use 8 to 50. Shorter n catches more but flags common phrases ("in the United States of America" is 7 words; 13 is long enough that coincidences are rare).
+
+In the build, you'll hold out 1% of articles as a clean eval set, then decontaminate the rest against it. That sounds pointless (they're different articles!), but on my run **4,765 training articles** (out of about 172,000 that survived the filters) shared at least one 13-gram with the 1,748 eval articles. Look at *which* 13-grams, and it splits in two:
+
+- **Template sentences.** The most-shared 13-grams were "the united states census bureau says that the city has a total area of" (in 264 flagged articles), "is a former japanese football player he played for the japan national team" (232), and "scientists from the iucn say this frog is not in danger of dying out" (184). Bots wrote thousands of articles from the same sentence. That's not leakage of a *fact*, but a model that has seen the sentence 2,000 times will predict it perfectly in the eval set, so it still inflates eval scores.
+- **Real copying.** "Ring (mathematics)" shared 253 of its 660 13-grams with "Field (mathematics)" in the eval set: whole paragraphs of definitions copied between articles. A set of NHL season articles shared over half their 13-grams with one held-out season. That's the leak that made the validation loss in The Problem look too good.
+
+So a single shared 13-gram is a blunt rule. Real pipelines either remove only the overlapping spans, or flag a document only when a meaningful fraction of its n-grams overlap. Dropping everything flagged, as the funnel below does, costs 3.6% of tokens; decide whether that's worth it for your eval.
+
+Here's the whole funnel from my run. Every filter is a toggle, and every combination of toggles was computed from the real pipeline output, so you can ask "what if I didn't dedup?" and see the honest answer.
+
+<Figure n="005" title="WHAT SURVIVES" caption="A real run over the Simple English Wikipedia dump. Bars are relative to the raw article wikitext (tokens) or to all dump pages (documents). Switch between tokens and documents: the length filter removes many documents but few tokens, near-dedup removes few documents but repetitive ones, and extraction alone removes more than half the tokens." wide>
+
+<DataFunnel />
+
+</Figure>
+
+### Tokenizing at scale
+
+Once the text is clean, turn it into token IDs. Two facts make this the easy part, if you set it up right.
+
+**It's embarrassingly parallel.** Every document tokenizes independently. That's exactly the job from [Threads, processes and the GIL](/lessons/processes-threads-gil/): CPU-bound, no shared state, so give each worker process a shard of documents. If your tokenizer's core is written in Rust (Hugging Face `tokenizers`, and `tiktoken` under its Python skin), it also releases the GIL inside batch calls, so threads work too. Measured on my Mac with `tiktoken`'s GPT-2 encoding: about **2.3M tokens per second on one thread**, and about **10M tokens per second** with `encode_ordinary_batch(..., num_threads=8)`. On the full run, all 69M clean tokens took **8.3 seconds** with 10 threads. Tokenizing is not where your time goes.
+
+**Send paths, not data.** Same lesson as last time: if the parent reads all the text and pickles it to workers, the copying costs more than the tokenizing. Give each worker a file name and a byte range, let it read, tokenize and write its own output file, and have the parent only collect file names.
+
+**Append the separator.** After each document, append the <Term w="EOT token">End-of-text token. A special token ID (50256 in GPT-2's vocabulary) marking where one document ends and the next begins, so the model learns that a boundary means "new topic, forget the old one".</Term>. It's how the model learns where one document ends and the next begins.
+
+On Simple English Wikipedia, GPT-2's tokenizer averaged **4.29 characters per token** on my clean text. That's a useful sanity number: English prose with a GPT-2-style tokenizer lands around 4 characters per token. Raw wikitext lands lower, because markup is full of short, rare character sequences.
+
+### Packing: no padding allowed
+
+The trainer wants a rectangular batch: B rows of exactly T tokens (say T = 1,024). Documents are every length. The naive way is one document per row, padded with a pad token to 1,024, which on Wikipedia would mean most of every batch is padding: compute spent on nothing. The fix is <Term w="sequence packing">Concatenating documents end to end (with separators) into one long stream, then cutting the stream into fixed-length rows. No padding; a row may hold several documents, or part of one.</Term>: concatenate everything, separators included, and chop the stream into rows.
+
+That raises a question. In a packed row, should a token in document B be allowed to attend to document A, which happens to sit before it in the same row?
+
+<Figure n="006" title="PACKING AND MASKS" caption="Top: four documents laid end to end and cut into 12-token rows. Document C spills across the row boundary. Bottom: two attention masks for row 1. Plain causal attention lets B's tokens see A's. A document mask makes attention block-diagonal, so each document only sees itself.">
+
+<DataPacking />
+
+</Figure>
+
+- **Plain causal mask** (GPT-2, nanoGPT): yes, B sees A. It's simplest and fastest, and the EOT token teaches the model that what comes before a boundary is unrelated. Most small-scale training does this, and it works fine.
+- **Document mask** (block-diagonal causal): no. Each token only attends within its own document. Cleaner (no learning to ignore junk context), and it matters more for long-context training where a row can hold dozens of unrelated documents. Meta's Llama 3 paper says it used a mask that stops attention across documents within a sequence. It needs kernel support: FlashAttention's "varlen" interface takes the document boundaries (as cumulative sequence lengths) instead of a mask matrix, and PyTorch's FlexAttention can express it as a mask function.
+
+Also decide what to do with **position IDs**: restart at 0 for each document (natural with a document mask) or keep counting across the row (natural with plain causal). And with packing, a document longer than T simply spills into the next row; you lose a little context at the cut, which doesn't matter much.
+
+### Shards, shuffling, and the file on disk
+
+The final format has one job: let the trainer read random batches as fast as the GPU eats them, without ever loading the whole dataset into RAM.
+
+The simplest format that works is the one nanoGPT uses: **all the token IDs in one flat binary file of `uint16`**. GPT-2's vocabulary has 50,257 tokens, and a `uint16` holds 0 to 65,535, so each token costs exactly 2 bytes. 100M tokens is 200 MB. The trainer opens it with `np.memmap`, which maps the file into the address space (see [Virtual memory](/lessons/virtual-memory/)), and slices `data[i : i + T + 1]` at random offsets. The OS pages in only the bytes you touch. No parsing, no decoding. (If your vocabulary is bigger than 65,536, like Llama 3's 128K, you need `uint32`, and the file doubles.)
+
+At larger scale you split that into <Term w="shards">A dataset split into many files of manageable size (say 100M tokens each), so many workers and machines can read different parts in parallel, and a failed write only loses one piece.</Term>: many files of fixed size, each one a few hundred MB. Shards let many data-loader workers (and many machines) read in parallel, and let you resume after a crash by remembering which shard and offset you were at.
+
+Other formats you'll meet, and when they fit:
+
+| Format | What it is | Good for |
+| --- | --- | --- |
+| Raw `uint16`/`uint32` `.bin` + memmap | Token IDs, nothing else | Pretraining from pre-tokenized data; fastest and simplest |
+| Arrow / Parquet | Columnar tables; Hugging Face `datasets` uses Arrow on disk with memory-mapping | Text plus metadata (url, score, language), filtering and inspection |
+| WebDataset | Shards that are plain `.tar` files of samples, read sequentially | Streaming from object storage (S3), especially images + text |
+| Mosaic Streaming (MDS) | Shards built for deterministic, resumable streaming from cloud storage | Multi-node training from S3 with exact resume |
+
+Now **shuffling**. Wikipedia's dump is in roughly the order articles were created, and similar articles cluster together (all the French communes were created by the same bot in the same week). If you train in dump order, the model sees 3,000 communes in a row, and its loss curve will tell you about it. You want each batch to look like a random sample of the whole dataset.
+
+- A <Term w="global shuffle">Putting every example of the whole dataset in a uniformly random order. Ideal statistically, but needs random access to everything.</Term> is the ideal. With a memmapped token file you get it nearly for free: random offsets *are* a global shuffle.
+- A <Term w="local shuffle">Shuffling only within a window: read shards in some order, fill a buffer of N examples, and draw randomly from the buffer. Cheap for streaming, but examples far apart in the data never mix.</Term> is what streaming formats do: read shards in a random order, keep a buffer of a few thousand examples, and pop random ones. It only mixes what fits in the buffer, so if shards themselves are sorted (all communes in shard 7), the buffer must be bigger than a cluster or you shuffle once properly at write time.
+
+The robust recipe: **shuffle documents globally once when you write the shards** (it's a one-time cost), then do a cheap local shuffle at read time. Seed everything, so a resumed run sees the same order.
+
+### Mixtures and epochs
+
+Real training data comes from several sources: web, code, books, papers, Wikipedia, math. A <Term w="data mixture">The proportions in which different sources are sampled during training, like 50% web, 20% code, 10% books. Chosen separately from how much data each source actually has.</Term> sets how much each one is sampled, regardless of its size. Small, high-quality sources (Wikipedia, books) are often *up*-sampled, seen several times per run; huge noisy ones are down-sampled. Meta reported Llama 3's final mix as roughly half general knowledge, a quarter math and reasoning, 17% code and 8% multilingual. Mixtures are mostly found by ablation (train small models on candidate mixtures, compare), and there's research on learning them (DoReMi, 2023).
+
+How many times can you repeat data? Muennighoff et al. (2023) trained hundreds of models on repeated data and found that up to about **4 epochs** is almost as good as fresh data, with value falling off steeply after that. That's why upsampling Wikipedia 2-3 times is common, and why repeating it 40 times is not.
+
+<Predict id="raw-vs-clean">
+You train two identical tiny LMs for exactly the same number of tokens: one on raw wikitext, one on the cleaned, deduplicated text. You evaluate both on the *clean* held-out set. Which wins, and by roughly how much validation loss? Then: which one would win if you evaluated both on held-out *raw* wikitext?
+<Fragment slot="answer">
+
+On clean held-out text, the clean model should win clearly. A good chunk of the raw model's token budget went to markup it never sees at eval time, and its outputs put probability on `{{`, `[[` and `|` where clean text has none, which costs loss on every clean token. Expect a gap of a few tenths of a nat at small scale (check yourself; it depends on model size and token budget).
+
+On raw held-out text, the raw model wins easily: it's the only one that knows what `{{cite web|` is followed by. This is the core lesson of evals: "better" is defined by the distribution you evaluate on. Decide what you want the model to be good at *before* you choose the data.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Everything lives in `~/workbench/data/`. Use a virtual environment; you need `numpy`, `mwparserfromhell`, `datasketch`, `tiktoken`, and optionally `fasttext` with the `lid.176.ftz` model. Do the pipeline on your Mac (it fits easily), then copy the shards to the Spark for the training runs.
+
+Structure every stage as **a function from one document to one document (or to nothing)**, run by a worker pool, plus a small amount of global work in the parent (exact dedup, LSH, decontam need to see everything). And log the time spent in every stage, per document, from the start. You'll need those numbers.
+
+<Task id="t0" title="Download the dump and stream it to JSONL" agent="ok">
+
+```bash
+mkdir -p ~/workbench/data/raw && cd ~/workbench/data
+curl -L -o raw/simplewiki.xml.bz2 \
+  https://dumps.wikimedia.org/simplewiki/latest/simplewiki-latest-pages-articles.xml.bz2
+python3 -m venv .venv && . .venv/bin/activate
+pip install numpy mwparserfromhell datasketch tiktoken
+```
+
+Stream the XML once into one JSON line per article, so later stages don't pay bzip2 again:
+
+```python
+# dump_jsonl.py
+import bz2, json, sys, time, xml.etree.ElementTree as ET
+
+src, out = sys.argv[1], sys.argv[2]
+t0, n = time.perf_counter(), 0
+with open(out, "w") as f:
+    for _, el in ET.iterparse(bz2.open(src), events=("end",)):
+        if el.tag.endswith("}page"):
+            ns = el.find("{*}ns").text
+            if ns == "0" and el.find("{*}redirect") is None:
+                f.write(json.dumps({
+                    "id": el.find("{*}id").text,
+                    "title": el.find("{*}title").text,
+                    "wikitext": el.find("{*}revision/{*}text").text or "",
+                }) + "\n")
+                n += 1
+            el.clear()  # without this, memory grows with the file
+print(f"{n} articles in {time.perf_counter() - t0:.0f}s")
+```
+
+`python dump_jsonl.py raw/simplewiki.xml.bz2 raw/articles.jsonl`. Expect around 285,000 articles (the count grows with each dump) and a 1.1 GB file.
+
+</Task>
+
+<Task id="t1" title="Extract and normalize" agent="hands">
+
+Write the per-document cleaners. This is the part to own: you'll look at real output and keep fixing it.
+
+```python
+# clean.py
+import re, unicodedata
+import mwparserfromhell as mw
+
+DROP_TAGS = {"ref", "table", "gallery", "math", "references", "timeline"}
+DROP_LINK_PREFIXES = ("file:", "image:", "category:", "media:")
+
+def extract(wikitext: str) -> str:
+    """Wikitext -> plain text.
+    Parse with mw.parse(). Remove top-level templates (code.filter_templates(recursive=False)),
+    tags in DROP_TAGS, and wikilinks whose title starts with a DROP_LINK_PREFIXES prefix.
+    Then code.strip_code() turns remaining links into their visible text.
+    Finally drop leftover table lines (starting with '{|', '|', '!')."""
+    ...
+
+def normalize(text: str) -> str:
+    """NFC, collapse spaces/tabs/nbsp to one space, strip each line,
+    collapse 3+ newlines to 2, strip the ends."""
+    ...
+```
+
+Hints:
+
+- `code.remove(node)` can raise `ValueError` if a node was already removed as part of a parent. Catch it.
+- Print 20 random extracted articles and *read them*. You'll find things: stray `thumb|` fragments, empty "References" headings, `()` where a template sat inside parentheses. Fix the ones that are common. Stop when the junk is rare. Write down what you fixed.
+- Compare token counts before and after. On the full dump mine kept about 18% of the raw wikitext's tokens.
+
+</Task>
+
+<Task id="t2" title="Filters: language, length, quality rules" agent="hands">
+
+```python
+# filters.py
+STOP = {"the", "be", "to", "of", "and", "that", "have", "with"}
+
+def quality_flags(text: str) -> dict[str, bool]:
+    """Return a flag per rule that the document FAILS:
+    short (< 50 words), word_len (mean outside 3..10), alpha (< 80% of words contain a letter),
+    stop (fewer than 2 distinct stop words), dup_lines (> 30% of lines are repeated lines).
+    Compute every flag, don't stop at the first failure: the funnel needs all of them."""
+    ...
+```
+
+Return *all* flags rather than the first failure. You'll want to answer "how many documents fail only the alpha rule?" later, and you'll want to toggle rules without rerunning.
+
+Optional language ID: `pip install fasttext`, download `lid.176.ftz` from the fastText language identification page, and keep documents where the top label is `__label__en` with probability ≥ 0.65. Pass text with newlines replaced by spaces (fastText predicts one line). If `model.predict` errors under NumPy 2 (it did for me), the lower-level `model.f.predict(text, 1, 0.0, "replace")` returns `[(prob, label)]`; check the current package first.
+
+Print five random documents that fail each rule. Is the rule doing what you think? (Mine: the stop-word rule fired most, about 35,000 times, mostly on articles that are one sentence plus a table of statistics, like a footballer's club career. The length rule caught 100,000 stubs.)
+
+</Task>
+
+<Task id="t3" title="MinHash dedup, your own and datasketch's" agent="review">
+
+Implement MinHash yourself first, on 5-word shingles, then check it against `datasketch`.
+
+```python
+# minhash.py
+import numpy as np
+
+P = (1 << 61) - 1  # a Mersenne prime, so (a*x + b) % P is a decent random permutation
+
+def shingles(text: str, k: int = 5) -> set[str]:
+    """Lowercased word k-grams."""
+    ...
+
+def signature(sh: set[str], a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hash each shingle to a 64-bit int (e.g. int.from_bytes of a blake2b digest, mod P),
+    apply all k permutations at once with (a * x + b) % P as a (k, n) array, take min over n.
+    Watch for uint64 overflow in a * x: use Python ints, or 32-bit hashes so the product fits."""
+    ...
+
+def lsh_buckets(sig: np.ndarray, bands: int, rows: int) -> list[tuple[int, bytes]]:
+    """One (band_index, bytes of that band's slice) key per band."""
+    ...
+```
+
+Then the global step in the parent: a `dict` from bucket key to list of document indices, a union-find over candidate pairs (verify each pair: signatures agreeing in ≥ 80% of positions), and keep the first document in each cluster.
+
+Check yourself against `datasketch` (`MinHash(num_perm=128)`, `update_batch`, `MinHashLSH(threshold=0.8, num_perm=128)`). Note: datasketch 2.0 changed how MinHash objects are rebuilt from stored hash values (you must pass the `scheme` it was built with); read the docs for your installed version. Have an agent review your code for the overflow bug and for a band hash that accidentally ignores some rows.
+
+Print the five biggest clusters by title. You should recognise them immediately.
+
+</Task>
+
+<Task id="t4" title="Hold out, decontaminate, scrub" agent="hands">
+
+1. Choose the eval set **before** filtering decisions can leak into it: 1% of articles by `hash(id) % 100 == 0` (use `hashlib.md5`, not Python's `hash`, which is randomised per process). Keep only eval articles that pass the quality filters, so it's a *clean* eval set. Never train on them.
+2. Build a set of all 13-word sequences in the eval set (store `hash()` of each joined 13-gram to save memory; within one process that's fine). Flag every training document that shares any of them. Print ten flagged pairs side by side and decide whether each is real leakage.
+3. Replace emails and phone numbers with placeholders using two regexes. Print 20 matches. Is your phone regex eating years and ISBNs? Tighten it.
+
+</Task>
+
+<Task id="t5" title="Tokenize in parallel, pack, write shards" agent="hands">
+
+```python
+# shard.py
+import numpy as np, tiktoken
+from concurrent.futures import ProcessPoolExecutor
+
+EOT = 50256  # GPT-2's <|endoftext|>
+
+def tokenize_file(in_path: str, out_path: str) -> int:
+    """Read one chunk of clean JSONL, encode each text with encode_ordinary, append EOT,
+    concatenate into one np.uint16 array, write it with arr.tofile(out_path). Return token count."""
+    ...
+
+if __name__ == "__main__":
+    # 1. split the clean documents into ~N_WORKERS * 4 chunk files, after a seeded global shuffle
+    # 2. ProcessPoolExecutor().map(tokenize_file, ins, outs)  -- paths in, counts out
+    # 3. concatenate chunk outputs into train.bin (and eval.bin from the held-out set),
+    #    or keep them as shards of ~50M tokens each
+    # 4. assert every token < 65536 before casting to uint16
+    ...
+```
+
+Then the reader, which is all the trainer needs:
+
+```python
+def get_batch(path: str, B: int, T: int, rng: np.random.Generator):
+    data = np.memmap(path, dtype=np.uint16, mode="r")
+    ix = rng.integers(0, len(data) - T - 1, size=B)
+    x = np.stack([data[i : i + T] for i in ix]).astype(np.int64)
+    y = np.stack([data[i + 1 : i + 1 + T] for i in ix]).astype(np.int64)
+    return x, y
+```
+
+Also write a **raw** version: tokenize the raw wikitext (no extraction, no filters, no dedup) into `raw_train.bin`, same procedure. That's the baseline for t7.
+
+</Task>
+
+<Task id="t6" title="Time every stage" agent="explain">
+
+Wrap each per-document stage in `time.perf_counter()` and sum the CPU time per stage across workers. Measure the global stages (LSH, decontam) and the wall time of each pool separately. Fill the first table in Measure. An agent may explain profiler output (`py-spy top --pid ...` on a running worker is perfect here) but not change your code.
+
+</Task>
+
+<Task id="t7" title="Raw vs clean: two tiny-LM runs" agent="review">
+
+On the Spark, train two identical models from [Train a small LM](/lessons/tiny-lm/): one reads `raw_train.bin`, one reads `train.bin`. Same architecture, same seed, same batch size, and **the same number of training tokens** (pick something both files can supply; repeating the clean set up to ~2 epochs is fine if needed). Something like a 6-layer, 384-wide model at T = 512 for 50-100M tokens is enough to see the effect in an hour or so; scale to your budget.
+
+Evaluate both every few hundred steps on `eval.bin`, the clean held-out set, and also on a raw-wikitext version of the same held-out articles. Plot all four curves. Sample 5 completions from each model with the same prompts. Have an agent review the training script for unfairness: different token counts, different eval batches, evaluating on data either model trained on.
+
+</Task>
+
+<DoneWhen>
+
+- `train.bin`, `raw_train.bin` and `eval.bin` exist, and you can state their token counts and sizes in MB without looking.
+- You can name the five biggest near-duplicate clusters and show one contaminated pair.
+- The stage-timing table is filled in and you can say which stage dominates and why.
+- Two training runs, same tokens, with four eval curves (two models × two eval sets) on one plot.
+
+</DoneWhen>
+
+## Measure
+
+**Where the time goes.** Fill this in for your run. Mine, on an M4 Pro (10 performance + 4 efficiency cores), 10 worker processes, with other heavy jobs running at the same time (so treat the absolute numbers as pessimistic and the ratios as the point):
+
+| Stage | Where it runs | My CPU time (full dump) | Share of per-doc CPU | Yours |
+| --- | --- | --- | --- | --- |
+| bzip2 + XML parse | 1 process | ~100 s wall | (separate pass) | |
+| Extract (mwparserfromhell) | workers | 4,503 s | 87% | |
+| Normalize | workers | 49 s | 0.9% | |
+| Language ID (fastText) | workers | 125 s | 2.4% | |
+| Quality rules | workers | 83 s | 1.6% | |
+| PII regexes | workers | 64 s | 1.2% | |
+| MinHash signatures (datasketch, 128) | workers | 366 s | 7.1% | |
+| LSH + clustering | parent | 27 s wall | | |
+| 13-gram decontam | parent | 17 s wall | | |
+| Tokenize clean text (tiktoken, 10 threads) | parent | 8 s wall | | |
+
+What it should tell you:
+
+**Extraction dominates: 87% of the per-document CPU time.** Building a full parse tree of every article in pure Python is far more work per byte than anything else here. MinHash is second: hashing a few thousand shingles 128 ways per document. Tokenizing, the step everyone worries about, is a rounding error because it runs in Rust with the GIL released. This is the usual shape of real pipelines: the expensive part is *understanding the format*, and the clever-sounding parts are cheap. If you needed this 20 times faster (full English Wikipedia), you'd attack extraction first: more processes, a faster extractor, or start from pre-extracted text.
+
+**Scaling.** Everything up to MinHash is per-document, so it scales with cores: 20 Spark cores should give roughly twice the Mac's throughput on those stages (efficiency cores help less). LSH and decontam are global and ran in one process here. At web scale they're also distributed, by partitioning buckets across machines, which is how datatrove (FineWeb's library) does it.
+
+**The funnel.** From Figure 005, with every filter on, your numbers should look roughly like mine:
+
+| Stage | Docs left | Tokens left |
+| --- | --- | --- |
+| Articles (raw wikitext) | 285,478 | 373.2M (raw wikitext) |
+| Extracted (minus eval holdout) | 283,730 | 68.5M |
+| + language ID | 279,646 | 67.1M |
+| + length ≥ 50 words | 179,083 | 62.7M |
+| + quality rules | 172,389 | 58.4M |
+| + exact dedup | 172,384 | 58.4M |
+| + near dedup | 172,328 | 58.4M |
+| + decontam | 167,563 | 56.3M |
+
+Three things to check in yours: extraction should remove more than half the tokens; the length filter should remove many documents but few tokens (mine: 35% of documents, 6.5% of tokens); and near-dedup on its own should remove far more than exact dedup (mine: 13,468 vs 186), though almost nothing once the length filter has run. The workers stage took 536 s of wall time with 10 processes; with a quiet machine it should be well under that.
+
+**Raw vs clean.** Fill in after t7:
+
+| Model | Train tokens | Val loss, clean eval | Val loss, raw eval | Sample looks like |
+| --- | --- | --- | --- | --- |
+| Raw wikitext | | | | |
+| Cleaned + dedup | | | | |
+| Prediction (gap on clean eval) | | | | |
+
+I haven't run this pair myself on the Spark, so I won't give you numbers to match. What you should see: the clean model wins on clean eval and loses badly on raw eval, and the raw model's samples are full of markup. If the clean model *doesn't* win on clean eval, check that both saw the same number of tokens, and that eval articles really are excluded from both training files.
+
+## Break It
+
+**1. Skip near-dedup and watch memorisation.** Train the clean model again with near-dedup turned off. Then prompt both with the opening of a template stub ("Achicourt is a commune. It is in") and compare. Expect the no-dedup model to complete the template word for word. (Note from the funnel: with the length filter on, near-dedup barely matters on this corpus, so for this experiment turn the length filter off too and keep the stubs.) Also compare the training loss curves: the duplicated run's training loss drops faster than its validation loss, the signature of memorising repeated text.
+
+**2. Train in dump order.** Replace the random-offset reader with a sequential one over an *unshuffled* `train.bin`. The loss curve gets a texture: sudden drops when the model hits a run of near-identical bot-created stubs, and bumps when it leaves them. This is why shuffling matters, and why a local shuffle buffer smaller than a cluster isn't enough.
+
+**3. Contaminate on purpose.** Append the eval articles to `train.bin` three times and retrain. Validation loss on `eval.bin` drops well below the clean run's, while loss on genuinely new text (articles from a newer dump that weren't in your snapshot) doesn't improve. You have built a model that looks better and isn't. Now you know what to look for when a number in a paper seems too good.
+
+**4. Forget normalization.** Skip NFC and whitespace collapsing, rerun exact dedup and MinHash, and count. Exact dedup misses more (one invisible character changes the hash), and a few documents with odd whitespace become non-matching shingle sets. On Wikipedia the effect is small because editors and bots are fairly consistent. On web text it isn't.
+
+## Explain It Back
+
+<details>
+<summary>1. Why does data quality matter more than model tweaks for a fixed compute budget?</summary>
+
+At a fixed budget you train on a fixed number of tokens. A model learns the distribution of whatever those tokens are, so tokens of markup, boilerplate and duplicates spend capacity and gradient steps on things you don't want. Cleaning makes each token teach more, deduplication stops a few documents from being effectively upweighted thousands of times, and decontamination keeps your measurements honest. Published ablations (C4 in T5, FineWeb) show data changes moving benchmark scores as much as large changes in model size.
+
+</details>
+
+<details>
+<summary>2. Explain MinHash to someone who has never heard of it.</summary>
+
+Turn each document into the set of its overlapping 5-word phrases. Two documents are similar if they share most of their phrases (Jaccard similarity). Now shuffle every possible phrase into a random order and, for each document, note which of its phrases comes first. Two documents pick the same "first" phrase exactly when the first phrase of their combined set is one they share, which happens with probability equal to their Jaccard similarity. Do that with 128 different random orders (really, 128 seeded hash functions, taking the minimum hash) and the fraction of agreements estimates the similarity, within about ±0.05. The 128 numbers are a tiny fingerprint you can compare instead of the documents.
+
+</details>
+
+<details>
+<summary>3. How does near-dedup scale to a billion documents? You can't compare all pairs.</summary>
+
+Two layers. MinHash shrinks each document to a fixed signature (say 112-128 numbers), computed independently per document, so that part is embarrassingly parallel. LSH then avoids pairwise comparison: split the signature into b bands of r numbers, hash each band to a bucket, and only compare documents that share a bucket. The probability a pair collides is 1 − (1 − s^r)^b, an S-curve with a step near (1/b)^(1/r), so similar pairs almost always collide and dissimilar ones almost never. Bucketing is a hash-join, linear in the number of documents, and you can partition it across machines by band (each machine handles some bands), then merge candidate pairs with a distributed union-find. FineWeb did this over trillions of tokens with 14 bands of 8.
+
+</details>
+
+<details>
+<summary>4. Your pipeline takes 10 hours. Where do you look first, and how do you make it faster?</summary>
+
+Measure per-stage CPU time first; don't guess. In text pipelines the expensive stage is usually format handling (parsing HTML or wikitext) or a model-based filter, not tokenization or hashing. Then: per-document stages are embarrassingly parallel, so use worker processes (not threads, unless the hot code is native and releases the GIL), give workers file paths instead of data, and order filters cheapest-first so expensive ones see fewer documents. Avoid re-doing slow decompression by caching an intermediate format. Global stages (dedup, decontam) need different scaling: partition by hash. And check the I/O: if it's reading compressed data on one core, that's a ceiling no amount of workers will lift.
+
+</details>
+
+<details>
+<summary>5. Packed sequences: what's the trade-off between plain causal attention and a document mask?</summary>
+
+Packing concatenates documents with an EOT token between them and cuts the stream into fixed-length rows, so there's no wasted padding. With plain causal attention, tokens can attend to earlier, unrelated documents in the same row; it's simplest, fastest and works fine at short context because the model learns that EOT means "start over". A document mask makes attention block-diagonal so each document only sees itself, which avoids learning from irrelevant context and matters more at long context lengths where a row holds many documents. It needs kernel support (FlashAttention's variable-length interface or FlexAttention) and usually goes with position IDs that restart per document.
+
+</details>
+
+## Go Deeper
+
+- **Colin Raffel et al., "Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer"** (JMLR 2020), Section 2.2. The T5 paper; the C4 cleaning rules, stated plainly, and the experiment showing they help.
+- **Guilherme Penedo et al., "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale"** (2024), plus the FineWeb blog post on Hugging Face. The best single resource on this topic: every stage, with an ablation behind each choice, including the per-snapshot dedup surprise and the FineWeb-Edu classifier.
+- **Jack Rae et al., "Scaling Language Models: Methods, Analysis & Insights from Training Gopher"** (DeepMind, 2021), Appendix A. The MassiveText quality rules and repetition filters that most pipelines still copy.
+- **Katherine Lee et al., "Deduplicating Training Data Makes Language Models Better"** (ACL 2022). Measured how much duplication is in standard datasets, how it causes memorisation, and that removing it costs nothing.
+- **Leo Gao et al., "The Pile: An 800GB Dataset of Diverse Text for Language Modeling"** (2020) and **Guilherme Penedo et al., "The RefinedWeb Dataset for Falcon LLM"** (2023). The curated-mixture view and the "web alone, filtered hard" view, side by side.
+- **Jure Leskovec, Anand Rajaraman and Jeff Ullman, _Mining of Massive Datasets_, Chapter 3 "Finding Similar Items"** (free online at mmds.org). The clearest derivation of shingling, MinHash and the LSH S-curve. Andrei Broder's "On the resemblance and containment of documents" (1997) is the original MinHash paper.
+- **Niklas Muennighoff et al., "Scaling Data-Constrained Language Models"** (NeurIPS 2023). How many epochs of repeated data are worth it (about four), and what to do when you run out.
+- **Andrej Karpathy's nanoGPT** (`data/openwebtext/prepare.py`) and the **datatrove** library from Hugging Face. The first is the minimal uint16 memmap pipeline in under 100 lines; the second is the production pipeline FineWeb was built with. Reading both shows you the distance between the two.
+
+## Connections
+
+This lesson leans on [Threads, processes and the GIL](/lessons/processes-threads-gil/) (every per-document stage is a process pool, and the "send paths, not data" rule comes from there), [Virtual memory](/lessons/virtual-memory/) (why memmapping a 200 MB token file costs almost nothing) and [Files and disks](/lessons/files-and-disks/) (why streaming beats random access on compressed archives). The token IDs come from [Tokenizers](/lessons/tokenizers/), and the two training runs reuse [Train a small LM](/lessons/tiny-lm/).
+
+It feeds [Why evals are separate](/lessons/why-evals-are-separate/), which takes the contamination idea further, and [Train your own draft model](/lessons/draft-model/), where the choice of distillation data decides how well the draft model matches the big one. And it's the same skill you need for your cross-encoder at work: before touching the model, deduplicate the query-document pairs, check that eval queries don't leak into training, and look at fifty random examples.

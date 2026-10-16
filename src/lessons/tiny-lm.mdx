@@ -1,0 +1,765 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import TinyLMLossExplorer from '../components/figures/TinyLMLossExplorer.astro';
+import TinyLMCompute from '../components/figures/TinyLMCompute.astro';
+
+## Today
+
+- Run the whole lifecycle once, for real: raw web text, tokenizer, a file of token IDs on disk, a data loader, a 124M-parameter GPT, a training run of a couple of billion tokens on the Spark, a checkpoint, samples, and an eval score.
+- Know which training-loop details actually decide whether a run works (learning-rate schedule, warmup, which weights get weight decay, gradient clipping, batch size in tokens) and why each one is there.
+- Read a loss curve like a doctor reads a chart: say what a number means (loss to perplexity, ln of the vocab size at step 0) and tell a healthy curve from too-high LR, too-low LR, no warmup, overfitting, and a data bug.
+- Estimate how long a run will take before you start it (6 × params × tokens), measure how close you got (MFU), and know the Chinchilla rule of about 20 tokens per parameter.
+- Have a debugging routine that catches most broken runs in the first five minutes instead of the fifth hour.
+
+Prerequisites: you have written a GPT-2 forward pass before (you have, several times). Helpful but not required: [Tokenizers](/lessons/tokenizers/), [fp32, bf16, fp16, fp8](/lessons/number-formats/), [Why training needs so much memory](/lessons/training-memory/), and the atomic-save recipe from [Files and disks](/lessons/files-and-disks/). Rough time: two evenings of building, one overnight run, one morning of evaluating.
+
+## The Problem
+
+You have built GPT-2 from scratch more than once. Attention, the causal mask, RoPE in the Llama version: all fine. And yet every time you tried something of your own, a new attention variant, a different normalisation, a trick from a paper, the result was the same. The loss went down a bit, the samples were mush, and you could not tell whether your idea was bad or your training was.
+
+That second possibility is the whole problem. A training run has maybe twenty settings that each, if wrong, quietly cost you a factor of two. A learning rate 10× too low does not crash; it just makes a model that looks dumb. Forgetting warmup does not crash; it costs you a few percent. Feeding the model the wrong targets does not crash; it gives you a *beautiful* loss curve. None of these throw an exception. All of them make your creative idea look like it failed.
+
+People who get good results are not mostly more creative. They have a **baseline that works**, a run they trust, and they change one thing at a time against it. They also have a checklist that catches the silent bugs before they burn a night of compute. This lesson builds both: one trusted, end-to-end training run of a small language model on the Spark, plus the habits around it.
+
+<Origin year="2019 → 2024" title="GPT-2, then everyone reproducing GPT-2">
+
+In February 2019 OpenAI released GPT-2, a family of language models from 124M to 1.5B parameters trained on WebText, a scrape of pages linked from Reddit. The paper ("Language Models are Unsupervised Multitask Learners", Radford et al.) gave the architecture but left a lot of the training recipe unsaid. The GPT-3 paper a year later (Brown et al., 2020) filled in many of the missing numbers for a 125M "GPT-3 Small": batch size of 0.5M tokens, peak learning rate 6e-4, warmup, cosine decay, weight decay 0.1, gradient clipping at 1.0.
+
+Then Andrej Karpathy turned the recipe into something you could read in an afternoon. **nanoGPT** (late 2022) was about 300 lines of model and 300 lines of training loop that reproduce GPT-2 124M on OpenWebText. In 2024 came **llm.c**, the same training in plain C and CUDA, and a write-up showing GPT-2 124M reproduced in about 90 minutes for about $20 on one 8×A100 node, trained on 10B tokens of **FineWeb-Edu**. The companion video, "Let's reproduce GPT-2 (124M)", and its repo **build-nanogpt** walk through every line, including the boring ones that matter. This lesson follows that lineage. When in doubt, those repos are the reference implementation; when your run disagrees with them, assume your run is wrong first.
+
+</Origin>
+
+## The Idea
+
+### The whole loop on one page
+
+Here is everything that happens between "a pile of web pages" and "a model that writes".
+
+<Figure n="001" title="THE TRAINING LIFECYCLE" caption="Six stages. The first two run once and write files. The middle loop runs thousands of times. The last two read a checkpoint. Most silent bugs live in the arrows, not the boxes: wrong dtype into the file, targets not shifted, val data leaking into train." wide>
+<svg viewBox="0 0 860 300" role="img" aria-label="Pipeline from raw text through tokenizer, token file, data loader, model and optimizer, to checkpoint, sampling and eval">
+  <rect x="10" y="40" width="110" height="64" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="64" text-anchor="middle" class="strong">RAW TEXT</text>
+  <text x="65" y="80" text-anchor="middle">fineweb-edu</text>
+  <text x="65" y="94" text-anchor="middle">parquet / stream</text>
+  <line x1="120" y1="72" x2="150" y2="72" class="ink" stroke-width="1.2" />
+  <polygon points="150,68 158,72 150,76" class="fill-blue" />
+  <rect x="160" y="40" width="110" height="64" class="fill-paper" stroke-width="1.2" />
+  <text x="215" y="64" text-anchor="middle" class="strong">TOKENIZER</text>
+  <text x="215" y="80" text-anchor="middle">gpt-2 bpe</text>
+  <text x="215" y="94" text-anchor="middle">+ EOT per doc</text>
+  <line x1="270" y1="72" x2="300" y2="72" class="ink" stroke-width="1.2" />
+  <polygon points="300,68 308,72 300,76" class="fill-blue" />
+  <rect x="310" y="40" width="120" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="370" y="64" text-anchor="middle" class="strong">TOKEN FILES</text>
+  <text x="370" y="80" text-anchor="middle">uint16 · 2 B/token</text>
+  <text x="370" y="94" text-anchor="middle">train_*.bin val_*.bin</text>
+  <text x="215" y="24" text-anchor="middle" class="blue-t">RUNS ONCE</text>
+  <line x1="10" y1="30" x2="430" y2="30" class="blue dash" stroke-width="1" />
+  <rect x="300" y="150" width="540" height="110" class="fill-paper dash" stroke-width="1" />
+  <text x="312" y="168" class="blue-t">THE TRAINING LOOP · ~5,000 STEPS</text>
+  <line x1="370" y1="104" x2="370" y2="182" class="ink" stroke-width="1.2" />
+  <polygon points="366,182 370,190 374,182" class="fill-blue" />
+  <rect x="316" y="192" width="110" height="54" class="fill-paper" stroke-width="1.2" />
+  <text x="371" y="214" text-anchor="middle" class="strong">LOADER</text>
+  <text x="371" y="232" text-anchor="middle">x, y = (B, T)</text>
+  <line x1="426" y1="219" x2="452" y2="219" class="ink" stroke-width="1.2" />
+  <polygon points="452,215 460,219 452,223" class="fill-blue" />
+  <rect x="462" y="192" width="110" height="54" class="fill-wash" stroke-width="1.2" />
+  <text x="517" y="214" text-anchor="middle" class="strong">GPT · 124M</text>
+  <text x="517" y="232" text-anchor="middle">bf16 · compiled</text>
+  <line x1="572" y1="219" x2="598" y2="219" class="ink" stroke-width="1.2" />
+  <polygon points="598,215 606,219 598,223" class="fill-blue" />
+  <rect x="608" y="192" width="100" height="54" class="fill-paper" stroke-width="1.2" />
+  <text x="658" y="214" text-anchor="middle" class="strong">LOSS</text>
+  <text x="658" y="232" text-anchor="middle">cross-entropy</text>
+  <line x1="708" y1="219" x2="724" y2="219" class="ink" stroke-width="1.2" />
+  <polygon points="724,215 732,219 724,223" class="fill-blue" />
+  <rect x="734" y="192" width="96" height="54" class="fill-paper" stroke-width="1.2" />
+  <text x="782" y="210" text-anchor="middle" class="strong">ADAMW</text>
+  <text x="782" y="226" text-anchor="middle">clip · lr(t)</text>
+  <text x="782" y="240" text-anchor="middle">update</text>
+  <path d="M 782 192 L 782 178 L 517 178 L 517 190" class="blue" stroke-width="1.2" />
+  <text x="650" y="174" text-anchor="middle" class="blue-t">NEW WEIGHTS</text>
+  <rect x="520" y="40" width="110" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="575" y="64" text-anchor="middle" class="strong">CHECKPOINT</text>
+  <text x="575" y="80" text-anchor="middle">model + optim</text>
+  <text x="575" y="94" text-anchor="middle">+ step + data pos</text>
+  <line x1="575" y1="150" x2="575" y2="112" class="ink dash" stroke-width="1" />
+  <polygon points="571,112 575,104 579,112" class="fill-blue" />
+  <text x="582" y="132">EVERY N STEPS</text>
+  <line x1="630" y1="60" x2="680" y2="60" class="ink" stroke-width="1.2" />
+  <polygon points="680,56 688,60 680,64" class="fill-blue" />
+  <line x1="630" y1="88" x2="680" y2="88" class="ink" stroke-width="1.2" />
+  <polygon points="680,84 688,88 680,92" class="fill-blue" />
+  <rect x="690" y="40" width="150" height="26" class="fill-paper" stroke-width="1.2" />
+  <text x="765" y="57" text-anchor="middle" class="strong">SAMPLE · temp, top-p</text>
+  <rect x="690" y="76" width="150" height="26" class="fill-paper" stroke-width="1.2" />
+  <text x="765" y="93" text-anchor="middle" class="strong">EVAL · val ppl, hellaswag</text>
+  <text x="10" y="200">THE SILENT BUGS:</text>
+  <text x="10" y="218">· int32 → uint16 overflow</text>
+  <text x="10" y="236">· y not shifted from x</text>
+  <text x="10" y="254">· val docs also in train</text>
+  <text x="10" y="272">· loader replays one shard</text>
+</svg>
+</Figure>
+
+You have built the blue box in the middle many times. This lesson is about every other box, and about the arrows, because that is where runs die quietly.
+
+### Choosing the text
+
+The model can only become as good as what it reads, so the first real decision is the dataset. Two good choices, for two different jobs:
+
+- **TinyStories** (Eldan and Li, 2023). About two million short children's stories, written by GPT-3.5 and GPT-4 with a deliberately tiny vocabulary of words. A few hundred million tokens in total (check the exact count on the dataset card). Its superpower is **fast feedback**: a model of only a few million parameters learns to write coherent little stories in minutes, so you can tell a working pipeline from a broken one before your coffee cools. Its weakness: it only teaches you about TinyStories. Nothing you learn about hyperparameters transfers cleanly to real text.
+- **FineWeb-Edu** (Penedo et al., 2024, from Hugging Face). Web pages from Common Crawl, filtered by a classifier trained to spot "educational" content. It has ready-made samples, including `sample-10BT`, a random 10-billion-token slice. This is what llm.c and build-nanogpt trained on, which is the second superpower: **there are published curves to compare against**. When your run is at step 2,000, you can check whether a known-good run was at roughly the same loss.
+
+**Recommendation: FineWeb-Edu `sample-10BT` for the real run, TinyStories for the five-minute smoke tests.** You are not trying to make the best 124M model in the world. You are trying to make a run you can *trust*, and the fastest way to trust a run is to have someone else's run to hold it up against. TinyStories is your unit test; FineWeb-Edu is your integration test.
+
+You will not use all 10B tokens. Below you will compute that about 2.5B is the sensible budget for a 124M model, which is a single night on the Spark.
+
+### Tokenize once, store as uint16
+
+Tokenizing is slow, Python-heavy work (see [Tokenizers](/lessons/tokenizers/) for what BPE is actually doing). Training wants to read millions of tokens a second. So you never tokenize during training. You tokenize **once**, up front, and write the token IDs to disk as one flat array of integers. During training you just read slices of that array.
+
+Three decisions make this file right:
+
+1. **One integer type, the smallest that fits.** GPT-2's tokenizer has 50,257 tokens, so every ID is between 0 and 50,256. An unsigned 16-bit integer holds 0 to 65,535. So each token takes **2 bytes** as a `uint16`. 2.5B tokens is 5 GB on disk. As `int64`, the default for `torch.tensor`, it would be 20 GB. (If you ever switch to a tokenizer with more than 65,536 tokens, like Llama 3's 128K vocabulary, you need `uint32`, and a silent cast to `uint16` will wrap the big IDs around to garbage. Assert the max before you cast.)
+2. **A separator between documents.** Put GPT-2's special <Term w="end-of-text token">Token 50256, written &lt;|endoftext|&gt;. It marks the boundary between two documents so the model learns that what follows is unrelated to what came before.</Term> in front of every document. Then concatenate everything, ignoring document boundaries. A training window of 1,024 tokens will often span the end of one page and the start of the next; the separator tells the model "context resets here". This is the simplest form of <Term w="packing">Concatenating many documents into one long token stream and cutting it into fixed-length windows, so no compute is wasted on padding.</Term>, and it is what GPT-2 and nanoGPT do.
+3. **Read it with a memory map.** `np.memmap(path, dtype=np.uint16, mode="r")` gives you an array-shaped view of the file without reading it. Slicing it reads just those bytes, through the page cache, on demand. That is the mmap from [Virtual memory](/lessons/virtual-memory/) and [Files and disks](/lessons/files-and-disks/): the OS keeps hot pages in RAM, and with 128 GB of unified memory on the Spark, your whole 5 GB dataset will end up cached after the first pass.
+
+<Figure n="002" title="TOKENS ON DISK, WINDOWS IN MEMORY" caption="The file is one long row of 2-byte IDs, documents separated by EOT. A training example is any T+1 consecutive tokens. x is the first T, y is the same window shifted left by one, so position i is asked to predict token i+1. Get this shift wrong and the loss becomes a lie.">
+<svg viewBox="0 0 640 250" role="img" aria-label="A row of token IDs with end-of-text separators; a window of T+1 tokens is cut into x and y shifted by one">
+  <text x="10" y="22" class="strong">train_0001.bin · uint16 · one flat array</text>
+  <g>
+    <rect x="10" y="34" width="44" height="28" class="fill-wash" stroke-width="1" /><text x="32" y="52" text-anchor="middle" class="blue-t">EOT</text>
+    <rect x="54" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="76" y="52" text-anchor="middle">464</text>
+    <rect x="98" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="120" y="52" text-anchor="middle">3797</text>
+    <rect x="142" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="164" y="52" text-anchor="middle">286</text>
+    <rect x="186" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="208" y="52" text-anchor="middle">13</text>
+    <rect x="230" y="34" width="44" height="28" class="fill-wash" stroke-width="1" /><text x="252" y="52" text-anchor="middle" class="blue-t">EOT</text>
+    <rect x="274" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="296" y="52" text-anchor="middle">818</text>
+    <rect x="318" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="340" y="52" text-anchor="middle">257</text>
+    <rect x="362" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="384" y="52" text-anchor="middle">2068</text>
+    <rect x="406" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="428" y="52" text-anchor="middle">11</text>
+    <rect x="450" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="472" y="52" text-anchor="middle">340</text>
+    <rect x="494" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="516" y="52" text-anchor="middle">373</text>
+    <rect x="538" y="34" width="44" height="28" class="fill-paper" stroke-width="1" /><text x="560" y="52" text-anchor="middle">257</text>
+    <text x="596" y="52">· · ·</text>
+  </g>
+  <text x="76" y="80" text-anchor="middle">DOC 1</text>
+  <text x="340" y="80" text-anchor="middle">DOC 2</text>
+  <line x1="142" y1="94" x2="142" y2="112" class="blue" stroke-width="1.2" />
+  <line x1="406" y1="94" x2="406" y2="112" class="blue" stroke-width="1.2" />
+  <line x1="142" y1="104" x2="406" y2="104" class="blue" stroke-width="1.2" />
+  <text x="274" y="98" text-anchor="middle" class="blue-t">ONE WINDOW: T+1 TOKENS FROM A RANDOM START</text>
+  <text x="10" y="148" class="strong">x</text>
+  <rect x="40" y="132" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="65" y="149" text-anchor="middle">286</text>
+  <rect x="90" y="132" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="115" y="149" text-anchor="middle">13</text>
+  <rect x="140" y="132" width="50" height="26" class="fill-wash" stroke-width="1" /><text x="165" y="149" text-anchor="middle" class="blue-t">EOT</text>
+  <rect x="190" y="132" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="215" y="149" text-anchor="middle">818</text>
+  <rect x="240" y="132" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="265" y="149" text-anchor="middle">257</text>
+  <text x="10" y="196" class="strong">y</text>
+  <rect x="40" y="180" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="65" y="197" text-anchor="middle">13</text>
+  <rect x="90" y="180" width="50" height="26" class="fill-wash" stroke-width="1" /><text x="115" y="197" text-anchor="middle" class="blue-t">EOT</text>
+  <rect x="140" y="180" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="165" y="197" text-anchor="middle">818</text>
+  <rect x="190" y="180" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="215" y="197" text-anchor="middle">257</text>
+  <rect x="240" y="180" width="50" height="26" class="fill-paper" stroke-width="1" /><text x="265" y="197" text-anchor="middle">2068</text>
+  <line x1="65" y1="158" x2="65" y2="180" class="ink dash" stroke-width="1" />
+  <line x1="115" y1="158" x2="115" y2="180" class="ink dash" stroke-width="1" />
+  <line x1="165" y1="158" x2="165" y2="180" class="ink dash" stroke-width="1" />
+  <line x1="215" y1="158" x2="215" y2="180" class="ink dash" stroke-width="1" />
+  <line x1="265" y1="158" x2="265" y2="180" class="ink dash" stroke-width="1" />
+  <text x="320" y="149">x = buf[s : s+T]</text>
+  <text x="320" y="197">y = buf[s+1 : s+T+1]</text>
+  <text x="320" y="173" class="blue-t">EACH x[i] IS SCORED ON y[i]</text>
+  <text x="10" y="236">T = 1,024 in the real run; 5 shown. B windows stacked make one micro-batch of shape (B, T).</text>
+</svg>
+</Figure>
+
+### The loader: random windows, a held-out split
+
+The loader's whole job is: given a batch size B and a context length T, hand back two integer tensors `x` and `y` of shape `(B, T)`, where `y` is `x` shifted by one. Three details make it correct.
+
+**Hold out validation data before anything else.** Validation data has to be text the model never trains on, or the validation loss means nothing. The cleanest split is by file: the first shard is `val`, the rest are `train`. Never split by sampling random windows from one big file into "train" and "val"; windows overlap, so the same sentences end up in both.
+
+**Cover the data, don't just sample it.** The tempting loader picks B random start positions each step. That works, but it samples with replacement.
+
+<Predict id="replacement">
+Your train set is cut into one million non-overlapping windows. Each step you draw random windows with replacement, and you draw one million in total (one "epoch" worth). What fraction of the windows does the model ever see?
+
+<Fragment slot="answer">
+
+About **63%**. Each window has a (1 − 1/n) chance of being missed on each draw, and (1 − 1/n)ⁿ → 1/e ≈ 0.37 for large n. So 37% of your data is never seen, and many windows are seen twice. For a single-epoch run that is a real waste. The fix is cheap: cut the data into windows, **shuffle the list of window start positions** once per epoch, and walk through it. Every window exactly once.
+
+</Fragment>
+</Predict>
+
+**Keep the integers small until the last moment.** Slice `uint16` from the memmap, convert to `int64` (PyTorch's embedding lookup wants `long`), then move to the GPU. On the Spark the CPU and GPU share the same physical memory, but a `.to("cuda")` still goes through the CUDA allocator; at these sizes it is noise either way.
+
+### The model: GPT-2 small, with two small changes
+
+Use the GPT-2 124M configuration: 12 layers, 12 heads, model width 768, context 1,024. You know this model. Two details worth getting exactly right:
+
+- **Tie the embeddings.** The input <Term w="embedding table">A big matrix with one row per token. Looking up a token ID returns its row: the vector the model starts from.</Term> and the output layer (the "LM head") share one matrix. That saves 38.6M parameters and is what GPT-2 did. With tying, the model has **124,475,904** parameters (I counted them with PyTorch on my Mac with the configuration below); 85M of those are in the transformer blocks, the rest are the embedding tables.
+- **Pad the vocabulary to 50,304.** That is 50,257 rounded up to a multiple of 128. The extra 47 rows are never used as targets, so the model learns to give them near-zero probability. Why bother? GPU matrix-multiply hardware works in tiles, and dimensions that are multiples of 64 or 128 fill the tiles exactly. Karpathy measured a few percent speedup from this one change. It is your first taste of the theme of the speed section: the numbers the hardware likes are not the numbers the model needs.
+
+Initialise like GPT-2: linear and embedding weights from a normal distribution with standard deviation 0.02, biases at zero, and the two projections that write back into the residual stream (attention output, MLP output) scaled down by 1/√(2 × layers), so the residual stream does not grow with depth.
+
+### What the loss number means
+
+The loss is <Term w="cross-entropy">For each position, minus the log of the probability the model gave to the correct next token. Averaged over all positions in the batch. Zero only if the model is certain and right.</Term>, measured in <Term w="nats">The unit you get when you use the natural log (ln). One nat is about 1.44 bits.</Term>. If the model gives the correct next token probability 0.05, that position contributes −ln(0.05) ≈ 3.0.
+
+<Predict id="init-loss">
+You build the 124M model with the init above and, before any training, run one batch of real text through it. What loss do you expect, roughly? What would you conclude if you saw 68?
+
+<Fragment slot="answer">
+
+About **ln(50,257) ≈ 10.82**. With small random weights the logits are all close to zero, so the softmax is close to uniform: every one of the 50,257 tokens gets probability ≈ 1/50,257, and −ln(1/V) = ln(V). (With the padded vocabulary, ln(50,304) = 10.83; the same thing.) I measured **10.98** for this exact model at init: slightly above, because the logits are small but not zero. Anything from about 10.8 to 11.2 is healthy.
+
+A 68 means the model is extremely confident and wrong at step 0, which only happens when the logits are huge: an init that is far too large. I got exactly that by initialising the same architecture with standard deviation 1.0 instead of 0.02: initial loss **68.2**. A network starting there spends its first thousand steps undoing the init, and often never recovers fully.
+
+</Fragment>
+</Predict>
+
+This is the single cheapest sanity check in deep learning, and it catches broken inits, wrong vocab sizes, mismatched loss reductions, and labels from the wrong tokenizer.
+
+To make loss numbers feel like something, convert them to <Term w="perplexity">e raised to the loss. Read it as: "the model is as uncertain as if it were choosing uniformly among this many tokens."</Term>:
+
+| Loss (nats) | Perplexity | What it feels like |
+| --- | --- | --- |
+| 10.83 | ~50,000 | Random guessing over the whole vocabulary. Step 0. |
+| 7 | ~1,100 | Knows which tokens are common, nothing about order. |
+| 5 | ~150 | Local word patterns, grammar-ish. Samples are word salad with structure. |
+| 4 | ~55 | Mostly grammatical sentences; topic drifts. |
+| ~3.3 | ~27 | Where a 124M model ends up on web text after a few billion tokens. Paragraphs that hold a topic. |
+| 0.05 | ~1.05 | Impossible on real text. You have a bug (see below). |
+
+Two warnings. **Losses are only comparable on the same tokenizer and the same validation text.** A loss of 3.3 on FineWeb-Edu and 1.5 on TinyStories are not comparing models, they are comparing datasets (stories are far more predictable). And **small differences matter**: at this scale, a change that drops validation loss by 0.02 nats is a real improvement if it is consistent, and a change that costs 0.05 is a real regression.
+
+### The optimizer: AdamW, with weight decay on the right things
+
+<Term w="AdamW">Adam with "decoupled" weight decay: the weights shrink a little each step, separately from the gradient update. Adam itself keeps a running average of each weight's gradient (momentum) and of its square, and divides one by the square root of the other, so every weight gets its own step size.</Term> is the default for transformers, and the GPT-3 settings are a good place to stand: betas (0.9, 0.95), epsilon 1e-8, weight decay 0.1. The 0.95 (instead of Adam's usual 0.999) makes the squared-gradient average forget faster, which helps when gradient sizes swing around, as they do in language models.
+
+<Term w="Weight decay">Shrinking every weight slightly toward zero each step. A gentle pressure toward small weights that acts as regularisation.</Term> is where people get it subtly wrong. Apply it to the **2-D weight matrices** (every linear layer and the embedding table), and **not** to biases or LayerNorm gains and offsets. Decaying a LayerNorm gain pulls it toward zero, which literally scales down that layer's output; there is no reason to want that. The rule that implements this is one line: decay a parameter if `p.dim() >= 2`. For the 124M model that puts 124,354,560 parameters in the decay group and 121,344 (biases and norms) in the no-decay group, which I also counted. If your no-decay group is empty, or holds tens of millions of parameters, something is off.
+
+### The learning rate: warm up, then cosine down
+
+The learning rate is the most important number in the run. Get it within a factor of two of good and most other settings stop mattering much.
+
+The shape that works: **linear warmup** from near zero to the peak over a few hundred steps, then **cosine decay** down to about 10% of the peak by the last step.
+
+<Figure n="003" title="WARMUP + COSINE" caption="Peak 6e-4, 300 warmup steps, cosine down to 6e-5 at step 5,000. The warmup is a sliver of the run but protects the most fragile moment: step 0, when the weights are random and Adam has no history. The slow tail of the cosine is where the last few hundredths of a nat come from.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Learning rate rising linearly for 300 steps then following a cosine curve down to 10 percent of the peak">
+  <line x1="50" y1="20" x2="50" y2="190" class="ink" stroke-width="1" />
+  <line x1="50" y1="190" x2="620" y2="190" class="ink" stroke-width="1" />
+  <text x="44" y="34" text-anchor="end">6e-4</text>
+  <text x="44" y="172" text-anchor="end">6e-5</text>
+  <text x="44" y="194" text-anchor="end">0</text>
+  <line x1="50" y1="174" x2="620" y2="174" class="ink dash" stroke-width="0.8" />
+  <polyline class="blue" stroke-width="1.8" points="50,190 84,30.0 96,30.2 107,30.6 118,31.4 130,32.6 141,34.0 153,35.7 164,37.7 175,40.1 187,42.6 198,45.5 210,48.6 221,51.9 232,55.5 244,59.3 255,63.3 267,67.4 278,71.7 289,76.1 301,80.7 312,85.3 324,90.0 335,94.8 346,99.6 358,104.4 369,109.2 381,114.0 392,118.7 403,123.3 415,127.9 426,132.3 438,136.6 449,140.7 460,144.7 472,148.5 483,152.1 495,155.4 506,158.5 517,161.4 529,163.9 540,166.3 552,168.3 563,170.0 574,171.4 586,172.6 597,173.4 609,173.8 620,174.0" />
+  <text x="56" y="18" class="strong">LR</text>
+  <text x="620" y="206" text-anchor="end">STEP 5,000</text>
+  <text x="84" y="206" text-anchor="middle">300</text>
+  <line x1="84" y1="30" x2="84" y2="190" class="ink dash" stroke-width="0.8" />
+  <text x="96" y="70" class="blue-t">WARMUP</text>
+  <text x="96" y="84">linear, ~5% of run</text>
+  <text x="330" y="52" class="blue-t">COSINE DECAY</text>
+  <text x="330" y="66">half a cosine wave from peak to min</text>
+  <text x="400" y="166">MIN = 10% OF PEAK</text>
+</svg>
+</Figure>
+
+Why each part is there:
+
+- **Warmup.** At step 0 Adam's running averages are empty, so its first few steps are oddly sized, and the gradients of a random network point in wild directions. A full-size step on top of that can throw the model somewhere it never fully recovers from. A few hundred steps of ramping is cheap insurance. GPT-3 Small warmed up over 375M tokens; for a 2.5B-token run, a few hundred steps of 0.5M tokens is in the same spirit.
+- **Peak.** 6e-4 is GPT-3 Small's peak and a safe starting point for 124M. Karpathy found 124M models tolerate about 3× that. You will find your own with a sweep.
+- **Decay.** Early on, big steps make fast progress. Late in training the loss surface is a narrow valley, and big steps bounce off its walls. Lowering the LR lets the model settle into the valley floor. You will see this as an extra dip in the last fifth of the run.
+
+### Batch size is measured in tokens
+
+For language models, think of batch size as **tokens per optimizer step**, not sequences. GPT-3 Small used about 0.5M tokens per step; nanoGPT uses 2¹⁹ = 524,288 (a power of two near 0.5M). With T = 1,024 that is 512 sequences per step.
+
+That will not fit in one forward pass on the Spark, and it does not need to. <Term w="Gradient accumulation">Running several small forward/backward passes and adding up their gradients before taking one optimizer step. Mathematically the same as one big batch, just slower per step and lighter on memory.</Term> splits the big batch into micro-batches: run, say, 32 micro-batches of 16 × 1,024 tokens each, summing gradients, then step once.
+
+<Figure n="004" title="ONE STEP, 32 MICRO-BATCHES" caption="Gradients from each micro-batch add up in .grad. Only after the last one does the optimizer move the weights. Because .grad adds, each micro-batch's loss must be divided by the number of micro-batches, or you are summing 32 losses instead of averaging them.">
+<svg viewBox="0 0 640 210" role="img" aria-label="Thirty-two micro-batches each run forward and backward, their gradients accumulate, then one optimizer step and zero grad">
+  <rect x="10" y="30" width="58" height="40" class="fill-paper" stroke-width="1.2" /><text x="39" y="48" text-anchor="middle" class="strong">μB 1</text><text x="39" y="62" text-anchor="middle">16×1024</text>
+  <rect x="76" y="30" width="58" height="40" class="fill-paper" stroke-width="1.2" /><text x="105" y="48" text-anchor="middle" class="strong">μB 2</text><text x="105" y="62" text-anchor="middle">16×1024</text>
+  <rect x="142" y="30" width="58" height="40" class="fill-paper" stroke-width="1.2" /><text x="171" y="48" text-anchor="middle" class="strong">μB 3</text><text x="171" y="62" text-anchor="middle">16×1024</text>
+  <text x="228" y="54" text-anchor="middle">· · ·</text>
+  <rect x="256" y="30" width="58" height="40" class="fill-paper" stroke-width="1.2" /><text x="285" y="48" text-anchor="middle" class="strong">μB 32</text><text x="285" y="62" text-anchor="middle">16×1024</text>
+  <text x="10" y="20">FORWARD + BACKWARD, loss / 32</text>
+  <line x1="39" y1="70" x2="39" y2="110" class="ink" stroke-width="1" />
+  <line x1="105" y1="70" x2="105" y2="110" class="ink" stroke-width="1" />
+  <line x1="171" y1="70" x2="171" y2="110" class="ink" stroke-width="1" />
+  <line x1="285" y1="70" x2="285" y2="110" class="ink" stroke-width="1" />
+  <rect x="10" y="110" width="304" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="162" y="131" text-anchor="middle" class="strong">.grad += ∂(loss/32)/∂w   (accumulates)</text>
+  <line x1="314" y1="127" x2="350" y2="127" class="ink" stroke-width="1.2" />
+  <polygon points="350,123 358,127 350,131" class="fill-blue" />
+  <rect x="360" y="104" width="120" height="46" class="fill-paper" stroke-width="1.2" />
+  <text x="420" y="124" text-anchor="middle" class="strong">CLIP NORM ≤ 1</text>
+  <text x="420" y="140" text-anchor="middle">log the norm</text>
+  <line x1="480" y1="127" x2="506" y2="127" class="ink" stroke-width="1.2" />
+  <polygon points="506,123 514,127 506,131" class="fill-blue" />
+  <rect x="516" y="104" width="114" height="46" class="fill-paper" stroke-width="1.2" />
+  <text x="573" y="124" text-anchor="middle" class="strong">OPT.STEP()</text>
+  <text x="573" y="140" text-anchor="middle">then zero_grad</text>
+  <text x="10" y="176" class="blue-t">32 × 16 × 1,024 = 524,288 TOKENS PER OPTIMIZER STEP</text>
+  <text x="10" y="196">Bigger micro-batch if memory allows: fewer, fatter passes usually run faster.</text>
+</svg>
+</Figure>
+
+Why not just use a small batch and skip the accumulation? Because the batch size is a hyperparameter of the *recipe*. The LR of 6e-4 was tuned for 0.5M-token batches. Smaller batches give noisier gradients and want a smaller LR; if you change one, you have changed the other. Keeping the batch at 0.5M tokens means published numbers still apply to you.
+
+### Gradient clipping
+
+Every so often a batch produces a gradient far larger than usual: a weird document, a rare token, an unlucky moment. One giant step can undo hours of progress. <Term w="Gradient clipping">Before the optimizer step, measure the size (L2 norm) of the whole gradient, all parameters together. If it is bigger than a threshold, scale it down to the threshold. Direction kept, size capped.</Term> at a norm of 1.0 caps the damage. `torch.nn.utils.clip_grad_norm_` returns the norm *before* clipping; **log it every step**. A healthy run's gradient norm settles somewhere below 1 after the early phase and drifts slowly. Spikes in the norm come before spikes in the loss, so it is your early warning.
+
+### Making it fast: four switches
+
+None of these change what the model learns (to within noise). All of them change how many tokens per second you get.
+
+1. **bf16 autocast.** Wrap the forward pass and loss in `torch.autocast(device_type="cuda", dtype=torch.bfloat16)`. Matrix multiplies run in <Term w="bf16">A 16-bit float with the same exponent range as fp32 but fewer digits of precision. Big range means no overflow/underflow trouble, so no loss scaling is needed (unlike fp16).</Term> on the tensor cores; the weights, the optimizer state, and sensitive operations like softmax and the loss stay in fp32. You do not need a gradient scaler with bf16. That is fp16's problem, and why [fp32, bf16, fp16, fp8](/lessons/number-formats/) says everyone switched.
+2. **TF32 for whatever is left in fp32.** `torch.set_float32_matmul_precision("high")` lets fp32 matmuls use tensor cores at reduced precision. Free speed, harmless for training.
+3. **Flash attention.** Use `F.scaled_dot_product_attention(q, k, v, is_causal=True)` instead of writing out softmax(QKᵀ)V by hand. PyTorch picks a fused kernel that never writes the T × T attention matrix to memory, which is the whole story of [FlashAttention](/lessons/flash-attention/).
+4. **`torch.compile(model)`.** Traces your model and fuses chains of small operations (add, LayerNorm, GELU, dropout) into single kernels. On the Spark this matters more than on an H100: its memory bandwidth (273 GB/s, spec sheet) is low relative to its compute, so every unfused elementwise op that reads and writes a whole activation tensor is relatively expensive. The first step takes a minute or more while it compiles; the steps after are faster. How much faster is one of the things you will measure.
+
+Also pass `fused=True` to AdamW if your PyTorch version supports it on your device: the optimizer update becomes one kernel instead of a loop over parameter tensors.
+
+### Reading loss curves
+
+Now the part that would have saved your earlier experiments. Every training run produces a loss curve, and the shape tells you far more than the final number. Below are the six curves you will meet most often. They are shaped from the real behaviour of runs like this one, but they are illustrations, not measurements. Click through them all and read each annotation.
+
+<Figure n="005" title="LOSS-CURVE EXPLORER" caption="Six typical runs of a 124M GPT on web text, 5,000 steps of 0.5M tokens. Blue is the noisy per-step training loss, black the validation loss. The strip underneath is each run's learning rate on a log scale. Switch to a log step axis to see the first hundred steps, where warmup problems live." wide>
+
+<TinyLMLossExplorer />
+
+</Figure>
+
+The patterns to burn in:
+
+- **The first number is ln(V).** If step 0 is not near 10.8, stop.
+- **Too good to be true is a bug.** A 124M model on web text does not reach loss 1. If you see it, you are leaking the answer. I checked this on my Mac with a tiny GPT fed *random* tokens: a correct pipeline cannot do better than ln(V) on random data (there is nothing to learn), yet with `y = x` instead of the shifted target, the loss fell from 10.5 to 5.8 in 100 steps. Random-token training is a two-minute test for leaks.
+- **Spikes that recover are a warning; spikes that don't are a verdict.** Lower the LR, check clipping, look at the gradient norm.
+- **Still falling steeply at the end** means you stopped too early or the LR is too low: compute left on the table.
+- **Val pulling away from train** is overfitting. In a single-epoch pretraining run it should not happen, so if it does, suspect the data (too small, or replayed).
+
+Two more habits. **Evaluate validation loss on a fixed set** of batches (say 20 batches, the same ones every time), so the val number moves only when the model changes. And **always plot new runs on top of your baseline, same axes.** Most "did my idea work?" questions are answered by whether the new curve is below the old one at the same step.
+
+### How big, how long: scaling laws and 6·N·D
+
+How many tokens should a 124M model see? In 2022, DeepMind's **Chinchilla** paper (Hoffmann et al.) trained over 400 models of different sizes on different amounts of data, all for different compute budgets, and asked: for a fixed compute budget, what split between model size and data gives the lowest loss? The answer, roughly: grow them together, with about **20 tokens per parameter**. Earlier work (Kaplan et al., 2020) had said to favour bigger models; Chinchilla's correction was that most big models of the time were badly undertrained.
+
+So for 124M parameters: about **2.5B tokens**. That is the "compute-optimal" budget: the cheapest way to *train* to a given loss. (Plenty of real models go far past 20 tokens per parameter on purpose: Llama 3 8B saw over 15 trillion tokens, because a small model trained long is cheaper to *serve*. That trade is about inference cost, not training.)
+
+Now the compute. Training a transformer costs about **6 FLOPs per parameter per token**:
+
+- The forward pass does one multiply and one add per weight per token: **2·N** FLOPs per token.
+- The backward pass computes two things for every layer, the gradient with respect to its inputs (to pass back) and with respect to its weights (to update). Each costs about as much as the forward: **4·N**.
+
+Total training compute ≈ **6·N·D**, where D is the number of training tokens. This ignores the attention scores themselves (QKᵀ and the weighted sum of V), which add about 12 × layers × width × T FLOPs per token. For our model at T = 1,024 that is 113M on top of 6N = 747M, about 15% more, so a fairer count is **~860M FLOPs per token**. Both numbers below; neither is exact.
+
+For 124M parameters and 2.5B tokens: 6 × 1.245e8 × 2.5e9 ≈ **1.9e18 FLOPs** (2.2e18 with attention).
+
+What the Spark can do: about **125 TFLOP/s** of dense bf16 at most. That is not a published spec; it is the estimate derived in [Bandwidth bound](/lessons/bandwidth-bound/) from NVIDIA's marketing number, and you will measure the real one. No training run gets the peak. The fraction it does get is the <Term w="MFU">Model FLOPs utilization: the FLOPs your model's math actually needs per second (tokens/s × FLOPs per token), divided by the hardware's peak. Counts only useful model math, not recomputation or overhead. Introduced in Google's PaLM paper.</Term>. Well-tuned large-scale runs reach about 40-60%; llm.c's GPT-2 run on 8 A100s works out to roughly 60% by this formula (10B tokens in 90 minutes is about 1.85M tokens/s). For a single small model on the Spark, 30-45% would be a good result. I do not know your number; that is why you will measure it.
+
+At 40% MFU, 50 TFLOP/s achieved: 1.9e18 / 5e13 ≈ 37,000 s ≈ **10 hours** (about 12 with attention). At 25% MFU, more like 17-19 hours. That is an overnight run, and it tells you something important before you write any code: **you get about one full-size run per day.** So everything you want to learn about hyperparameters has to be learned on smaller, faster runs first.
+
+Play with the budget. Then try the reverse panel with the tokens/second you measure later.
+
+<Figure n="006" title="COMPUTE CALCULATOR" caption="Training compute ≈ 6 × params × tokens. Divide by the FLOP/s you actually achieve (peak × MFU) to get wall-clock time. Spark peak is the site's 125 TFLOP/s bf16 estimate; A100 and H100 are spec-sheet dense bf16. The 6N rule ignores attention (about +15% for this model at T = 1,024), so treat every number as ±20%.">
+
+<TinyLMCompute />
+
+</Figure>
+
+### The debugging recipe
+
+Karpathy's "A Recipe for Training Neural Networks" (2019) boils down to: neural nets fail silently, so be paranoid, and build up from things you can verify. For a language model, in this order, before any long run:
+
+1. **Look at the data.** Decode a few training windows back to text and read them. Is it text? Are there EOT tokens between documents? Print one `(x, y)` pair side by side and check `y` is `x` moved left by one.
+2. **Check the init loss.** One forward pass, no training. ≈ ln(V)? (Above.)
+3. **Overfit one batch.** Take a single small batch and train on it, over and over, for a few hundred steps. A working model and optimizer must drive the loss to near zero, because memorising 256 tokens is trivial. I ran this on my Mac with a 4-layer GPT on one batch of 4 × 64 tokens at LR 1e-3: loss went from 10.87 to **0.08 in 50 steps** and 0.005 by step 300. If yours plateaus at 5, something between the loss and the weights is broken: wrong targets, detached tensors, an optimizer that was given the wrong parameters, an LR of zero.
+4. **Train on random tokens for a minute.** The loss must stay at or above ln(V). If it drops, the model can see its targets.
+5. **Print the LR every step for the first few.** Is warmup happening? Is it the number you think? (Off-by-one-order-of-magnitude LRs are the most common silent bug.)
+6. **A short real run on TinyStories or a small FineWeb slice.** Does the curve look like the "good run" in Figure 005? Do samples get better?
+7. **Only then, the long run.** And keep notes.
+
+### Checkpoints
+
+A 10-hour run will be interrupted at some point: a reboot, an OOM, a `Ctrl-C` you regret. A checkpoint is everything needed to continue as if nothing happened:
+
+- the model weights (from the *uncompiled* model; `torch.compile` wraps it and prefixes every key with `_orig_mod.`),
+- the optimizer state (Adam's two running averages, twice the size of the model),
+- the step number (so the LR schedule resumes in the right place),
+- the data position (epoch, shuffle seed, index into the window list), so you don't retrain on the same data,
+- the config, and ideally the git commit of your code.
+
+Write it with the crash-safe recipe from [Files and disks](/lessons/files-and-disks/): write to a temp file in the same directory, fsync, `os.replace` over the old one, fsync the directory. A checkpoint that is half-written when the machine dies is worse than none, because it overwrote the good one. Keep the last two or three, plus a few milestones, so a bad stretch of training doesn't leave you with only bad checkpoints.
+
+How big? Weights in fp32: 124.5M × 4 bytes ≈ 0.5 GB. Adam state: 1.0 GB. About 1.5 GB per checkpoint. (See [Why training needs so much memory](/lessons/training-memory/) for where those multiples come from.)
+
+### Sampling: turning probabilities into text
+
+The model outputs a probability for every token. How you pick from them changes the text a lot, and none of it changes the model.
+
+- **Greedy**: always take the most likely token. Deterministic, and for small models falls into loops quickly ("the the the", or one sentence forever).
+- **Temperature**: divide the logits by τ before the softmax. τ &lt; 1 sharpens the distribution (safer, duller); τ &gt; 1 flattens it (more surprising, more nonsense). τ = 1 is the model's own distribution.
+- **Top-k**: keep only the k most likely tokens, renormalise, sample. Cuts off the long tail of very unlikely tokens, each individually rare but collectively likely to be picked once every few words.
+- **Top-p** (nucleus sampling, Holtzman et al., 2019): keep the smallest set of tokens whose probabilities add to at least p, say 0.9. Adapts to context: when the model is sure, the set is two tokens; when it is unsure, it is hundreds.
+
+For a 124M model, temperature 0.8 to 1.0 with top-p 0.9 or top-k 50 is a reasonable start. Fix a prompt and a seed, so samples from different checkpoints are comparable.
+
+### Small evals
+
+Validation loss is your main number: cheap, smooth, and directly what you optimised. But loss does not tell you whether the model knows anything, so add one small task eval.
+
+**HellaSwag** (Zellers et al., 2019) gives a short context and four possible endings; one is right, three are machine-generated traps. A language model can do it without any instruction following: compute the model's average loss on each ending's tokens given the context, and pick the ending with the lowest loss. Random guessing scores 25%. Karpathy measured OpenAI's GPT-2 124M at about 29.5% on the 10,042-example validation set this way; a 124M model is barely above chance, which is exactly why it is a good *small* eval: it moves as you train. The standard error on 10,042 examples is about ±0.45 points, so differences under about one point between two runs are noise (more on that in [Statistics for evals](/lessons/statistics-for-evals/)).
+
+## Build It
+
+Everything runs on the Spark except where noted. Keep one folder, `~/tinylm/`, under git. Commit before every run, so every result in your log points at the exact code that made it.
+
+<Task id="t0" title="Set up the Spark and measure its matmul peak" agent="ok">
+
+The lowest-friction way to get a CUDA PyTorch build for the Spark's ARM CPU and Blackwell GPU is NVIDIA's NGC PyTorch container; a pip wheel built for aarch64 + CUDA may also work. Check NVIDIA's DGX Spark documentation for the current recommendation; it has changed over time. Then:
+
+```bash
+pip install tiktoken datasets numpy matplotlib
+python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name())"
+```
+
+If you did [Bandwidth bound](/lessons/bandwidth-bound/), you already have `flops.py`. If not, time a large bf16 matmul (8192 × 8192 is a good size), with warmup and `torch.cuda.synchronize()` before stopping the clock. A square n × n matmul is 2n³ FLOPs. Write the plateau down: this **measured peak** is what you'll compute MFU against, alongside the 125 estimate.
+
+</Task>
+
+<Task id="t1" title="Tokenize FineWeb-Edu into uint16 shards" agent="ok">
+
+Boilerplate. It streams the 10BT sample (so you don't download all of it), tokenizes in parallel, writes 100M-token shards, and stops after the budget. Shard 0 is validation.
+
+```python
+# prepare.py
+import os, numpy as np, tiktoken, multiprocessing as mp
+from datasets import load_dataset
+
+OUT = os.path.expanduser("~/data/fineweb_edu")
+SHARD = 100_000_000            # tokens per shard = 200 MB of uint16
+BUDGET = 2_700_000_000         # val shard + ~2.6B train tokens
+enc = tiktoken.get_encoding("gpt2")
+EOT = enc.eot_token            # 50256
+
+def tok(doc):
+    ids = np.array([EOT] + enc.encode_ordinary(doc["text"]), dtype=np.int64)
+    assert ids.max() < 2**16, "token id does not fit in uint16"
+    return ids.astype(np.uint16)
+
+if __name__ == "__main__":
+    os.makedirs(OUT, exist_ok=True)
+    ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
+                      split="train", streaming=True)
+    buf = np.empty(SHARD, dtype=np.uint16)
+    n = shard = total = 0
+    with mp.Pool(max(1, os.cpu_count() - 2)) as pool:
+        for ids in pool.imap(tok, ds, chunksize=64):
+            while len(ids):
+                take = min(SHARD - n, len(ids))
+                buf[n:n + take] = ids[:take]
+                n += take
+                ids = ids[take:]
+                if n == SHARD:
+                    split = "val" if shard == 0 else "train"
+                    buf.tofile(f"{OUT}/{split}_{shard:04d}.bin")
+                    total += n
+                    shard += 1
+                    n = 0
+                    print(f"wrote shard {shard}, {total / 1e9:.2f}B tokens", flush=True)
+            if total >= BUDGET:
+                break
+```
+
+Time it. Note the tokens per second in your log; it tells you whether tokenizing on the fly could ever have kept up with training (it couldn't, but check). Then do the same for TinyStories (`roneneldan/TinyStories`, field `text`) into `~/data/tinystories/`, with smaller shards. Dataset names and fields can change; check the dataset cards if a load fails.
+
+Last, read your data back: memmap one train shard, take 300 tokens from a random offset, `enc.decode` them, and read the text. Find an EOT in it.
+
+</Task>
+
+<Task id="t2" title="Write the data loader" agent="hands">
+
+Yours to write. The shape:
+
+```python
+class Loader:
+    def __init__(self, data_dir: str, split: str, B: int, T: int, seed: int = 0):
+        """Memmap every {split}_*.bin shard (np.memmap, dtype=np.uint16, mode='r').
+        Build the list of (shard, start) window positions, stride T, each window
+        needing T+1 tokens. Shuffle it with a seeded generator."""
+
+    def next_batch(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return x, y: int64 tensors of shape (B, T) on the GPU. y is x shifted by one.
+        Walk the shuffled window list; when it runs out, bump the epoch and reshuffle."""
+
+    def state_dict(self) -> dict: ...      # epoch, position, seed: enough to resume exactly
+    def load_state_dict(self, d: dict): ...
+```
+
+Hints: convert with `torch.from_numpy(arr.astype(np.int64))`. Write a three-line test: for one batch, `assert (x[:, 1:] == y[:, :-1]).all()`. For val, you don't need shuffling; you need the *same* first 20 batches every time.
+
+</Task>
+
+<Task id="t3" title="The model: your GPT-2, with the checklist" agent="review">
+
+Use your own GPT-2 implementation. Before moving on, make it pass this checklist, then have an agent review the diff against nanoGPT's `model.py`:
+
+- Config: `n_layer=12, n_head=12, n_embd=768, block_size=1024, vocab_size=50304`.
+- LM head weight tied to the token embedding (`self.lm_head.weight = self.wte.weight`).
+- Init std 0.02; residual output projections scaled by `(2 * n_layer) ** -0.5`; biases zero.
+- Attention through `F.scaled_dot_product_attention(..., is_causal=True)`.
+- `forward(idx, targets=None)` returns `(logits, loss)`, loss computed in fp32 over the flattened `(B*T, V)` logits.
+- A parameter count that prints **124,475,904** (with untied embeddings you would see 163M).
+
+</Task>
+
+<Task id="t4" title="The two sanity checks: init loss and overfit one batch" agent="hands">
+
+Write `sanity.py`. Three checks, each prints PASS or FAIL:
+
+1. **Init loss.** One batch of real data through the fresh model. Expect 10.8-11.2. Print `math.log(50257)` next to it.
+2. **Overfit one batch.** B = 4, T = 64 (keep it tiny), plain AdamW at 1e-3, no schedule, 300 steps on the same batch. Expect the loss under 0.1 well before the end.
+3. **Random tokens.** Fresh model, fresh random token batches each step, correct shifting, 100 steps. Loss must never go meaningfully below ln(V). Then flip `y = x` and watch it fall, so you have seen what the bug looks like.
+
+Run this on the Mac too, on CPU with a 4-layer model. It is fast, and it means you can catch model bugs without touching the Spark.
+
+</Task>
+
+<Task id="t5" title="The training loop" agent="hands">
+
+This is the core of the lesson; write it yourself. Skeleton and spec:
+
+```python
+# train.py (shape, not a solution)
+@dataclass
+class TrainConfig:
+    data_dir: str = "~/data/fineweb_edu"
+    total_batch: int = 524_288        # tokens per optimizer step
+    B: int = 16; T: int = 1024        # micro-batch
+    max_lr: float = 6e-4; min_lr_frac: float = 0.1
+    warmup_steps: int = 300; max_steps: int = 4_800   # ~2.5B tokens
+    weight_decay: float = 0.1; grad_clip: float = 1.0
+    eval_every: int = 250; ckpt_every: int = 500; compile: bool = True
+
+def get_lr(step: int, cfg: TrainConfig) -> float:
+    """Linear warmup to max_lr over warmup_steps, then cosine to max_lr*min_lr_frac at max_steps."""
+
+def configure_optimizer(model, cfg) -> torch.optim.Optimizer:
+    """Two param groups: dim >= 2 gets weight_decay, the rest gets 0.
+    Print both group sizes. AdamW, betas=(0.9, 0.95), eps=1e-8, fused if available."""
+
+def save_checkpoint(path, raw_model, opt, step, loader, cfg): ...   # atomic: tmp, fsync, os.replace, fsync dir
+
+# main loop, per step:
+#   set lr on every param group from get_lr(step)
+#   for micro in range(grad_accum):  (grad_accum = total_batch // (B*T); assert it divides)
+#       x, y = loader.next_batch()
+#       with torch.autocast("cuda", dtype=torch.bfloat16): _, loss = model(x, y)
+#       (loss / grad_accum).backward()
+#   norm = clip_grad_norm_(model.parameters(), cfg.grad_clip)
+#   opt.step(); opt.zero_grad(set_to_none=True)
+#   torch.cuda.synchronize(); time the step; log
+```
+
+Log one line per step to stdout **and** to `log.jsonl`:
+
+```
+step 1200 | loss 3.8123 | lr 5.81e-04 | norm 0.42 | dt 9012ms | tok/s 58,170 | mfu 39.9%
+```
+
+Compute MFU in the loop: `tok_per_s * flops_per_token / peak`, with `flops_per_token = 6*N + 12*n_layer*n_embd*T`, and print it against both the 125 TFLOP/s estimate and your measured matmul peak from t0. Every `eval_every` steps, compute val loss on the fixed 20 batches under `torch.no_grad()` and log it. Every `ckpt_every`, save. Add `--resume path` that restores everything, including the loader position, and check that a resumed run's next loss matches what the uninterrupted run logged.
+
+Then, before the real thing, run it for 200 steps on TinyStories with a 6-layer model and confirm the curve looks like the good run.
+
+</Task>
+
+<Task id="t6" title="One controlled experiment: an LR sweep at small scale" agent="review">
+
+You get one long run a day, so learn the LR on small runs. Use a 6-layer, width-384, 6-head model (about 30M parameters, a lot of it embedding), total batch 65,536 tokens (B=16, T=1,024, accumulation 4), warmup 30, 300 steps, FineWeb-Edu. That is about 20M tokens per run, a few minutes each on the Spark.
+
+Sweep the peak LR over `[1e-4, 3e-4, 1e-3, 3e-3, 1e-2]`. **Change nothing else**, same seed, same data order. Save each run's `log.jsonl`. Then write `plot.py` with matplotlib: one figure with all five training curves (smoothed with an exponential moving average, raw curves faint behind them), and a second figure of final val loss against LR on a log x-axis.
+
+Have an agent review the plot and your conclusion, not write them. Expect a U shape in the second plot: too low is slow, too high is unstable, the bottom is usually just below where instability starts. Caveat: the best LR at 30M is not exactly the best LR at 124M (smaller models usually tolerate higher LRs). Use the sweep to sanity-check 6e-4 and to see the U with your own eyes, not to pick a number to four digits.
+
+</Task>
+
+<Task id="t7" title="Measure throughput and MFU" agent="hands">
+
+With the full 124M config, run 30 steps four ways and record steady-state tok/s (skip the first few steps, and with compile on, skip the compile time):
+
+1. fp32, no compile
+2. bf16 autocast, no compile
+3. bf16 + `torch.compile`
+4. (3) with micro-batch B = 32 or 64 if memory allows (accumulation shrinks to match)
+
+Compute MFU for each against both peaks. Then, with the best setting, use the calculator in Figure 006 (reverse panel) to check your arithmetic, and set `max_steps` so the main run fits a night.
+
+</Task>
+
+<Task id="t8" title="The main run, with a training log" agent="ok">
+
+Start it inside `tmux` (so a dropped SSH session from [SSH and Tailscale](/lessons/ssh-and-tailscale/) doesn't kill it) and send output to a file:
+
+```bash
+tmux new -s train
+cd ~/tinylm && git commit -am "main run: 124M, 2.5B tok, lr 6e-4" && \
+python train.py 2>&1 | tee runs/main/stdout.log
+# detach: Ctrl-b d      reattach: tmux attach -t train
+```
+
+Keep `LOG.md` in the repo, one entry per run, written *before* the run starts and finished after:
+
+```markdown
+## 2026-10-18 main-124m
+commit: a1b2c3d   config: 124M, 2.5B tok, B=16x1024x32, lr 6e-4, warmup 300
+hypothesis: matches build-nanogpt's curve at equal tokens, within ~0.05
+started: 22:10   expected: ~10-12 h at 40% MFU
+result: (fill in) final val, hellaswag, tok/s, MFU, anything weird and at which step
+```
+
+Check on it after 10 minutes (warmup done? loss below 7?), then go to bed.
+
+</Task>
+
+<Task id="t9" title="Sample from your checkpoints" agent="hands">
+
+Write `sample.py`: load a checkpoint into the uncompiled model, encode a prompt, generate 200 tokens with temperature, top-k and top-p as flags. Implement top-p yourself: sort probabilities descending, cumulative sum, mask everything after the point where the sum passes p (keep at least one token), renormalise, `torch.multinomial`.
+
+Fix the prompt ("The most important thing about learning is") and the seed. Generate from the step-500, step-2,000 and final checkpoints, and paste all three into `LOG.md`. Then, from the final checkpoint, compare greedy, τ = 0.7, τ = 1.0 and τ = 1.5 with top-p 0.9.
+
+</Task>
+
+<Task id="t10" title="Evaluate: val perplexity and HellaSwag" agent="review">
+
+Two numbers for the final checkpoint:
+
+1. **Val loss and perplexity** on the first 100 batches of the val shard (more than the 20 used during training, for a steadier number).
+2. **HellaSwag accuracy** on the 10,042 validation examples. Download the val split (the original release is a JSONL file in the `rowanz/hellaswag` GitHub repo; build-nanogpt's `hellaswag.py` shows a loader). For each example, build four token sequences `context + ending`, compute the mean cross-entropy over just the ending tokens, and pick the lowest. Also evaluate OpenAI's GPT-2 124M weights (from Hugging Face) with the same code, so you have a reference measured by *your* harness.
+
+Have an agent review the eval code for the classic bugs: scoring the context tokens too, an off-by-one in which positions count as "ending", or padding tokens included in the mean.
+
+</Task>
+
+<DoneWhen>
+
+- `sanity.py` passes all three checks, and you have seen the random-token check fail with `y = x`.
+- An LR sweep plot (five curves plus the U-shaped summary) exists, made from five runs that differ only in LR.
+- You have measured tok/s and MFU for four settings and know which switch bought the most.
+- A ~2.5B-token run of the 124M model finished (or resumed from a checkpoint and then finished), with a `log.jsonl` and a `LOG.md` entry.
+- `sample.py` produces readable paragraphs from your final checkpoint.
+- You have a val loss, a perplexity and a HellaSwag accuracy for your model and for OpenAI's GPT-2 124M, measured by the same code.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in as you go. The "expect" column is my best guess from the arithmetic above and from published reproductions; where I can't know (anything Spark-specific), it says so.
+
+| Measurement | Yours | Expect | Why |
+| --- | --- | --- | --- |
+| Init loss, 124M | | 10.8-11.2 (I got 10.98) | ln(50,257) = 10.82; near-uniform softmax |
+| Overfit one batch, loss at step 300 | | under 0.1 (I got 0.005 on a 4-layer model) | memorising 256 tokens is trivial |
+| Measured bf16 matmul peak | | ≤ 125 TFLOP/s (estimate) | check yourself |
+| tok/s, fp32, no compile | | lowest of the four | no tensor cores for most math |
+| tok/s, bf16 | | a few × fp32 | tensor cores |
+| tok/s, bf16 + compile | | +10-50% over bf16 (check) | fused elementwise ops; matters more on low bandwidth |
+| MFU, best setting (vs 125) | | 25-45% (approximate) | 40% ⇒ ~58K tok/s for this model |
+| Hours for 2.5B tokens | | ~10-19 | 6ND / (peak × MFU), Figure 006 |
+| LR sweep best peak LR (30M model) | | around 1e-3 to 3e-3 (check) | smaller models tolerate higher LR |
+| Final val loss | | roughly 3.2-3.5 | FineWeb-Edu at 2.5B tokens; compare build-nanogpt's curve at the same token count |
+| Final val perplexity | | ~25-35 | e^loss |
+| HellaSwag, your model | | ~27-30% (approximate) | random is 25%; GPT-2 124M ≈ 29.5% |
+| HellaSwag, OpenAI GPT-2 124M, your harness | | ~29-30% | if not, your harness has a bug |
+| Checkpoint size | | ~1.5 GB | 0.5 GB weights + 1 GB Adam state |
+
+What to look for:
+
+- **The MFU row is the honest number.** If it is under 20%, the GPU is waiting on something: data loading (watch `htop` for one pegged CPU core), Python overhead (micro-batch too small), or unfused elementwise ops (compile off). Each has a different fix. If it is over 60%, check your FLOP count and your timer; you probably forgot a `synchronize()`.
+- **Your val loss vs. the published curve at the same number of tokens.** If you are within a few hundredths, you have a trusted baseline. If you are 0.2 worse, something in the recipe differs, and finding it will teach you more than any new idea would have.
+- **Samples vs. loss.** Read the step-500, step-2,000 and final samples next to their val losses. This is how you build the instinct for "what does 4.0 look like?" that the perplexity table above only describes.
+
+## Break It
+
+Each of these is a short run (a few hundred steps of the 30M model is enough) plotted on the same axes as a good run. The point is to *see* the failure once, so you recognise it the next time it happens by accident.
+
+1. **Unshifted targets.** Set `y = x` in the loader. The loss dives toward zero and both train and val look superb. Then sample from it: garbage. Lesson: the loss measures what you told it to measure; nothing more. Leaking validation data into training is the same bug, slower.
+2. **No warmup, 5× the LR.** Set `warmup_steps=0` and multiply `max_lr` by 5. Watch the first 100 steps on a log axis and watch the gradient-norm column: the norm spikes before the loss does. Then turn clipping off as well and see whether it diverges completely. Lesson: warmup and clipping exist for the first and worst moments of the run.
+3. **Forget to divide by `grad_accum`.** Use `loss.backward()` instead of `(loss / grad_accum).backward()`.
+
+<Predict id="accum">
+With AdamW, accumulation 32, and clipping at 1.0, how bad is forgetting the division? Is it like a 32× higher LR?
+
+<Fragment slot="answer">
+
+Probably much less bad than you'd guess, and that is the interesting part. With plain SGD it *would* be a 32× bigger step. But Adam divides each gradient by the square root of its own running squared average, so multiplying every gradient by 32 mostly cancels out (only epsilon notices). What does change: the gradient norm is now 32× larger, so clipping at 1.0 fires on every single step, quietly turning your optimizer into "normalised-gradient Adam"; and your logged loss is 32× too big if you log the summed value. Run it and compare curves; I expect a small difference rather than a disaster, but measure it. The general lesson: knowing *why* a bug is harmless or harmful requires knowing what the optimizer does with gradient scale.
+
+</Fragment>
+</Predict>
+
+4. **Replay one shard.** Make the loader reshuffle and restart after the first shard (100M tokens) instead of moving to the next one, and run the 30M model long enough for several passes. You will see the "tiny data" curve from Figure 005: train keeps dropping with a cliff at each pass, val turns up. Lesson: in pretraining, rising val loss almost always means a data-pipeline bug, not a model problem.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Why is the loss of a freshly initialised language model about ln(vocab size), and what do you conclude if it isn't?</summary>
+
+With small random weights, the logits are all close to zero, so the softmax gives every token about the same probability, 1/V. Cross-entropy is −ln of the probability of the correct token, so −ln(1/V) = ln(V): 10.82 for GPT-2's 50,257 tokens. If it is much higher, the model starts out confidently wrong, which means the logits are big: init too large, a missing scaling, or the wrong vocab size. If it is much lower, it can already see the answer: a leak. Either way you stop before training.
+
+</details>
+
+<details>
+<summary>2. Walk me through the training recipe for a 124M GPT and why each piece is there.</summary>
+
+AdamW with betas (0.9, 0.95) and weight decay 0.1 applied only to the weight matrices, not to biases or LayerNorm parameters, because shrinking a norm's gain just shrinks that layer's output. Batch size of about 0.5M tokens per step, built from small micro-batches with gradient accumulation, dividing each micro-batch's loss by the number of micro-batches. Learning rate: linear warmup over a few hundred steps, because the random network and empty Adam statistics make the first steps fragile, then cosine decay to 10% of the peak so the model can settle into the bottom of the valley at the end. Gradient clipping at norm 1.0 to cap the damage from a freak batch, with the norm logged as an early warning. bf16 autocast, flash attention and torch.compile for speed; none of them change what the model learns. Checkpoints that include optimizer state, step and data position, saved atomically.
+
+</details>
+
+<details>
+<summary>3. You have a fixed compute budget. How do you decide model size versus number of tokens, and how long will it take?</summary>
+
+Training compute is about 6 × N × D FLOPs: 2N per token for the forward pass and 4N for the backward. Chinchilla found that for a fixed budget, the lowest loss comes from growing N and D together, with about 20 tokens per parameter. So for C FLOPs, N ≈ √(C / 120) and D ≈ 20N. For 124M that's 2.5B tokens and about 1.9e18 FLOPs. Time is that divided by achieved FLOP/s: peak times MFU. On the Spark, at an estimated 125 TFLOP/s peak and 40% MFU, about 10 hours. If you expect to serve the model a lot, you deliberately go past 20 tokens per parameter with a smaller model, because inference cost scales with N.
+
+</details>
+
+<details>
+<summary>4. Your loss dropped nicely, spiked twice, and is now flat around 7. Diagnose it.</summary>
+
+The learning rate is too high (or warmup too short, or clipping off). The first spikes were overshoots it recovered from; the last one knocked the weights into a region where the model only predicts token frequencies, which is roughly what a flat line in the 7s means on GPT-2 tokens. Look at the gradient-norm log right before each spike. Restore from the last checkpoint before the first spike with a 2-3× lower peak LR, or restart; check clipping is on. If spikes keep appearing at the same step across runs, inspect the batch at that step: a corrupted or bizarre document can do it too.
+
+</details>
+
+<details>
+<summary>5. What is MFU, how do you compute it for your run, and how does it change if you scale to a 1B model or to 8 GPUs?</summary>
+
+Model FLOPs utilization: the FLOPs your model's math needs per second divided by the hardware's peak. For a run, tokens per second × (6N + 12·layers·width·T) ÷ peak FLOP/s. It counts only useful math, so recomputation or overhead lowers it. Bigger models usually get *higher* MFU on the same GPU, because the matrices get larger and the fixed overheads (Python, kernel launches, elementwise ops bound by memory bandwidth) become a smaller fraction of each step. Going to 8 GPUs adds communication: every step, gradients must be averaged across devices, so MFU drops unless that communication overlaps with compute, and it drops more on slow interconnects. That is the subject of [Distributed training](/lessons/distributed-training/).
+
+</details>
+
+## Go Deeper
+
+- **Andrej Karpathy, [nanoGPT](https://github.com/karpathy/nanoGPT)** and **[build-nanogpt](https://github.com/karpathy/build-nanogpt)**, with the video "Let's reproduce GPT-2 (124M)" (2024). The reference implementation for everything in this lesson. The video is four hours and every minute earns its place, especially the parts about vocab padding, the weight-decay groups and the HellaSwag eval.
+- **Andrej Karpathy, [llm.c](https://github.com/karpathy/llm.c)**, and its discussion post "Reproducing GPT-2 (124M) in llm.c in 90 minutes for $20". The same training in C/CUDA, with the loss and HellaSwag curves you should compare yours against.
+- **Andrej Karpathy, ["A Recipe for Training Neural Networks"](https://karpathy.github.io/2019/04/25/recipe/)** (2019). The debugging philosophy: neural nets fail silently, so build up from things you can verify. Short, and it will change how you start every project.
+- **Hoffmann et al., "Training Compute-Optimal Large Language Models"** (DeepMind, 2022, arXiv 2203.15556). Chinchilla. Read the figures and the first two sections for where "20 tokens per parameter" comes from, and how they fit it three different ways.
+- **Kaplan et al., "Scaling Laws for Neural Language Models"** (OpenAI, 2020, arXiv 2001.08361). The original power laws, and the clearest derivation of the 6N FLOPs-per-token rule (their Section 2.1).
+- **Penedo et al., "The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale"** (Hugging Face, 2024, arXiv 2406.17557), and **Eldan and Li, "TinyStories: How Small Can Language Models Be and Still Speak Coherent English?"** (2023, arXiv 2305.07759). Where your two datasets come from, and good reading for [Data a model can eat](/lessons/data-pipelines/).
+- **Holtzman et al., "The Curious Case of Neural Text Degeneration"** (2019, arXiv 1904.09751). Why greedy and pure sampling both fail, and the paper that introduced top-p.
+- **Chowdhery et al., "PaLM: Scaling Language Modeling with Pathways"** (Google, 2022, arXiv 2204.02311). Appendix B defines MFU and gives the FLOPs-per-token formula with the attention term, the one used in this lesson.
+
+## Connections
+
+This lesson cashes in several earlier ones. The uint16 memmap is [Virtual memory](/lessons/virtual-memory/) and [Files and disks](/lessons/files-and-disks/) in practice, and the checkpoint uses the latter's crash-safe save. bf16 autocast is the payoff of [fp32, bf16, fp16, fp8](/lessons/number-formats/); the checkpoint and optimizer sizes come from [Why training needs so much memory](/lessons/training-memory/); the attention kernel is [FlashAttention](/lessons/flash-attention/); the peak FLOP/s and the "why compile matters more on the Spark" argument come from [Bandwidth bound](/lessons/bandwidth-bound/); the tokenizer is the one you built in [Tokenizers](/lessons/tokenizers/).
+
+Looking ahead, this run is the baseline for everything else in the track. [Data a model can eat](/lessons/data-pipelines/) changes only the data and measures the effect against this curve. [Train your own draft model](/lessons/draft-model/) reuses this loop with a distillation loss. [Comparing transformer variants](/lessons/architecture-compute/) is where your creative ideas finally get a fair test: one change at a time, plotted against a run you trust. And [Distributed training](/lessons/distributed-training/) is what you reach for when one night per run stops being enough.

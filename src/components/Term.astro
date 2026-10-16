@@ -1,0 +1,9 @@
+---
+// Inline jargon term with a plain-language margin note.
+// Usage: <Term w="kernel">The core of the OS that ...</Term>
+// On wide screens the note sits in the right margin; on narrow screens tap the word.
+interface Props { w: string; label?: string }
+const { w, label } = Astro.props;
+const id = 't-' + Math.random().toString(36).slice(2, 9);
+---
+<span class="term"><label class="term-word" for={id}>{w}</label><input type="checkbox" id={id} class="term-toggle" /><span class="term-note"><b>{label ?? w}</b><slot /></span></span>

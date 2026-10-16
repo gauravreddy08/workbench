@@ -1,0 +1,870 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import FlashTiles from '../components/figures/FlashTiles.astro';
+import FlashTraffic from '../components/figures/FlashTraffic.astro';
+
+## Today
+
+- Draw a GPU's memory hierarchy from memory (registers, shared memory, L2, HBM) with rough sizes and speeds, and say which one attention is stuck on.
+- Count the bytes naive attention moves and explain why it is memory-bound for long sequences even though the math is the same.
+- Derive the online softmax trick step by step, prove to yourself that it gives the exact answer, and use it to build attention one tile at a time.
+- Explain FlashAttention's forward pass, why its backward pass recomputes instead of remembering, and what FlashAttention-2 and -3 changed.
+- Write a small GPU kernel in Triton, benchmark it without fooling yourself, and compare it with PyTorch's built-in attention on the Spark.
+
+Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (arithmetic intensity, the roofline, the ridge point) and [Why is NumPy 100x faster?](/lessons/cpu-caches/) (caches, tiling, reuse). You have written attention yourself in GPT-2, so the math is not new; the machine underneath it is. Rough time: an evening on the idea and the NumPy builds, then a long session on the Spark.
+
+## The Problem
+
+You want to try your Llama implementation on a long document. 32,000 tokens: one long PDF, a codebase, a day of agent traces. Your attention looks like the version everyone writes first:
+
+```python
+s = (q @ k.transpose(-2, -1)) / math.sqrt(d)   # (B, H, N, N)
+p = torch.softmax(s, dim=-1)
+out = p @ v
+```
+
+At 2K tokens it is fine. At 8K it is noticeably slow, and the profiler shows the GPU busy but the math units mostly idle. At 32K the Spark, with 128 GB of memory, dies with an out-of-memory error on the first layer.
+
+<Predict id="s-bytes">
+Llama 3.1 8B has 32 query heads. For one layer, batch size 1, N = 32,768 tokens, in fp16 (2 bytes per number): how big is the score matrix `s`? And how big are `s` and `p` together, since `torch.softmax` writes a new tensor?
+
+<Fragment slot="answer">
+
+`s` has shape (1, 32, 32768, 32768). That is 32 × 32,768² ≈ 34.4 billion numbers, × 2 bytes ≈ **68.7 GB**. With `p` alive at the same time, about **137 GB**. The Spark has 128 GB in total, shared with the CPU. Per head it is "only" 2.1 GB, but every head needs its own. At N = 8K the same pair is about 8.6 GB, which fits but has to be written and read back through a 273 GB/s pipe. The memory grows with N², and so does the traffic.
+
+</Fragment>
+</Predict>
+
+Notice what is strange here. Q, K and V at 32K tokens are tiny: 32 heads × 32,768 × 128 × 2 bytes = 268 MB each. The output is the same size. The giant thing, `s`, is an intermediate result that you compute, use once, and throw away. You never wanted it. You only wanted the output. Everything bad about long-context attention comes from writing that intermediate down.
+
+<Origin year="2022" title="Attention that is aware of where its bytes live">
+
+By 2020, everyone knew attention was quadratic in sequence length, and a small industry of approximations grew up to fix it: Reformer (hashing), Linformer (low-rank projections), Performer (random features), and a dozen more. They cut the number of FLOPs, sometimes from N² to N. They mostly did not make training faster in wall-clock time, and they changed the model's math, which made people nervous to use them.
+
+In 2022, Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra and Christopher Ré at Stanford published "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness." Their argument was that everyone had been counting the wrong thing. On a GPU, attention is not limited by FLOPs; it is limited by moving the N × N matrix in and out of GPU memory. Keep it on the chip and you can do *more* FLOPs and still finish sooner, with the exact same answer as before. Their kernel trained GPT-2 about 3x faster than the standard implementation and made 16K-token sequences practical for the first time. The trick that makes it possible, computing softmax in one streaming pass, came from a 2018 NVIDIA note by Maxim Milakov and Natalia Gimelshein. Within two years, FlashAttention (or something built the same way) was inside essentially every training and serving stack, including PyTorch itself.
+
+</Origin>
+
+## The Idea
+
+### Two kinds of memory on one chip
+
+In the [caches lesson](/lessons/cpu-caches/) you met a CPU's ladder: registers, L1, L2, L3, RAM, each one bigger and slower than the last. A GPU has the same ladder, with one big difference: the fast rungs are tiny and *you* manage the most important one by hand.
+
+A GPU is made of many <Term w="SMs">Streaming multiprocessors: the GPU's "cores", each a block of math units with its own small fast memory. An A100 has 108; the Spark's GB10 has dozens (check yours).</Term>. Each SM has three kinds of storage on it, and the whole chip shares two more.
+
+- <Term w="Registers">The fastest storage there is, inside each SM, private to each thread. A few hundred KB per SM in total. Values here are what the math units actually operate on.</Term>: where the numbers being multiplied right now live.
+- <Term w="shared memory" label="shared memory (SRAM)">A small scratchpad on each SM, built from SRAM, that a group of threads fills and reads by hand. Around 100 to 228 KB per SM depending on the chip. Shared by the threads of one block, invisible to other SMs.</Term>, which the FlashAttention paper and most people just call <Term w="SRAM">Static RAM: fast memory built into the chip itself. On a GPU this means registers, shared memory and caches. Fast and tiny because each bit costs several transistors.</Term>: a scratchpad you load tiles into and reuse.
+- An L1 cache, which on NVIDIA chips is carved out of the same SRAM as shared memory.
+- <Term w="L2">A cache shared by all SMs, tens of MB on data-center GPUs. Managed by the hardware, not by you. If data you re-read is still here, you skip the trip to main memory.</Term>, shared by the whole chip.
+- <Term w="HBM">High-bandwidth memory: the GPU's main memory, stacked DRAM next to the chip. Tens of GB, a few TB/s. People say "HBM" for GPU main memory in general; on the Spark it is LPDDR5x shared with the CPU, but it plays the same role.</Term>: the big main memory, where every tensor you allocate in PyTorch lives.
+
+<Figure n="001" title="THE GPU MEMORY LADDER" caption="Approximate, from public spec sheets and the FlashAttention paper. Each rung up is roughly 10x faster per byte and 1000x smaller. Every tensor lives at the bottom; math only happens at the top. Spark numbers marked CHECK are ones you should read off your own device in the Spark setup task.">
+<svg viewBox="0 0 660 330" role="img" aria-label="Memory hierarchy pyramid from registers at the top to HBM at the bottom, with sizes and bandwidths for A100 and DGX Spark">
+  <text x="400" y="22" class="strong">A100 (PAPER)</text>
+  <text x="530" y="22" class="strong">DGX SPARK</text>
+  <polygon points="150,40 210,40 240,96 120,96" class="fill-blue" />
+  <text x="180" y="74" text-anchor="middle" style="fill:var(--paper)">REGS</text>
+  <polygon points="120,104 240,104 270,160 90,160" class="fill-wash" stroke-width="1.2" />
+  <text x="180" y="130" text-anchor="middle" class="strong">SHARED MEM</text>
+  <text x="180" y="146" text-anchor="middle" class="strong">/ L1 (SRAM)</text>
+  <polygon points="90,168 270,168 300,224 60,224" class="fill-paper" stroke-width="1.2" />
+  <text x="180" y="200" text-anchor="middle" class="strong">L2 CACHE</text>
+  <polygon points="60,232 300,232 330,300 30,300" class="fill-paper" stroke-width="1.5" />
+  <text x="180" y="262" text-anchor="middle" class="strong">HBM / DRAM</text>
+  <text x="180" y="280" text-anchor="middle">every torch tensor</text>
+  <line x1="250" y1="68" x2="390" y2="68" class="ink dash" stroke-width="0.6" />
+  <line x1="280" y1="132" x2="390" y2="132" class="ink dash" stroke-width="0.6" />
+  <line x1="310" y1="196" x2="390" y2="196" class="ink dash" stroke-width="0.6" />
+  <line x1="340" y1="266" x2="390" y2="266" class="ink dash" stroke-width="0.6" />
+  <text x="400" y="60">256 KB / SM</text>
+  <text x="400" y="76">~1 CYCLE</text>
+  <text x="530" y="60">256 KB / SM?</text>
+  <text x="530" y="76">CHECK</text>
+  <text x="400" y="124">192 KB / SM</text>
+  <text x="400" y="140">~19 TB/S TOTAL</text>
+  <text x="530" y="124">~100 KB / SM?</text>
+  <text x="530" y="140">~10+ TB/S TOTAL</text>
+  <text x="400" y="188">40 MB</text>
+  <text x="400" y="204">SHARED BY ALL</text>
+  <text x="530" y="188">CHECK</text>
+  <text x="530" y="204">L2_CACHE_SIZE</text>
+  <text x="400" y="258" class="blue-t">40-80 GB HBM2E</text>
+  <text x="400" y="274" class="blue-t">1.5-2 TB/S</text>
+  <text x="530" y="258" class="blue-t">128 GB LPDDR5X</text>
+  <text x="530" y="274" class="blue-t">273 GB/S</text>
+  <text x="30" y="322">FASTER AND SMALLER ↑ · BIGGER AND SLOWER ↓ · HUNDREDS OF CYCLES TO HBM</text>
+</svg>
+</Figure>
+
+Two numbers to hold onto. On the A100 the FlashAttention paper used, on-chip SRAM moves about 19 TB/s in aggregate and HBM about 1.5 TB/s: roughly a 12x gap. (That SRAM figure is just arithmetic: 108 SMs × 128 bytes per clock × 1.41 GHz ≈ 19.5 TB/s.) On the Spark the gap is wider. Its main memory is 273 GB/s on the spec sheet, while its SRAM, by the same arithmetic with its own SM count and clock, is on the order of 10 TB/s or more. Every byte you avoid sending to main memory is worth even more on your machine than on the A100 the paper was written for.
+
+The programming model follows from the hardware. A <Term w="kernel" label="kernel (GPU)">One function that runs on the GPU, launched from the CPU. Thousands of copies run at once, each on its own slice of the data. Not the operating-system kernel.</Term> is launched as a grid of <Term w="thread blocks">Groups of GPU threads (often 128 or 256) that run together on one SM and can share that SM's shared memory. In Triton, one block is one "program".</Term>. Each block lands on one SM, loads what it needs from HBM into its shared memory and registers, computes, and writes results back to HBM. Blocks cannot see each other's shared memory, and when a kernel ends, everything in SRAM is gone. **The only way to pass data from one kernel to the next is through HBM.** Hold that sentence; the whole lesson hangs off it.
+
+### What naive attention actually does
+
+Run the three lines from The Problem in eager PyTorch, and here is what the GPU does. Each line is at least one kernel, and each kernel reads its inputs from HBM and writes its output to HBM.
+
+<Figure n="002" title="NAIVE ATTENTION, THREE KERNELS" caption="Every arrow crosses the slow boundary. The two N × N matrices, S and P, are written to HBM by one kernel and read back by the next, only because kernels cannot hand data to each other any other way. Q, K, V and O are N × d; S and P are N × N. At N = 8K and d = 128, each N × N matrix is 64x bigger than Q." wide>
+<svg viewBox="0 0 700 300" role="img" aria-label="Three kernels each reading from and writing to HBM, with the large S and P matrices round-tripping">
+  <rect x="10" y="20" width="680" height="96" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="40" class="strong">HBM</text>
+  <rect x="30" y="52" width="26" height="52" class="fill-wash" stroke-width="1" />
+  <text x="43" y="82" text-anchor="middle" class="strong">Q</text>
+  <rect x="64" y="52" width="26" height="52" class="fill-wash" stroke-width="1" />
+  <text x="77" y="82" text-anchor="middle" class="strong">K</text>
+  <rect x="250" y="44" width="70" height="66" class="fill-paper" stroke-width="1.5" />
+  <text x="285" y="74" text-anchor="middle" class="strong">S</text>
+  <text x="285" y="90" text-anchor="middle">N × N</text>
+  <rect x="450" y="44" width="70" height="66" class="fill-paper" stroke-width="1.5" />
+  <text x="485" y="74" text-anchor="middle" class="strong">P</text>
+  <text x="485" y="90" text-anchor="middle">N × N</text>
+  <rect x="560" y="52" width="26" height="52" class="fill-wash" stroke-width="1" />
+  <text x="573" y="82" text-anchor="middle" class="strong">V</text>
+  <rect x="640" y="52" width="26" height="52" class="fill-wash" stroke-width="1" />
+  <text x="653" y="82" text-anchor="middle" class="strong">O</text>
+  <line x1="10" y1="150" x2="690" y2="150" class="blue dash" stroke-width="1" />
+  <text x="690" y="144" text-anchor="end" class="blue-t">SLOW BOUNDARY · 273 GB/S ON THE SPARK</text>
+  <rect x="40" y="200" width="150" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="115" y="224" text-anchor="middle" class="strong">KERNEL 1</text>
+  <text x="115" y="242" text-anchor="middle">S = Q Kᵀ</text>
+  <rect x="270" y="200" width="150" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="345" y="224" text-anchor="middle" class="strong">KERNEL 2</text>
+  <text x="345" y="242" text-anchor="middle">P = softmax(S)</text>
+  <rect x="500" y="200" width="150" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="575" y="224" text-anchor="middle" class="strong">KERNEL 3</text>
+  <text x="575" y="242" text-anchor="middle">O = P V</text>
+  <line x1="60" y1="104" x2="90" y2="200" class="ink" stroke-width="1" />
+  <line x1="77" y1="104" x2="110" y2="200" class="ink" stroke-width="1" />
+  <text x="14" y="186">READ Q, K</text>
+  <line x1="160" y1="200" x2="270" y2="110" class="ink" stroke-width="2.5" />
+  <text x="180" y="168" class="strong">WRITE N²</text>
+  <line x1="300" y1="110" x2="330" y2="200" class="ink" stroke-width="2.5" />
+  <text x="336" y="176" class="strong">READ N²</text>
+  <line x1="380" y1="200" x2="470" y2="110" class="ink" stroke-width="2.5" />
+  <text x="400" y="168" class="strong">WRITE N²</text>
+  <line x1="500" y1="110" x2="545" y2="200" class="ink" stroke-width="2.5" />
+  <text x="470" y="190" class="strong">READ N²</text>
+  <line x1="573" y1="104" x2="585" y2="200" class="ink" stroke-width="1" />
+  <line x1="630" y1="200" x2="650" y2="104" class="ink" stroke-width="1" />
+  <text x="652" y="176">V · O</text>
+  <text x="350" y="288" text-anchor="middle" class="blue-t">4 PASSES OVER N² NUMBERS · ONLY 4 PASSES OVER N × d</text>
+</svg>
+</Figure>
+
+Count the bytes for one head, in elements. Reading Q and K is 2Nd. Writing S is N². Reading S back is N². Writing P is N². Reading P and V is N² + Nd. Writing O is Nd. Total: **4N² + 4Nd**. For N = 8,192 and d = 128, the 4Nd part is 4 million elements and the 4N² part is 268 million. The useful inputs and outputs are 1.5% of the traffic. The rest is S and P, going out and coming back.
+
+That is the minimum. Real eager code is often worse: a separate kernel for the `/ sqrt(d)` scale (read N², write N²), another for a <Term w="causal mask">The rule in a decoder that token i may only attend to tokens at or before i. Implemented by setting the scores for future tokens to minus infinity before the softmax.</Term> (`masked_fill`, read N², write N²), dropout during training (more again). Each elementwise op on S is two more trips.
+
+Now, the roofline from [the bandwidth lesson](/lessons/bandwidth-bound/). The FLOPs for attention, per head, are about 4N²d: 2N²d for Q Kᵀ and 2N²d for P V. Divide by bytes (4N² elements × 2 bytes, ignoring the small part) to get the <Term w="arithmetic intensity">FLOPs done per byte moved to or from main memory. Compare it with the chip's ridge point (peak FLOP/s divided by bandwidth) to know which one limits you.</Term>:
+
+```text
+arithmetic intensity (naive)  ≈  4 N² d / (8 N²)  =  d / 2  FLOPs per byte
+d = 128  →  64 FLOPs/byte        d = 64  →  32 FLOPs/byte
+```
+
+The Spark's ridge point, from the bandwidth lesson, is a few hundred FLOPs per byte (around 460 on spec-sheet numbers). An A100's is around 150 to 200. Naive attention at 64 sits well to the left: <Term w="memory-bound">The work finishes when the data finishes arriving. Faster math would not help; fewer or faster bytes would.</Term>. And notice that the intensity does not depend on N. Longer sequences give you more work *and* proportionally more bytes, so you never climb out.
+
+<Predict id="qk-matmul">
+Look at kernel 1 alone: S = Q Kᵀ for one head, N = 8,192, d = 128. It is a matrix multiply, and you learned that big matmuls are compute-bound. Is this one? Count its FLOPs and bytes and decide.
+
+<Fragment slot="answer">
+
+FLOPs: 2 × N × N × d = 2 × 8192² × 128 ≈ 17.2 billion. Bytes: it reads Q and K (2 × 8192 × 128 × 2 bytes ≈ 4 MB) but writes S: 8192² × 2 bytes ≈ 134 MB. Intensity ≈ 17.2e9 / 138e6 ≈ 125 FLOPs per byte, which is just d. On the Spark, math would take about 17.2e9 / 125e12 ≈ 0.14 ms and writing S about 134 MB / 273 GB/s ≈ 0.49 ms. So it is memory-bound, and the bottleneck is not reading the inputs, it is *writing the output*. This is the unusual thing about attention's matmuls: the output is much bigger than the inputs. The "big matmuls are compute-bound" rule assumes all three matrices are about the same size.
+
+</Fragment>
+</Predict>
+
+### The obvious fix, and why it is hard
+
+If S and P only go to HBM because kernels cannot hand data to each other, the fix is to do everything in one kernel: <Term w="kernel fusion">Merging several operations into one GPU kernel so the intermediate results stay in registers or shared memory instead of making a round trip through HBM.</Term>. Load a few rows of Q, compute their scores, softmax them, multiply by V, write the output rows. S and P exist only inside the SM, a tile at a time, and never touch HBM.
+
+For elementwise ops this is easy, and compilers do it automatically. `torch.compile` will happily fuse the scale, the mask and the exponent into one pass. The problem is softmax, because softmax is not elementwise. To output even one probability, you need the sum of exponentials over the **entire row**:
+
+```text
+softmax(x)_i  =  e^(x_i) / Σ_j e^(x_j)
+```
+
+A row of S has N entries. At N = 32K, one row in fp32 is 128 KB, about the size of an SM's whole shared memory, and a block wants to work on 64 or 128 rows at once. You cannot hold a full row of scores on the chip for long sequences. So it looks like you have to compute the whole row, store it somewhere (HBM), sum it, and come back. That is exactly the round trip we are trying to kill.
+
+The way out is to find a way to compute softmax while seeing the row **one piece at a time**, never holding all of it. That is the online softmax.
+
+### Softmax, the safe way
+
+First, a detail you may have skipped in GPT-2, because `torch.softmax` hid it. You never compute `e^(x_i)` directly. In fp16 the largest number is 65,504, and e^x passes that at x ≈ 11.09. Scores bigger than 11 are normal in attention. In fp32 it overflows at x ≈ 88.7. On my Mac, `np.exp(np.float16(12.0))` is `inf`, and softmax of `[1000, 1001, 1002]` computed directly comes back as `[nan, nan, nan]` (inf divided by inf).
+
+The fix is to subtract the row's maximum first. Softmax does not change when you shift every input by the same constant, because the shift factors out of the top and the bottom:
+
+```text
+e^(x_i - m) / Σ_j e^(x_j - m)  =  (e^(x_i) · e^(-m)) / (e^(-m) · Σ_j e^(x_j))  =  softmax(x)_i
+```
+
+With m = max(x), every exponent is at most 0, so every e^ is between 0 and 1 and nothing overflows. This is the <Term w="safe softmax">Softmax computed as e^(x - max) / sum of e^(x - max). Mathematically identical to plain softmax, but no exponent is ever positive, so nothing overflows.</Term>, and every real implementation does it. It costs three passes over the row:
+
+1. Pass 1: find m = max of the row.
+2. Pass 2: compute l = Σ e^(x_j − m).
+3. Pass 3: output e^(x_i − m) / l.
+
+Three reads of every element. For a row in HBM, that is three trips. Milakov and Gimelshein's question in 2018 was: can passes 1 and 2 be one pass?
+
+### Online softmax: keep a running max and a running sum
+
+Here is the scene. Numbers arrive one at a time, like cards dealt from a deck. You keep two things on a sticky note: the biggest number you have seen so far, **m**, and a running sum, **l**, of e^(x − m) for everything so far, *measured against the current m*.
+
+When a new number x arrives, there are two cases.
+
+- **x is not a new max.** m stays. Add e^(x − m) to l. Done.
+- **x is a new max.** Every term already in l was computed as e^(x_j − m_old). You want them as e^(x_j − m_new). Since e^(x_j − m_new) = e^(x_j − m_old) · e^(m_old − m_new), you can fix **all of them at once** by multiplying l by one number, e^(m_old − m_new). Then add e^(x − m_new), which is e^0 = 1.
+
+Both cases are the same formula:
+
+```text
+m_new = max(m, x)
+l_new = l · e^(m - m_new)  +  e^(x - m_new)
+start:  m = -∞,  l = 0
+```
+
+When the max does not change, e^(m − m_new) = e^0 = 1 and the formula is just "add". When it does change, the factor is less than 1 and shrinks the old sum to the new scale. At the very start, e^(−∞) = 0, so the empty sum vanishes cleanly.
+
+Walk it through on x = [2, 1, 5, 3]:
+
+| Arrives | m | Rescale e^(m_old − m_new) | l |
+| --- | --- | --- | --- |
+| 2 | 2 | 0 (from −∞) | 0 · 0 + e^0 = 1 |
+| 1 | 2 | 1 | 1 + e^(−1) = 1.3679 |
+| 5 | 5 | e^(2 − 5) = 0.0498 | 1.3679 × 0.0498 + e^0 = 1.0681 |
+| 3 | 5 | 1 | 1.0681 + e^(−2) = 1.2034 |
+
+The two-pass way: m = 5, l = e^(−3) + e^(−4) + e^0 + e^(−2) = 0.0498 + 0.0183 + 1 + 0.1353 = 1.2034. Same number.
+
+**Why it is exact, not approximate.** Claim: after seeing the first k numbers, m_k is their max and l_k = Σ over j ≤ k of e^(x_j − m_k). Prove it by induction.
+
+- After 1 number: m_1 = x_1 and l_1 = 0 · e^(−∞) + e^(x_1 − x_1) = 1 = e^(x_1 − m_1). True.
+- Suppose it is true after k numbers. Then m_(k+1) = max(m_k, x_(k+1)) is the max of the first k + 1, and
+  l_(k+1) = l_k · e^(m_k − m_(k+1)) + e^(x_(k+1) − m_(k+1))
+  = Σ_(j ≤ k) e^(x_j − m_k) · e^(m_k − m_(k+1)) + e^(x_(k+1) − m_(k+1))
+  = Σ_(j ≤ k) e^(x_j − m_(k+1)) + e^(x_(k+1) − m_(k+1))
+  = Σ_(j ≤ k+1) e^(x_j − m_(k+1)). True.
+
+So at the end, l is exactly the safe-softmax denominator. Nothing was dropped or estimated; the only differences from the two-pass version are floating-point rounding. You still need a second pass to produce the outputs e^(x_i − m) / l, but max and sum are now one pass.
+
+<Predict id="merge">
+Now generalize. Two workers each process half of a row and each ends up with their own sticky note: (m₁, l₁) and (m₂, l₂). How do you combine them into the (m, l) for the whole row, without looking at the numbers again?
+
+<Fragment slot="answer">
+
+m = max(m₁, m₂), and l = l₁ · e^(m₁ − m) + l₂ · e^(m₂ − m). Each partial sum is rescaled to the common max and then they are added. The one-at-a-time update is just the special case where the second worker saw a single number (m₂ = x, l₂ = 1). This merge is associative, so you can split a row into any number of pieces, process them in any grouping, and merge. That single fact powers FlashAttention (merge tile by tile), Flash-Decoding (split the KV cache across many SMs and merge at the end), and ring attention (split a sequence across GPUs).
+
+</Fragment>
+</Predict>
+
+### From a sum to an output row
+
+Attention does not want the softmax itself. It wants the softmax times V: for one query row, o = Σ_j softmax(s)_j · v_j, a weighted average of value vectors. The beautiful part is that this output can ride along on the same sticky note.
+
+Keep a third running quantity, **o**, a vector of length d: the un-normalized sum Σ e^(s_j − m) · v_j against the current max. When a new score s and its value vector v arrive:
+
+```text
+m_new = max(m, s)
+α     = e^(m - m_new)                       # the rescale factor
+l_new = l · α  +  e^(s - m_new)
+o_new = o · α  +  e^(s - m_new) · v          # same rescale, same new weight
+```
+
+At the end, the answer is o / l. The proof is the same induction: o is always Σ e^(s_j − m) v_j against the current m, because rescaling by α moves every past term to the new max at once. Dividing by l at the end turns the weights e^(s_j − m) / l into exactly softmax(s)_j.
+
+Now do it a **tile** at a time instead of one key at a time. Take a block of Bc keys and their values. Compute that block's scores for one query row, take the block's max, and apply the update to the whole block at once:
+
+```text
+s_blk  = q · K_blkᵀ                          # Bc scores
+m_new  = max(m, max(s_blk))
+p      = e^(s_blk - m_new)                   # Bc weights
+α      = e^(m - m_new)
+l      = l · α + sum(p)
+o      = o · α + p · V_blk                   # (Bc) @ (Bc × d) → d
+m      = m_new
+```
+
+That is the merge rule from the Predict, with the block as the "second worker". And it is shaped like a matmul: `p · V_blk` is a small dense matrix product, which is what GPUs are built for.
+
+### FlashAttention's forward pass
+
+Put it together. Give each GPU program a block of Br query rows. The program:
+
+1. Loads its Q block (Br × d) from HBM into SRAM, **once**.
+2. Sets m = −∞, l = 0, o = 0 for each of its Br rows. These live in registers.
+3. Loops over the K and V blocks, Bc rows at a time. For each: load K_j and V_j into SRAM, compute the Br × Bc score tile S = Q_blk K_jᵀ, update m, l, o with the block rule above.
+4. After the last block, divides o by l and writes the Br × d output block to HBM. Also writes one extra number per row, the <Term w="logsumexp">m + log(l) for a row: the log of the softmax denominator. One number per query row. Storing it lets the backward pass rebuild any probability as e^(s - L) without recomputing the sum.</Term> L = m + log(l), for the backward pass.
+
+The score tile S and the probability tile P exist only in SRAM and registers, for one block at a time. Nothing N × N is ever written. Step through it below on a tiny example: 8 keys in blocks of 2, d = 2, and one program's 2 query rows. Watch the α column. Whenever a row's max goes up, its old l and o shrink. At the end, check the output against the exact answer.
+
+<Figure n="003" title="ONE PROGRAM, TILE BY TILE" caption="Q0 is loaded once. K and V tiles stream through SRAM one block at a time. Each row's running max m, sum l and output o update in place; α (in orange when it is below 1) is the rescale applied when a row's max rises. The N × N counter stays at zero. At the last step, o / l matches exact softmax(S)V to rounding error." wide>
+
+<FlashTiles />
+
+</Figure>
+
+That is the core of FlashAttention, and it gives the same answer as the three-line version, not an approximation of it. Two details of the original paper differ from this picture. FlashAttention-1 actually put the K/V loop on the *outside* and the Q loop inside, so it re-read and re-wrote partial outputs in HBM; FlashAttention-2 swapped the loops to the order shown here. And the paper's full version also fuses masking and dropout into the same kernel, which this toy leaves out.
+
+### Counting bytes: the IO argument
+
+The paper's real contribution, beyond the trick, was to count. Its title says <Term w="IO-aware">Designed around the cost of moving data between levels of memory (here HBM and SRAM), not only the cost of arithmetic. IO means input/output: reads and writes.</Term>: judge an algorithm by how many bytes it moves between HBM and SRAM, not just by FLOPs.
+
+Per head, the Q-block-outer version moves:
+
+- Q: read once, Nd elements.
+- K and V: read once **per query block**, so (N / Br) × 2Nd.
+- O: written once, Nd.
+
+Total about 2Nd + 2N²d / Br. Compare with naive's 4N² + 4Nd. The block size Br is limited by SRAM: the Q tile, a K and V tile, and the S tile all have to fit, so Br and Bc end up around M / d for an SRAM of M elements. Substitute and the paper's theorem pops out: FlashAttention needs Θ(N² d² / M) HBM accesses, against Θ(N² + Nd) for standard attention. The paper also proves that no exact attention algorithm can do asymptotically better than that across all SRAM sizes.
+
+Plug in real numbers and you get something more modest than "quadratic to linear". With d = 128 and Br = 128, the worst case is 2N² elements against naive's 4N²: a 2x saving, plus the eager extras. Both are still quadratic in N, which the paper is clear about; the saving is the constant d² / M.
+
+So why is FlashAttention many times faster in practice? Three reasons, in order of how much they matter on current hardware:
+
+1. **K and V are re-read from L2, not HBM.** The worst case assumes every re-read of K and V goes all the way to main memory. But K and V for one head at N = 8K and d = 128 are 4 MB together, and the programs working on the same head run at about the same time. Their re-reads mostly hit in L2. In the best case, real HBM traffic is just Q, K, V and O once: 4Nd, linear in N.
+2. **The eager extras vanish.** Scale, mask, dropout and softmax all happen inside the one kernel, on tiles already in registers.
+3. **Intensity moves past the ridge.** With traffic of about 4Nd and FLOPs of 4N²d, intensity is about N FLOPs per byte. At N = 8K that is in the thousands, far right of any ridge point. FlashAttention turns attention from a memory-bound job into a compute-bound one, which is why the next generations of the kernel are all about using the math units better.
+
+Play with the counter. Flip between the two K/V modes to see the bound: real kernels sit somewhere between, and you will measure where yours sits in Break It.
+
+<Figure n="004" title="HBM TRAFFIC COUNTER" caption="One layer, 32 heads, batch 1, fp16, forward pass only. Naive traffic is 4Nd plus 4 (or 8) passes over N². Flash is Q and O once plus K and V once per query block (worst) or once in total (best, when L2 keeps them). Time floors use the Spark's 273 GB/s spec and a rough 125 TFLOP/s upper bound for dense BF16. Real kernels land above these floors." wide>
+
+<FlashTraffic />
+
+</Figure>
+
+And then there is memory. Naive's S and P need 2 × H × N² × 2 bytes; flash needs 2 numbers per query row. At N = 32K, that is 137 GB against 8 MB. That difference alone is what made long-context training possible, before any speed argument.
+
+### The backward pass: recompute instead of remember
+
+Training needs gradients. The standard backward pass for attention uses P, the N × N probability matrix, saved from the forward pass. FlashAttention never stored P. What now?
+
+It **recomputes** it. The forward pass saved O (N × d) and the logsumexp L (one number per row). In the backward pass, a kernel walks the same tiles again: reload Q, K, V tiles, recompute S = Q Kᵀ for the tile, and rebuild the exact probabilities as P = e^(S − L). No running max is needed this time, because L already is the final answer to "what is this row's normalizer". With the P tile in hand, the gradients follow from the chain rule, tile by tile:
+
+```text
+dV  += Pᵀ dO                      # (Bc × Br) @ (Br × d)
+dP   = dO Vᵀ                      # per tile
+D    = rowsum(dO ∘ O)             # one number per query row, computed once
+dS   = P ∘ (dP − D)               # softmax backward, elementwise
+dQ  += dS K · scale       dK += dSᵀ Q · scale
+```
+
+The D trick is worth a second look. The softmax backward for row i needs Σ_j P_ij dP_ij, which would mean a full pass over the row. But Σ_j P_ij dP_ij = Σ_j P_ij (dO_i · v_j) = dO_i · (Σ_j P_ij v_j) = dO_i · O_i. You already have O. So D is one dot product per row, done once, before the tile loop.
+
+This is a deliberate trade: **more FLOPs, fewer bytes.** The recomputation adds roughly one extra Q Kᵀ matmul, and the paper's backward pass did more FLOPs than standard attention and still ran faster, because the bytes saved were worth more than the FLOPs spent. You will see this trade everywhere in ML systems once you know to look: <Term w="activation checkpointing">Also called gradient checkpointing: during training, throw away some intermediate results after the forward pass and recompute them during the backward pass. Saves memory at the cost of extra compute.</Term> is the same idea at the level of whole layers.
+
+<Predict id="recompute">
+FlashAttention's forward pass does about 4N²d FLOPs. Its backward recomputes S and does four more matmuls. Roughly how many FLOPs is the backward, relative to the forward? And why can it still be a good deal?
+
+<Fragment slot="answer">
+
+The backward has five N × N × d matmuls (recompute S, then dV, dP, dQ, dK), about 2N²d each, so roughly 10N²d: about 2.5x the forward. The standard backward, which reuses saved P, has four: about 2x. So recomputation costs about 25% more FLOPs in the backward. It is a good deal whenever the backward was memory-bound, because reading a saved N × N matrix from HBM costs far more time than recomputing it from tiles already in SRAM. It also removes the N² memory, which is often the real constraint.
+
+</Fragment>
+</Predict>
+
+### FlashAttention-2, -3, and what came after
+
+Once attention is compute-bound, the game changes from "move fewer bytes" to "keep the math units busy." The later versions are mostly about that.
+
+**FlashAttention-2** (Tri Dao, 2023) got about 2x over the first version, reaching 50 to 73% of an A100's peak FLOPs. Three changes:
+
+- **Fewer non-matmul FLOPs.** <Term w="Tensor cores">Special units on NVIDIA GPUs that do only one thing, small matrix multiply-adds, many times faster than the regular math units. Most of a GPU's advertised FLOPs live here.</Term> do matrix multiplies roughly 16x faster than the regular units do exponentials and divisions. So FA-2 keeps o unnormalized until the very end (one division per row, not one per block) and trims every other bit of scalar bookkeeping.
+- **Parallelize over the sequence.** FA-1 gave one program to each (batch, head) pair. With batch 1 and long sequences, that can be fewer programs than the GPU has SMs. FA-2 also splits over query blocks, which is the loop order you just stepped through.
+- **Better split of work inside a program.** Within a block, FA-2 divides the *queries* among its <Term w="warps">Groups of 32 GPU threads that execute the same instruction together. A thread block is several warps.</Term> instead of the keys, so warps do not have to exchange partial results through shared memory.
+
+It also skips blocks that are fully masked out for causal attention, roughly halving the work when every token can only see the past.
+
+**FlashAttention-3** (Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani and Tri Dao, 2024) is specific to the H100 (Hopper). It reached about 740 TFLOP/s in fp16, around 75% of peak, and close to 1.2 PFLOP/s in FP8. The ideas:
+
+- **Asynchrony.** Hopper has a hardware copy engine (TMA) and asynchronous tensor-core instructions. FA-3 dedicates some warps to loading tiles and others to math (<Term w="warp specialization">Giving different warps in a block different jobs, for example "producer" warps that only load data and "consumer" warps that only compute, so loading and math overlap.</Term>), so the next tile arrives while the current one is being multiplied.
+- **Overlapping softmax with matmul.** The exponentials are slow and the tensor cores sit idle during them. FA-3 staggers two groups of warps so one does its softmax while the other does its matmul ("ping-pong").
+- **FP8**, with per-block scaling and a trick to spread out outlier values before quantizing.
+
+FA-3's code relies on Hopper-only instructions. NVIDIA's data-center Blackwell (B200) got its own rewrite, often called FlashAttention-4, in Tri Dao's repository; check the repo for its status. Your Spark's GB10 is a different Blackwell variant from the B200, and as far as I know it does not have the B200's new tensor-core instructions, so neither FA-3 nor FA-4 targets it. Check what is supported for compute capability 12.1 before you assume anything. What *does* work everywhere is the algorithm, and PyTorch's own `scaled_dot_product_attention`, which picks a backend for you.
+
+One more relative: **Flash-Decoding** (Dao and collaborators, 2023). In decoding, there is one query row and a long KV cache. A single query block gives the GPU almost nothing to parallelize, so Flash-Decoding splits the *keys* across many programs, each producing its own (m, l, o), and then merges them with the rule from the Predict above. Same trick, opposite axis.
+
+### Writing a kernel: Triton
+
+You could write all this in CUDA C++, managing threads, warps and shared memory by hand. <Term w="Triton">A Python-embedded language and compiler from OpenAI (Philippe Tillet) for writing GPU kernels. You write code for one block of data; the compiler handles threads, shared memory and much of the scheduling.</Term> lets you think one level up: you write the code for **one program working on one tile**, and the compiler decides how threads inside that program split the work, when to use shared memory, and how to feed the tensor cores.
+
+The key ideas, in a vector add:
+
+```python
+import torch, triton
+import triton.language as tl
+
+@triton.jit
+def add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)                       # which program am I? 0, 1, 2, ...
+    offs = pid * BLOCK + tl.arange(0, BLOCK)     # the BLOCK element indices I own
+    mask = offs < n                              # the last program may run past the end
+    x = tl.load(x_ptr + offs, mask=mask)         # gather a whole tile from HBM
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)   # write the tile back
+
+def add(x, y):
+    out = torch.empty_like(x)
+    grid = (triton.cdiv(x.numel(), 1024),)       # how many programs to launch
+    add_kernel[grid](x, y, out, x.numel(), BLOCK=1024)
+    return out
+```
+
+- **A program** is one instance of the kernel. You launch a *grid* of them, and `tl.program_id(axis)` tells each which one it is. One program runs on one SM (as one thread block); many run at once.
+- **Pointers and offsets.** PyTorch tensors arrive as pointers to their first element. `x_ptr + offs` is a whole vector of addresses, and `tl.load` fetches them all in one go. For 2D tiles you build a grid of addresses from row and column offsets with broadcasting: `ptr + rows[:, None] * stride + cols[None, :]`.
+- <Term w="mask" label="mask (Triton)">A vector of True/False the same shape as the tile, passed to tl.load and tl.store. Lanes where it is False are not read (they get the `other` value instead) and not written. This is how a kernel handles sizes that are not a multiple of the block.</Term>. N is rarely a multiple of your block size. If N = 300 and BLOCK = 128, the third program owns indices 256 to 383, and only 44 of those exist. Without a mask it reads memory past the end of the tensor (garbage, or a crash); with `mask=offs < n` it skips them. `tl.load(..., mask=m, other=0.0)` says what value to use for the skipped lanes.
+- **`tl.constexpr`** marks values known at compile time, like block sizes. Triton compiles a separate version of the kernel for each value, and block sizes must be powers of 2.
+- **Tile operations**: `tl.dot(a, b)` multiplies two tiles on the tensor cores (each dimension at least 16), `tl.max(x, axis=1)`, `tl.sum`, `tl.exp`, `tl.where`, `tl.maximum`. Everything works on whole tiles, like NumPy.
+
+<Figure n="005" title="A FLASH KERNEL AS A TRITON GRID" caption="The launch grid is query blocks × (batch × heads). Each program owns Br query rows of one head: it loads its Q tile once, loops over every K/V tile, and writes its O tile once. Programs never talk to each other. The last query block is partial when N is not a multiple of Br, so its loads and stores are masked.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Grid of Triton programs indexed by query block and head, with one program expanded to show its loop over key and value tiles">
+  <text x="20" y="24" class="strong">LAUNCH GRID</text>
+  <text x="20" y="40">AXIS 0: QUERY BLOCK · AXIS 1: BATCH × HEAD</text>
+  <g stroke-width="1">
+    <rect x="40" y="56" width="40" height="30" class="fill-paper" /><rect x="84" y="56" width="40" height="30" class="fill-paper" /><rect x="128" y="56" width="40" height="30" class="fill-paper" /><rect x="172" y="56" width="40" height="30" class="fill-paper dash" />
+    <rect x="40" y="90" width="40" height="30" class="fill-paper" /><rect x="84" y="90" width="40" height="30" class="fill-blue" /><rect x="128" y="90" width="40" height="30" class="fill-paper" /><rect x="172" y="90" width="40" height="30" class="fill-paper dash" />
+    <rect x="40" y="124" width="40" height="30" class="fill-paper" /><rect x="84" y="124" width="40" height="30" class="fill-paper" /><rect x="128" y="124" width="40" height="30" class="fill-paper" /><rect x="172" y="124" width="40" height="30" class="fill-paper dash" />
+  </g>
+  <text x="60" y="172" text-anchor="middle">Q0</text><text x="104" y="172" text-anchor="middle">Q1</text><text x="148" y="172" text-anchor="middle">Q2</text><text x="192" y="172" text-anchor="middle">Q3</text>
+  <text x="32" y="75" text-anchor="end">H0</text><text x="32" y="109" text-anchor="end">H1</text><text x="32" y="143" text-anchor="end">H2</text>
+  <text x="192" y="190" text-anchor="middle">PARTIAL:</text>
+  <text x="192" y="204" text-anchor="middle">MASKED</text>
+  <line x1="124" y1="105" x2="300" y2="70" class="blue" stroke-width="1" />
+  <line x1="124" y1="105" x2="300" y2="270" class="blue" stroke-width="1" />
+  <rect x="300" y="56" width="320" height="214" class="fill-wash" stroke-width="1.2" />
+  <text x="314" y="76" class="strong">PROGRAM (1, 1) · HEAD 1, ROWS Br..2Br</text>
+  <text x="314" y="100">1  LOAD Q1 TILE → SRAM          (ONCE)</text>
+  <text x="314" y="118">2  m = −∞, l = 0, o = 0         (REGISTERS)</text>
+  <text x="314" y="136">3  FOR j IN K/V TILES:</text>
+  <rect x="330" y="146" width="22" height="16" class="fill-blue" /><rect x="356" y="146" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="382" y="146" width="22" height="16" class="fill-paper" stroke-width="1" /><rect x="408" y="146" width="22" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="440" y="158">K, V TILES STREAM IN</text>
+  <text x="330" y="182">S = tl.dot(q, kᵀ) · scale</text>
+  <text x="330" y="200">m, l, o ← RESCALE + ADD</text>
+  <text x="314" y="224">4  o / l → STORE O1 TILE       (ONCE)</text>
+  <text x="314" y="242">5  STORE L = m + log l         (N NUMBERS)</text>
+  <text x="314" y="262" class="blue-t">NOTHING N × N EVER LEAVES THE SM</text>
+</svg>
+</Figure>
+
+Triton has been in your stack all along. When you call `torch.compile`, its default backend (TorchInductor) *writes Triton kernels* for your fused elementwise and reduction ops. Run any compiled model with `TORCH_LOGS="output_code"` and you can read them. After this lesson they will look familiar.
+
+### Benchmarking a kernel without lying to yourself
+
+GPU timing has more ways to be wrong than right. The rules:
+
+1. **Synchronize.** As in [Waiting vs working](/lessons/waiting-vs-working/), a kernel launch returns as soon as the work is queued. Time without `torch.cuda.synchronize()` (or CUDA events) and you measure how fast Python can queue work. You will get numbers that beat the hardware's peak.
+2. **Warm up.** The first call to a Triton kernel compiles it, which takes hundreds of milliseconds to seconds. The first call to a <Term w="cuBLAS">NVIDIA's library of tuned linear-algebra kernels. When PyTorch multiplies two matrices on the GPU, it usually calls cuBLAS.</Term> matmul may run a heuristic search. PyTorch's memory allocator grabs memory from the driver the first time and reuses it after. Run each function several times before you start the clock.
+3. **Repeat and take a robust statistic.** Run many iterations; report the median (or mean, with the spread). GPU clocks change with temperature and power.
+4. **Watch the cache.** If you run the same small kernel 100 times in a row, its inputs may sit in L2 and you measure L2 speed, not HBM speed. `triton.testing.do_bench` clears the L2 by writing a big buffer between runs (check the source of your version to confirm).
+5. **Check correctness before speed.** A wrong kernel can be extremely fast. Compare against a reference first, with a tolerance that fits the dtype: fp16 attention typically agrees to about 1e-3, not 1e-6.
+6. **Time only the kernel.** Allocate inputs outside the timed region. Keep shapes fixed so nothing recompiles.
+
+`triton.testing.do_bench(fn)` does most of this for you: it warms up, synchronizes, flushes L2, runs repeatedly for a target time, and returns milliseconds. (In recent versions the arguments are `warmup` and `rep` in milliseconds and the default statistic is the mean; read the docstring for your version.) For memory, `torch.cuda.reset_peak_memory_stats()` before a call and `torch.cuda.max_memory_allocated()` after tell you the high-water mark of PyTorch's allocations.
+
+## Build It
+
+Three builds, in increasing distance from the metal. The first two run on your Mac. The third needs the Spark.
+
+<Task id="t1" title="Online softmax in NumPy" agent="hands">
+
+Write it yourself; the whole point is that your fingers learn the rescale.
+
+```python
+# online_softmax.py
+import numpy as np
+
+def softmax_safe(x: np.ndarray) -> np.ndarray:
+    """Three passes: max, sum of exp(x - max), divide."""
+    ...
+
+def online_max_sum(x: np.ndarray) -> tuple[float, float]:
+    """One pass over x, one element at a time. Return (m, l) where l = sum(exp(x - m))."""
+    ...
+
+def softmax_online(x: np.ndarray) -> np.ndarray:
+    """Use online_max_sum, then one more pass to produce outputs."""
+    ...
+
+def merge(a: tuple[float, float], b: tuple[float, float]) -> tuple[float, float]:
+    """Combine two partial (m, l) states into one."""
+    ...
+
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    for scale in [1, 10, 100]:
+        x = rng.normal(size=10_000) * scale
+        # 1. compare softmax_online with softmax_safe: max abs difference
+        # 2. split x into 7 uneven chunks, run online_max_sum on each, merge them all,
+        #    and check you get the same (m, l) as one pass over x
+        # 3. compare with scipy.special.softmax if you have scipy (optional)
+        ...
+    # 4. show the overflow: np.exp(x) / np.exp(x).sum() for x = [1000, 1001, 1002]
+```
+
+Hints:
+
+- Start `m = -np.inf` and `l = 0.0`. `np.exp(-np.inf)` is `0.0`, which is what makes the first step work without a special case.
+- Merging with an empty state (m = −∞) should be a no-op. Check that it is.
+- On my Mac, the online and safe versions differ by about 1e-15 in float64. If yours differ by more than 1e-12, a term is being rescaled against the wrong max.
+
+</Task>
+
+<Task id="t2" title="Tiled attention in NumPy, matched to naive" agent="hands">
+
+Now the real algorithm, with tiles instead of single numbers.
+
+```python
+# tiled_attention.py
+import numpy as np
+
+def naive_attention(Q, K, V):
+    """Q, K, V: (N, d). Build the full N x N score matrix, safe softmax, @ V."""
+    ...
+
+def tiled_attention(Q, K, V, Br=64, Bc=64):
+    """Same result, never building anything bigger than Br x Bc.
+    Outer loop over query blocks of Br rows; inner loop over key/value blocks of Bc rows.
+    Keep m (Br,), l (Br,), acc (Br, d) for the current query block."""
+    N, d = Q.shape
+    scale = 1.0 / np.sqrt(d)
+    O = np.empty_like(Q)
+    for i in range(0, N, Br):
+        q = Q[i:i + Br]
+        m = np.full(q.shape[0], -np.inf)
+        l = np.zeros(q.shape[0])
+        acc = np.zeros_like(q)
+        for j in range(0, N, Bc):
+            ...  # scores, new max, p, alpha, update l and acc, m = m_new
+        O[i:i + Br] = ...
+    return O
+```
+
+Then test it hard:
+
+- N = 1000 (not a multiple of 64, so the last blocks are partial), d = 64, float64 and float32. Max absolute difference against `naive_attention` must be below **1e-5**. (Mine was about 4e-16 in float64 and 8e-9 in float32.)
+- Try Br = Bc = 1 (pure online softmax, one key at a time) and Br = Bc = N (one block: it becomes naive). Both must still match.
+- Add a `causal=True` option: query i may only see keys j ≤ i. Set masked scores to `-np.inf` before the max. Then skip key blocks that are entirely in the future of the whole query block. Count how many blocks you skipped for N = 1024, Br = Bc = 64.
+- Measure peak memory with `tracemalloc` (NumPy reports its allocations to it) for N = 1024, 4096, 8192.
+
+</Task>
+
+<Task id="t-setup" title="Set up the Spark for Triton" agent="ok">
+
+Kernel work is where versions matter most. NVIDIA's recommended path on DGX Spark is its PyTorch container from NGC, which ships a PyTorch, CUDA and Triton built for the GB10. If you use your own environment, you need a PyTorch build that supports compute capability 12.1 and a Triton recent enough to know Blackwell (Triton 3.3 and later added Blackwell support; check the release notes for the GB10 specifically). If kernels fail to compile with an unknown-architecture error, switch to the container before debugging anything else.
+
+```python
+# gpuinfo.py
+import torch, triton
+print("torch", torch.__version__, "cuda", torch.version.cuda, "triton", triton.__version__)
+p = torch.cuda.get_device_properties(0)
+print(p.name, "capability", torch.cuda.get_device_capability(0))   # expect (12, 1) on GB10
+print("SMs", p.multi_processor_count, "total memory GB", p.total_memory / 1e9)
+for attr in ["shared_memory_per_block_optin", "shared_memory_per_multiprocessor", "L2_cache_size", "regs_per_multiprocessor"]:
+    print(attr, getattr(p, attr, "not exposed in this torch version"))
+```
+
+Write these numbers into Figure 001's CHECK slots. Then run Triton's own tutorial `01-vector-add.py` from the Triton repo as a smoke test. One debugging tool worth knowing now: setting `TRITON_INTERPRET=1` in the environment runs Triton kernels on the CPU in an interpreter, slowly, where `print` and a debugger work. Use it whenever a kernel gives wrong numbers.
+
+</Task>
+
+<Task id="t3" title="A fused softmax kernel in Triton" agent="hands">
+
+Warm up on a kernel with one row per program. This is softmax over the last dimension of a 2D tensor, in one read and one write of HBM.
+
+```python
+# softmax_triton.py
+import torch, triton
+import triton.language as tl
+
+@triton.jit
+def softmax_kernel(out_ptr, in_ptr, row_stride, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    mask = cols < n_cols
+    # 1. load this row: in_ptr + row * row_stride + cols, masked, other=-inf
+    #    (why -inf and not 0? think about the max and the exp)
+    # 2. subtract the max, exponentiate, sum, divide (in float32)
+    # 3. store to out_ptr with the same mask
+    ...
+
+def softmax(x: torch.Tensor) -> torch.Tensor:
+    n_rows, n_cols = x.shape
+    out = torch.empty_like(x)
+    BLOCK = triton.next_power_of_2(n_cols)
+    softmax_kernel[(n_rows,)](out, x, x.stride(0), n_cols, BLOCK=BLOCK)
+    return out
+
+def softmax_eager(x):
+    """The unfused version: several separate kernels, several HBM round trips."""
+    m = x.max(dim=1, keepdim=True).values
+    e = torch.exp(x - m)
+    return e / e.sum(dim=1, keepdim=True)
+```
+
+Check it against `torch.softmax` for shapes (4096, 1000), (4096, 4096) and (1, 37). Then benchmark all three (yours, `torch.softmax`, `softmax_eager`) with `do_bench` and report **GB/s**: an ideal softmax reads and writes each element once, so bytes = 2 × rows × cols × element size. Compare with the 273 GB/s spec. Your fused kernel and `torch.softmax` should be close to each other; the eager one should be several times slower. Count how many HBM passes the eager version makes and see if that predicts the gap.
+
+</Task>
+
+<Task id="t4" title="A FlashAttention forward kernel in Triton" agent="hands">
+
+Now the real thing, simplified: forward pass only, no causal mask, no dropout, fp16 inputs, fp32 accumulators, head dim 64 or 128. One program per (query block, batch × head). The wrapper and the setup are given; the loop body is yours. It is the same loop as your NumPy `tiled_attention`, written with `tl.` functions.
+
+```python
+# flash_triton.py
+import torch, triton
+import triton.language as tl
+
+@triton.jit
+def _flash_fwd(Q, K, V, O, N, stride_bh, stride_n, scale,
+               BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, D: tl.constexpr):
+    pid_m = tl.program_id(0)            # which query block
+    pid_bh = tl.program_id(1)           # which (batch, head)
+    base = pid_bh * stride_bh
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    dims = tl.arange(0, D)
+    offs_n = tl.arange(0, BLOCK_N)
+
+    # Q tile: (BLOCK_M, D), loaded once
+    q = tl.load(Q + base + rows[:, None] * stride_n + dims[None, :],
+                mask=rows[:, None] < N, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
+    l_i = tl.zeros([BLOCK_M], tl.float32)
+    acc = tl.zeros([BLOCK_M, D], tl.float32)
+
+    for start in range(0, N, BLOCK_N):
+        cols = start + offs_n
+        # 1. load K tile TRANSPOSED as (D, BLOCK_N): address = K + base + cols[None, :] * stride_n + dims[:, None]
+        #    mask on cols < N, other=0.0
+        # 2. s = tl.dot(q, k) * scale; then set columns >= N to -inf with tl.where
+        # 3. m_new = max(m_i, row max of s); p = exp(s - m_new[:, None]); alpha = exp(m_i - m_new)
+        # 4. l_i = l_i * alpha + row sum of p
+        # 5. load V tile (BLOCK_N, D), masked; acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+        # 6. m_i = m_new
+        ...
+
+    acc = acc / l_i[:, None]
+    tl.store(O + base + rows[:, None] * stride_n + dims[None, :],
+             acc.to(O.dtype.element_ty), mask=rows[:, None] < N)
+
+def flash_fwd(q, k, v, BLOCK_M=64, BLOCK_N=64):
+    """q, k, v: (B, H, N, D) fp16 on cuda. Returns (B, H, N, D)."""
+    B, H, N, D = q.shape
+    q, k, v = (t.reshape(B * H, N, D).contiguous() for t in (q, k, v))
+    o = torch.empty_like(q)
+    grid = (triton.cdiv(N, BLOCK_M), B * H)
+    _flash_fwd[grid](q, k, v, o, N, q.stride(0), q.stride(1), 1.0 / D ** 0.5,
+                     BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, D=D)
+    return o.reshape(B, H, N, D)
+```
+
+Hints:
+
+- `tl.max(s, axis=1)` and `tl.sum(p, axis=1)` reduce over the key dimension. `tl.maximum(a, b)` is elementwise max.
+- `tl.dot` wants both inputs in the same dtype; `p` is fp32, so cast it to fp16 before the second dot. The accumulator stays fp32.
+- Test with `torch.testing.assert_close(flash_fwd(q, k, v), F.scaled_dot_product_attention(q, k, v), atol=2e-2, rtol=2e-2)`, for N = 1024, N = 1000 (partial blocks) and N = 77.
+- When the numbers are wrong, rerun with `TRITON_INTERPRET=1` and N = 77 and print `m_i` after each block.
+- Real kernels use `tl.exp2` with log₂(e) folded into the scale, because the hardware's native instruction is base 2. Try it after it works and see if it is measurably faster.
+
+Once it passes, compare with Triton's official "Fused Attention" tutorial (06-fused-attention.py in the Triton repo). It is the same algorithm with causal masking, a backward pass, autotuned block sizes and hardware-specific tricks. You will be able to read it now.
+
+</Task>
+
+<Task id="t5" title="Benchmark naive vs SDPA vs yours, and plot" agent="ok">
+
+Boilerplate; have an agent write it if you like, but write your predictions in the Measure table before you run it.
+
+```python
+# bench_attn.py
+import json, torch, triton
+import torch.nn.functional as F
+from flash_triton import flash_fwd
+
+def naive(q, k, v):
+    s = (q @ k.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+    return torch.softmax(s, dim=-1) @ v
+
+def sdpa(q, k, v):
+    return F.scaled_dot_product_attention(q, k, v)
+
+def peak_bytes(fn, *args):
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    fn(*args)
+    torch.cuda.synchronize()
+    return torch.cuda.max_memory_allocated() - base
+
+B, H, D = 1, 32, 128
+rows = []
+for N in [512, 1024, 2048, 4096, 8192, 16384]:
+    q, k, v = (torch.randn(B, H, N, D, device="cuda", dtype=torch.float16) for _ in range(3))
+    ref = sdpa(q, k, v)
+    torch.testing.assert_close(flash_fwd(q, k, v), ref, atol=2e-2, rtol=2e-2)
+    flops = 4 * B * H * N * N * D
+    for name, fn in [("naive", naive), ("sdpa", sdpa), ("mine", flash_fwd)]:
+        try:
+            ms = triton.testing.do_bench(lambda: fn(q, k, v))
+            mem = peak_bytes(fn, q, k, v)
+            rows.append(dict(N=N, impl=name, ms=ms, tflops=flops / ms / 1e9, peak_gb=mem / 1e9))
+        except torch.cuda.OutOfMemoryError:
+            rows.append(dict(N=N, impl=name, ms=None, tflops=None, peak_gb=None))
+            torch.cuda.empty_cache()
+        print(rows[-1])
+json.dump(rows, open("attn_bench.json", "w"), indent=1)
+```
+
+Then a plot script: two panels side by side, time (ms) vs N and peak memory (GB) vs N, log-log, one line per implementation. Matplotlib is fine.
+
+Also find out which backend SDPA used. Force one at a time and see whether it runs or raises "no available kernel":
+
+```python
+from torch.nn.attention import sdpa_kernel, SDPBackend
+for backend in [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH]:
+    with sdpa_kernel(backend):
+        ...  # call sdpa(q, k, v), catch RuntimeError, print which ones work and their do_bench time
+```
+
+On a new architecture, the flash backend may not be built for it yet, and SDPA silently falls back to something else.
+
+**Careful at N = 32K.** Naive needs about 137 GB there (you predicted this). On the Spark, memory is shared with the operating system, so instead of a clean `OutOfMemoryError` you may get the Linux OOM killer ending your process, or the machine swapping. Try 32K once, on purpose, by itself, with nothing else running, and watch `free -g` in another terminal.
+
+</Task>
+
+<Task id="t6" title="Get your kernel reviewed" agent="review">
+
+Have an agent review `flash_triton.py` for the bugs that pass small tests: mask mistakes when N is not a multiple of BLOCK_N, a row that could end up all `-inf` (and produce NaN), integer overflow in offsets for very large tensors, wrong strides if the input is not contiguous, and fp16 accumulation anywhere it should be fp32. Fix what it finds, yourself.
+
+</Task>
+
+<DoneWhen>
+
+- `online_softmax.py` matches safe softmax to about 1e-15 and your merged chunks give the same (m, l) as one pass.
+- `tiled_attention.py` matches naive attention to below 1e-5 for N = 1000, any block sizes, causal and not, and its peak memory grows linearly with N.
+- Your Triton softmax and FlashAttention kernels pass `assert_close` against PyTorch for awkward sizes (N = 77, 1000).
+- The Measure table is filled with your Spark numbers and you have the two-panel plot.
+- You can explain every gap between your kernel, SDPA and naive in bytes and FLOPs.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in on the Spark: B = 1, H = 32, d = 128, fp16, forward only. Write the prediction column before running anything.
+
+| N | Naive ms | Naive peak GB | SDPA ms | SDPA peak GB | Mine ms | Mine peak GB | Mine TFLOP/s | Prediction |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1,024 | | | | | | | | |
+| 4,096 | | | | | | | | |
+| 8,192 | | | | | | | | |
+| 16,384 | | | | | | | | |
+| 32,768 | | | | | | | | |
+
+And for the softmax kernel:
+
+| Shape | Mine GB/s | torch.softmax GB/s | Eager GB/s | Eager HBM passes (counted) |
+| --- | --- | --- | --- | --- |
+| 4096 × 4096 fp16 | | | | |
+| 4096 × 32768 fp16 | | | | |
+
+What I measured on my Mac, for the NumPy builds (CPU, float32, d = 64, peak memory from `tracemalloc`):
+
+| N | Naive peak | Tiled peak (Br = Bc = 64) |
+| --- | --- | --- |
+| 1,024 | 17.8 MB | 0.5 MB |
+| 4,096 | 273 MB | 1.2 MB |
+| 8,192 | 1,082 MB | 2.3 MB |
+
+Naive grows 4x each time N doubles; tiled grows 2x. That is N² against N, measured. Notice that the tiled NumPy version was *slower* (0.31 s against 0.13 s at N = 4096): NumPy cannot fuse, so every line in your inner loop is a separate pass over a small array, and the Python loop adds overhead. Tiling only pays when the tiles stay on the chip, which is what the Triton kernel adds.
+
+What the Spark numbers should look like, and why. These are predictions from the counting model, not measurements; the point is to check them.
+
+**Naive time grows as N² and is memory-bound.** At N = 8K, Figure 004 says about 17 GB of traffic, which at 273 GB/s is at least about 64 ms. The FLOPs (about 1.1 TFLOP) need only about 9 ms even at a generous 125 TFLOP/s. Expect naive to land near or above the memory floor.
+
+**Naive memory grows as N² and falls off a cliff.** About 8.6 GB of S and P at 8K, 34 GB at 16K, 137 GB at 32K (does not fit).
+
+**SDPA and yours: time grows as N², memory stays flat.** The extra memory beyond Q, K, V and O should be a few MB at every N. If SDPA's peak memory grows with N², it fell back to the math backend; you found out which backend it used in Task 5.
+
+**Your kernel vs SDPA.** A first, untuned Triton kernel landing within 1.5 to 3x of a production backend is a good result. Compute your TFLOP/s and compare with the matmul plateau you measured in the bandwidth lesson: that plateau is the ceiling, and FlashAttention-class kernels on mature hardware get 50 to 75% of it. Try BLOCK_M and BLOCK_N of 64 and 128, and `num_warps=4` or `8` (an extra launch argument); the best values depend on the chip's shared memory size, which is why real kernels autotune.
+
+**Softmax GB/s.** The fused versions should reach a large fraction of 273 GB/s on big shapes; the eager version should be slower by roughly the ratio of HBM passes you counted.
+
+## Break It
+
+**1. Drop the max subtraction.** In your Triton softmax, compute `tl.exp(x)` directly, and feed it fp16 rows scaled by 20. You get `inf`, then `nan` from inf / inf, exactly as on the Mac. Now ask what this means for the online version: the running max is not an optimization you can skip; it is the thing that makes fp16 attention possible at all.
+
+**2. Forget the rescale.** In your NumPy `tiled_attention`, comment out the `* alpha` on `acc` (keep it on `l`). Run your tests. The output is wrong, but by how much depends on the data: if the largest score in every row happens to fall in the first key block, alpha is always 1 and the bug is invisible. Build a test where the max is in the last block (add a large constant to the last few keys' scores) and watch it fail loudly. This is why tests with random data alone are not enough for kernels.
+
+**3. Forget the mask.** Remove `mask=` from the K and V loads in your Triton kernel and run N = 1000 with BLOCK_N = 64. Sometimes you get wrong answers (it read past the end into whatever was next in memory), sometimes an illegal memory access error, sometimes, worst of all, correct-looking output because the memory past the end happened to be zeros. Then remove only the `tl.where(..., -inf)` on the scores and keep the load masks. The padded keys now have score 0, not −∞, so they get real weight in the softmax. Why does that give a wrong answer even though their V rows were loaded as zeros?
+
+**4. Lie with a benchmark.** Time `flash_fwd` with `time.perf_counter()` around a single call, no warmup and no synchronize. Then with warmup but no synchronize. Then properly. Write down all three numbers. The first includes compilation (hundreds of milliseconds or more), the second measures launch overhead (absurdly fast), the third is real. Then measure the actual HBM bytes with <Term w="Nsight Compute">NVIDIA's kernel profiler (the `ncu` command). Runs a kernel under hardware counters and reports bytes moved at each memory level, achieved FLOPs, stalls and more.</Term>: run it on a script that does one N = 8K call:
+
+```bash
+ncu --metrics dram__bytes_read.sum,dram__bytes_write.sum python bench_one.py
+```
+
+Check `ncu --query-metrics` for the exact names on the GB10; unified memory may report them differently. Where between Figure 004's worst and best cases does your kernel land? That tells you how much L2 is saving you.
+
+**5. Ask for too much SRAM.** Set BLOCK_M = BLOCK_N = 256 with D = 128. Triton should refuse with an "out of resources: shared memory" error, telling you how much it wanted and how much the chip has. That number is the M in the paper's Θ(N² d² / M). Find the largest block sizes that compile, then check whether the largest is the fastest. (Often it is not: bigger tiles mean fewer programs fit on an SM at once, so the GPU has less work to switch to while waiting on memory.)
+
+## Explain It Back
+
+Say each answer out loud, as if in an interview. Then check.
+
+<details>
+<summary>1. Attention does the same FLOPs whether you write it naively or as FlashAttention. So why is the naive version slow for long sequences?</summary>
+
+Because the naive version is limited by memory traffic, not math. It runs as separate kernels, and kernels can only pass data through HBM, so the N × N score matrix gets written to HBM, read back for softmax, the N × N probability matrix gets written, and read back again for the multiply with V. That is at least 4N² numbers of traffic against only about 4Nd for the real inputs and outputs. The arithmetic intensity comes out to about d / 2 FLOPs per byte, around 64 for d = 128, well below the ridge point of any modern GPU, and it does not improve with N. FlashAttention fuses everything into one kernel and keeps the score tiles on the chip, so it moves roughly the inputs and outputs only and becomes compute-bound. It also never allocates the N × N matrix, which at 32K tokens and 32 heads would be over 60 GB for one layer.
+
+</details>
+
+<details>
+<summary>2. Explain online softmax, and convince me it is exact.</summary>
+
+Keep a running max m and a running sum l of e^(x − m) over everything seen so far. For each new value x: the new max is max(m, x); multiply the old sum by e^(m_old − m_new), which re-expresses every previous term relative to the new max in one step, because e^(x_j − m_new) = e^(x_j − m_old) · e^(m_old − m_new); then add e^(x − m_new). By induction, after k values l is exactly the sum of e^(x_j − m_k) over the first k values, which at the end is the safe-softmax denominator. There is no approximation, only floating-point rounding. Two partial states combine the same way, m = max of the two, each l rescaled to it and added, which is what lets you process tiles independently and merge. For attention you carry a third quantity, the un-normalized output o, rescaled by the same factor, and divide by l at the end.
+
+</details>
+
+<details>
+<summary>3. How does FlashAttention scale with sequence length, head dimension and SRAM size, in time, memory and HBM traffic?</summary>
+
+FLOPs are still about 4N²d per head for the forward pass, so compute time grows as N²; FlashAttention does not change the asymptotic work. Extra memory drops from N² per head (the score and probability matrices) to N per head (m and l, or the logsumexp), so it is linear. HBM traffic in the paper's model is Θ(N² d² / M), with M the SRAM size, against Θ(N² + Nd) for naive: still quadratic in N, but with a smaller constant that improves as SRAM grows and gets worse as d grows, because bigger heads mean smaller tiles fit. The paper proves no exact algorithm can do better across all M. In practice, K and V re-reads often hit in L2, so real traffic is closer to linear, and the kernel is compute-bound at long N. That is why FlashAttention-2 and -3 focus on keeping the tensor cores busy rather than on moving fewer bytes.
+
+</details>
+
+<details>
+<summary>4. Why does the backward pass recompute attention instead of saving the probabilities?</summary>
+
+Saving P would mean writing an N × N matrix per head to HBM in the forward pass and reading it back in the backward: exactly the memory and traffic FlashAttention was built to avoid. Instead the forward saves the output O and one number per row, the logsumexp L = m + log l. The backward reloads Q, K, V tiles, recomputes the score tile, and rebuilds exact probabilities as e^(S − L), then computes the gradient tiles. The softmax gradient needs a row sum of P times dP, which simplifies to the dot product of dO and O per row, computed once up front. It costs roughly 25% more FLOPs in the backward but saves far more time in memory traffic, and it removes the quadratic memory. Same trade as activation checkpointing: spend cheap compute to avoid expensive bytes.
+
+</details>
+
+<details>
+<summary>5. You are asked to make a new attention variant fast, say one with a per-head learned bias added to the scores and a different normalization. How do you approach it?</summary>
+
+First write the reference in plain PyTorch and a test harness with awkward shapes, so every faster version has something to match. Then ask the FlashAttention question: can the computation be done one key tile at a time with a small running state per query row, and can two partial states be merged exactly? An additive bias that you can compute per tile is easy: add it to the score tile before the max. A different normalization needs its own running statistic and merge rule; if it has one (like softmax's max and sum), it tiles; if it needs the whole row at once, you need two passes or a different algorithm. Then count bytes and FLOPs to know whether the fused kernel should be memory- or compute-bound, write it in Triton starting from a working flash kernel, check exactness, and benchmark properly: warmup, synchronize, do_bench, several sequence lengths, compared against SDPA on the plain-softmax case. Then profile with Nsight Compute to see whether you are near the roofline, and only then tune block sizes and warps.
+
+</details>
+
+## Go Deeper
+
+- **Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, Christopher Ré, "FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness"** (NeurIPS 2022), [arXiv:2205.14135](https://arxiv.org/abs/2205.14135). Read Section 2 (the hardware model, including the memory hierarchy figure this lesson's Figure 001 borrows from), Algorithm 1, and Theorem 2 with its proof sketch. The appendix has the backward pass in full.
+- **Maxim Milakov and Natalia Gimelshein, "Online normalizer calculation for softmax"** (2018), [arXiv:1805.02867](https://arxiv.org/abs/1805.02867). Four pages. The original online softmax, with the induction proof and GPU benchmarks. The idea that made everything else possible.
+- **Tri Dao, "FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning"** (2023), [arXiv:2307.08691](https://arxiv.org/abs/2307.08691). Short and readable; the loop swap, the warp partitioning, and why non-matmul FLOPs are expensive.
+- **Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao, "FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision"** (2024), [arXiv:2407.08608](https://arxiv.org/abs/2407.08608). What it takes to reach 75% of an H100: warp specialization, ping-pong scheduling, FP8.
+- **Triton tutorials**, especially "Fused Softmax" and "Fused Attention", at [triton-lang.org](https://triton-lang.org/main/getting-started/tutorials/index.html). The fused attention tutorial is the reference implementation to compare your kernel against.
+- **Horace He, "Making Deep Learning Go Brrrr From First Principles"**, [horace.io/brrr_intro.html](https://horace.io/brrr_intro.html). The best short essay on compute-bound vs memory-bound vs overhead-bound, and why fusion matters, by someone who works on `torch.compile`.
+- **Markus N. Rabe and Charles Staats, "Self-attention Does Not Need O(n²) Memory"** (2021), [arXiv:2112.05682](https://arxiv.org/abs/2112.05682). The same chunked-softmax idea from the memory side, written for TPUs in JAX, a few months before FlashAttention.
+- **Philippe Tillet, H. T. Kung, David Cox, "Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations"** (MAPL 2019). Why "program per tile" is the right abstraction for GPU kernels.
+
+## Connections
+
+This lesson is the roofline from [Why ~17 tokens per second?](/lessons/bandwidth-bound/) applied to one operation: naive attention sits left of the ridge, FlashAttention moves it to the right. The tiling is the temporal locality from [Why is NumPy 100x faster?](/lessons/cpu-caches/), done by hand in shared memory instead of by a hardware cache. The benchmarking rules come from [Waiting vs working](/lessons/waiting-vs-working/) (GPU calls are asynchronous) and [Why is Python slow?](/lessons/python-speed/) (`torch.compile` and the Triton kernels it generates).
+
+Forward: [The KV cache, by hand](/lessons/kv-cache/) and [Paged attention and prefix caching](/lessons/prefix-caching/) are about attention at decode time, where the query is one row and Flash-Decoding's split-and-merge takes over. [Inside vLLM and SGLang](/lessons/serving-engines/) will show you production attention kernels (FlashAttention, FlashInfer) wired into a server; you can now read them.

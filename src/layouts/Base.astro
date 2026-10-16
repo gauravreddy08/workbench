@@ -1,0 +1,52 @@
+---
+import '../styles/global.css';
+interface Props { title: string; description?: string }
+const { title, description = 'A build-it-yourself manual for the gaps in CS and ML.' } = Astro.props;
+const path = Astro.url.pathname;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const nav = [
+  { href: base || '/', label: 'Contents' },
+  { href: `${base}/method`, label: 'Method' },
+  { href: `${base}/inbox`, label: 'Gap inbox' },
+];
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <link rel="icon" href={`${base}/favicon.svg`} type="image/svg+xml" />
+    <script is:inline>
+      try { const t = localStorage.getItem('wb:theme'); if (t) document.documentElement.dataset.theme = t; } catch {}
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href={base || '/'}>WORKBENCH</a>
+      <nav>
+        {nav.map((n) => <a href={n.href} aria-current={path === n.href ? 'page' : undefined}>{n.label}</a>)}
+        <button class="theme-btn" type="button" id="theme-btn">Theme</button>
+      </nav>
+    </header>
+    <div class="wrap"><div class="ticks"></div></div>
+    <slot />
+    <footer class="site">
+      <span class="label">Workbench · predict, build, measure, explain</span>
+      <span class="label">Progress saves in this browser, and syncs once unlocked</span>
+    </footer>
+    <script is:inline>
+      document.getElementById('theme-btn').addEventListener('click', () => {
+        const root = document.documentElement;
+        const dark = root.dataset.theme ? root.dataset.theme === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches;
+        root.dataset.theme = dark ? 'light' : 'dark';
+        try { localStorage.setItem('wb:theme', root.dataset.theme); } catch {}
+      });
+    </script>
+    <script>
+      import { pullProgress } from '../lib/db';
+      pullProgress();
+    </script>
+  </body>
+</html>

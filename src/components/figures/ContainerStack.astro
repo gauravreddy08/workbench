@@ -1,0 +1,182 @@
+---
+// VM vs container stack. Buttons switch between side-by-side, VM only, containers only,
+// and "Docker on a Mac" (containers inside a Linux VM). Hover, focus or tap a layer to read
+// what it is. Drawn in JS so each mode can reuse the same layer notes.
+---
+<div class="cstack" data-fig="container-stack">
+  <div class="ctl cstack-modes">
+    <button class="btn" type="button" data-mode="both" aria-pressed="true">Side by side</button>
+    <button class="btn" type="button" data-mode="vm" aria-pressed="false">VMs</button>
+    <button class="btn" type="button" data-mode="ctr" aria-pressed="false">Containers</button>
+    <button class="btn" type="button" data-mode="mac" aria-pressed="false">Docker on a Mac</button>
+  </div>
+  <svg viewBox="0 0 640 300" role="img" aria-label="Layer stack of virtual machines and containers"></svg>
+  <p class="cstack-sum" data-r="sum"></p>
+  <div class="cstack-note" aria-live="polite">
+    <span class="label" data-r="title">Hover or tap a layer</span>
+    <p data-r="note">Each box is something that has to exist in memory and, at startup, has to be loaded or booted. Count the kernels.</p>
+  </div>
+</div>
+
+<style is:global>
+  .cstack svg { margin-top: 12px; }
+  .cstack svg [data-k] { cursor: pointer; }
+  .cstack svg [data-k]:focus { outline: none; }
+  .fig .cstack svg rect.hot { fill: var(--blue-fill); stroke: var(--blue); stroke-width: 2; }
+  .cstack-sum { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+  .cstack-note { margin-top: 10px; border-top: 1px solid var(--blue); padding-top: 6px; min-height: 92px; }
+  .cstack-note .label { color: var(--blue); }
+  .cstack-note p { margin: 4px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  type Box = { r: number; h: number; x: number; w: number; label: string; k: string; fence?: boolean };
+
+  const NOTES: Record<string, [string, string]> = {
+    hw: ['Hardware', 'The physical CPU cores, RAM, disk, network card and GPU. Only one piece of software can be in charge of them directly: whatever runs at the most privileged level of the CPU.'],
+    hostk: ['Host kernel', 'The one program that talks to the hardware. It schedules processes, hands out memory, runs drivers, and answers system calls. In the container world this is the ONLY kernel. Everything above it is ordinary processes.'],
+    hostkc: ['Host kernel (with namespaces, cgroups, overlayfs)', 'The same Linux kernel, using three of its own features: namespaces (each container gets its own view of PIDs, mounts, network, hostname, users), cgroups (limits on CPU and memory), and overlayfs (stacking image layers into one filesystem). A container is a normal process the kernel has agreed to lie to and to limit.'],
+    hyp: ['Hypervisor', 'Software that splits one machine into several pretend machines. It runs in a CPU mode above the kernels (EL2 on ARM, VMX root on x86), so each guest kernel can believe it owns the hardware. With KVM, the Linux host kernel is the hypervisor and a QEMU process per VM provides the fake devices.'],
+    vhw: ['Virtual hardware', 'What a guest sees when it looks down: a virtual CPU, a fixed slab of "physical" RAM, a virtual disk (just a file on the host), a virtual network card. The guest has to probe and initialise all of it at boot, exactly like real hardware.'],
+    gk: ['Guest kernel', 'A complete, separate kernel booted inside the VM. It has its own scheduler, its own memory manager, its own drivers, its own page cache. It can be a different version or even a different OS (Windows next to Linux). This is the big thing a container does not have.'],
+    gu: ['Guest userland', 'The guest OS files and processes above its kernel: an init system (systemd), libc, a shell, a package manager, sshd, logging daemons. Booted and kept running inside each VM.'],
+    app: ['Your app', 'The thing you actually wanted to run: python serve.py. In both worlds it is, at the bottom, a process making system calls. The question is just which kernel answers them.'],
+    cu: ['Container userland (the image)', 'Files only: a libc, a shell, Python, pip packages, your code. This is what "FROM ubuntu" or "FROM alpine" gives you. It looks like an OS from the inside (there is an /etc/os-release) but there is no kernel in it. Nothing boots. There is usually no init system either: your app is PID 1.'],
+    fence: ['The fence (namespaces + cgroup)', 'Not a layer of software at all. It is a set of labels the kernel attaches to these processes: which PID numbering, which mount table, which network stack, which hostname, which user IDs they see, and which cgroup limits their CPU and memory. Drawn dashed because it costs almost nothing.'],
+    rt: ['Container runtime', 'dockerd, containerd and runc. They unpack the image, ask the kernel to create the namespaces and cgroup, set up overlayfs, start your process inside, and then step aside. They are not between your app and the kernel: once started, your app talks to the kernel directly.'],
+    mhw: ['Apple silicon', 'Your Mac: ARM64 CPU cores, unified memory, SSD.'],
+    xnu: ['macOS kernel (XNU)', 'macOS has its own kernel, XNU, which is not Linux. It has no Linux namespaces or cgroups and cannot run Linux system calls. A Linux container needs a Linux kernel, so there is no way to run one directly on it.'],
+    vz: ['Apple Virtualization.framework', 'The macOS hypervisor API. Docker Desktop (and OrbStack, Colima, Podman machine) use it to boot one small Linux VM in the background.'],
+    lk: ['Linux kernel in a hidden VM', 'This is the kernel your Mac containers really share. Run docker run --rm alpine uname -r on your Mac and you will see a Linux version string, not a macOS one.'],
+    cli: ['docker CLI', 'The docker command on macOS is just a client. It sends your request over a socket into the VM, where the real Docker daemon runs.'],
+  };
+
+  // Layouts are bottom-up rows. Each function lays out one column at [x0, x0 + w].
+  function vmCol(x0: number, w: number): Box[] {
+    const out: Box[] = [
+      { r: 0, h: 1, x: x0, w, label: 'HARDWARE', k: 'hw' },
+      { r: 1, h: 1, x: x0, w, label: 'HOST KERNEL', k: 'hostk' },
+      { r: 2, h: 1, x: x0, w, label: 'HYPERVISOR (KVM)', k: 'hyp' },
+    ];
+    const g = 6, cw = (w - 2 * g) / 3;
+    for (let i = 0; i < 3; i++) {
+      const x = x0 + i * (cw + g);
+      out.push({ r: 3, h: 1, x, w: cw, label: 'VIRTUAL HW', k: 'vhw' });
+      out.push({ r: 4, h: 1, x, w: cw, label: 'GUEST KERNEL', k: 'gk' });
+      out.push({ r: 5, h: 1, x, w: cw, label: 'USERLAND', k: 'gu' });
+      out.push({ r: 6, h: 1, x, w: cw, label: `APP ${'ABC'[i]}`, k: 'app' });
+    }
+    return out;
+  }
+
+  function ctrCol(x0: number, w: number, rt = true, base = 0): Box[] {
+    const out: Box[] = [];
+    if (base === 0) {
+      out.push({ r: 0, h: 1, x: x0, w, label: 'HARDWARE', k: 'hw' });
+      out.push({ r: 1, h: 1, x: x0, w, label: 'HOST KERNEL', k: 'hostkc' });
+    }
+    const r0 = base === 0 ? 2 : base;
+    const rtw = rt ? Math.min(70, w * 0.22) : 0;
+    const g = 6, cw = (w - rtw - (rt ? g : 0) - 2 * g) / 3;
+    for (let i = 0; i < 3; i++) {
+      const x = x0 + i * (cw + g);
+      out.push({ r: r0, h: 2, x: x - 3, w: cw + 6, label: '', k: 'fence', fence: true });
+      out.push({ r: r0, h: 1, x, w: cw, label: 'IMAGE FILES', k: 'cu' });
+      out.push({ r: r0 + 1, h: 1, x, w: cw, label: `APP ${'ABC'[i]}`, k: 'app' });
+    }
+    if (rt) out.push({ r: r0, h: 2, x: x0 + w - rtw, w: rtw, label: 'RUNTIME', k: 'rt' });
+    return out;
+  }
+
+  function macCol(x0: number, w: number): Box[] {
+    const cliw = 80, g = 8;
+    const vx = x0 + cliw + g, vw = w - cliw - g;
+    return [
+      { r: 0, h: 1, x: x0, w, label: 'APPLE SILICON', k: 'mhw' },
+      { r: 1, h: 1, x: x0, w, label: 'macOS KERNEL (XNU)', k: 'xnu' },
+      { r: 2, h: 2, x: x0, w: cliw, label: 'DOCKER CLI', k: 'cli' },
+      { r: 2, h: 1, x: vx, w: vw, label: 'VIRTUALIZATION.FRAMEWORK', k: 'vz' },
+      { r: 3, h: 1, x: vx, w: vw, label: 'LINUX VM: VIRTUAL HW', k: 'vhw' },
+      { r: 4, h: 1, x: vx, w: vw, label: 'LINUX KERNEL (THE SHARED ONE)', k: 'lk' },
+      ...ctrCol(vx, vw, true, 5),
+    ];
+  }
+
+  const SUMS: Record<string, string> = {
+    both: 'Left: 3 VMs = 4 kernels running (1 host + 3 guests). Right: 3 containers = 1 kernel. Same three apps.',
+    vm: 'Kernels running: 4. Starting a new VM means booting a kernel and an OS: firmware, kernel, device probing, init. Seconds.',
+    ctr: 'Kernels running: 1. Starting a container means starting a process with some labels on it. Milliseconds.',
+    mac: 'Kernels running: 2 (XNU + one Linux). Every container on your Mac shares the hidden Linux VM’s kernel.',
+  };
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="container-stack"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    let mode = 'both';
+
+    function show(k: string) {
+      const [t, n] = NOTES[k];
+      r('title').textContent = t;
+      r('note').textContent = n;
+      svg.querySelectorAll('rect[data-k]').forEach((x) => x.classList.toggle('hot', x.getAttribute('data-k') === k));
+    }
+
+    function draw() {
+      const ROWS = 7, RH = 32, TOP = 26;
+      const H = TOP + ROWS * RH + 8;
+      svg.setAttribute('viewBox', `0 0 640 ${H}`);
+      svg.replaceChildren();
+      const cols: { title: string; boxes: Box[]; x: number; w: number }[] = [];
+      if (mode === 'both') {
+        cols.push({ title: 'VIRTUAL MACHINES', boxes: vmCol(0, 312), x: 0, w: 312 });
+        cols.push({ title: 'CONTAINERS', boxes: ctrCol(328, 312), x: 328, w: 312 });
+      } else if (mode === 'vm') cols.push({ title: 'VIRTUAL MACHINES', boxes: vmCol(0, 640), x: 0, w: 640 });
+      else if (mode === 'ctr') cols.push({ title: 'CONTAINERS', boxes: ctrCol(0, 640), x: 0, w: 640 });
+      else cols.push({ title: 'DOCKER DESKTOP ON macOS', boxes: macCol(0, 640), x: 0, w: 640 });
+
+      for (const c of cols) {
+        svg.append(el('text', { x: c.x + c.w / 2, y: 14, 'text-anchor': 'middle', class: 'strong' }, c.title));
+        // fences first so solid boxes draw on top
+        const sorted = [...c.boxes].sort((a, b) => Number(!!b.fence) - Number(!!a.fence));
+        for (const b of sorted) {
+          const y = TOP + (ROWS - b.r - b.h) * RH;
+          const h = b.h * RH - 4;
+          if (b.fence) {
+            const f = el('rect', { x: b.x, y: y - 3, width: b.w, height: h + 6, class: 'blue dash', 'stroke-width': 1.2, 'data-k': b.k, tabindex: 0, style: 'fill:transparent' });
+            svg.append(f);
+            continue;
+          }
+          const isKernel = ['hostk', 'hostkc', 'gk', 'lk', 'xnu'].includes(b.k);
+          const cls = isKernel ? 'fill-wash' : 'fill-paper';
+          svg.append(el('rect', { x: b.x, y, width: b.w, height: h, class: cls, 'stroke-width': 1, 'data-k': b.k, tabindex: 0 }));
+          const tx = el('text', { x: b.x + b.w / 2, y: y + h / 2 + 4, 'text-anchor': 'middle', class: isKernel ? 'blue-t' : '', 'pointer-events': 'none' }, b.label);
+          if (b.w < 90) tx.setAttribute('font-size', '9');
+          svg.append(tx);
+        }
+      }
+      r('sum').textContent = SUMS[mode];
+      svg.querySelectorAll<SVGElement>('[data-k]').forEach((n) => {
+        const k = n.getAttribute('data-k')!;
+        n.addEventListener('pointerenter', () => show(k));
+        n.addEventListener('focus', () => show(k));
+        n.addEventListener('click', () => show(k));
+      });
+    }
+
+    btns.forEach((b) => b.addEventListener('click', () => {
+      mode = b.dataset.mode!;
+      btns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    draw();
+  });
+</script>

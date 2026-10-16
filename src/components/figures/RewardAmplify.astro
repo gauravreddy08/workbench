@@ -1,0 +1,96 @@
+---
+// Why a verifier's false positives are the worst kind of error for RL. Toy model, not data.
+// A policy mixes two behaviours: try honestly (succeeds with probability s, verified correctly) or
+// try a hack (the verifier wrongly passes it with probability f, its false-positive rate on hacks).
+// Each RL step reweights behaviours by the reward they earned (multiplicative weights, eta = 1.5):
+//   logit(p_hack) += eta * (f - s)
+// Start: 1% of attempts are hacks. Usage: <RewardAmplify />
+---
+<div class="ramp" data-fig="reward-amplify">
+  <svg viewBox="0 0 640 300" role="img" aria-label="Line chart of hack share, measured reward and true success over RL steps"></svg>
+  <div class="ctl">
+    <label>honest success rate s <input type="range" min="2" max="90" step="1" value="10" data-k="s" /> <output data-o="s">0.10</output></label>
+    <label>verifier false positives f <input type="range" min="0" max="40" step="1" value="15" data-k="f" /> <output data-o="f">0.15</output></label>
+  </div>
+  <p class="ramp-read">
+    after 100 steps: hack share <span class="readout" data-r="hack">-</span> ·
+    measured reward <span class="readout" data-r="meas">-</span> ·
+    true success <span class="readout" data-r="true">-</span> ·
+    hacks pass 50% at step <span class="readout" data-r="half">-</span>
+  </p>
+</div>
+
+<style>
+  .ramp-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const STEPS = 100, ETA = 1.5, P0 = 0.01;
+
+  function sim(s: number, f: number) {
+    const out: { p: number; meas: number; tru: number }[] = [];
+    let z = Math.log(P0 / (1 - P0));
+    for (let t = 0; t <= STEPS; t++) {
+      const p = 1 / (1 + Math.exp(-z));
+      out.push({ p, meas: p * f + (1 - p) * s, tru: (1 - p) * s });
+      z += ETA * (f - s);
+    }
+    return out;
+  }
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="reward-amplify"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const sIn = root.querySelector<HTMLInputElement>('[data-k="s"]')!;
+    const fIn = root.querySelector<HTMLInputElement>('[data-k="f"]')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const P = { x: 50, y: 16, w: 450, h: 236 };
+    const X = (t: number) => P.x + (t / STEPS) * P.w;
+    const Y = (v: number) => P.y + P.h - v * P.h;
+
+    function draw() {
+      const s = Number(sIn.value) / 100, f = Number(fIn.value) / 100;
+      root.querySelector<HTMLElement>('[data-o="s"]')!.textContent = s.toFixed(2);
+      root.querySelector<HTMLElement>('[data-o="f"]')!.textContent = f.toFixed(2);
+      const run = sim(s, f);
+      svg.replaceChildren();
+      svg.append(el('rect', { x: P.x, y: P.y, width: P.w, height: P.h, class: 'fill-paper', 'stroke-width': 1 }));
+      for (const v of [0, 0.5, 1]) {
+        svg.append(el('line', { x1: P.x, y1: Y(v), x2: P.x + P.w, y2: Y(v), class: 'ink dash', 'stroke-width': 0.6 }));
+        svg.append(el('text', { x: P.x - 8, y: Y(v) + 4, 'text-anchor': 'end' }, v.toFixed(1)));
+      }
+      const path = (g: (q: (typeof run)[number]) => number) => run.map((q, t) => `${t ? 'L' : 'M'}${X(t).toFixed(1)},${Y(g(q)).toFixed(1)}`).join(' ');
+      svg.append(el('path', { d: path((q) => q.p), class: 'blue', 'stroke-width': 2 }));
+      svg.append(el('path', { d: path((q) => q.meas), class: 'ink dash', 'stroke-width': 1.4 }));
+      svg.append(el('path', { d: path((q) => q.tru), class: 'ink', 'stroke-width': 1.4 }));
+      const last = run[STEPS];
+      const lab = [
+        { v: last.p, t: 'HACK SHARE', c: 'blue-t' },
+        { v: last.meas, t: 'MEASURED REWARD', c: 'strong' },
+        { v: last.tru, t: 'TRUE SUCCESS', c: 'strong' },
+      ].sort((a, b) => b.v - a.v);
+      let prev = -99;
+      for (const l of lab) {
+        let y = Y(l.v) + 4;
+        if (y - prev < 14) y = prev + 14;
+        prev = y;
+        svg.append(el('text', { x: P.x + P.w + 8, y, class: l.c }, l.t));
+      }
+      svg.append(el('text', { x: P.x + P.w / 2, y: P.y + P.h + 28, 'text-anchor': 'middle', class: 'strong' }, 'RL STEPS →'));
+      const half = run.findIndex((q) => q.p >= 0.5);
+      r('hack').textContent = last.p.toFixed(2);
+      r('meas').textContent = last.meas.toFixed(2);
+      r('true').textContent = last.tru.toFixed(2);
+      r('half').textContent = half < 0 ? 'never' : String(half);
+    }
+    sIn.addEventListener('input', draw);
+    fIn.addEventListener('input', draw);
+    draw();
+  });
+</script>

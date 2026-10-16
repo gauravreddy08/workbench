@@ -1,0 +1,175 @@
+---
+// Interactive: the vLLM V1 architecture as three processes. Click a component to see what it does,
+// which of your own lessons built the toy version, and where to look in the source.
+// File names are "at the time of writing" (checked against vLLM main, Oct 2026); they move.
+---
+<div class="em" data-fig="engine-map">
+  <div class="em-grid">
+    <div class="em-proc">
+      <span class="label em-proc-t">Process 1 · API server</span>
+      <button class="em-c" type="button" data-id="api">OpenAI HTTP server</button>
+      <button class="em-c" type="button" data-id="tok">Input processor</button>
+      <button class="em-c" type="button" data-id="client">Engine client</button>
+      <button class="em-c" type="button" data-id="detok">Output processor</button>
+    </div>
+    <div class="em-link" aria-hidden="true"><span>ZMQ</span><span class="em-arr">⇄</span></div>
+    <div class="em-proc">
+      <span class="label em-proc-t">Process 2 · Engine core</span>
+      <button class="em-c" type="button" data-id="loop">Busy loop</button>
+      <button class="em-c" type="button" data-id="sched">Scheduler</button>
+      <button class="em-c" type="button" data-id="kv">KV cache manager</button>
+      <button class="em-c" type="button" data-id="so">Structured output</button>
+    </div>
+    <div class="em-link" aria-hidden="true"><span>RPC</span><span class="em-arr">⇄</span></div>
+    <div class="em-proc">
+      <span class="label em-proc-t">GPU worker</span>
+      <button class="em-c" type="button" data-id="runner">Model runner</button>
+      <button class="em-c" type="button" data-id="graphs">CUDA graphs + compile</button>
+      <button class="em-c" type="button" data-id="attn">Attention backend</button>
+      <button class="em-c" type="button" data-id="sample">Sampler</button>
+    </div>
+  </div>
+  <div class="em-panel" aria-live="polite">
+    <div class="em-ph"><span class="label">Component</span><span class="readout" data-o="name"></span></div>
+    <p data-o="does"></p>
+    <div class="em-row"><span class="label">Your version</span><span data-o="yours"></span></div>
+    <div class="em-row"><span class="label">Where to look</span><code data-o="look"></code></div>
+  </div>
+</div>
+
+<style>
+  .em-grid { display: grid; grid-template-columns: 1fr 34px 1fr 34px 1fr; gap: 0; align-items: stretch; }
+  .em-proc { border: 1px solid var(--ink); background: var(--paper); padding: 10px; display: flex; flex-direction: column; gap: 8px; }
+  .em-proc-t { font-size: 10px; margin-bottom: 2px; }
+  .em-c {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; text-align: left;
+    background: var(--paper-2); color: var(--ink); border: 1px solid var(--rule); padding: 9px 10px; cursor: pointer;
+  }
+  .em-c:hover { border-color: var(--blue); color: var(--blue); }
+  .em-c[aria-pressed='true'] { background: var(--blue-fill); border-color: var(--blue); color: var(--blue); }
+  .em-link { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-family: var(--mono); font-size: 9.5px; color: var(--ink-3); }
+  .em-arr { font-size: 16px; color: var(--blue); }
+  .em-panel { margin-top: 14px; border-top: 1px solid var(--rule); padding-top: 12px; font-size: 15.5px; line-height: 1.5; }
+  .em-panel p { margin: 6px 0 10px; }
+  .em-ph { display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap; }
+  .em-row { display: grid; grid-template-columns: 110px 1fr; gap: 10px; margin-top: 6px; align-items: baseline; }
+  .em-row .label { font-size: 10px; }
+  .em-row code { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; color: var(--ink-2); }
+  @media (max-width: 640px) {
+    .em-grid { grid-template-columns: 1fr; }
+    .em-link { flex-direction: row; padding: 4px 0; }
+    .em-arr { transform: rotate(90deg); }
+    .em-row { grid-template-columns: 1fr; gap: 2px; }
+  }
+</style>
+
+<script>
+  type C = { name: string; does: string; yours: string; slug?: string; look: string };
+  const DATA: Record<string, C> = {
+    api: {
+      name: 'OpenAI HTTP server',
+      does: 'A FastAPI app. Validates the JSON body, turns it into sampling parameters, and streams SSE chunks back. It never touches the GPU.',
+      yours: 'The endpoint in server_naive.py',
+      slug: 'baseline-vs-fireworks',
+      look: 'vllm/entrypoints/openai/api_server.py, chat_completion/serving.py',
+    },
+    tok: {
+      name: 'Input processor',
+      does: 'Applies the chat template and tokenizes, then builds the request object the engine understands. It lives in the API process so slow CPU work like tokenizing a 100k-token prompt never pauses the GPU loop.',
+      yours: 'apply_chat_template in your endpoint',
+      slug: 'baseline-vs-fireworks',
+      look: 'vllm/v1/engine/input_processor.py, async_llm.py (AsyncLLM.generate)',
+    },
+    client: {
+      name: 'Engine client',
+      does: 'Serializes requests and pushes them over a ZMQ socket to the engine-core process, and runs a background asyncio task that pulls outputs back and routes each one to the right waiting request.',
+      yours: 'The streamer queue between your generate thread and response thread',
+      slug: 'processes-threads-gil',
+      look: 'vllm/v1/engine/core_client.py (MPClient)',
+    },
+    detok: {
+      name: 'Output processor',
+      does: 'Turns new token ids into text incrementally (a token can be half a character), checks stop strings, and builds the stream chunks, including usage at the end.',
+      yours: 'TextIteratorStreamer plus your chunk() helper',
+      slug: 'baseline-vs-fireworks',
+      look: 'vllm/v1/engine/output_processor.py, detokenizer.py',
+    },
+    loop: {
+      name: 'Engine-core busy loop',
+      does: 'A loop in its own process: drain new requests from the input socket, run one step (schedule, execute, update), send outputs, repeat. One trip around it is one forward pass over the weights.',
+      yours: 'The step loop you wrote for continuous batching',
+      slug: 'batching',
+      look: 'vllm/v1/engine/core.py (EngineCore.step, run_busy_loop)',
+    },
+    sched: {
+      name: 'Scheduler',
+      does: 'Every step, decides which requests run and how many tokens each gets, under a token budget. Running requests go first (usually 1 token each), then waiting ones are admitted, with long prompts chunked. If memory runs out it preempts.',
+      yours: 'Your continuous-batching scheduler',
+      slug: 'batching',
+      look: 'vllm/v1/core/sched/scheduler.py (Scheduler.schedule, update_from_output)',
+    },
+    kv: {
+      name: 'KV cache manager',
+      does: 'Owns a pool of fixed-size KV blocks (pages). Finds cached prefix blocks by hash, hands out new blocks as sequences grow, and returns freed blocks to an LRU queue where they stay reusable until evicted.',
+      yours: 'Your KV cache, then your prefix cache with LRU',
+      slug: 'prefix-caching',
+      look: 'vllm/v1/core/kv_cache_manager.py (get_computed_blocks, allocate_slots, free), block_pool.py',
+    },
+    so: {
+      name: 'Structured output',
+      does: 'Compiles a JSON schema or grammar into a machine that says which tokens are legal next, and builds a bitmask of allowed tokens each step. The sampler applies the mask, so invalid JSON is impossible, not just unlikely.',
+      yours: 'Nothing yet. New in this lesson.',
+      look: 'vllm/v1/structured_output/',
+    },
+    runner: {
+      name: 'GPU model runner',
+      does: 'Turns the scheduler’s decision into tensors: token ids, positions, the block table and slot mapping that tell attention where each token’s KV lives. Keeps a persistent batch and applies only the changes each step. Then calls the model.',
+      yours: 'The body of your generate loop',
+      slug: 'kv-cache',
+      look: 'vllm/v1/worker/gpu_model_runner.py (execute_model, _model_forward), gpu_worker.py',
+    },
+    graphs: {
+      name: 'CUDA graphs + torch.compile',
+      does: 'Records the hundreds of kernel launches of one forward pass for a given batch size once, then replays them with a single launch. torch.compile fuses small ops first. Removes CPU launch overhead from every decode step.',
+      yours: 'torch.compile and kernel launch overhead',
+      slug: 'python-speed',
+      look: 'vllm/v1/cudagraph_dispatcher.py, docs/design/cuda_graphs.md',
+    },
+    attn: {
+      name: 'Attention backend',
+      does: 'Paged attention kernels (FlashAttention, FlashInfer, Triton) that read K and V from scattered blocks through the block table, and handle prefill and decode tokens in one mixed batch.',
+      yours: 'Your attention from GPT-2, then FlashAttention next',
+      slug: 'flash-attention',
+      look: 'vllm/v1/attention/backends/ (flash_attn.py, flashinfer.py)',
+    },
+    sample: {
+      name: 'Sampler',
+      does: 'Logits to token ids for the whole batch at once: grammar mask, penalties, temperature, top-p. With speculative decoding, a rejection sampler checks the draft tokens.',
+      yours: 'Your speculative sampling',
+      slug: 'speculative-decoding',
+      look: 'vllm/v1/sample/, vllm/v1/spec_decode/',
+    },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="engine-map"]').forEach((root) => {
+    const btns = [...root.querySelectorAll<HTMLButtonElement>('.em-c')];
+    const o = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    function show(id: string) {
+      const c = DATA[id];
+      btns.forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.id === id)));
+      o('name').textContent = c.name;
+      o('does').textContent = c.does;
+      const y = o('yours');
+      y.replaceChildren();
+      if (c.slug) {
+        const a = document.createElement('a');
+        a.href = `/lessons/${c.slug}/`;
+        a.textContent = c.yours;
+        y.appendChild(a);
+      } else y.textContent = c.yours;
+      o('look').textContent = c.look;
+    }
+    btns.forEach((b) => b.addEventListener('click', () => show(b.dataset.id!)));
+    show('sched');
+  });
+</script>

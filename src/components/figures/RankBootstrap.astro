@@ -1,0 +1,137 @@
+---
+// Paired bootstrap over queries. A synthetic eval set of N queries, each with a per-query
+// NDCG@10 delta (new ranker minus baseline). True mean delta is about +0.02. Top panel:
+// the per-query deltas. Bottom panel: 2,000 bootstrap means and the 95% interval.
+// "New eval set" draws a different N queries from the same population.
+---
+<div class="rboot" data-fig="rank-bootstrap">
+  <svg viewBox="0 0 640 330" role="img" aria-label="Histogram of per-query deltas and of bootstrap means with a 95 percent interval"></svg>
+  <div class="ctl">
+    <label>Queries <input type="range" min="0" max="6" value="2" data-n /> <output data-no>100</output></label>
+    <button class="btn" type="button" data-new>New eval set</button>
+  </div>
+  <p class="rboot-read">
+    Mean delta <span class="readout" data-r="mean">-</span> ·
+    95% CI <span class="readout" data-r="ci">-</span> ·
+    wins / losses / ties <span class="readout" data-r="wlt">-</span>
+  </p>
+  <p class="rboot-read" data-r="why"></p>
+</div>
+
+<style>
+  .rboot-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const NS_LIST = [25, 50, 100, 200, 400, 800, 1600];
+  const B = 2000;
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function normal(r: () => number) {
+    const u = Math.max(r(), 1e-12), v = r();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+  }
+  // Population: 45% of queries tie exactly (both rankers return the same top 10),
+  // the rest move by a noisy amount centred slightly above zero. Mean is about +0.02.
+  function deltas(n: number, seed: number) {
+    const r = rng(seed);
+    const d: number[] = [];
+    for (let i = 0; i < n; i++) {
+      if (r() < 0.45) d.push(0);
+      else d.push(Math.max(-0.6, Math.min(0.6, 0.036 + 0.15 * normal(r))));
+    }
+    return d;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="rank-bootstrap"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const nIn = root.querySelector<HTMLInputElement>('[data-n]')!;
+    const nOut = root.querySelector<HTMLOutputElement>('[data-no]')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    let seed = 7;
+
+    function hist(vals: number[], lo: number, hi: number, bins: number) {
+      const h = new Array(bins).fill(0);
+      for (const v of vals) {
+        const b = Math.floor(((v - lo) / (hi - lo)) * bins);
+        if (b >= 0 && b < bins) h[b]++;
+      }
+      return h;
+    }
+
+    function panel(y0: number, y1: number, vals: number[], lo: number, hi: number, bins: number, title: string, ticks: number[]) {
+      const X0 = 20, X1 = 620;
+      const h = hist(vals, lo, hi, bins);
+      const max = Math.max(...h, 1);
+      const bw = (X1 - X0) / bins;
+      const x = (v: number) => X0 + ((v - lo) / (hi - lo)) * (X1 - X0);
+      svg.append(el('text', { x: X0, y: y0 - 8, class: 'strong' }, title));
+      svg.append(el('line', { x1: X0, y1: y1, x2: X1, y2: y1, class: 'ink', 'stroke-width': 1 }));
+      h.forEach((c, i) => {
+        if (!c) return;
+        const hh = (c / max) * (y1 - y0);
+        svg.append(el('rect', { x: X0 + i * bw + 0.5, y: y1 - hh, width: Math.max(bw - 1, 0.8), height: hh, class: 'fill-wash', 'stroke-width': 0.8 }));
+      });
+      for (const t of ticks) {
+        svg.append(el('line', { x1: x(t), y1: y1, x2: x(t), y2: y1 + 4, class: 'ink', 'stroke-width': 1 }));
+        svg.append(el('text', { x: x(t), y: y1 + 16, 'text-anchor': 'middle' }, (t > 0 ? '+' : '') + t.toFixed(t === 0 ? 0 : 2)));
+      }
+      svg.append(el('line', { x1: x(0), y1: y0 - 2, x2: x(0), y2: y1, class: 'ink dash', 'stroke-width': 1 }));
+      return x;
+    }
+
+    function update() {
+      const n = NS_LIST[+nIn.value];
+      nOut.textContent = String(n);
+      const d = deltas(n, seed);
+      const mean = d.reduce((a, b) => a + b, 0) / n;
+      const r2 = rng(seed * 31 + n);
+      const means: number[] = [];
+      for (let b = 0; b < B; b++) {
+        let s = 0;
+        for (let i = 0; i < n; i++) s += d[Math.floor(r2() * n)];
+        means.push(s / n);
+      }
+      means.sort((a, b) => a - b);
+      const lo = means[Math.floor(0.025 * B)], hi = means[Math.floor(0.975 * B) - 1];
+      const wins = d.filter((v) => v > 0).length, losses = d.filter((v) => v < 0).length;
+
+      svg.replaceChildren();
+      panel(30, 130, d, -0.6, 0.6, 48, `PER-QUERY DELTA, NDCG@10 (N = ${n})`, [-0.5, -0.25, 0, 0.25, 0.5]);
+      const x = panel(196, 296, means, -0.1, 0.1, 80, `${B} BOOTSTRAP MEANS (RESAMPLE QUERIES WITH REPLACEMENT)`, [-0.1, -0.05, 0, 0.05, 0.1]);
+      const clip = (v: number) => Math.max(20, Math.min(620, x(v)));
+      svg.append(el('rect', { x: clip(lo), y: 300, width: Math.max(clip(hi) - clip(lo), 1), height: 6, class: 'fill-blue' }));
+      svg.append(el('line', { x1: clip(mean), y1: 190, x2: clip(mean), y2: 306, class: 'blue', 'stroke-width': 1.5 }));
+      svg.append(el('text', { x: 620, y: 324, 'text-anchor': 'end', class: 'blue-t' }, `95% CI [${lo >= 0 ? '+' : ''}${lo.toFixed(3)}, ${hi >= 0 ? '+' : ''}${hi.toFixed(3)}]`));
+
+      r('mean').textContent = (mean >= 0 ? '+' : '') + mean.toFixed(3);
+      r('ci').textContent = `[${lo.toFixed(3)}, ${hi.toFixed(3)}]`;
+      r('wlt').textContent = `${wins} / ${losses} / ${n - wins - losses}`;
+      r('why').textContent = lo > 0
+        ? 'The interval sits entirely above zero: on queries like these, the new ranker is better, and the interval says by roughly how much.'
+        : hi < 0
+          ? 'The interval sits below zero: this draw of queries says the new ranker is worse. Try another eval set.'
+          : 'The interval straddles zero: with this many queries you cannot tell a +0.02 ranker from no change. Add queries or try another draw.';
+    }
+
+    nIn.addEventListener('input', update);
+    root.querySelector('[data-new]')!.addEventListener('click', () => { seed = (seed * 1103515245 + 12345) % 2147483647; update(); });
+    update();
+  });
+</script>

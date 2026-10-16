@@ -1,0 +1,328 @@
+---
+// Context window filling up across a 30-step agent task, under four strategies:
+// stuff (preload everything), truncate (sliding window), summarize (compaction), sub-agent.
+// A deterministic toy model: each step appends a tool result of a fixed size. Shows what is in the
+// window at the chosen step, what was dropped, tokens billed so far, and cost with or without caching.
+---
+<div class="ctxfill" data-fig="ctx-window-fill">
+  <svg viewBox="0 0 640 250" role="img" aria-label="Bar showing what fills the context window at one step of an agent task, and a chart of context size per step"></svg>
+  <div class="ctl">
+    <span>Strategy</span>
+    <button class="btn" type="button" data-s="stuff" aria-pressed="true">Stuff</button>
+    <button class="btn" type="button" data-s="truncate" aria-pressed="false">Truncate</button>
+    <button class="btn" type="button" data-s="summarize" aria-pressed="false">Summarize</button>
+    <button class="btn" type="button" data-s="subagent" aria-pressed="false">Sub-agent</button>
+  </div>
+  <div class="ctl">
+    <label>Step <input type="range" min="1" max="30" value="30" data-k="step" /> <output data-o="step">30</output></label>
+    <label>Window <input type="range" min="0" max="3" value="1" data-k="win" /> <output data-o="win">64K</output></label>
+    <button class="btn" type="button" data-cache aria-pressed="true">Prompt cache on</button>
+  </div>
+  <p class="ctxfill-read">
+    In window <span class="readout" data-r="ctx">-</span> ·
+    billed input <span class="readout" data-r="billed">-</span> ·
+    cache hits <span class="readout" data-r="hit">-</span> ·
+    cost <span class="readout" data-r="cost">-</span>
+  </p>
+  <p class="ctxfill-read" data-r="why"></p>
+</div>
+
+<style>
+  .ctxfill-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  type Kind = 'sys' | 'repo' | 'search' | 'read' | 'run' | 'log' | 'edit' | 'use' | 'summary';
+  type Seg = { id: string; kind: Kind; tok: number; label: string };
+  type Step = { kind: Kind; tok: number; label: string; key?: 'config' | 'error'; needs?: 'config' | 'error' };
+
+  // Tokens are in thousands. Each step = one tool call plus the model's short reply.
+  const STEPS: Step[] = [
+    { kind: 'search', tok: 0.6, label: 'grep' },
+    { kind: 'read', tok: 2.4, label: 'read' },
+    { kind: 'read', tok: 1.8, label: 'read config', key: 'config' },
+    { kind: 'search', tok: 0.5, label: 'grep' },
+    { kind: 'read', tok: 3.0, label: 'read' },
+    { kind: 'run', tok: 8.0, label: 'tests' },
+    { kind: 'read', tok: 2.2, label: 'read' },
+    { kind: 'read', tok: 1.6, label: 'read' },
+    { kind: 'log', tok: 12.0, label: 'server log', key: 'error' },
+    { kind: 'search', tok: 0.6, label: 'grep' },
+    { kind: 'read', tok: 2.8, label: 'read' },
+    { kind: 'edit', tok: 0.8, label: 'edit' },
+    { kind: 'run', tok: 7.5, label: 'tests' },
+    { kind: 'read', tok: 2.0, label: 'read' },
+    { kind: 'read', tok: 2.6, label: 'read' },
+    { kind: 'search', tok: 0.5, label: 'grep' },
+    { kind: 'read', tok: 3.2, label: 'read' },
+    { kind: 'edit', tok: 0.9, label: 'edit' },
+    { kind: 'run', tok: 9.0, label: 'tests' },
+    { kind: 'read', tok: 1.4, label: 'read' },
+    { kind: 'read', tok: 2.1, label: 'read' },
+    { kind: 'search', tok: 0.7, label: 'grep' },
+    { kind: 'read', tok: 2.9, label: 'read' },
+    { kind: 'edit', tok: 1.0, label: 'edit' },
+    { kind: 'run', tok: 6.5, label: 'tests' },
+    { kind: 'read', tok: 1.8, label: 'read' },
+    { kind: 'use', tok: 0.6, label: 'fix timeout', needs: 'config' },
+    { kind: 'use', tok: 0.6, label: 'fix error', needs: 'error' },
+    { kind: 'edit', tok: 0.8, label: 'edit' },
+    { kind: 'run', tok: 5.0, label: 'tests' },
+  ];
+  const WINDOWS = [32, 64, 128, 200];
+  const SYS = 3; // system prompt + tool definitions
+  const REPO = 40; // whole repo, preloaded by "stuff"
+  const OUT = 0.3; // output tokens per call
+  const PRICE_IN = 3, PRICE_OUT = 15; // $ per million tokens, example prices
+  const GROUP = 5; // steps per sub-agent task
+  const NS = 'http://www.w3.org/2000/svg';
+
+  type Call = { ctx: Seg[] };
+  type Result = {
+    main: Seg[][]; // main window contents after each step
+    sub: (Seg[] | null)[]; // sub-agent window after each step
+    calls: Call[][]; // calls made during each step
+    overflow: number; // first step whose request did not fit, or 0
+    dropped: Set<string>[]; // ids no longer in the main window, after each step
+    lost: Set<string>[]; // keys whose exact value is no longer available
+  };
+
+  const stepSeg = (i: number, s: Step, tok = s.tok): Seg => ({ id: 's' + i, kind: s.kind, tok, label: s.label });
+  const sum = (c: Seg[]) => c.reduce((a, x) => a + x.tok, 0);
+
+  function simulate(strategy: string, W: number): Result {
+    const r: Result = { main: [], sub: [], calls: [], overflow: 0, dropped: [], lost: [] };
+    const sys: Seg = { id: 'sys', kind: 'sys', tok: SYS, label: 'system' };
+    let hist: Seg[] = [];
+    const lost = new Set<string>();
+    const dropped = new Set<string>();
+    let compactions = 0;
+    STEPS.forEach((s, i) => {
+      const calls: Call[] = [];
+      let sub: Seg[] | null = null;
+      if (strategy === 'stuff') {
+        // file reads are free: the repo is already in the window
+        const tok = s.kind === 'read' || s.kind === 'search' ? 0.3 : s.tok;
+        hist.push(stepSeg(i, s, tok));
+        const ctx = [sys, { id: 'repo', kind: 'repo' as Kind, tok: REPO, label: 'whole repo' }, ...hist];
+        if (sum(ctx) > W && !r.overflow) r.overflow = i + 1;
+        calls.push({ ctx });
+        r.main.push(ctx);
+      } else if (strategy === 'truncate') {
+        hist.push(stepSeg(i, s));
+        while (SYS + sum(hist) > W * 0.9 && hist.length > 1) {
+          const d = hist.shift()!;
+          dropped.add(d.id);
+          const st = STEPS[+d.id.slice(1)];
+          if (st.key) lost.add(st.key);
+        }
+        const ctx = [sys, ...hist];
+        calls.push({ ctx });
+        r.main.push(ctx);
+      } else if (strategy === 'summarize') {
+        hist.push(stepSeg(i, s));
+        if (SYS + sum(hist) > W * 0.8) {
+          // compaction: everything so far becomes one summary. Small facts survive,
+          // the exact line buried in a 12K log does not.
+          const n = hist.filter((h) => h.kind !== 'summary').length;
+          compactions++;
+          hist.forEach((h) => {
+            if (h.kind !== 'summary') dropped.add(h.id);
+            const st = h.kind === 'summary' ? null : STEPS[+h.id.slice(1)];
+            if (st?.key === 'error') lost.add('error');
+          });
+          const prev = hist.find((h) => h.kind === 'summary');
+          const tok = Math.min(6, (prev ? prev.tok : 1) + 0.15 * n);
+          // the compaction call itself reads the whole history once
+          calls.push({ ctx: [sys, ...hist] });
+          hist = [{ id: 'sum' + compactions, kind: 'summary', tok, label: 'summary' }];
+        }
+        const ctx = [sys, ...hist];
+        calls.push({ ctx });
+        r.main.push(ctx);
+      } else {
+        // sub-agent: raw results live in a throwaway window; main keeps a short report per task
+        const g = Math.floor(i / GROUP);
+        const start = g * GROUP;
+        const subSys: Seg = { id: 'subsys' + g, kind: 'sys', tok: 1.5, label: 'task brief' };
+        sub = [subSys, ...STEPS.slice(start, i + 1).map((x, k) => stepSeg(start + k, x))];
+        calls.push({ ctx: sub });
+        dropped.add('s' + i);
+        if (i % GROUP === GROUP - 1 || i === STEPS.length - 1) {
+          hist.push({ id: 'rep' + g, kind: 'summary', tok: 0.6, label: 'report' });
+          calls.push({ ctx: [sys, ...hist] });
+        }
+        r.main.push([sys, ...hist]);
+      }
+      r.sub.push(sub);
+      r.calls.push(calls);
+      r.dropped.push(new Set(dropped));
+      r.lost.push(new Set(lost));
+    });
+    return r;
+  }
+
+  // Cost of every call up to and including `step`. With caching, the longest prefix shared with the
+  // previous call in the same window is read at 0.1x; the rest is written at 1.25x.
+  function cost(r: Result, step: number, cache: boolean) {
+    let billed = 0, hit = 0, dollars = 0;
+    const last: Record<string, string[]> = {};
+    for (let i = 0; i < step; i++) {
+      for (const c of r.calls[i]) {
+        const ids = c.ctx.map((x) => x.id);
+        const lane = ids[0];
+        const prev = last[lane] ?? [];
+        let shared = 0;
+        for (let k = 0; k < ids.length && k < prev.length && ids[k] === prev[k]; k++) shared += c.ctx[k].tok;
+        const total = sum(c.ctx);
+        billed += total;
+        if (cache) {
+          hit += shared;
+          dollars += (shared * 0.1 + (total - shared) * 1.25) * PRICE_IN;
+        } else dollars += total * PRICE_IN;
+        dollars += OUT * PRICE_OUT;
+        last[lane] = ids;
+      }
+    }
+    return { billed, hit: billed ? hit / billed : 0, dollars: dollars / 1000 }; // tok in K, price per M
+  }
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  const STYLE: Record<Kind, Record<string, string>> = {
+    sys: { class: 'fill-paper' },
+    repo: { style: 'fill:var(--ink-3);opacity:0.35;stroke:var(--ink)' },
+    search: { class: 'fill-wash' },
+    read: { class: 'fill-wash' },
+    edit: { class: 'fill-wash' },
+    use: { class: 'fill-wash' },
+    run: { class: 'fill-blue' },
+    log: { class: 'fill-blue' },
+    summary: { style: 'fill:var(--paper);stroke:var(--blue);stroke-dasharray:3 2' },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="ctx-window-fill"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const st = { strategy: 'stuff', step: 30, win: 1, cache: true };
+    const sBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-s]')];
+    const cacheBtn = root.querySelector<HTMLButtonElement>('[data-cache]')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const o = (k: string) => root.querySelector<HTMLOutputElement>(`[data-o="${k}"]`)!;
+
+    function bar(ctx: Seg[], y: number, h: number, W: number, scale: number, X0: number, title: string) {
+      svg.append(el('text', { x: X0, y: y - 6, class: 'strong' }, title));
+      let x = X0;
+      for (const s of ctx) {
+        const w = s.tok * scale;
+        const over = x + w > X0 + W * scale;
+        const attrs: Record<string, string | number> = { x, y, width: Math.max(w - 0.6, 0.6), height: h, 'stroke-width': 1, ...STYLE[s.kind] };
+        svg.append(el('rect', attrs));
+        if (w > 34 && s.kind !== 'run' && s.kind !== 'log') svg.append(el('text', { x: x + 4, y: y + h / 2 + 4 }, s.kind === 'summary' ? 'SUM' : s.kind === 'repo' ? 'REPO' : s.kind === 'sys' ? 'SYS' : ''));
+        if (over) svg.append(el('rect', { x: Math.max(x, X0 + W * scale), y: y - 2, width: Math.min(w, x + w - (X0 + W * scale)), height: h + 4, style: 'fill:var(--warn);opacity:0.35' }));
+        x += w;
+      }
+      const wx = X0 + W * scale;
+      svg.append(el('line', { x1: wx, y1: y - 4, x2: wx, y2: y + h + 4, class: 'ink', 'stroke-width': 1.5 }));
+    }
+
+    function draw() {
+      const W = WINDOWS[st.win];
+      const res = simulate(st.strategy, W);
+      const i = st.step - 1;
+      const ctx = res.main[i];
+      const sub = res.sub[i];
+      svg.replaceChildren();
+      const X0 = 8, X1 = 632;
+      const maxTok = Math.max(W, ...res.main.map(sum), SYS + REPO) * 1.02;
+      const scale = (X1 - X0) / maxTok;
+
+      bar(ctx, 26, 26, W, scale, X0, `MAIN WINDOW · STEP ${st.step}`);
+      svg.append(el('text', { x: X0 + W * scale - 4, y: 20, 'text-anchor': 'end' }, `LIMIT ${W}K`));
+      if (sub) bar(sub, 82, 16, W, scale, X0, `SUB-AGENT WINDOW · TASK ${Math.floor(i / GROUP) + 1}`);
+      else svg.append(el('text', { x: X0, y: 90 }, st.strategy === 'stuff' ? 'NOTHING IS EVER REMOVED' : 'ONE WINDOW, NO SUB-AGENTS'));
+
+      // chart: main context size per step
+      const cy0 = 124, cy1 = 214, cw = (X1 - 40) / STEPS.length;
+      const ys = (t: number) => cy1 - (t / maxTok) * (cy1 - cy0);
+      svg.append(el('text', { x: X0, y: cy0 - 8, class: 'strong' }, 'TOKENS IN MAIN WINDOW, PER STEP'));
+      svg.append(el('line', { x1: 36, y1: ys(W), x2: X1, y2: ys(W), class: 'ink dash', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: 36, y1: cy1, x2: X1, y2: cy1, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      svg.append(el('text', { x: 32, y: ys(W) + 4, 'text-anchor': 'end' }, `${W}K`));
+      svg.append(el('text', { x: 32, y: cy1 + 4, 'text-anchor': 'end' }, '0'));
+      res.main.forEach((c, k) => {
+        const t = sum(c);
+        const x = 40 + k * cw;
+        const a: Record<string, string | number> = { x: x + 1, y: ys(t), width: Math.max(cw - 3, 1), height: cy1 - ys(t) };
+        if (t > W) a.style = 'fill:var(--warn);opacity:0.75';
+        else if (k === i) a.class = 'fill-blue';
+        else a.style = 'fill:var(--blue);opacity:0.28';
+        svg.append(el('rect', a));
+      });
+      svg.append(el('text', { x: 40, y: cy1 + 16 }, 'STEP 1'));
+      svg.append(el('text', { x: X1, y: cy1 + 16, 'text-anchor': 'end' }, 'STEP 30'));
+      // legend
+      const ly = 246;
+      svg.append(el('rect', { x: X0, y: ly - 9, width: 14, height: 10, class: 'fill-wash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: X0 + 20, y: ly }, 'READ/GREP'));
+      svg.append(el('rect', { x: 110, y: ly - 9, width: 14, height: 10, class: 'fill-blue' }));
+      svg.append(el('text', { x: 130, y: ly }, 'TESTS/LOGS'));
+      svg.append(el('rect', { x: 226, y: ly - 9, width: 14, height: 10, style: 'fill:var(--paper);stroke:var(--blue);stroke-dasharray:3 2' }));
+      svg.append(el('text', { x: 246, y: ly }, 'SUMMARY'));
+      svg.append(el('rect', { x: 320, y: ly - 9, width: 14, height: 10, style: 'fill:var(--warn);opacity:0.6' }));
+      svg.append(el('text', { x: 340, y: ly }, 'OVER LIMIT'));
+
+      const c = cost(res, st.step, st.cache);
+      const t = sum(ctx);
+      r('ctx').textContent = `${t.toFixed(1)}K / ${W}K`;
+      r('billed').textContent = `${Math.round(c.billed)}K`;
+      r('hit').textContent = st.cache ? Math.round(c.hit * 100) + '%' : 'off';
+      r('cost').textContent = '$' + c.dollars.toFixed(2);
+
+      const lost = res.lost[i];
+      const nDrop = [...res.dropped[i]].length;
+      let why = '';
+      if (st.strategy === 'stuff') {
+        why = res.overflow && res.overflow <= st.step
+          ? `Request no longer fits from step ${res.overflow}. Nothing was dropped, so the task just fails (or the API refuses the call).`
+          : 'Everything is visible, including the whole repo, every step. Reads are free because the files are already there. Cheap with a cache, because the prefix never changes.';
+      } else if (st.strategy === 'truncate') {
+        why = nDrop ? `Dropped the oldest ${nDrop} step(s) to stay under the limit. ` : 'Nothing dropped yet. ';
+        if (lost.has('config')) why += 'The config value read at step 3 is gone; step 27 needs it and must re-read or guess. ';
+        if (lost.has('error')) why += 'The error line from the step 9 log is gone too. ';
+        if (nDrop) why += 'Every drop changes the start of the history, so the cache misses.';
+      } else if (st.strategy === 'summarize') {
+        why = nDrop ? `Compacted ${nDrop} raw step(s) into one summary. The small config fact survived. ` : 'Under 80% of the limit; no compaction yet. ';
+        if (lost.has('error')) why += 'The exact error line buried in the 12K log did not make the summary: step 28 has to go find it again. Each compaction also rewrites the prefix, so the cache restarts.';
+      } else {
+        why = 'Each 5-step chunk runs in its own sub-agent window, which is thrown away. The main window only gets a short report, so it barely grows. You pay for the sub-agents\' tokens, and you only keep what their reports chose to say.';
+      }
+      r('why').textContent = why;
+    }
+
+    sBtns.forEach((b) => b.addEventListener('click', () => {
+      st.strategy = b.dataset.s!;
+      sBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    cacheBtn.addEventListener('click', () => {
+      st.cache = !st.cache;
+      cacheBtn.setAttribute('aria-pressed', String(st.cache));
+      cacheBtn.textContent = st.cache ? 'Prompt cache on' : 'Prompt cache off';
+      draw();
+    });
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        const k = inp.dataset.k!;
+        if (k === 'step') { st.step = +inp.value; o('step').textContent = inp.value; }
+        else { st.win = +inp.value; o('win').textContent = WINDOWS[st.win] + 'K'; }
+        draw();
+      });
+    });
+    draw();
+  });
+</script>

@@ -1,0 +1,130 @@
+---
+// Funnel of a real run over the Simple English Wikipedia dump (Oct 2026). Each filter can be
+// toggled; the counts for every one of the 64 on/off combinations were precomputed by running
+// the actual pipeline (fastText lang ID, length + Gopher-style rules, SHA-1 exact dedup,
+// MinHash LSH near-dedup at Jaccard 0.8, 13-gram decontamination against a 1% held-out set).
+// Tokens are GPT-2 BPE tokens.
+const data = {"base":{"pages":562214,"redirects":115214,"articles":285478,"rawTokens":373235486,"cleanTokens":68517813,"candDocs":283730,"evalDocs":1748},"combos":{"111111":[[279646,67078723],[179083,62738738],[172389,58442557],[172384,58441500],[172328,58429740],[167563,56341571]],"111110":[[279646,67078723],[179083,62738738],[172389,58442557],[172384,58441500],[172328,58429740],[172328,58429740]],"111101":[[279646,67078723],[179083,62738738],[172389,58442557],[172384,58441500],[172384,58441500],[167614,56351878]],"111100":[[279646,67078723],[179083,62738738],[172389,58442557],[172384,58441500],[172384,58441500],[172384,58441500]],"111011":[[279646,67078723],[179083,62738738],[172389,58442557],[172389,58442557],[172328,58429740],[167563,56341571]],"111010":[[279646,67078723],[179083,62738738],[172389,58442557],[172389,58442557],[172328,58429740],[172328,58429740]],"111001":[[279646,67078723],[179083,62738738],[172389,58442557],[172389,58442557],[172389,58442557],[167619,56352935]],"111000":[[279646,67078723],[179083,62738738],[172389,58442557],[172389,58442557],[172389,58442557],[172389,58442557]],"110111":[[279646,67078723],[179083,62738738],[179083,62738738],[179077,62737553],[179021,62725793],[174129,60590594]],"110110":[[279646,67078723],[179083,62738738],[179083,62738738],[179077,62737553],[179021,62725793],[179021,62725793]],"110101":[[279646,67078723],[179083,62738738],[179083,62738738],[179077,62737553],[179077,62737553],[174180,60600901]],"110100":[[279646,67078723],[179083,62738738],[179083,62738738],[179077,62737553],[179077,62737553],[179077,62737553]],"110011":[[279646,67078723],[179083,62738738],[179083,62738738],[179083,62738738],[179021,62725793],[174129,60590594]],"110010":[[279646,67078723],[179083,62738738],[179083,62738738],[179083,62738738],[179021,62725793],[179021,62725793]],"110001":[[279646,67078723],[179083,62738738],[179083,62738738],[179083,62738738],[179083,62738738],[174186,60602086]],"110000":[[279646,67078723],[179083,62738738],[179083,62738738],[179083,62738738],[179083,62738738],[179083,62738738]],"101111":[[279646,67078723],[279646,67078723],[239106,61563034],[239068,61561075],[230101,61256471],[224896,59144972]],"101110":[[279646,67078723],[279646,67078723],[239106,61563034],[239068,61561075],[230101,61256471],[230101,61256471]],"101101":[[279646,67078723],[279646,67078723],[239106,61563034],[239068,61561075],[239068,61561075],[232516,59399220]],"101100":[[279646,67078723],[279646,67078723],[239106,61563034],[239068,61561075],[239068,61561075],[239068,61561075]],"101011":[[279646,67078723],[279646,67078723],[239106,61563034],[239106,61563034],[230101,61256471],[224896,59144972]],"101010":[[279646,67078723],[279646,67078723],[239106,61563034],[239106,61563034],[230101,61256471],[230101,61256471]],"101001":[[279646,67078723],[279646,67078723],[239106,61563034],[239106,61563034],[239106,61563034],[232554,59401179]],"101000":[[279646,67078723],[279646,67078723],[239106,61563034],[239106,61563034],[239106,61563034],[239106,61563034]],"100111":[[279646,67078723],[279646,67078723],[279646,67078723],[279542,67075513],[266780,66660389],[261400,64498330]],"100110":[[279646,67078723],[279646,67078723],[279646,67078723],[279542,67075513],[266780,66660389],[266780,66660389]],"100101":[[279646,67078723],[279646,67078723],[279646,67078723],[279542,67075513],[279542,67075513],[272815,64863098]],"100100":[[279646,67078723],[279646,67078723],[279646,67078723],[279542,67075513],[279542,67075513],[279542,67075513]],"100011":[[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723],[266780,66660389],[261400,64498330]],"100010":[[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723],[266780,66660389],[266780,66660389]],"100001":[[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723],[272919,64866308]],"100000":[[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723],[279646,67078723]],"011111":[[283730,68517813],[180900,64067012],[173598,59246037],[173593,59244980],[173537,59233220],[168753,57130779]],"011110":[[283730,68517813],[180900,64067012],[173598,59246037],[173593,59244980],[173537,59233220],[173537,59233220]],"011101":[[283730,68517813],[180900,64067012],[173598,59246037],[173593,59244980],[173593,59244980],[168804,57141086]],"011100":[[283730,68517813],[180900,64067012],[173598,59246037],[173593,59244980],[173593,59244980],[173593,59244980]],"011011":[[283730,68517813],[180900,64067012],[173598,59246037],[173598,59246037],[173537,59233220],[168753,57130779]],"011010":[[283730,68517813],[180900,64067012],[173598,59246037],[173598,59246037],[173537,59233220],[173537,59233220]],"011001":[[283730,68517813],[180900,64067012],[173598,59246037],[173598,59246037],[173598,59246037],[168809,57142143]],"011000":[[283730,68517813],[180900,64067012],[173598,59246037],[173598,59246037],[173598,59246037],[173598,59246037]],"010111":[[283730,68517813],[180900,64067012],[180900,64067012],[180894,64065827],[180838,64054067],[175921,61902462]],"010110":[[283730,68517813],[180900,64067012],[180900,64067012],[180894,64065827],[180838,64054067],[180838,64054067]],"010101":[[283730,68517813],[180900,64067012],[180900,64067012],[180894,64065827],[180894,64065827],[175972,61912769]],"010100":[[283730,68517813],[180900,64067012],[180900,64067012],[180894,64065827],[180894,64065827],[180894,64065827]],"010011":[[283730,68517813],[180900,64067012],[180900,64067012],[180900,64067012],[180838,64054067],[175921,61902462]],"010010":[[283730,68517813],[180900,64067012],[180900,64067012],[180900,64067012],[180838,64054067],[180838,64054067]],"010001":[[283730,68517813],[180900,64067012],[180900,64067012],[180900,64067012],[180900,64067012],[175978,61913954]],"010000":[[283730,68517813],[180900,64067012],[180900,64067012],[180900,64067012],[180900,64067012],[180900,64067012]],"001111":[[283730,68517813],[283730,68517813],[241591,62427343],[241553,62425384],[232144,62107428],[226920,59981657]],"001110":[[283730,68517813],[283730,68517813],[241591,62427343],[241553,62425384],[232144,62107428],[232144,62107428]],"001101":[[283730,68517813],[283730,68517813],[241591,62427343],[241553,62425384],[241553,62425384],[234982,60249257]],"001100":[[283730,68517813],[283730,68517813],[241591,62427343],[241553,62425384],[241553,62425384],[241553,62425384]],"001011":[[283730,68517813],[283730,68517813],[241591,62427343],[241591,62427343],[232144,62107428],[226920,59981657]],"001010":[[283730,68517813],[283730,68517813],[241591,62427343],[241591,62427343],[232144,62107428],[232144,62107428]],"001001":[[283730,68517813],[283730,68517813],[241591,62427343],[241591,62427343],[241591,62427343],[235020,60251216]],"001000":[[283730,68517813],[283730,68517813],[241591,62427343],[241591,62427343],[241591,62427343],[241591,62427343]],"000111":[[283730,68517813],[283730,68517813],[283730,68517813],[283544,68513555],[270262,68082985],[264857,65904520]],"000110":[[283730,68517813],[283730,68517813],[283730,68517813],[283544,68513555],[270262,68082985],[270262,68082985]],"000101":[[283730,68517813],[283730,68517813],[283730,68517813],[283544,68513555],[283544,68513555],[276792,66284734]],"000100":[[283730,68517813],[283730,68517813],[283730,68517813],[283544,68513555],[283544,68513555],[283544,68513555]],"000011":[[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813],[270262,68082985],[264857,65904520]],"000010":[[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813],[270262,68082985],[270262,68082985]],"000001":[[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813],[276978,66288992]],"000000":[[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813],[283730,68517813]]}};
+const stages = [
+  { key: 'lang', name: 'Language ID', note: 'fastText says English, p ≥ 0.65' },
+  { key: 'short', name: 'Length', note: 'at least 50 words' },
+  { key: 'rules', name: 'Quality rules', note: 'Gopher-style: word length, symbols, stop words, repeated lines' },
+  { key: 'exact', name: 'Exact dedup', note: 'same SHA-1 of the cleaned text' },
+  { key: 'near', name: 'Near dedup', note: 'MinHash + LSH, Jaccard ≥ 0.8' },
+  { key: 'decon', name: 'Decontaminate', note: 'shares a 13-gram with the eval set' },
+];
+---
+<div class="fun" data-fig="data-funnel" data-json={JSON.stringify(data)}>
+  <div class="ctl fun-metric" role="group" aria-label="Count">
+    <button class="btn" type="button" data-metric="1" aria-pressed="true">Tokens</button>
+    <button class="btn" type="button" data-metric="0" aria-pressed="false">Documents</button>
+  </div>
+  <ol class="fun-rows">
+    <li class="fun-row fixed">
+      <div class="fun-name"><b>Dump pages</b><span>every page in the XML</span></div>
+      <div class="fun-bar"><span data-fixbar="0"></span></div>
+      <div class="fun-num"><span class="readout" data-fix="0"></span><span class="fun-d" data-fixd="0"></span></div>
+    </li>
+    <li class="fun-row fixed">
+      <div class="fun-name"><b>Articles</b><span>drop redirects, talk, user, template pages</span></div>
+      <div class="fun-bar"><span data-fixbar="1"></span></div>
+      <div class="fun-num"><span class="readout" data-fix="1"></span><span class="fun-d" data-fixd="1"></span></div>
+    </li>
+    <li class="fun-row fixed">
+      <div class="fun-name"><b>Extract</b><span>wikitext to plain text, minus eval holdout</span></div>
+      <div class="fun-bar"><span data-fixbar="2"></span></div>
+      <div class="fun-num"><span class="readout" data-fix="2"></span><span class="fun-d" data-fixd="2"></span></div>
+    </li>
+    {stages.map((s, i) => (
+      <li class="fun-row" data-row={i}>
+        <div class="fun-name">
+          <button class="btn fun-tog" type="button" data-tog={i} aria-pressed="true" aria-label={`Toggle ${s.name}`}>on</button>
+          <b>{s.name}</b><span>{s.note}</span>
+        </div>
+        <div class="fun-bar"><span data-bar={i}></span></div>
+        <div class="fun-num"><span class="readout" data-n={i}></span><span class="fun-d" data-d={i}></span></div>
+      </li>
+    ))}
+  </ol>
+  <p class="fun-sum" data-sum></p>
+</div>
+
+<style>
+  .fun-metric { margin-top: 0; margin-bottom: 10px; }
+  .fun-rows { list-style: none; margin: 0; padding: 0; }
+  .fun-row { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr) 118px; gap: 10px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--rule); }
+  .fun-name { display: grid; grid-template-columns: auto 1fr; column-gap: 8px; align-items: baseline; font-family: var(--mono); font-size: 12px; min-width: 0; }
+  .fixed .fun-name { grid-template-columns: 1fr; }
+  .fun-name b { font-weight: 600; color: var(--ink); }
+  .fun-name span { grid-column: 1 / -1; font-size: 10.5px; color: var(--ink-3); line-height: 1.35; }
+  .fun-row:not(.fixed) .fun-name span { grid-column: 2; }
+  .fun-tog { padding: 2px 6px; font-size: 10px; min-width: 38px; grid-row: 1 / 3; align-self: center; }
+  .fun-bar { height: 16px; border: 1px solid var(--rule); background: var(--paper); position: relative; }
+  .fun-bar span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--blue-fill); border-right: 2px solid var(--blue); transition: width 0.25s; }
+  .fun-row.off .fun-bar span { background: var(--paper-2); border-right-color: var(--ink-3); }
+  .fun-row.off .fun-name b { color: var(--ink-3); text-decoration: line-through; }
+  .fun-num { text-align: right; font-family: var(--mono); font-size: 12px; display: flex; flex-direction: column; }
+  .fun-d { font-size: 10.5px; color: var(--ink-3); }
+  .fun-sum { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 12px 0 0; line-height: 1.6; }
+  @media (prefers-reduced-motion: reduce) { .fun-bar span { transition: none; } }
+  @media (max-width: 560px) {
+    .fun-row { grid-template-columns: minmax(0, 1fr) 96px; }
+    .fun-bar { grid-column: 1 / -1; grid-row: 2; }
+  }
+</style>
+
+<script>
+  type Data = { base: Record<string, number>; combos: Record<string, [number, number][]> };
+  const fmt = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : n >= 1e4 ? (n / 1e3).toFixed(0) + 'k' : n.toLocaleString('en-US'));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="data-funnel"]').forEach((root) => {
+    const data: Data = JSON.parse(root.dataset.json!);
+    const on = [1, 1, 1, 1, 1, 1];
+    let metric = 1; // 1 = tokens, 0 = docs
+    const b = data.base;
+
+    function render() {
+      const key = on.join('');
+      const rows = data.combos[key];
+      const fixed = metric
+        ? [NaN, b.rawTokens, b.cleanTokens]
+        : [b.pages, b.articles, b.candDocs];
+      const max = metric ? b.rawTokens : b.pages;
+      fixed.forEach((v, i) => {
+        root.querySelector<HTMLElement>(`[data-fix="${i}"]`)!.textContent = Number.isNaN(v) ? '—' : fmt(v);
+        root.querySelector<HTMLElement>(`[data-fixbar="${i}"]`)!.style.width = Number.isNaN(v) ? '0' : `${(100 * v) / max}%`;
+        const prev = i ? fixed[i - 1] : NaN;
+        root.querySelector<HTMLElement>(`[data-fixd="${i}"]`)!.textContent = !Number.isNaN(prev) && !Number.isNaN(v) ? `−${fmt(prev - v)}` : i === 0 ? '' : metric ? 'raw wikitext' : '';
+      });
+      let prev = fixed[2];
+      rows.forEach((r, i) => {
+        const v = r[metric];
+        root.querySelector<HTMLElement>(`[data-n="${i}"]`)!.textContent = fmt(v);
+        root.querySelector<HTMLElement>(`[data-bar="${i}"]`)!.style.width = `${(100 * v) / max}%`;
+        root.querySelector<HTMLElement>(`[data-d="${i}"]`)!.textContent = on[i] ? `−${fmt(prev - v)}` : 'skipped';
+        root.querySelector<HTMLElement>(`[data-row="${i}"]`)!.classList.toggle('off', !on[i]);
+        prev = v;
+      });
+      const last = rows[rows.length - 1];
+      const keptDocs = (100 * last[0]) / b.candDocs, keptTok = (100 * last[1]) / b.cleanTokens;
+      root.querySelector<HTMLElement>('[data-sum]')!.textContent =
+        `Training set: ${last[0].toLocaleString('en-US')} documents, ${last[1].toLocaleString('en-US')} tokens. ` +
+        `That keeps ${keptDocs.toFixed(0)}% of extracted documents but ${keptTok.toFixed(0)}% of their tokens. ` +
+        `Packed into 1,024-token rows: about ${Math.round(last[1] / 1024).toLocaleString('en-US')} rows, ${(last[1] * 2 / 1e6).toFixed(0)} MB as uint16.`;
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-tog]').forEach((btn) => btn.addEventListener('click', () => {
+      const i = +btn.dataset.tog!;
+      on[i] = on[i] ? 0 : 1;
+      btn.setAttribute('aria-pressed', String(!!on[i]));
+      btn.textContent = on[i] ? 'on' : 'off';
+      render();
+    }));
+    root.querySelectorAll<HTMLButtonElement>('[data-metric]').forEach((btn) => btn.addEventListener('click', () => {
+      metric = +btn.dataset.metric!;
+      root.querySelectorAll<HTMLButtonElement>('[data-metric]').forEach((x) => x.setAttribute('aria-pressed', String(x === btn)));
+      render();
+    }));
+    render();
+  });
+</script>

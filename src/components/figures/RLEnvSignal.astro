@@ -1,0 +1,101 @@
+---
+// Where the learning signal lives. A task the model solves with probability p is sampled k times.
+// If all k attempts get the same reward (all pass or all fail), a group-relative method like GRPO
+// gets zero advantage for every attempt: no gradient. Curve: P(mixed group) = 1 - p^k - (1-p)^k.
+// Dashed curve: reward variance p(1-p), scaled so its peak is 1.
+// Usage: <RLEnvSignal />
+---
+<div class="rlsig" data-fig="rlenv-signal">
+  <svg viewBox="0 0 640 260" role="img" aria-label="Curve of how often a group of attempts has mixed outcomes, as a function of the task's pass rate"></svg>
+  <div class="ctl">
+    <label>Pass rate p <input type="range" min="0" max="100" value="10" data-k="p" /> <output data-o="p">0.10</output></label>
+    <label>Attempts per task k <input type="range" min="1" max="32" value="8" data-k="k" /> <output data-o="k">8</output></label>
+  </div>
+  <p class="rlsig-read">
+    all fail <span class="readout" data-r="fail">-</span> ·
+    all pass <span class="readout" data-r="pass">-</span> ·
+    useful (mixed) <span class="readout" data-r="mix">-</span>
+  </p>
+  <p class="rlsig-read" data-r="why"></p>
+</div>
+
+<style>
+  .rlsig svg { width: 100%; }
+  .rlsig-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const X0 = 50, X1 = 620, Y0 = 210, Y1 = 24;
+  const sx = (p: number) => X0 + p * (X1 - X0);
+  const sy = (v: number) => Y0 - v * (Y0 - Y1);
+
+  document.querySelectorAll<HTMLElement>('[data-fig="rlenv-signal"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const s = { p: 0.1, k: 8 };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+
+    function draw() {
+      svg.replaceChildren();
+      // axes
+      svg.append(mk('line', { x1: X0, y1: Y0, x2: X1, y2: Y0, class: 'ink', 'stroke-width': 1 }));
+      svg.append(mk('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, class: 'ink', 'stroke-width': 1 }));
+      [0, 0.25, 0.5, 0.75, 1].forEach((v) => {
+        svg.append(mk('text', { x: sx(v), y: Y0 + 16, 'text-anchor': 'middle' }, v.toFixed(2)));
+        svg.append(mk('text', { x: X0 - 6, y: sy(v) + 4, 'text-anchor': 'end' }, String(v)));
+        if (v > 0) svg.append(mk('line', { x1: X0, y1: sy(v), x2: X1, y2: sy(v), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+      });
+      svg.append(mk('text', { x: X1, y: Y0 + 34, 'text-anchor': 'end' }, 'TASK PASS RATE p →'));
+      svg.append(mk('text', { x: X0, y: 14 }, 'P(GROUP OF k HAS BOTH PASSES AND FAILS)'));
+      // shade dead zones (useful < 0.5)
+      // curves
+      let d = '', dv = '';
+      for (let i = 0; i <= 200; i++) {
+        const p = i / 200;
+        const mix = 1 - Math.pow(p, s.k) - Math.pow(1 - p, s.k);
+        const v = 4 * p * (1 - p);
+        d += (i ? 'L' : 'M') + sx(p).toFixed(1) + ',' + sy(mix).toFixed(1);
+        dv += (i ? 'L' : 'M') + sx(p).toFixed(1) + ',' + sy(v).toFixed(1);
+      }
+      svg.append(mk('path', { d: dv, class: 'ink dash', 'stroke-width': 1 }));
+      svg.append(mk('path', { d, class: 'blue', 'stroke-width': 1.8 }));
+      // marker
+      const mix = 1 - Math.pow(s.p, s.k) - Math.pow(1 - s.p, s.k);
+      svg.append(mk('line', { x1: sx(s.p), y1: Y0, x2: sx(s.p), y2: sy(mix), class: 'blue dash', 'stroke-width': 1 }));
+      svg.append(mk('circle', { cx: sx(s.p), cy: sy(mix), r: 5, class: 'fill-blue' }));
+      // legend
+      svg.append(mk('line', { x1: 380, y1: 40, x2: 404, y2: 40, class: 'blue', 'stroke-width': 1.8 }));
+      svg.append(mk('text', { x: 410, y: 44 }, `MIXED GROUP, k = ${s.k}`));
+      svg.append(mk('line', { x1: 380, y1: 58, x2: 404, y2: 58, class: 'ink dash', 'stroke-width': 1 }));
+      svg.append(mk('text', { x: 410, y: 62 }, 'REWARD VARIANCE p(1-p), SCALED'));
+
+      const fail = Math.pow(1 - s.p, s.k), pass = Math.pow(s.p, s.k);
+      const pct = (x: number) => (x * 100).toFixed(x < 0.01 && x > 0 ? 2 : 0) + '%';
+      r('fail').textContent = pct(fail);
+      r('pass').textContent = pct(pass);
+      r('mix').textContent = pct(mix);
+      let why: string;
+      if (s.p === 0) why = 'Impossible task: every attempt scores 0. Nothing to compare, nothing to learn. Pure cost.';
+      else if (s.p === 1) why = 'Solved task: every attempt scores 1. Also no signal, and you paid for k sandboxes.';
+      else if (mix < 0.5) why = 'Most groups come back all-same. Those samples cost compute and teach nothing. Either raise k or move this task out of the pool.';
+      else why = 'Most groups contain both a success and a failure, so the update can push toward what worked and away from what did not.';
+      r('why').textContent = why;
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => {
+        const k = inp.dataset.k!;
+        if (k === 'p') { s.p = +inp.value / 100; root.querySelector<HTMLElement>('[data-o="p"]')!.textContent = s.p.toFixed(2); }
+        else { s.k = +inp.value; root.querySelector<HTMLElement>('[data-o="k"]')!.textContent = inp.value; }
+        draw();
+      });
+    });
+    draw();
+  });
+</script>

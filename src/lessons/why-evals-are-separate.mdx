@@ -1,0 +1,642 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import EvalSepJudgeMatrix from '../components/figures/EvalSepJudgeMatrix.astro';
+import EvalSepGoodhart from '../components/figures/EvalSepGoodhart.astro';
+
+## Today
+
+- Say in one sentence what an eval is for, and why "it's also just a model" misses the point: an eval's job is to be an **independent** measurement, not a smart one.
+- Explain why a model grading its own answers approves its own mistakes (correlated errors), and when a model-based judge is fine anyway.
+- Explain Goodhart's law with a picture: why a score you optimize against stops tracking what you care about, and why it breaks first at the top.
+- Explain the difference between a training objective and an evaluation metric, and why train, dev and test are separate piles that get touched different numbers of times.
+- Build it: catch a small LLM approving its own wrong arithmetic, make a flawed metric go up while true accuracy goes down, and build a frozen held-out eval with a harness that logs everything.
+
+Prerequisites: none hard. You've trained models and watched a validation loss, which is enough. [Training a tiny LM](/lessons/tiny-lm/) helps for the train/val picture. Rough time: one evening to read, one session on the Spark for the build.
+
+## The Problem
+
+You said it yourself: "I used to read about how there is an evaluation system and there is a model. I never understood why there is a separate evaluation system and a separate model when both are basically some kind of machine learning models themselves."
+
+It's a fair question, and the honest answer is that the word "eval" hides the important part. Here is the scene where it bites.
+
+You fine-tune a small model to do arithmetic word problems. To check it, you ask the same model, "Here is a question and your answer. Is the answer correct? Say YES or NO." It says YES 91% of the time. Great. Then you run a ten-line Python script that actually computes the answers, and the true accuracy is 55%.
+
+Nothing crashed. Nobody lied on purpose. The model that produced `347 × 28 = 9,616` (the real answer is 9,716) looked at `9,616` and found it entirely believable, because it was computed by the same weights with the same blind spot. You didn't measure the model. You asked it for its opinion of itself.
+
+Now a second scene, closer to your real work. You're tuning the cross-encoder. Every afternoon you change something, rerun the eval set, and keep the change if NDCG goes up. After three weeks, you've made 60 decisions against the same 500 queries. Your NDCG is up 4 points. You ship. Online, the click-through rate doesn't move.
+
+Same disease, different organ. In the first scene, the measurement shared the model's errors. In the second, the measurement was slowly absorbed into the model: every decision you made against those 500 queries leaked a little information about them into your system, until your system was partly fit to them. Both scenes end the same way: the number says "better" and reality says "no".
+
+Separating the eval from the model is the fix for both. Not because the eval is a different *kind* of thing (it can absolutely be a neural network), but because its value comes from being **independent** of the thing it measures, and **untouched** by the process that improves it.
+
+<Origin year="1986-2015" title="The Common Task Framework, and the age of benchmarks">
+
+In the late 1980s, DARPA got tired of speech recognition labs each reporting great numbers on their own private recordings. It started funding research a new way: every lab got the same training data, and a neutral party (NIST) held back a test set nobody could see, ran everyone's systems on it, and published the scores. Statistician David Donoho later called this the Common Task Framework and argued it was the secret engine of machine learning's progress: progress became measurable because the ruler belonged to nobody.
+
+ImageNet (Fei-Fei Li's group, 2009) scaled the idea up. The ImageNet challenge kept test labels on a server and capped how often each team could submit. In 2012, AlexNet won with a top-5 error around 15% against about 26% for the runner-up, and because the test set was neutral, everyone believed it at once. In 2015, a team from Baidu was disqualified for creating extra accounts to submit far more often than the rules allowed, which tells you how much a few extra peeks at a test set are worth, and how seriously people took the wall.
+
+The era also showed the failure modes. Benchmarks **saturate**: GLUE (2018) was beaten by models within about a year, so SuperGLUE (2019) replaced it, and the cycle has repeated for nearly every popular benchmark since. And with LLMs trained on most of the public internet, benchmarks get **contaminated**: the test questions, sometimes with answers, end up in the training data. When Scale AI wrote fresh grade-school math problems in the style of GSM8K (GSM1k, 2024), some models scored noticeably worse on the new ones than on the originals. The model hadn't learned the skill as well as the score said; it had partly learned the test.
+
+</Origin>
+
+## The Idea
+
+### An eval is a thermometer, not a doctor
+
+Start with what an eval is *for*. You have something you actually care about: "the ranker puts the right document first", "the answer is correct", "users are happier". You can't observe that directly at scale, so you build an instrument that produces a number you hope moves with it. That instrument is the <Term w="eval">Short for evaluation. A fixed procedure that takes a model (or prompt, or system) and produces a score meant to reflect how good it is at the thing you care about.</Term>.
+
+The quality of an instrument isn't how clever it is. A thermometer is dumber than a doctor. What makes a thermometer useful is that its reading depends on the patient's temperature and on nothing else: not on what the patient wants it to say, not on what the doctor hopes, not on whether you've used it ten times today. The word for that is <Term w="independence">Two things are independent when knowing one tells you nothing about the other. An eval's errors should be independent of the model's errors, so they don't line up and hide each other.</Term>, and it's the whole game.
+
+So the precise version of your question is not "why is the eval a different model?" It's: **what does the eval have to be independent of?** Two things:
+
+1. **The model's errors.** If the grader tends to be wrong in the same places the model is wrong, its mistakes don't add noise, they add *bias*, always in the flattering direction.
+2. **The optimization process.** If the score is used to make changes to the model, the model will drift toward whatever the score rewards, including the parts of the score that are wrong.
+
+Everything else in this lesson is one of those two ideas in more detail.
+
+<Figure n="001" title="TWO LOOPS, ONE WALL" caption="The training loop optimizes a proxy (the loss) with gradients, millions of times. The evaluation loop runs a frozen model on held-out data, produces a number for a human decision, and sends nothing back into the weights. The wall between them is the point.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Training loop on the left with gradients flowing back into the model; evaluation loop on the right ending in a human decision; a dashed wall between them">
+  <text x="150" y="20" text-anchor="middle" class="strong">TRAINING LOOP</text>
+  <text x="150" y="36" text-anchor="middle">runs millions of times</text>
+  <rect x="20" y="56" width="110" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="75" y="76" text-anchor="middle" class="strong">TRAIN DATA</text>
+  <text x="75" y="91" text-anchor="middle">seen every epoch</text>
+  <rect x="170" y="56" width="110" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="225" y="83" text-anchor="middle" class="strong">MODEL</text>
+  <rect x="170" y="150" width="110" height="52" class="fill-paper" stroke-width="1.2" />
+  <text x="225" y="170" text-anchor="middle" class="strong">LOSS</text>
+  <text x="225" y="186" text-anchor="middle">cheap, smooth,</text>
+  <text x="225" y="198" text-anchor="middle">a proxy</text>
+  <line x1="130" y1="78" x2="168" y2="78" class="ink" stroke-width="1.2" />
+  <line x1="225" y1="100" x2="225" y2="148" class="ink" stroke-width="1.2" />
+  <path d="M170 176 C 110 176, 110 90, 168 90" class="blue" stroke-width="1.5" />
+  <text x="40" y="140" class="blue-t">GRADIENTS</text>
+  <text x="40" y="154" class="blue-t">CHANGE WEIGHTS</text>
+  <line x1="320" y1="14" x2="320" y2="290" class="ink dash" stroke-width="1.2" />
+  <text x="320" y="262" text-anchor="middle" class="strong">WALL</text>
+  <text x="320" y="278" text-anchor="middle">nothing flows back</text>
+  <text x="480" y="20" text-anchor="middle" class="strong">EVALUATION LOOP</text>
+  <text x="480" y="36" text-anchor="middle">runs a handful of times</text>
+  <rect x="350" y="56" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="410" y="76" text-anchor="middle" class="strong">TEST SET</text>
+  <text x="410" y="91" text-anchor="middle">frozen, unseen</text>
+  <rect x="500" y="56" width="120" height="44" class="fill-wash dash" stroke-width="1.2" />
+  <text x="560" y="76" text-anchor="middle" class="strong">MODEL</text>
+  <text x="560" y="91" text-anchor="middle">weights frozen</text>
+  <rect x="500" y="130" width="120" height="52" class="fill-paper" stroke-width="1.2" />
+  <text x="560" y="150" text-anchor="middle" class="strong">GRADER</text>
+  <text x="560" y="166" text-anchor="middle">program, human,</text>
+  <text x="560" y="178" text-anchor="middle">or other model</text>
+  <rect x="350" y="130" width="120" height="52" class="fill-paper" stroke-width="1.2" />
+  <text x="410" y="150" text-anchor="middle" class="strong">METRIC</text>
+  <text x="410" y="166" text-anchor="middle">what you care</text>
+  <text x="410" y="178" text-anchor="middle">about, maybe slow</text>
+  <rect x="350" y="212" width="270" height="36" class="fill-blue" />
+  <text x="485" y="235" text-anchor="middle" style="fill:var(--paper)">DECISION: SHIP? WHICH RUN?</text>
+  <line x1="470" y1="78" x2="498" y2="78" class="ink" stroke-width="1.2" />
+  <line x1="560" y1="100" x2="560" y2="128" class="ink" stroke-width="1.2" />
+  <line x1="500" y1="156" x2="472" y2="156" class="ink" stroke-width="1.2" />
+  <line x1="410" y1="182" x2="410" y2="210" class="ink" stroke-width="1.2" />
+</svg>
+</Figure>
+
+### Loss is not the metric: the training objective is a proxy on purpose
+
+Even inside a single training run, there are already two different numbers, and they're different on purpose.
+
+The <Term w="training objective">The number the optimizer pushes down during training, usually called the loss. It has to be cheap to compute and differentiable so gradients can flow through it.</Term> has hard engineering requirements. It must be computed millions of times, so it has to be cheap. Gradients have to flow through it, so it has to be <Term w="differentiable">You can compute how a tiny change in each weight would change the number. Gradient descent needs this; a step function like "right or wrong" gives zero gradient almost everywhere.</Term>. Cross-entropy is a great training objective. Nobody actually cares about cross-entropy.
+
+The <Term w="evaluation metric">The number you use to judge whether the model is good at the real task. It can be slow, non-differentiable, or even a human opinion, because you compute it rarely and never take gradients of it.</Term> has the opposite constraints. It must match what you care about, and that's all. It can be a step function (exact match). It can involve a sort (NDCG). It can take a human a minute per example. It can be "did the user buy something in the next week".
+
+Your cross-encoder is the perfect example. You train it with binary cross-entropy or a pairwise loss on (query, document) scores, because those are smooth. You judge it with NDCG@10, which depends on the *order* of the top ten documents. Sorting is a step function: nudge a score a hair and the order either flips or doesn't, so NDCG has no useful gradient. The loss is a differentiable stand-in for NDCG, and they usually move together. Usually. A model can lower the loss by getting more confident about documents ranked 40th, which NDCG doesn't see at all.
+
+That's the first reason the eval is separate: **the thing you optimize is chosen to be optimizable, and the thing you measure is chosen to be true.** Those are different design goals, so they're different objects.
+
+### Self-grading: correlated errors
+
+Now the first scene. Why does a model grading itself fail?
+
+Think of two students. One takes an arithmetic test and gets 45% of it wrong. The other grades it. If the grader is an independent person who's good at arithmetic, their grading mistakes are random: once in a while they miss an error, once in a while they mark a right answer wrong. Those mistakes are unrelated to *which* questions the student got wrong. Average over 1,000 questions and the grader's noise mostly washes out.
+
+Now let the student grade their own test. The question they got wrong is precisely the question where their mental arithmetic has a hole. Rechecking with the same hole, they get the same wrong answer, and it looks right. The grading mistakes are now concentrated exactly on the student's mistakes. That's <Term w="correlated errors">When two systems tend to be wrong on the same inputs. Averaging doesn't cancel correlated errors; they stack in one direction.</Term>, and they don't wash out. They push the score in one direction: up.
+
+A model is in the same position, only more so. Its "opinion" of an answer comes from the same weights that produced the answer. If it believes 347 × 28 is 9,616, a judging prompt doesn't install new arithmetic. And there's a second, subtler effect: researchers have found that LLM judges tend to recognize and prefer text written by themselves, a <Term w="self-preference bias">The tendency of an LLM judge to rate its own outputs (or outputs in its own style) higher than equally good outputs from others.</Term> separate from correctness. Huang and colleagues (2023) found that LLMs asked to review and fix their own reasoning, with no outside feedback, mostly didn't improve, and sometimes changed right answers to wrong ones.
+
+Here is the bookkeeping. Every graded answer lands in one of four boxes: right and approved, right and rejected, wrong and approved, wrong and rejected. The box that matters is **wrong and approved**, the <Term w="false approval">A wrong answer the judge marks as correct. In classifier language, a false positive. This is the box that inflates your score.</Term>. Play with who does the grading.
+
+<Predict id="self-judge">
+A model is right on 55% of 1,000 arithmetic questions. It grades its own answers. Say it approves 95% of its right answers, and it approves 85% of its wrong ones (because it shares the blind spot that caused most of them). What accuracy does the self-judge report?
+<Fragment slot="answer">
+
+Right and approved: 0.95 × 550 ≈ 523. Wrong and approved: 0.85 × 450 ≈ 383. The judge says YES to 523 + 383 = 906 answers, so it reports about **91%**, against a true 55%. Notice the self-judge is not even "a bit generous". It mostly measures how often the model answers at all, because it approves nearly everything. Load the "Same model" preset below and you'll see these exact counts.
+
+</Fragment>
+</Predict>
+
+<Figure n="002" title="WHO GRADES MATTERS" caption="Expected counts out of 1,000 answers. The blue cell is wrong answers the judge approved. A judge that shares the model's blind spot moves most wrong answers into that cell, and the measured bar runs far ahead of the true one. Drag the blind-spot slider for any judge to see how much independence is worth. Presets are illustrative, not measurements; you'll measure real ones in the build.">
+
+<EvalSepJudgeMatrix />
+
+</Figure>
+
+The formula behind that figure is short, and it's worth knowing, because it tells you what a judge is actually reporting. Call the model's true accuracy *a*. Call the judge's approval rate on right answers TPR (true positive rate) and on wrong answers FAR (false approval rate). Then:
+
+```text
+measured = a · TPR + (1 − a) · FAR
+```
+
+If FAR is 0 and TPR is 1, measured = a. Perfect. Every bit of FAR adds score that doesn't exist, and the size of the lie is biggest exactly when the model is weak (large 1 − a). And here's the real reason independence matters: an independent judge has *some* FAR, but it's roughly the same no matter which questions the model gets wrong. A self-judge's FAR is high *because* of which questions the model gets wrong. Change the model, and the self-judge's FAR changes with it, so you can't even compare two models fairly.
+
+There's a hopeful corollary. If you measure TPR and FAR on a sample where you know the truth (a couple hundred examples you labeled yourself), you can solve that equation backward:
+
+```text
+a ≈ (measured − FAR) / (TPR − FAR)
+```
+
+Epidemiologists use this to correct disease prevalence for imperfect tests (it's called the <Term w="Rogan-Gladen correction">A 1978 formula from epidemiology that recovers the true rate of something from a measured rate, given the test's known true positive and false positive rates.</Term>). It only works if FAR and TPR are stable, which is exactly what an independent judge gives you and a self-judge doesn't. Hold that thought; it's the core of when a model-judge is fine.
+
+### What can grade: programs, people, models
+
+There are three kinds of grader. Each has a failure mode, and picking one is a trade between how much it costs and how closely it tracks the truth.
+
+| Grader | Examples | Strong at | Fails by |
+| --- | --- | --- | --- |
+| **Program** | exact match, unit tests, a calculator, a SQL query result, a JSON schema check, a <Term w="verifier">A program that checks whether an output is correct, usually much simpler than producing it. Running a test suite verifies code; multiplying back verifies a division.</Term> | Free, fast, deterministic, zero shared blind spots | Only works when "correct" is computable; brittle parsing marks right answers wrong ("9716" vs "9,716"); checks the letter of the spec, not its intent (tests pass, code is awful) |
+| **Human** | you labeling 200 rankings, annotators, domain experts | Closest to what you mean by "good" | Slow and expensive; people disagree with each other; tired raters drift; they prefer confident, long, well-formatted answers too |
+| **Model** | an LLM judge with a rubric, a reward model, a trained classifier | Cheap at scale, handles fuzzy criteria ("is this summary faithful?") | Shares blind spots with models like it; biased toward position, length, its own style; can be fooled by text written to fool it |
+
+The rule of thumb: **use the cheapest grader that's independent enough for the decision.** Arithmetic and code get programs. "Is the right document in the top three?" gets your own labels, once, then a program (NDCG over the labels). "Is this answer helpful and faithful?" gets a model judge, calibrated on human labels.
+
+That last one is where your original confusion lives. A model judge is fine, and very widely used, when four things hold:
+
+1. **It isn't the model being graded,** and ideally isn't from the same family or trained on the same outputs. Different training data means less-correlated errors.
+2. **The judging task is easier than the generating task.** Checking that a summary contains no claims absent from the source is easier than writing a great summary. Checking a sudoku is easier than solving one. Verification being easier than generation is why a judge can sometimes grade a model stronger than itself.
+3. **It's calibrated against humans.** You hand-label a few hundred examples, run the judge on them, and measure agreement (and TPR and FAR). In the MT-Bench paper (Zheng et al., 2023), strong LLM judges agreed with human preferences about as often as humans agreed with each other, above 80%, and the paper also documented their position, length, and self-enhancement biases.
+4. **It never becomes the training target** without a separate check. Which brings us to Goodhart.
+
+[LLMs as judges](/lessons/llm-judges/) is the full lesson on building and calibrating one. Here, the point is narrower: "both are ML models" is fine. "Both share errors" is not.
+
+### Goodhart's law: when the measure becomes the target
+
+The second scene, the slow leak, has a famous name. Economist Charles Goodhart wrote in 1975 that any observed statistical regularity tends to collapse once pressure is placed on it for control purposes. Anthropologist Marilyn Strathern later gave it the form everyone quotes: <Term w="Goodhart's law">"When a measure becomes a target, it ceases to be a good measure." Optimizing hard against a proxy finds the ways the proxy differs from the real thing.</Term>.
+
+Here's why it's a law and not a proverb. A proxy is correlated with the real thing, but it's not *the* real thing; there's some gap. When you optimize gently, you mostly move along the shared direction (real improvements raise both). But real improvements are hard and get harder, while the gap is often cheap to exploit: a judge that likes long answers is easier to please by writing more than by being right. Optimize harder, and the cheap direction wins.
+
+There's also a purely statistical version that needs no cheating at all. Pick the 30 highest-scoring candidates out of 300. Score = true quality + noise. The candidates at the very top are disproportionately the ones that got lucky noise, so their true quality is lower than their scores suggest. Researchers call this flavor <Term w="regressional Goodhart">Selecting on a noisy proxy: the top scorers are partly top because of noise, so their true value regresses toward average. Happens even when nobody games anything.</Term>, and it's why the correlation between score and truth is always weakest among the winners, which is where you're looking.
+
+Push the slider.
+
+<Figure n="003" title="GOODHART, IN ONE SLIDER" caption="Left: 300 candidates, measured score against true quality. Right: average score (blue) and average true quality (black) as optimization pressure against the score rises. At first both climb. Then the cheap trick the score rewards takes over: the score keeps rising and true quality falls. Note how flat the blue top-10% cluster is even at zero pressure: among the winners, score barely predicts truth. Toy model with fixed seeds." wide>
+
+<EvalSepGoodhart />
+
+</Figure>
+
+<Predict id="goodhart-peak">
+Before you move the slider: at what pressure do you expect average true quality to peak, and what happens to the score past that point? And among the top 10% by score at zero pressure, do you expect a strong or weak correlation between score and true quality?
+<Fragment slot="answer">
+
+In this toy, true quality peaks around pressure 30-40 (about 0.42) while the score keeps climbing in a nearly straight line to 3.3. By pressure 100, average true quality is about −0.84, worse than where you started, while the score is the best it's ever been.
+
+The top-10% correlation is weak even at zero pressure. Among the 30 winners, the range of true quality is narrow and noise dominates, so the score barely ranks them. That's regressional Goodhart, no gaming required. The overall correlation drops from about 0.77 to 0.10 as pressure rises.
+
+</Fragment>
+</Predict>
+
+This isn't hypothetical in modern ML. **RLHF is Goodhart's law with a GPU.** A reward model is trained to predict human preferences: it's an eval. Then the policy is trained by RL to maximize it: now it's a target. Gao, Schulman and Hilton (2022) measured this carefully: as the policy optimizes harder against a learned reward model, the score from a separate "gold" reward model first rises, then falls, while the optimized reward keeps rising. That's the curve in Figure 003, measured for real. It's why RLHF uses a KL penalty to keep the policy near where it started, and why labs evaluate RL-trained models on things other than the reward model they trained against. When the model finds a way to raise the reward that isn't what you meant, it's called <Term w="reward hacking">When an optimized system raises its reward by exploiting flaws in how the reward is computed, rather than by doing the intended task better.</Term>.
+
+So here's the cleanest definition of an eval you'll find in this lesson: **an eval is a measurement you promise not to optimize against directly.** The moment you do, it becomes a training signal, and you need a new eval to check it.
+
+### Train, dev, test: three piles, three levels of contact
+
+The same idea governs how you split data. The question isn't "is this data in the training set?" It's "how many times has this data influenced a decision?"
+
+- The <Term w="training set">Data the optimizer fits the weights on. Touched every step.</Term> is touched millions of times by gradients. The model is, by design, fit to it. Its loss is optimistic.
+- The <Term w="dev set">Also called the validation set. Data you use to make choices: hyperparameters, prompts, early stopping, which checkpoint. You look at it often.</Term> isn't trained on, but you look at it dozens or hundreds of times to pick learning rates, prompts, checkpoints, features. Each look leaks a little. After 60 decisions, your system is partly fit to the dev set through *you*. Its scores are mildly optimistic.
+- The <Term w="test set">Held-out data you score on once (or very rarely), at the end, to report how good the final choice is. Any decision made using it turns it into a dev set.</Term> is looked at once, at the end, after all decisions are made. That one number is the only one you're allowed to believe without a discount.
+
+<Figure n="004" title="WHO TOUCHES WHAT, HOW OFTEN" caption="Each pile is defined by how much it has influenced the system, not just by whether it was trained on. Leaks (dashed) quietly move test data leftward: duplicates across splits, the same query in both sides, contamination in pretraining, and you peeking at the test score to make a choice.">
+<svg viewBox="0 0 640 260" role="img" aria-label="Data split into train, dev and test, with how often each is touched, and leak arrows from test back to train and dev">
+  <rect x="20" y="50" width="380" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="210" y="72" text-anchor="middle" class="strong">TRAIN · 80%</text>
+  <text x="210" y="88" text-anchor="middle">fit the weights</text>
+  <rect x="400" y="50" width="110" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="455" y="72" text-anchor="middle" class="strong">DEV · 10%</text>
+  <text x="455" y="88" text-anchor="middle">make choices</text>
+  <rect x="510" y="50" width="110" height="50" class="fill-blue" />
+  <text x="565" y="72" text-anchor="middle" style="fill:var(--paper)" class="strong">TEST · 10%</text>
+  <text x="565" y="88" text-anchor="middle" style="fill:var(--paper)">report once</text>
+  <text x="20" y="32">TOUCHED BY</text>
+  <text x="210" y="124" text-anchor="middle">the optimizer, every step</text>
+  <text x="210" y="138" text-anchor="middle" class="blue-t">~10⁶ times</text>
+  <text x="455" y="124" text-anchor="middle">you, every experiment</text>
+  <text x="455" y="138" text-anchor="middle" class="blue-t">~10-1000 times</text>
+  <text x="565" y="124" text-anchor="middle">you, at the end</text>
+  <text x="565" y="138" text-anchor="middle" class="blue-t">once</text>
+  <path d="M560 160 C 520 220, 300 220, 240 104" class="blue dash" stroke-width="1.2" />
+  <path d="M575 160 C 575 200, 470 200, 455 146" class="blue dash" stroke-width="1.2" />
+  <text x="300" y="232" class="blue-t">LEAKS: DUPLICATES · SAME QUERY IN BOTH ·</text>
+  <text x="300" y="248" class="blue-t">PRETRAINING CONTAMINATION · PEEKING</text>
+</svg>
+</Figure>
+
+Two leaks deserve special mention because they bite you specifically.
+
+**Group leakage.** Your cross-encoder data is (query, document, label) triples. If you split randomly by *row*, the same query appears in train and test with different documents. The model can learn "for this query, documents about X are relevant" and then ace the test on that query, a skill it won't have on new queries in production. Split by query (all rows for a query go to one side). The general rule: split along whatever unit will be new in production. New queries? Split by query. New users? Split by user. Future data? Split by time.
+
+**Adaptive overfitting.** This is the second scene, made precise. Each time you look at a test score and make a decision, you've used the test set as a dev set. Do it enough and you can overfit a test set *without ever training on it*, just by choosing. Researchers who study this call it <Term w="adaptive data analysis">Analysis where each new question you ask of a dataset depends on the answers to earlier questions. Reusing a holdout this way can make it overfit even though no model trained on it.</Term>. How bad can it get? Here is a simulation you'll run yourself in the build: 1,000 test examples with *random* labels (no model can truly beat 50%), and a bunch of random-guess "models" scored against them.
+
+<Figure n="005" title="WINNING ON NOISE" caption="1,000 random labels, K random-guess models, keep the best by test score (measured on this Mac, numpy, 20 trials each). The best looks better and better as you try more, and on a fresh test set every one of them scores 50%. Majority-voting the 'lucky' half of 1,000 random models reaches 71% on the test set it was chosen on, and 50% on a fresh one.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Best test accuracy of K random models rising from 50 to 56 percent as K grows, flat 50 percent on fresh data, and a 71 percent point for majority voting">
+  <line x1="60" y1="260" x2="600" y2="260" class="ink" stroke-width="1" />
+  <line x1="60" y1="30" x2="60" y2="260" class="ink" stroke-width="1" />
+  <text x="54" y="246" text-anchor="end">50%</text>
+  <text x="54" y="157" text-anchor="end">60%</text>
+  <text x="54" y="69" text-anchor="end">70%</text>
+  <line x1="60" y1="153" x2="600" y2="153" class="ink dash" stroke-width="0.6" />
+  <line x1="60" y1="65" x2="600" y2="65" class="ink dash" stroke-width="0.6" />
+  <text x="60" y="278" text-anchor="middle">1</text>
+  <text x="195" y="278" text-anchor="middle">10</text>
+  <text x="330" y="278" text-anchor="middle">100</text>
+  <text x="465" y="278" text-anchor="middle">1,000</text>
+  <text x="600" y="278" text-anchor="end">10,000</text>
+  <text x="330" y="296" text-anchor="middle" class="strong">MODELS TRIED AGAINST THE SAME TEST SET (K)</text>
+  <line x1="60" y1="242" x2="600" y2="242" class="ink" stroke-width="1.2" />
+  <text x="596" y="236" text-anchor="end">FRESH TEST SET: 50%</text>
+  <path d="M60 240 L195 219 L330 208 L465 198 L600 188" class="blue" stroke-width="1.8" />
+  <circle cx="60" cy="240" r="3" class="fill-blue" />
+  <circle cx="195" cy="219" r="3" class="fill-blue" />
+  <circle cx="330" cy="208" r="3" class="fill-blue" />
+  <circle cx="465" cy="198" r="3" class="fill-blue" />
+  <circle cx="600" cy="188" r="3" class="fill-blue" />
+  <text x="330" y="198" text-anchor="middle" class="blue-t">BEST OF K: 54%</text>
+  <text x="596" y="178" text-anchor="end" class="blue-t">56%</text>
+  <rect x="459" y="50" width="12" height="12" class="fill-blue" />
+  <line x1="465" y1="62" x2="465" y2="196" class="blue dash" stroke-width="1" />
+  <text x="455" y="48" text-anchor="end" class="strong">VOTE OF THE LUCKY ONES: 71%</text>
+</svg>
+</Figure>
+
+Notice the shape. Trying 100 models and keeping the best buys you 4 points of pure noise on a 1,000-example set. That's bigger than most of the "wins" in a typical paper's results table. The voting trick is from Blum and Hardt's "Ladder" paper, written precisely because competition leaderboards on Kaggle were being climbed this way. ([Is that improvement real?](/lessons/statistics-for-evals/) is where you learn to put error bars on this.)
+
+One honest caveat, because it surprised the field: when Recht and colleagues (2019) built a fresh ImageNet test set to measure a decade of adaptive overfitting, accuracy dropped about 11-14 points, but the *ranking* of models was almost perfectly preserved, and the drop came mostly from the new images being slightly harder, not from overfitting to the old test set. Big, diverse test sets used by a whole community proved surprisingly robust. Your 500-query dev set that one person makes 60 decisions on is not a big community benchmark. Treat it like Figure 005.
+
+### The eval is the spec
+
+There's one more reason the eval is a separate system, and it's the one that matters most once you're building products instead of reading papers. **Writing the eval forces you to decide what "good" means.**
+
+"Make the ranker better" is not a spec. "Raise NDCG@10 on 500 real queries, labeled with these four relevance grades, sampled from last month's traffic in proportion to frequency, with no drop on the 50 navigational queries" is a spec. It answers questions nobody wants to answer: which queries matter? How much is a grade-2 document worth compared to a grade-3? Do rare queries count as much as common ones? Two engineers who disagree on those will build two different rankers and both claim victory. The eval set settles the argument before the work starts.
+
+That's why strong teams practice <Term w="eval-driven development">Writing the eval before (or alongside) the system, like tests in test-driven development: collect examples of the behaviour you want, see them fail, change the system until they pass, and keep them as a regression suite.</Term>. You collect examples of the behaviour you want (including the embarrassing failures from production), you see the current system fail them, you change things until they pass, and every fixed failure stays in the suite forever so it can't silently come back. It's TDD with a score instead of a pass/fail, and it's what your validation harness at work is, or should become.
+
+### Offline evals and online tests
+
+Last distinction. Everything so far is an <Term w="offline eval">Scoring a system on a fixed, stored dataset, without real users. Fast, cheap, repeatable, and only a proxy for what users experience.</Term>: a frozen dataset, scored in minutes, repeatable forever. Offline evals are how you iterate.
+
+But an offline eval is itself a proxy, for what happens when real users meet the system. The ground truth for a product is an <Term w="A/B test">An online controlled experiment: randomly send some real users to the new system and some to the old one, and compare what they do (clicks, purchases, retention).</Term>: randomly split real traffic, show half the new ranker, and measure what users actually do. It's slow (days to weeks to get enough data), risky (real users see the bad version), and needs care to avoid its own traps, but it's the closest thing to the truth you'll get.
+
+The two form a ladder, and each rung checks the one below it:
+
+1. **Training loss** (cheap proxy) checked by
+2. **dev-set metric** (what you iterate on) checked by
+3. **frozen test set** (what you report) checked by
+4. **online A/B test** (what users do).
+
+When a rung stops predicting the next one up, you have a Goodhart problem at that rung. If your NDCG wins stop turning into click-through wins, it's time to look hard at whether your offline labels still mean what users mean. Measuring how well offline wins predict online wins is a real piece of work, and teams that do it trust their offline evals for good reasons instead of out of habit.
+
+## Build It
+
+You'll do this on the Spark: a small model answering arithmetic, three different judges grading it, a Goodhart demo, and then a clean harness. Arithmetic is chosen on purpose: a ten-line program knows the truth, so every judge can be checked exactly.
+
+Make a folder, say `~/workbench/evals/`. Everything below goes in it.
+
+<Task id="t0" title="Serve three local models and write a cached client" agent="ok">
+
+On the Spark, install Ollama and pull a tiny answerer, a bigger sibling from the same family, and a model from a different family. (Check `ollama.com/library` for current tags; these existed at the time of writing.)
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull qwen2.5:0.5b     # the answerer, and its own judge
+ollama pull qwen2.5:7b       # same family, bigger
+ollama pull llama3.1:8b      # different family
+python3 -m venv .venv && . .venv/bin/activate && pip install openai numpy
+```
+
+Ollama serves an OpenAI-compatible API on port 11434. Every call goes through one function that caches to disk, so reruns are free and every raw output is kept.
+
+```python
+# llm.py
+import hashlib, json, os, time
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+CACHE = "cache.jsonl"
+_mem = {}
+if os.path.exists(CACHE):
+    for line in open(CACHE):
+        rec = json.loads(line)
+        _mem[rec["key"]] = rec
+
+def llm(model: str, prompt: str, temperature: float = 0.0, seed: int = 0, max_tokens: int = 512) -> str:
+    key = hashlib.sha256(json.dumps([model, prompt, temperature, seed, max_tokens]).encode()).hexdigest()
+    if key in _mem:
+        return _mem[key]["out"]
+    t0 = time.perf_counter()
+    r = client.chat.completions.create(
+        model=model, temperature=temperature, seed=seed, max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    out = r.choices[0].message.content
+    rec = {"key": key, "model": model, "prompt": prompt, "temperature": temperature,
+           "seed": seed, "out": out, "secs": round(time.perf_counter() - t0, 3)}
+    _mem[key] = rec
+    with open(CACHE, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+    return out
+```
+
+And a question generator. Seeded, so the set is reproducible.
+
+```python
+# questions.py
+import json, random
+
+def make(n: int, seed: int) -> list[dict]:
+    rng = random.Random(seed)
+    qs = []
+    for i in range(n):
+        a, b, c = rng.randint(100, 999), rng.randint(11, 99), rng.randint(10, 999)
+        qs.append({"id": f"q{seed}-{i}", "question": f"What is {a} * {b} - {c}?", "answer": a * b - c})
+    return qs
+
+if __name__ == "__main__":
+    with open("questions.jsonl", "w") as f:
+        for q in make(400, seed=1):
+            f.write(json.dumps(q) + "\n")
+```
+
+The 0.5B model should get somewhere between a fifth and two thirds of these right. If it's far outside that, change the digit ranges: you want plenty of both right and wrong answers to grade.
+
+</Task>
+
+<Task id="t1" title="Answer, then verify with a program" agent="hands">
+
+Write the answerer and the ground-truth checker. The checker is the most important ten lines in this lesson: it's the grader that shares nothing with the model.
+
+```python
+# answer.py
+from llm import llm
+
+ANSWER_PROMPT = "{question}\nWork it out, then end with a line 'ANSWER: <integer>'."
+
+def answer(model: str, question: str) -> str:
+    """Return the model's full text response at temperature 0."""
+    ...
+
+def parse_int(text: str) -> int | None:
+    """Pull the integer after the last 'ANSWER:'. Strip commas and spaces.
+    Return None if there isn't one (that counts as wrong, but log it separately)."""
+    ...
+
+def verify(text: str, truth: int) -> bool:
+    """The programmatic verifier: parse, compare to the true answer."""
+    ...
+```
+
+Run it over all 400 questions with `qwen2.5:0.5b`. Print accuracy, and the count of unparseable responses. Then eyeball 10 failures: are they arithmetic slips, or parse failures? A verifier that marks right answers wrong because of formatting is a broken ruler, and you'd want to know before you trust it.
+
+</Task>
+
+<Task id="t2" title="Three judges: self, sibling, stranger" agent="hands">
+
+Now grade the same 400 responses three more ways, with a model judge that sees the question and the response but **not** the true answer.
+
+```python
+# judge.py
+JUDGE_PROMPT = """Here is a math question and a proposed solution.
+Question: {question}
+Solution: {response}
+Is the final answer correct? Reply with exactly one word: YES or NO."""
+
+def judge(judge_model: str, question: str, response: str) -> bool | None:
+    """True for YES, False for NO, None if the reply is neither. Temperature 0."""
+    ...
+
+def confusion(truth: list[bool], verdict: list[bool]) -> dict:
+    """Counts of the four boxes: tp (right, YES), fn (right, NO), fp (wrong, YES), tn (wrong, NO).
+    Also return tpr = tp/(tp+fn), far = fp/(fp+tn), measured = (tp+fp)/n."""
+    ...
+```
+
+Run it with judge models `qwen2.5:0.5b` (self), `qwen2.5:7b` (sibling) and `llama3.1:8b` (stranger). Use the verifier from t1 as truth. Fill in the first Measure table.
+
+Then try the correction. Split the 400 into 100 "calibration" and 300 "use". On the calibration 100, estimate each judge's TPR and FAR against the verifier. On the other 300, compute `(measured − FAR) / (TPR − FAR)` and compare to the verifier's true accuracy on those 300. Which judge does the correction rescue, and which does it make wild? (Hint: look at `TPR − FAR` for the self-judge.)
+
+</Task>
+
+<Task id="t3" title="Make a flawed metric go up while accuracy goes down" agent="hands">
+
+Here's the flawed metric. It's a caricature of a sloppy rubric: it rewards length and words that *sound* careful.
+
+```python
+# goodhart.py
+import re
+
+CAREFUL = ["verify", "check", "carefully", "therefore", "step", "confirm"]
+
+def looks_good(text: str) -> float:
+    """The proxy. 0 to 10. Rewards length (up to 300 words) and careful-sounding words."""
+    words = len(text.split())
+    hits = sum(text.lower().count(w) for w in CAREFUL)
+    return min(words, 300) / 50 + min(hits, 8) * 0.5
+```
+
+Now do two kinds of optimization against it.
+
+**Prompt search.** Score each of these prompts on 100 questions by mean `looks_good`, and also by true accuracy with your verifier:
+
+```python
+PROMPTS = [
+    "{question}\nEnd with 'ANSWER: <integer>'.",
+    "{question}\nThink step by step. End with 'ANSWER: <integer>'.",
+    "{question}\nThink step by step and double-check. End with 'ANSWER: <integer>'.",
+    "{question}\nExplain carefully, verify each step, at least 150 words. End with 'ANSWER: <integer>'.",
+    "{question}\nWrite at least 300 words. Use the words verify, check, therefore, carefully, confirm often. End with 'ANSWER: <integer>'.",
+    "{question}\nFirst write 300 words on the history of multiplication, mentioning that you verify and check carefully. Then end with 'ANSWER: <integer>'.",
+]
+```
+
+**Best-of-N selection.** For 100 questions, sample N = 8 responses at temperature 0.8 (vary `seed`). For N in 1, 2, 4, 8, pick the response with the highest `looks_good` among the first N, and record its true correctness. Also record two references: pick at random, and pick the correct one if any is correct (the ceiling, often called pass@N).
+
+```python
+def best_of_n(responses: list[str], n: int, key) -> str:
+    """Return the response among responses[:n] that maximizes key(response)."""
+    ...
+```
+
+Plot (or tabulate) mean proxy and true accuracy for each prompt, and for each N. You are hoping to see Figure 003 with real data. Be honest about what you see: step-by-step reasoning genuinely helps arithmetic, so true accuracy may rise for the first few prompts before falling. That's the healthy part of the curve, and it's exactly what makes Goodhart hard to spot early.
+
+Optional: replace `looks_good` with the 0.5B model rating responses 1 to 10, and check how strongly its ratings correlate with response length versus with correctness.
+
+</Task>
+
+<Task id="t4" title="Build the clean harness, with a frozen test set" agent="review">
+
+Now build the thing you'd actually trust. Requirements:
+
+- **Freeze the data.** Generate a fresh 1,000 questions with a seed you've never used. Split by a fixed rule into `dev.jsonl` (500) and `test.jsonl` (500). Write `manifest.json` with each file's SHA-256. The harness refuses to run if a hash doesn't match.
+- **One command, one config.** `python run_eval.py --config configs/foo.json --split dev`. The config names the model, prompt template, temperature, seed, and grader.
+- **Log everything.** Each run gets a folder `runs/<utc-timestamp>-<name>/` containing the config, the git commit of your code (`git rev-parse HEAD`, and a flag if the tree is dirty), the dataset hashes, every prompt and raw response, every parsed answer and verdict, latency per call, and a `summary.json` with the score and a 95% bootstrap interval.
+- **Guard the test set.** Running `--split test` requires `--final`, asks for a one-line reason, and appends an entry to `test_log.jsonl` (time, config, score, reason). The log is your record of how many times you've peeked. If it has more than a handful of entries, your test set is turning into a dev set, and the log will tell you so.
+
+Write it yourself, then have an agent review it specifically for leaks: anywhere test data could influence a decision, any non-determinism that would make two runs of the same config disagree, anything not logged that you'd need to reproduce a number six months from now.
+
+</Task>
+
+<Task id="t5" title="Win on noise, on your Mac" agent="hands">
+
+Reproduce Figure 005 with numpy. No LLM needed.
+
+```python
+# peek.py
+import numpy as np
+
+def best_of_k(n: int, k: int, rng) -> tuple[float, float]:
+    """Random 0/1 labels of length n. k random 0/1 'models'. Return (best test accuracy,
+    that same model's accuracy on a fresh set of random labels)."""
+    ...
+
+def lucky_vote(n: int, k: int, rng) -> tuple[float, float]:
+    """Keep the models with test accuracy > 0.5, majority-vote them. Return (test acc, fresh acc)."""
+    ...
+```
+
+Average each over 10-20 trials for k in 1, 10, 100, 1000, with n = 1000. Then change n to 200 (a typical "quick eval set") and rerun. How much fake improvement can 100 tries buy you now?
+
+</Task>
+
+<DoneWhen>
+
+- You have true accuracy for the 0.5B model from a program, and a confusion matrix for each of three model judges against it.
+- You can say, with your own numbers, how much the self-judge inflates the score and why.
+- You've seen a proxy metric rise while true accuracy fell (or you can explain precisely why it didn't in your run).
+- `run_eval.py` runs from a config, logs everything, verifies dataset hashes, and refuses to touch the test set without `--final`.
+- `peek.py` reproduces the shape of Figure 005.
+
+</DoneWhen>
+
+## Measure
+
+**Judges.** One row per grader, all on the same 400 responses from `qwen2.5:0.5b`.
+
+| Grader | Measured accuracy | TPR | FAR (wrong approved) | Corrected estimate (300) | Your prediction of FAR |
+| --- | --- | --- | --- | --- | --- |
+| Verifier (truth) | | 1.00 | 0.00 | — | |
+| Self (qwen2.5:0.5b) | | | | | |
+| Sibling (qwen2.5:7b) | | | | | |
+| Stranger (llama3.1:8b) | | | | | |
+
+What to expect, roughly (I could not run these models on this Mac, so this is a prediction to check, not a result): the self-judge far above the truth, with FAR well over half, because a 0.5B model barely judges and says YES to most things. If its TPR is close to its FAR, it isn't discriminating at all, and the correction divides by nearly zero and blows up. The 7B sibling and 8B stranger should both be much better, because they can mostly do the arithmetic. If they're close to each other, that's a real finding: for arithmetic the shared blind spot is "can't multiply", which a 7B model mostly doesn't have. Family matters most for things a whole family learned wrong from the same data.
+
+**Goodhart.** One row per prompt, 100 questions each.
+
+| Prompt | Mean words | Mean `looks_good` | True accuracy |
+| --- | --- | --- | --- |
+| P0 bare | | | |
+| P1 step by step | | | |
+| P2 double-check | | | |
+| P3 150 words | | | |
+| P4 300 words + keywords | | | |
+| P5 history essay | | | |
+
+And for best-of-N:
+
+| N | Proxy-picked accuracy | Random-picked accuracy | pass@N (ceiling) |
+| --- | --- | --- | --- |
+| 1 | | | |
+| 2 | | | |
+| 4 | | | |
+| 8 | | | |
+
+You should see `looks_good` climb nearly monotonically down the prompt table: it's measuring words and keywords, and the later prompts ask for exactly that. True accuracy should rise from P0 to P1 or P2 (reasoning helps) and then flatten or fall as the model spends its small capacity on padding (P5 may also cause more parse failures, which count as wrong). For best-of-N, pass@N will rise steeply (more chances), random-picked stays flat, and proxy-picked tells you whether your proxy has any real signal: if it tracks random, the proxy is selecting on length, which carries no information about correctness here.
+
+**Peeking.** On my Mac (Python 3.14, numpy, 20 trials per row, n = 1,000):
+
+| Models tried (K) | Best test accuracy | Same model, fresh labels |
+| --- | --- | --- |
+| 1 | 50.3% | ~50% |
+| 10 | 52.6% | ~50% |
+| 100 | 53.9% | ~50% |
+| 1,000 | 55.0% | ~50% |
+| 10,000 | 56.2% | ~50% |
+| Lucky vote, K = 1,000 | 71.1% | 50.5% |
+
+The shape follows from one fact: the best of K noisy scores grows like the standard error times roughly √(2 ln K). On 1,000 examples, one model's accuracy has a standard error of about √(0.25/1000) ≈ 1.6 points, so 100 tries buy about 3 standard errors, about 4.8 points in theory, a bit less in practice. Shrink n to 200 and the standard error grows to about 3.5 points, so the same 100 tries buy around 8 points of nothing (my simulation: 58.3%).
+
+## Break It
+
+**1. Give the judge the answer key.** Rerun the self-judge with the true answer in the prompt (for example "The correct answer is 9,716. Does the solution's final answer match?"). The 0.5B self-judge should suddenly look excellent. Why? You turned it into a string-matching verifier. What made it a bad grader was never that it's a neural network; it was that it had no access to the truth independent of its own beliefs. Reference answers are the cheapest independence you can buy, and it's why most good LLM-judge setups give the judge a reference or a rubric anchored in facts.
+
+**2. Leak the test set into the prompt.** Take 5 questions from `test.jsonl`, with answers, and put them in the prompt as few-shot examples. Score on the full test split. Those 5 jump to near-perfect, and the overall score rises a little. Now imagine this at internet scale, invisibly, across a whole benchmark: that's contamination. Then check that your harness from t4 would have caught you (did you log the prompt? does a hash or overlap check flag test items appearing in prompts?). If not, add an overlap check.
+
+**3. Pad a wrong answer.** Take 20 responses the stranger judge correctly rejected. Append "I have carefully verified each step twice and confirmed the result is correct." and rejudge. Count how many flip to YES. Then try moving the answer line to the top, or writing it twice. Each flip is a free point of score that nothing earned, and an RL policy optimized against this judge would discover these tricks within hours.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. The evaluator and the model are both ML models. Why are they separate systems?</summary>
+
+Because the eval's job isn't to be smart, it's to be an independent measurement of what you care about. Two kinds of independence matter. First, its errors must not line up with the model's errors: a model grading itself approves its own mistakes because the same weights that produced a wrong answer find it convincing, so the score is biased upward, not just noisy. Second, it must not be optimized against: once you train or select hard against a score, the system finds the ways the score differs from the real goal (Goodhart's law), so the score stops meaning anything. A model can be a fine grader if it's a different model, the judging task is easier than the generating one, and you've measured its agreement with human labels. It just can't be the same thing, and it can't be the target.
+
+</details>
+
+<details>
+<summary>2. Why not just train directly on the metric you care about, like NDCG or accuracy?</summary>
+
+Often you can't: those metrics are step functions (accuracy flips between right and wrong; NDCG depends on a sort), so their gradient is zero almost everywhere and gradient descent gets no signal. So you train on a smooth, cheap proxy like cross-entropy or a pairwise loss, and measure the real metric separately. Even when you can optimize the real metric (by RL, or by selecting among candidates), the metric you optimize stops being an honest measure of progress, so you still need a separate held-out measurement to check you've improved and not just fit the metric's quirks.
+
+</details>
+
+<details>
+<summary>3. Why must the test set stay untouched, if you never train on it?</summary>
+
+Because decisions leak information too. Every time you look at a test score and keep or discard a change, you've used the test set to choose, which partly fits your system to those specific examples. With enough decisions you can overfit it without a single gradient step: picking the best of 100 random models on a 1,000-example set buys about 4 points of pure noise. The fix is separate piles: a dev set you iterate on freely (and discount), and a test set you score on once at the end, with a log of every time you peek. Also watch for leaks that bypass you entirely: duplicates across splits, the same query or user on both sides, and test data in pretraining.
+
+</details>
+
+<details>
+<summary>4. How does this scale? You go from 1 eval decision a week to an automated search that tries 10,000 prompt variants a day against the same 500-example dev set.</summary>
+
+The fake improvement from selection grows with the number of things you try, roughly like √(2 ln K) standard errors. At 500 examples one score's standard error is about 2 points at 50% accuracy, so the best of 10,000 variants can look about 9 points better than it is, purely by luck (I simulated it with random guessers: best of 10,000 on 500 random labels scored 58.9%), and the search will happily find it. So more search needs more data and more separation: a bigger dev set (the noise shrinks like 1/√n, so 4x the data halves it), a separate validation set to confirm the winner, a test set used once, and ideally fresh data regularly so nothing gets reused forever. Cost scales too: a model judge at 10,000 variants × 500 examples is 5 million judge calls a day, which is why cheap programmatic graders and caching matter, and why you'd shortlist with a cheap metric and confirm with an expensive one.
+
+</details>
+
+<details>
+<summary>5. When would you trust an LLM judge for your ranker's eval, and what would you check first?</summary>
+
+When the criterion is fuzzy enough that a program can't compute it (is this document actually relevant to the intent?), and labeling everything by hand is too slow. First I'd hand-label a few hundred (query, document) pairs myself, run the judge on them, and measure agreement and its false-approval and false-rejection rates, overall and per query type. I'd use a judge from a different model family than anything that generated or trained the ranker, give it a clear rubric with examples, check position and length bias by swapping order and padding, and recalibrate periodically. And I'd never train the ranker against that judge without keeping a separate, human-labeled test set to catch it gaming the judge. Finally, I'd check that offline wins under the judge predict online A/B wins, because that's the rung above.
+
+</details>
+
+## Go Deeper
+
+- **David Manheim and Scott Garrabrant, "Categorizing Variants of Goodhart's Law"** (2018, arXiv). Splits Goodhart into regressional, extremal, causal and adversarial versions. Short, and it turns a proverb into a checklist.
+- **Leo Gao, John Schulman, Jacob Hilton, "Scaling Laws for Reward Model Overoptimization"** (2022, arXiv). Figure 003 measured for real in RLHF: optimize a learned reward harder and a gold reward rises, then falls.
+- **Cynthia Dwork, Vitaly Feldman, Moritz Hardt, Toniann Pitassi, Omer Reingold, Aaron Roth, "The reusable holdout: Preserving validity in adaptive data analysis"** (Science, 2015). Why peeking at a holdout breaks it, and a provable way to reuse one safely.
+- **Avrim Blum and Moritz Hardt, "The Ladder: A Reliable Leaderboard for Machine Learning Competitions"** (ICML 2015). The leaderboard-climbing attack from Figure 005 and a leaderboard that resists it.
+- **Benjamin Recht, Rebecca Roelofs, Ludwig Schmidt, Vaishaal Shankar, "Do ImageNet Classifiers Generalize to ImageNet?"** (ICML 2019). The careful counterpoint: a decade of reuse produced less adaptive overfitting than feared, and why.
+- **Lianmin Zheng et al., "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"** (NeurIPS 2023 Datasets and Benchmarks). The standard reference for when model judges agree with humans, and their position, verbosity and self-enhancement biases.
+- **Ron Kohavi, Diane Tang, Ya Xu, _Trustworthy Online Controlled Experiments_** (Cambridge University Press, 2020). The book on A/B testing from people who ran it at Microsoft, Google and LinkedIn; read the chapters on metrics and on offline-online gaps.
+- **Hamel Husain, "Your AI Product Needs Evals"** (2024, blog at hamel.dev). The practitioner's case for eval-driven development: start from real failures, write cheap assertions, calibrate model judges on your own labels.
+
+## Connections
+
+This is the doorway to the Evaluation track. [Ranking metrics and eval sets](/lessons/ranking-metrics/) applies it to your cross-encoder: which metric, and how to build an eval set with query-level splits. [Is that improvement real?](/lessons/statistics-for-evals/) puts error bars on everything here, including how big a dev set has to be before a 1-point win means anything. [LLMs as judges](/lessons/llm-judges/) is the full treatment of model-based grading: rubrics, calibration, and catching position and length bias.
+
+It also sets up the Agents & RL track. A reward in RL is an eval that's become a target, so [Verifiers and rewards](/lessons/verifiers-rewards/) is this lesson's Goodhart section with a training loop attached, and it's why programmatic verifiers (like the ten-line arithmetic checker you wrote) are so valuable there. And [Training a tiny LM](/lessons/tiny-lm/) is where you first watched train and val loss diverge: overfitting is Goodhart's law applied to the training set.

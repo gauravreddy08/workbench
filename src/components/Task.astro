@@ -1,0 +1,35 @@
+---
+// A build task with a checkbox (saved in this browser) and an agent-help badge.
+// agent: "hands"   -> write it yourself, no agent
+//        "explain" -> agent may explain concepts, not write the code
+//        "review"  -> write it yourself, then let an agent review it
+//        "ok"      -> boilerplate; let the agent write it
+interface Props { id: string; title: string; agent?: 'hands' | 'explain' | 'review' | 'ok' }
+const { id, title, agent = 'hands' } = Astro.props;
+const lesson = Astro.url.pathname.replace(/\/$/, '').split('/').pop();
+const key = `wb:task:${lesson}:${id}`;
+const badge = { hands: 'Hands only', explain: 'Agent: explain only', review: 'Agent: review after', ok: 'Agent: fine' }[agent];
+---
+<section class="task" data-key={key}>
+  <div class="task-head">
+    <input type="checkbox" aria-label={`Mark "${title}" done`} />
+    <span class="t">{title}</span>
+    <span class:list={['badge', agent]}>{badge}</span>
+  </div>
+  <div class="task-body"><slot /></div>
+</section>
+<script>
+  import { saveProgress } from '../lib/db';
+  const wire = () => document.querySelectorAll<HTMLElement>('.task[data-key]').forEach((el) => {
+    const key = el.dataset.key!;
+    const cb = el.querySelector<HTMLInputElement>('.task-head input')!;
+    const sync = () => el.classList.toggle('done', cb.checked);
+    try { cb.checked = localStorage.getItem(key) === '1'; } catch {}
+    sync();
+    if (el.dataset.wired) return;
+    el.dataset.wired = '1';
+    cb.addEventListener('change', () => { sync(); saveProgress(key, cb.checked ? '1' : '0'); });
+  });
+  wire();
+  window.addEventListener('wb:synced', wire);
+</script>

@@ -1,0 +1,556 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import BandwidthStream from '../components/figures/BandwidthStream.astro';
+import BandwidthRoofline from '../components/figures/BandwidthRoofline.astro';
+
+## Today
+
+- Predict, with one division and no code, how many tokens per second your DGX Spark can generate for any model, before you download it.
+- Explain in plain words why generating text is limited by how fast memory moves bytes, not by how fast the GPU does math.
+- Read a roofline plot: know what arithmetic intensity is, where the ridge point sits on your machine, and which side of it a workload lives on.
+- Tell prefill from decode, and say which one sets time to first token and which one sets tokens per second.
+- Name every way around the wall (quantization, batching, mixture of experts, speculative decoding, faster memory) and say which byte each one saves.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (latency vs bandwidth, the Spark's memory numbers) and [Waiting vs working](/lessons/waiting-vs-working/) (a GPU call returns before the work is done). You have written a transformer forward pass before, so you know what is inside a layer. About 3 hours, half of it measuring.
+
+## The Problem
+
+You have built Llama from scratch. You know the forward pass: embed a token, run it through 32 layers of attention and MLP, project to the vocabulary, sample. You know about the KV cache. So here is the question from the diagnostic, sharpened into a number:
+
+<Predict id="tok-per-sec">
+You run Llama 3.1 8B in bf16 on your DGX Spark, one user, short prompt. How many tokens per second will it generate? Write a number, and one sentence on what limits it.
+
+<Fragment slot="answer">
+
+About **17 tokens per second at the very most**, and in practice a bit less. The limit is not the GPU's math. It is that every token needs every weight read out of memory once: 8 billion weights × 2 bytes = 16 GB, through a pipe the spec sheet rates at 273 GB/s. 16 / 273 ≈ 0.059 seconds per token, which is about 17 per second. If you said "the GPU is slow" or "attention is expensive", this lesson is for you. If you said 17, this lesson is about why it is 17 and how to beat it.
+
+</Fragment>
+</Predict>
+
+Here is the strange part. The Spark's GPU can do somewhere around a hundred trillion bf16 multiply-adds per second (we will pin that down by measuring). Generating one token of an 8B model needs about 16 billion operations. Divide, and the GPU should make thousands of tokens per second. It makes seventeen. The tensor cores are idle more than 99% of the time, waiting for weights to arrive.
+
+That gap between "how fast it can think" and "how fast it can be fed" is the whole lesson. And once you see it, every inference optimization in this track (quantization, batching, speculative decoding, the lot) turns into the same move: find a way to get more useful work out of each byte you drag out of memory.
+
+<Origin year="1995" title="Hitting the memory wall">
+
+In 1995 William Wulf and Sally McKee published a two-page note with a deliberately boring title: "Hitting the Memory Wall: Implications of the Obvious." Processor speed was improving about 60% a year. Memory speed was improving about 7% a year. They pointed out that if you just keep multiplying, there comes a point where the processor spends almost all its time waiting for memory, and no amount of faster arithmetic helps.
+
+Chip designers fought the wall with caches, which work when a program reuses the same data many times. Large language model decoding is the case caches cannot save: the "data" is 16 GB of weights, each used once per token, far too big for any cache. Thirty years later, the memory wall is the reason your chatbot types at the speed it does, and the reason inference companies buy GPUs with very expensive memory.
+
+</Origin>
+
+## The Idea
+
+### One token, one trip through every weight
+
+Picture a kitchen with one chef who can chop absurdly fast, maybe a thousand onions a second. The onions live in a warehouse across town and arrive by one delivery van. How many onions per second does the kitchen process? Not a thousand. It processes exactly as many as the van delivers. The chef is irrelevant. The van is everything.
+
+In decoding, the chef is the GPU's math units and the van is the memory bus. Here is what one decode step actually does, for one new token:
+
+1. Take the vector for the latest token (4,096 numbers for Llama 3.1 8B).
+2. For each of the 32 layers, multiply that vector by the layer's weight matrices: the attention projections (Q, K, V, output) and the MLP (gate, up, down).
+3. Multiply the result by the output projection to get a score for each of the 128,256 vocabulary entries. Sample one.
+
+Step 2 is a <Term w="matrix-vector multiply">Multiplying a matrix by a single column of numbers. Each weight in the matrix gets used exactly once: one multiply, one add, then it is never touched again for this token.</Term>, 32 times over. Every weight in every matrix has to travel from memory into the chip, get used for one multiply and one add, and be thrown away. Then the next token comes and the whole model has to travel again, because the GPU has nowhere near 16 GB of on-chip storage to keep it in.
+
+So the cost of a token is, to first order, **the time to read all the weights once**:
+
+```text
+time per token  ≈  bytes of weights  ÷  memory bandwidth
+                ≈  8.03e9 params × 2 bytes  ÷  273e9 bytes/s
+                ≈  16.06 GB ÷ 273 GB/s
+                ≈  0.0588 s
+
+tokens per second  ≈  1 ÷ 0.0588  ≈  17
+```
+
+<Term w="memory bandwidth">How many bytes per second can move between memory and the chip. Not how long one read takes (that is latency), but how wide the pipe is once data is flowing. The Spark's spec sheet says about 273 GB/s.</Term> is the number from the [latency lesson](/lessons/latency-numbers/) that you probably filed away as trivia. It is now the most important number about your machine.
+
+<Figure n="001" title="THE ONE DIVISION" caption="Every token drags the whole model through the pipe. The pipe, not the GPU, sets the speed.">
+
+<svg viewBox="0 0 560 230" role="img" aria-label="Memory holding 16 GB of weights connected by a narrow 273 GB/s pipe to a GPU with large compute capacity">
+  <rect x="10" y="20" width="190" height="150" class="fill-paper" stroke-width="1.2" />
+  <text x="20" y="40" class="strong">MEMORY · 128 GB</text>
+  <text x="20" y="56">LPDDR5X, SHARED CPU+GPU</text>
+  <rect x="24" y="72" width="162" height="56" class="fill-wash" stroke-width="1" />
+  <text x="105" y="96" text-anchor="middle" class="blue-t">WEIGHTS</text>
+  <text x="105" y="114" text-anchor="middle" class="blue-t">8.03B × 2 B = 16 GB</text>
+  <text x="24" y="152">REST: FREE</text>
+
+  <line x1="200" y1="88" x2="350" y2="88" class="ink" stroke-width="1.5" />
+  <line x1="200" y1="112" x2="350" y2="112" class="ink" stroke-width="1.5" />
+  <rect x="200" y="96" width="150" height="8" class="fill-blue" />
+  <polygon points="350,92 362,100 350,108" class="fill-blue" />
+  <text x="275" y="78" text-anchor="middle" class="strong">273 GB/S</text>
+  <text x="275" y="132" text-anchor="middle">THE NARROW PART</text>
+
+  <rect x="366" y="20" width="184" height="150" class="fill-paper" stroke-width="1.2" />
+  <text x="376" y="40" class="strong">GPU · TENSOR CORES</text>
+  <text x="376" y="56">~100+ TFLOP/S BF16</text>
+  <rect x="380" y="72" width="156" height="56" class="ink dash" stroke-width="1" />
+  <rect x="380" y="72" width="2" height="56" class="fill-blue" />
+  <text x="458" y="96" text-anchor="middle">BUSY &lt;1% OF</text>
+  <text x="458" y="112" text-anchor="middle">THE TIME</text>
+
+  <text x="280" y="200" text-anchor="middle" class="strong">16 GB ÷ 273 GB/S = 59 MS PER TOKEN → ~17 TOK/S</text>
+  <text x="280" y="220" text-anchor="middle">SPEC-SHEET BANDWIDTH · A CEILING, NOT A PROMISE</text>
+</svg>
+
+</Figure>
+
+Two refinements, so the number is honest. First, the embedding table at the bottom of the model is a lookup: you read one row of it, not all 525 million entries. The output projection at the top is a full matrix, so it does get read. That makes the true weight traffic about 15 GB, and the ceiling about 18 tok/s. Second, you never get the full spec-sheet bandwidth. Real memory systems deliver some fraction of their rated speed, and real software adds overhead on top. So "17" is a ceiling to beat your measurements against, not a promise. You will measure the real bandwidth in the Build section and redo the division with it.
+
+### Watch one step
+
+Step through a single decode step below. Each cell is one layer, about 436 MB in bf16. Watch the two timelines at the bottom: the memory bus is busy the whole time, and the tensor cores get a sliver at the end of each delivery. Then switch the batch to 16 and 128 and run it again.
+
+<Figure n="002" title="ONE DECODE STEP, LAYER BY LAYER" caption="Llama 3.1 8B, bf16, on spec-sheet Spark numbers (273 GB/s; ~125 TFLOP/s assumed). The bus is always busy. The math is a hairline until many tokens share each delivery.">
+
+<BandwidthStream />
+
+</Figure>
+
+Notice what changing the batch did. The memory bar did not change at all: the same 15 GB crossed the pipe. The compute slivers grew. With 128 users in one step, each layer's weights got used 128 times per trip instead of once, and you produced 128 tokens for the price of one delivery. Keep that in your pocket. It is the most important idea in inference economics, and we will come back to it.
+
+### Arithmetic intensity: work per byte
+
+Now the real vocabulary. The useful question about any piece of computation is: **for every byte I bring in from memory, how much math do I do with it?** That ratio has a name: <Term w="arithmetic intensity">FLOPs done divided by bytes moved from memory. High means you do lots of work per byte (good for the chip's math units). Low means you mostly shuffle data.</Term>. It is measured in <Term w="FLOPs">Floating-point operations: one multiply or one add of decimal numbers. A multiply-add counts as 2. "FLOP/s" (with the slash) means per second, a speed.</Term> per byte.
+
+For single-stream decode it is easy to work out by hand. Each weight does one multiply and one add, so 2 FLOPs. Each weight is 2 bytes in bf16. So:
+
+```text
+arithmetic intensity (decode, batch 1, bf16)  =  2 FLOPs / 2 bytes  =  1 FLOP per byte
+```
+
+Is 1 a lot? Compare it with what the chip can sustain. If the GPU can do (say) 125 trillion FLOPs a second, and memory delivers 273 billion bytes a second, then to keep the math units busy you would need to do 125e12 / 273e9 ≈ **458 FLOPs for every byte** you bring in. Decode does 1. You are short by a factor of hundreds.
+
+That number, peak FLOPs divided by bandwidth, is the machine's <Term w="ridge point">Peak FLOP/s divided by memory bandwidth, in FLOPs per byte. Work with intensity below it is limited by memory; above it, by math. Every chip has its own.</Term>. It is a property of the hardware, not of your code. Below the ridge you are <Term w="memory-bound">The work finishes when the data finishes arriving. Faster math would not help; fewer or faster bytes would. Also called bandwidth-bound.</Term>. Above it you are <Term w="compute-bound">The data arrives faster than the math can use it. Now faster math units would help, and fewer bytes would not.</Term>.
+
+A note on the 125 figure. NVIDIA markets the Spark as "up to 1 petaFLOP" of AI compute, which is FP4 precision with 2:4 sparsity, the most flattering number possible. A common rule of thumb for this generation is that dense is half of sparse, and each doubling of precision halves the rate: 1000 → 500 (dense FP4) → 250 (FP8) → 125 (BF16). Treat 125 TFLOP/s as an upper bound, not a spec. The real dense BF16 rate may be lower, and you will measure it yourself with one big matrix multiply. Whatever it turns out to be, the ridge point stays in the hundreds, and decode at 1 FLOP/byte stays hopelessly far to the left of it.
+
+### The roofline
+
+In 2009, Samuel Williams, Andrew Waterman and David Patterson drew this idea as a picture, and the picture stuck. It is called the <Term w="roofline model">A plot of achievable FLOP/s against arithmetic intensity. A sloped line (bandwidth × intensity) meets a flat line (peak compute). Your workload sits somewhere under that roof.</Term>.
+
+Put arithmetic intensity on the x-axis and achieved FLOP/s on the y-axis, both on log scales. Two lines limit you. The flat line at the top is the compute roof: you cannot go faster than the chip's peak math. The sloped line on the left is the bandwidth slope: if you do I FLOPs per byte and bytes arrive at 273 GB/s, you can do at most 273e9 × I FLOPs per second. Wherever the two meet is the ridge point. Your program lives somewhere under the roof, and which line is above it tells you what to fix.
+
+Here is the calculator for this whole lesson. Start with the defaults (8B, bf16, Spark, batch 1). Then drag batch up slowly and watch the dot walk up the slope. Then drag context up and watch it stall.
+
+<Figure n="003" title="DECODE CALCULATOR + ROOFLINE" caption="Hardware numbers are approximate spec-sheet figures (dense BF16; the Spark's compute is an upper-bound estimate). The dashed trail shows every batch size at the current settings. KV cache assumed bf16." wide>
+
+<BandwidthRoofline />
+
+</Figure>
+
+A few things to try, because each one is a later lesson in miniature:
+
+- **Batch 1 → 64 on the Spark at 1K context.** Per stream drops from ~17 to ~11 tok/s, but total throughput goes from 17 to about 700. That is [batching](/lessons/batching/).
+- **BF16 → FP8 → 4-bit at batch 1.** The ceiling goes 17 → 34 → 68. Halve the bytes, double the speed. That is [quantization](/lessons/quantization/).
+- **Switch to H100 SXM.** Same model, single stream, about 209 tok/s ceiling, because its HBM3 memory is spec'd at about 3.35 TB/s. That is a big part of why a provider like Fireworks feels faster per stream than your Spark, before any of their clever tricks.
+- **Context to 128K at batch 1.** The KV cache bar grows to the size of the weights and the speed halves. More on that below.
+- **Qwen3 30B-A3B.** A 30-billion-parameter model that decodes faster than the 8B. More on that below too.
+
+### Prefill is the opposite workload
+
+There is one more piece before the escape routes, and it matters a lot for the next lesson's metrics.
+
+When you send a prompt, the model does not process it one token at a time. All the prompt's tokens are known up front, so it runs them through the model together in one pass. This is <Term w="prefill">The first phase of generation: running the whole prompt through the model at once to fill the KV cache and produce the first output token.</Term>. Each weight matrix now multiplies a whole block of token vectors at once, a <Term w="matrix-matrix multiply">Multiplying a matrix by another matrix (here: weights × many tokens). Each weight, once loaded, is reused for every token in the block, so work per byte grows with the number of tokens.</Term>. A 1,000-token prompt reuses every weight 1,000 times per read. Arithmetic intensity is about 1,000. That is over the ridge: prefill is compute-bound.
+
+Then comes <Term w="decode">The second phase: generating output tokens one at a time, each depending on the one before. Each step is a matrix-vector multiply per layer, so it is memory-bound.</Term>. You cannot do decode tokens in parallel, because token 5 depends on token 4, which you have not picked yet. One at a time, one full read of the weights per token.
+
+<Figure n="004" title="PREFILL VS DECODE" caption="Same weights, same read. Prefill does N tokens of math per read; decode does one.">
+
+<svg viewBox="0 0 560 230" role="img" aria-label="Prefill multiplies the weight matrix by many token columns; decode multiplies it by one">
+  <text x="10" y="16" class="strong">PREFILL · MATRIX × MATRIX</text>
+  <rect x="10" y="30" width="110" height="110" class="fill-wash" stroke-width="1.2" />
+  <text x="65" y="90" text-anchor="middle" class="blue-t">W</text>
+  <text x="134" y="90" text-anchor="middle">×</text>
+  <rect x="148" y="30" width="110" height="110" class="fill-paper" stroke-width="1.2" />
+  <line x1="170" y1="30" x2="170" y2="140" class="ink" stroke-width="0.6" />
+  <line x1="192" y1="30" x2="192" y2="140" class="ink" stroke-width="0.6" />
+  <line x1="214" y1="30" x2="214" y2="140" class="ink" stroke-width="0.6" />
+  <line x1="236" y1="30" x2="236" y2="140" class="ink" stroke-width="0.6" />
+  <text x="203" y="156" text-anchor="middle">N PROMPT TOKENS</text>
+  <text x="10" y="180">ONE READ OF W → N TOKENS OF MATH</text>
+  <text x="10" y="198" class="blue-t">INTENSITY ≈ N FLOP/BYTE · COMPUTE-BOUND</text>
+  <text x="10" y="216" class="strong">SETS TIME TO FIRST TOKEN</text>
+
+  <line x1="290" y1="10" x2="290" y2="220" class="ink dash" stroke-width="1" />
+
+  <text x="310" y="16" class="strong">DECODE · MATRIX × VECTOR</text>
+  <rect x="310" y="30" width="110" height="110" class="fill-wash" stroke-width="1.2" />
+  <text x="365" y="90" text-anchor="middle" class="blue-t">W</text>
+  <text x="434" y="90" text-anchor="middle">×</text>
+  <rect x="448" y="30" width="20" height="110" class="fill-paper" stroke-width="1.2" />
+  <text x="458" y="156" text-anchor="middle">1 TOKEN</text>
+  <text x="310" y="180">ONE READ OF W → 1 TOKEN OF MATH</text>
+  <text x="310" y="198" class="blue-t">INTENSITY ≈ 1 FLOP/BYTE · MEMORY-BOUND</text>
+  <text x="310" y="216" class="strong">SETS TOKENS PER SECOND</text>
+</svg>
+
+</Figure>
+
+So the two numbers you will benchmark against Fireworks in [the next lesson](/lessons/baseline-vs-fireworks/) come from opposite sides of the roofline:
+
+- <Term w="TTFT">Time to first token: how long from sending the request until the first output token arrives. Dominated by prefill (plus queueing and network).</Term> is mostly prefill, so it depends on **compute**. Ideal prefill for 1,000 tokens of an 8B model is 2 × 8.03e9 × 1,000 ≈ 16 trillion FLOPs; at 125 TFLOP/s that is about 0.13 s. Expect a few times that in practice.
+- Tokens per second after that is decode, so it depends on **bandwidth**. The same 1,000 tokens generated one at a time take 1,000 / 17 ≈ 59 s.
+
+Same model, same number of tokens: about 0.13 seconds one way and about a minute the other. If you remember one picture from this lesson, make it that one.
+
+### The KV cache is also bytes
+
+You know the <Term w="KV cache">The stored keys and values for every past token, in every layer, so attention does not have to recompute them each step. It is read in full at every decode step.</Term> saves recomputing attention over the past. What it costs is memory, and since attention has to look at every past key and value each step, it is also **more bytes to read per token**. The weights are the same for every token; the KV cache grows with every token.
+
+Size per token of context:
+
+```text
+KV bytes/token = 2 (K,V) × layers × kv_heads × head_dim × bytes/value
+
+Llama 3.1 8B:   2 × 32 × 8 × 128 × 2  =  131,072 bytes  =  128 KiB
+```
+
+Llama 3.1 8B has 32 query heads but only 8 key/value heads, a trick called <Term w="GQA">Grouped-query attention: several query heads share one set of key and value heads. Llama 3.1 8B shares each K/V head across 4 query heads, which cuts the KV cache by 4x.</Term>. Without it, the cache would be 4x bigger. Now scale it:
+
+<Figure n="005" title="WEIGHTS VS KV CACHE, ONE STREAM" caption="Llama 3.1 8B, bf16 weights and cache, spec-sheet 273 GB/s. At 128K context the cache outweighs the model and the ceiling halves.">
+
+<svg viewBox="0 0 560 220" role="img" aria-label="Bar chart comparing the 16 GB of weights to KV cache size at 1K, 8K, 32K and 128K context">
+  <text x="10" y="16" class="strong">BYTES READ PER TOKEN</text>
+  <text x="550" y="16" text-anchor="end" class="strong">CEILING</text>
+
+  <text x="10" y="44">WEIGHTS</text>
+  <rect x="90" y="32" width="364" height="16" class="fill-blue" />
+  <text x="460" y="44">16.1 GB</text>
+  <text x="550" y="44" text-anchor="end">-</text>
+
+  <text x="10" y="80">KV @ 1K</text>
+  <rect x="90" y="68" width="3" height="16" class="fill-wash" stroke-width="1" />
+  <text x="100" y="80">0.13 GB</text>
+  <text x="550" y="80" text-anchor="end" class="blue-t">16.9 TOK/S</text>
+
+  <text x="10" y="114">KV @ 8K</text>
+  <rect x="90" y="102" width="24" height="16" class="fill-wash" stroke-width="1" />
+  <text x="120" y="114">1.1 GB</text>
+  <text x="550" y="114" text-anchor="end" class="blue-t">15.9 TOK/S</text>
+
+  <text x="10" y="148">KV @ 32K</text>
+  <rect x="90" y="136" width="97" height="16" class="fill-wash" stroke-width="1" />
+  <text x="193" y="148">4.3 GB</text>
+  <text x="550" y="148" text-anchor="end" class="blue-t">13.4 TOK/S</text>
+
+  <text x="10" y="182">KV @ 128K</text>
+  <rect x="90" y="170" width="389" height="16" class="fill-wash" stroke-width="1" />
+  <text x="404" y="182" text-anchor="end" class="strong">17.2 GB</text>
+  <text x="550" y="182" text-anchor="end" class="blue-t">8.2 TOK/S</text>
+
+  <line x1="454" y1="26" x2="454" y2="196" class="ink dash" stroke-width="1" />
+  <text x="90" y="210">CEILING = 273 GB/S ÷ (WEIGHTS + KV)</text>
+</svg>
+
+</Figure>
+
+For a single chat at normal lengths the cache is noise: 8K tokens of context costs you about 6% of your speed. It starts to matter in two situations. One is very long context, as in the figure. The other is batching, which is where it gets interesting: when 32 users each have 4K tokens of context, that is 32 × 4,096 × 128 KiB = 16 GiB, the same as one user at 128K. **Weights are shared across a batch. KV caches are not.** Each user's cache belongs to that user and has to be read separately. This is why, in Figure 003, throughput climbs steeply with batch at short context and then flattens long before the ridge point at 1K and beyond. It is also why the next few lessons spend so much effort on the cache: [how much memory it takes](/lessons/memory-math/), [what is in it](/lessons/kv-cache/), and [how to share it](/lessons/prefix-caching/).
+
+(The formula above counts bytes, not FLOPs. Attention's math per token also grows with context, but its intensity stays low, a few FLOPs per byte with GQA, because each cached key and value is used once per step. Attention in decode is memory-bound too.)
+
+### Every way around the wall
+
+The whole equation for single-stream decode fits on one line:
+
+```text
+tokens/sec  ≈  usable bandwidth  ÷  bytes read per token
+```
+
+Everything in the rest of this track attacks one side of that division, or changes how many tokens you get out of one read.
+
+<Figure n="006" title="THE ESCAPE ROUTES" caption="Each optimization in this track is a way to get more tokens out of each byte that crosses the pipe.">
+
+<svg viewBox="0 0 560 300" role="img" aria-label="The decode equation with five levers: fewer bytes per weight, fewer weights per token, more tokens per read via batching, more tokens per read via speculation, and more bandwidth">
+  <rect x="140" y="12" width="280" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="32" text-anchor="middle" class="strong">TOK/S ≈ BANDWIDTH ÷ BYTES PER TOKEN</text>
+  <text x="280" y="48" text-anchor="middle" class="blue-t">× TOKENS PER READ</text>
+
+  <line x1="280" y1="56" x2="280" y2="80" class="ink" stroke-width="1" />
+  <line x1="62" y1="80" x2="498" y2="80" class="ink" stroke-width="1" />
+  <line x1="62" y1="80" x2="62" y2="98" class="ink" stroke-width="1" />
+  <line x1="171" y1="80" x2="171" y2="98" class="ink" stroke-width="1" />
+  <line x1="280" y1="80" x2="280" y2="98" class="ink" stroke-width="1" />
+  <line x1="389" y1="80" x2="389" y2="98" class="ink" stroke-width="1" />
+  <line x1="498" y1="80" x2="498" y2="98" class="ink" stroke-width="1" />
+
+  <rect x="12" y="98" width="100" height="120" class="fill-paper" stroke-width="1" />
+  <text x="62" y="116" text-anchor="middle" class="strong">FEWER BYTES</text>
+  <text x="62" y="130" text-anchor="middle" class="strong">PER WEIGHT</text>
+  <text x="62" y="152" text-anchor="middle">FP8: 2×</text>
+  <text x="62" y="166" text-anchor="middle">4-BIT: ~4×</text>
+  <text x="62" y="204" text-anchor="middle" class="blue-t">QUANTIZATION</text>
+
+  <rect x="121" y="98" width="100" height="120" class="fill-paper" stroke-width="1" />
+  <text x="171" y="116" text-anchor="middle" class="strong">FEWER WEIGHTS</text>
+  <text x="171" y="130" text-anchor="middle" class="strong">PER TOKEN</text>
+  <text x="171" y="152" text-anchor="middle">30B STORED</text>
+  <text x="171" y="166" text-anchor="middle">3B READ</text>
+  <text x="171" y="204" text-anchor="middle" class="blue-t">MOE</text>
+
+  <rect x="230" y="98" width="100" height="120" class="fill-paper" stroke-width="1" />
+  <text x="280" y="116" text-anchor="middle" class="strong">MANY USERS</text>
+  <text x="280" y="130" text-anchor="middle" class="strong">PER READ</text>
+  <text x="280" y="152" text-anchor="middle">B STREAMS,</text>
+  <text x="280" y="166" text-anchor="middle">ONE READ</text>
+  <text x="280" y="204" text-anchor="middle" class="blue-t">BATCHING</text>
+
+  <rect x="339" y="98" width="100" height="120" class="fill-paper" stroke-width="1" />
+  <text x="389" y="116" text-anchor="middle" class="strong">MANY TOKENS</text>
+  <text x="389" y="130" text-anchor="middle" class="strong">PER READ</text>
+  <text x="389" y="152" text-anchor="middle">GUESS K,</text>
+  <text x="389" y="166" text-anchor="middle">CHECK IN ONE</text>
+  <text x="389" y="204" text-anchor="middle" class="blue-t">SPECULATION</text>
+
+  <rect x="448" y="98" width="100" height="120" class="fill-paper" stroke-width="1" />
+  <text x="498" y="116" text-anchor="middle" class="strong">WIDER</text>
+  <text x="498" y="130" text-anchor="middle" class="strong">PIPE</text>
+  <text x="498" y="152" text-anchor="middle">273 GB/S →</text>
+  <text x="498" y="166" text-anchor="middle">3,350 GB/S</text>
+  <text x="498" y="204" text-anchor="middle" class="blue-t">HBM</text>
+
+  <text x="280" y="246" text-anchor="middle">AND FOR THE KV SIDE OF THE BYTES:</text>
+  <text x="280" y="264" text-anchor="middle" class="blue-t">GQA · KV QUANTIZATION · PAGED + PREFIX-SHARED CACHE</text>
+  <text x="280" y="288" text-anchor="middle">FOR PREFILL (COMPUTE SIDE): FLASHATTENTION · PREFIX CACHING SKIPS IT ENTIRELY</text>
+</svg>
+
+</Figure>
+
+**Fewer bytes per weight: quantization.** Store each weight in 8 bits instead of 16 and you read 8 GB per token instead of 16: ceiling 34 tok/s. In 4 bits, roughly 4 GB and 68 tok/s. Real 4-bit formats store a scale factor alongside each small group of weights, so they average closer to 4.5 to 5 bits per weight; a popular 4-bit file of Llama 3.1 8B (llama.cpp's Q4_K_M) is about 4.9 GB, which predicts about 55 tok/s. The cost is accuracy, and measuring that cost honestly is [the quantization lesson](/lessons/quantization/). Notice the math still happens in 16-bit or so after unpacking; the win is purely in the bytes crossing the pipe.
+
+**Fewer weights per token: mixture of experts.** An <Term w="MoE">Mixture of experts: a model whose MLP layers are split into many smaller "expert" MLPs, with a small router that sends each token to only a few of them. Most weights sit idle for any given token.</Term> model replaces each big MLP with many small ones and only uses a few per token. Qwen3 30B-A3B has about 30.5 billion parameters in total, but each token activates only about 3.3 billion (8 of its 128 experts per layer, plus the shared attention). On bandwidth, it decodes like a 3B model: in bf16, about 6.7 GB per token, ceiling about 41 tok/s. But all 61 GB of weights have to sit in memory, because the next token might want different experts. This is where the Spark is unusual. Its 128 GB is slow, but it is a lot. A 24 GB gaming card cannot even hold that model; the Spark holds it and has room left over. Big-but-sparse models are the Spark's sweet spot. (One catch, visible in Figure 003: batch many users and between them they touch most of the experts, so the MoE advantage shrinks under heavy batching.)
+
+**Many users per read: batching.** This is the one inference companies live on. Process B users' tokens in the same step, and each weight read serves B tokens. While you are far below the ridge point, the step barely gets slower, so throughput goes up almost B-fold for free. Per-token cost is GPU-hours divided by tokens produced; if the GPU-hour produces 50x the tokens, each token costs about 1/50 as much. The limits are the ridge point (the math finally catches up) and the KV cache (each user's cache is their own bytes). [Batching](/lessons/batching/) and continuous batching are how real servers ride that curve.
+
+**Many tokens per read: speculative decoding.** If you could somehow know the next 4 tokens in advance, you could check all of them in one forward pass, like a tiny prefill, for about the price of one weight read. [Speculative decoding](/lessons/speculative-decoding/) uses a small, fast draft model to guess the next few tokens, then has the big model check them all in one pass. When the guesses are good, you get several tokens per trip through the weights. It works precisely because decode leaves the math units idle: checking 5 tokens instead of 1 costs almost nothing extra on a memory-bound machine.
+
+**A wider pipe: faster memory.** The brute-force option. Data-center GPUs use <Term w="HBM">High-bandwidth memory: DRAM chips stacked vertically and placed right next to the GPU on the same package, with thousands of wires between them. Much faster than normal memory, and much more expensive per GB.</Term>. The H100 SXM's spec is about 3.35 TB/s, roughly 12x the Spark. That buys about 209 tok/s for an 8B bf16 model, single stream. The Spark trades bandwidth for capacity: lots of affordable memory, slowly.
+
+The rest of the track fills in the remaining pieces: [serving engines](/lessons/serving-engines/) like vLLM combine all of these at once, and [FlashAttention](/lessons/flash-attention/) attacks the memory traffic inside attention itself, which matters most for long prompts.
+
+<Predict id="predict-sheet">
+Before you build anything, predict the decode ceiling on the Spark (spec 273 GB/s, batch 1, short context) for: (a) Llama 3.2 1B in bf16, (b) Llama 3.1 8B in Q8_0 (8.5 bits per weight), (c) Llama 3.1 8B in Q4_K_M (about 4.9 GB on disk).
+
+<Fragment slot="answer">
+
+(a) 1.24 billion params × 2 bytes ≈ 2.5 GB, so 273 / 2.5 ≈ **110 tok/s**. (This model shares its embedding and output matrix, so the whole thing really is read every token.) (b) 8.03e9 × 8.5 / 8 ≈ 8.5 GB, so **~32 tok/s**. (c) 273 / 4.9 ≈ **~55 tok/s**. Expect the small model to land furthest below its ceiling: with only 2.5 GB to read per token, fixed per-step costs (launching kernels, sampling, Python) become a bigger share of each 9 ms step.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+You will measure the two numbers that define your Spark's roofline, then use them to predict real model speeds, then check the predictions with a real engine. Nothing here is fancy. All of it is the kind of measurement that strong inference engineers do on day one with new hardware.
+
+<Task id="t1" title="Get a working CUDA PyTorch on the Spark" agent="ok">
+
+The Spark runs DGX OS (Ubuntu) on an ARM64 CPU, so x86 instructions and some pip wheels do not apply. The least painful path is usually NVIDIA's own containers. Check NVIDIA's **DGX Spark playbooks** and the DGX Spark user guide (both on NVIDIA's site; search "DGX Spark playbooks") for the currently recommended PyTorch container and the exact `docker run` line. Do not trust a command from memory, including this lesson's: the supported images change.
+
+Once you are inside, confirm the GPU is visible:
+
+```python
+import torch
+print(torch.__version__, torch.cuda.is_available())
+print(torch.cuda.get_device_name(0))
+props = torch.cuda.get_device_properties(0)
+print(f"{props.total_memory / 1e9:.1f} GB visible to CUDA, {props.multi_processor_count} SMs")
+```
+
+</Task>
+
+<Task id="t2" title="Measure the real memory bandwidth" agent="hands">
+
+Write `bw.py`. The idea: allocate two big buffers on the GPU, copy one into the other many times, and divide bytes moved by time. You write it. The shape:
+
+```python
+import torch, time
+
+def copy_bandwidth(n_bytes: int, iters: int = 50) -> float:
+    """Return achieved GB/s for a device-to-device copy of n_bytes."""
+    # 1. allocate src and dst: torch.empty(n_bytes, dtype=torch.uint8, device="cuda")
+    # 2. warm up: a few copies first (the first call pays one-time costs)
+    # 3. synchronize, start the clock, run `iters` copies, synchronize, stop the clock
+    # 4. bytes moved per copy = ?  (think before you answer)
+    ...
+
+for size_mb in [8, 32, 128, 512, 2048, 8192]:
+    print(size_mb, "MB:", f"{copy_bandwidth(size_mb * 2**20):.0f} GB/s")
+```
+
+Hints, in order of how often people get them wrong:
+
+- **Count both directions.** `dst.copy_(src)` reads every byte of `src` and writes every byte of `dst`. Both cross the memory bus. Bytes moved per copy is `2 * n_bytes`.
+- **Synchronize.** As you saw in [Waiting vs working](/lessons/waiting-vs-working/), a CUDA call returns as soon as the work is queued. Without `torch.cuda.synchronize()` before stopping the clock, you time the queueing, not the copy. (CUDA events, `torch.cuda.Event`, are the other correct way.)
+- **Go big.** Small buffers fit in the GPU's on-chip cache and report fantasy numbers. The sweep is there so you can see where the cache stops helping. Trust only the sizes in the GBs.
+- Optional second measurement: a read-only kernel like `src.float().sum()` is not ideal (the cast writes a temporary), but `src.sum()` on a big float16 tensor mostly reads. Compare its GB/s (counting `n_bytes` once) with the copy.
+
+</Task>
+
+<Task id="t3" title="Measure the real compute roof" agent="hands">
+
+Write `flops.py`: time a big bf16 matrix multiply and report TFLOP/s. A square matmul of size n×n by n×n does `2 * n**3` FLOPs (n³ multiply-adds). Sweep n from 1024 to 16384. Same rules: warm up, synchronize, run several iterations.
+
+```python
+def matmul_tflops(n: int, iters: int = 20) -> float:
+    a = torch.randn(n, n, dtype=torch.bfloat16, device="cuda")
+    b = torch.randn(n, n, dtype=torch.bfloat16, device="cuda")
+    # warm up, synchronize, time `iters` of (a @ b), synchronize
+    # return 2 * n**3 * iters / seconds / 1e12
+    ...
+```
+
+Then compute your machine's ridge point from **your** two numbers: measured TFLOP/s × 1e12 ÷ measured GB/s × 1e9. Small matmuls will look slow; that is the roofline again (a small matrix has too little work per byte to fill the chip). The number you want is the plateau at large n.
+
+</Task>
+
+<Task id="t4" title="Write the prediction sheet" agent="hands">
+
+Write a function and fill in a table before you run any model:
+
+```python
+def predict_decode(params_read: float, bytes_per_weight: float, bw_gbs: float) -> float:
+    """Ceiling tokens/sec at batch 1, short context."""
+    ...
+```
+
+Predict, using your **measured** bandwidth from t2 (and also the 273 spec number, for comparison): Llama 3.2 1B bf16, Llama 3.1 8B in BF16, Q8_0 and Q4_K_M GGUF. Use the model file size on disk as "bytes per token" for GGUF files; it is a good approximation, since nearly all of the file is weights.
+
+</Task>
+
+<Task id="t5" title="Measure real decode speed at batch 1" agent="explain">
+
+Use an existing engine. Two good choices; pick one, read its docs, and check the DGX Spark playbooks first, because NVIDIA publishes tested setups for some of these:
+
+- **llama.cpp**, built with CUDA. Its `llama-bench` tool measures prompt processing and generation speed separately. A typical run looks like `llama-bench -m model.gguf -p 512 -n 128`, which reports `pp512` (prefill speed, tokens/sec) and `tg128` (decode speed, tokens/sec). Check `llama-bench --help`; the flags evolve.
+- **vLLM**, if you would rather use the engine you will meet in [serving engines](/lessons/serving-engines/). It has its own benchmark scripts; look up the current ones in the vLLM docs rather than trusting a remembered command.
+
+Download the GGUF files from Hugging Face (the 1B in BF16 or F16, the 8B in BF16, Q8_0 and Q4_K_M). Record decode tokens/sec for each. Note the prefill number too; you will want it for the next lesson.
+
+</Task>
+
+<Task id="t6" title="Measure throughput vs batch size" agent="explain">
+
+Now watch batching happen. llama.cpp ships a `llama-batched-bench` tool that runs several sequences in parallel and reports generation speed for each batch size (look for options to set the list of parallel sequence counts, prompt length and generation length; check its `--help`). vLLM's throughput benchmark does the same at a higher level. Measure the 8B Q4_K_M at batch 1, 2, 4, 8, 16, 32, 64 with a short prompt. Record total tokens/sec and per-stream tokens/sec.
+
+</Task>
+
+<DoneWhen>
+
+- `bw.py` prints a bandwidth sweep, and you can say which sizes were hitting cache and what your real sustained GB/s is.
+- `flops.py` prints a TFLOP/s plateau, and you have computed your Spark's measured ridge point.
+- You have a prediction table written down **before** running a single model.
+- You have measured batch-1 decode speed for at least three model/precision combinations and a throughput-vs-batch curve for one.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. "Ceiling" uses your measured bandwidth; "% of ceiling" is measured ÷ ceiling.
+
+| Model | Format | Bytes / token | Ceiling @ 273 spec | Ceiling @ measured BW | Measured tok/s | % of ceiling |
+|---|---|---|---|---|---|---|
+| Llama 3.2 1B | BF16 | ~2.5 GB | ~110 | | | |
+| Llama 3.1 8B | BF16 | ~16 GB | ~17 | | | |
+| Llama 3.1 8B | Q8_0 | ~8.5 GB | ~32 | | | |
+| Llama 3.1 8B | Q4_K_M | ~4.9 GB | ~55 | | | |
+
+And the machine itself:
+
+| Quantity | Spec / estimate | Measured |
+|---|---|---|
+| Memory bandwidth | 273 GB/s (spec sheet) | |
+| Dense BF16 matmul | ≤125 TFLOP/s (estimate) | |
+| Ridge point | ≤~460 FLOP/byte | |
+
+**What to expect.** Your copy benchmark will almost certainly come in below 273 GB/s. That is normal for every memory system: the spec is the theoretical peak of the memory chips' pins, and real traffic loses some to refresh cycles, scheduling and the way reads and writes take turns. Write down your number without judging it; it is the real pipe.
+
+Real engines on a memory-bound model typically land somewhere around 60 to 85% of the ceiling you compute from **spec** bandwidth, and closer to your measured-bandwidth ceiling. Do not take that range as gospel; it is what you are here to measure. The gap comes from a few honest places:
+
+- **Not all time is weight-streaming.** Each step also reads the KV cache, runs attention, normalizations and the sampler, and launches dozens of small GPU kernels. Each launch has a fixed cost of a few microseconds; a few hundred of them per token add up.
+- **Kernels do not hit peak bandwidth.** A matrix-vector kernel reaches its best bandwidth only on large matrices with good memory access patterns. Small layers (the 1B model) run less efficiently.
+- **The host side.** Anything in Python between tokens (sampling, detokenizing, streaming) is time the GPU might sit idle. This is why the 1B model usually lands furthest from its ceiling: its steps are short, so fixed overhead is a bigger fraction.
+- **Quantized formats spend some work unpacking.** 4-bit kernels have to unpack and rescale weights. Usually still bandwidth-bound, but less perfectly so.
+
+**The batch curve** should look like Figure 003: total throughput climbs almost linearly at first (batch 2 gives nearly 2x), then bends and flattens. Per-stream speed sags slowly as batch grows. Where does it bend? Compare against your measured ridge point and against the KV cache bytes from the formula. With short prompts and a 4-bit model, you can plausibly get into the hundreds of tokens per second in total, while each individual stream still runs slower than at batch 1.
+
+## Break It
+
+**Tiny buffers.** Run `bw.py` with an 8 MB buffer and believe the result. You will "measure" bandwidth that is far beyond the spec, because the whole buffer lives in the GPU's on-chip cache, which is much faster than main memory. This is the latency ladder from [lesson 1](/lessons/latency-numbers/) showing up as bandwidth: every level of the memory hierarchy has its own pipe width. LLM weights are far too large for any cache, which is exactly why decode sees the slow pipe.
+
+**Forget to synchronize.** Delete the `torch.cuda.synchronize()` before you stop the clock. Your bandwidth and TFLOP/s numbers become impossible, sometimes hundreds of times the spec, because you timed how fast Python can put work in a queue. Every GPU benchmark you ever read online that looks too good to be true should make you ask this question first.
+
+**Count bytes once.** Report the copy as `n_bytes / t` instead of `2 * n_bytes / t`. Your bandwidth halves, every ceiling halves, and your engine suddenly appears to beat the laws of physics at 150% of ceiling. When a measurement exceeds a ceiling, the ceiling is wrong; go find the factor of two.
+
+**Make the cache heavy.** Run the 8B with a very long prompt already in context (llama-bench can benchmark generation at a given context depth in recent versions; check `--help`) and watch decode speed drop. Predict the drop first with the KV formula: 32K tokens adds about 4.3 GB per step on top of 16 GB of bf16 weights, or on top of 4.9 GB for Q4_K_M, where it hurts proportionally much more. (Some engines quantize the KV cache too; check what yours does before predicting.)
+
+## Explain It Back
+
+Say each answer out loud, in plain words, as if a smart interviewer asked.
+
+<details>
+<summary>1. Why is LLM decoding limited by memory bandwidth rather than compute?</summary>
+
+Each new token depends on the previous one, so you generate one at a time. For each token, every weight matrix multiplies a single vector, which means each weight gets read from memory and used for exactly one multiply-add before you are done with it. That is about 1 FLOP per byte in bf16. The GPU can do hundreds of FLOPs in the time it takes one byte to arrive, so it spends almost all its time waiting for weights. The speed is set by how fast you can stream the whole model out of memory, once per token.
+
+</details>
+
+<details>
+<summary>2. Why doesn't a GPU with 2x the FLOPs make your chatbot 2x faster?</summary>
+
+Because the chatbot (one user, decoding) is not using the FLOPs it already has; the math units are idle over 99% of the time. Doubling them doubles the idle capacity. What would help is doubling memory bandwidth, or halving the bytes per token. A 2x-FLOPs chip does help prefill (time to first token on a long prompt), and it raises the ridge point, which lets a server batch more users before going compute-bound. But single-stream tokens per second stays put.
+
+</details>
+
+<details>
+<summary>3. Estimate the decode speed of a 70B model in 4-bit on the Spark.</summary>
+
+70 billion weights × about half a byte = about 35 GB per token. 273 GB/s ÷ 35 GB ≈ 8 tok/s as a ceiling. Real 4-bit formats are closer to 4.5-5 bits per weight, so the file is more like 40-43 GB, giving a ceiling around 6-7 tok/s, and you would measure somewhat less than that: call it roughly 4-6 tok/s. Usable for reading along, slow for anything interactive. It does fit in 128 GB, which is the Spark's selling point; a 24 GB card cannot even load it.
+
+</details>
+
+<details>
+<summary>4. How does this scale: why does per-token cost drop with batching, and where does that stop?</summary>
+
+The expensive part of a decode step is reading the weights, and that cost is the same whether one user or 64 users' tokens ride along. So throughput goes up nearly B-fold while the hardware cost per hour stays the same, and cost per token falls roughly as 1/B. It stops for two reasons. First, at the ridge point (peak FLOPs ÷ bandwidth, a few hundred on these chips), the math becomes the bottleneck and extra users make each step slower. Second, and usually sooner at realistic context lengths, each user's KV cache is extra bytes that are not shared, so total bytes per step grow with B and the throughput curve flattens. Memory capacity is a third wall: all those caches have to fit. This is why serving companies care so much about batching, KV cache size and memory capacity.
+
+</details>
+
+<details>
+<summary>5. Prefill vs decode: which one is compute-bound, and which user-facing metric does each set?</summary>
+
+Prefill processes all prompt tokens in one pass, so each weight read is reused for every token in the prompt; intensity is about the prompt length, well above the ridge, so it is compute-bound. It sets time to first token. Decode generates one token per pass, intensity about 1 FLOP/byte, so it is memory-bound. It sets tokens per second. That is why a provider's TTFT and tokens/sec can be improved by different hardware and different tricks.
+
+</details>
+
+<details>
+<summary>6. Why does a 30B mixture-of-experts model decode faster than a dense 8B on the Spark?</summary>
+
+Speed depends on bytes read per token, not bytes stored. Qwen3 30B-A3B only activates about 3.3B parameters per token, so it reads about 6.7 GB per token in bf16, less than half of a dense 8B's 16 GB. It does need about 61 GB of memory to hold all the experts, which the Spark has. Under heavy batching different users route to different experts, so the batch as a whole reads more of the model and the advantage shrinks.
+
+</details>
+
+## Go Deeper
+
+- **"Making Deep Learning Go Brrrr From First Principles"**, Horace He (horace.io). The clearest essay on compute-bound vs memory-bound vs overhead-bound, built around a factory analogy much like this lesson's kitchen. Read it first.
+- **"Roofline: An Insightful Visual Performance Model for Multicore Architectures"**, Samuel Williams, Andrew Waterman, David Patterson, Communications of the ACM, 2009. The original roofline paper. Short and very readable; the plots are the point.
+- **"Hitting the Memory Wall: Implications of the Obvious"**, Wm. A. Wulf and Sally A. McKee, ACM SIGARCH Computer Architecture News, 1995. Two pages. The prediction that came true.
+- **"Transformer Inference Arithmetic"**, kipply (Carol Chen), 2022. Works through exactly these calculations (FLOPs, bytes, KV cache, batch size, latency) for real models, with the arithmetic shown.
+- **"How to Scale Your Model"**, Google DeepMind (Jacob Austin and colleagues), the "All About Rooflines" and inference chapters. A free online book that treats rooflines rigorously for TPUs and GPUs.
+- **"LLM Inference Performance Engineering: Best Practices"**, Databricks (MosaicML) blog, 2023. A practitioner's view: TTFT vs time per output token, memory bandwidth utilization as the metric to watch, and batching trade-offs.
+- **"Efficiently Scaling Transformer Inference"**, Reiner Pope et al. (Google), 2022. The paper-length version of this lesson for very large models across many chips: latency vs throughput, and how batch size moves you along the roofline.
+- **NVIDIA DGX Spark product page and user guide**, plus the DGX Spark playbooks. The source of the 273 GB/s and 128 GB spec numbers, and the supported containers for t1 and t5.
+
+## Connections
+
+This lesson is the spine of the [Inference track](/#track-inference). Built on: [How slow is slow?](/lessons/latency-numbers/) (bandwidth vs latency) and [Waiting vs working](/lessons/waiting-vs-working/) (why you synchronize before timing).
+
+Next: [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). You will build a naive streaming server and benchmark it. The ceiling you computed here is the line that server will be measured against: how close does it get, and where does the rest go?
+
+After that, each lesson in the track is one of the escape routes: [memory math](/lessons/memory-math/) and [the KV cache](/lessons/kv-cache/) (counting the bytes), [batching](/lessons/batching/) (sharing each read), [prefix caching](/lessons/prefix-caching/) (skipping prefill), [quantization](/lessons/quantization/) (fewer bytes per weight), [speculative decoding](/lessons/speculative-decoding/) (more tokens per read), [serving engines](/lessons/serving-engines/) (all of it at once), and [FlashAttention](/lessons/flash-attention/) (fewer bytes inside attention).

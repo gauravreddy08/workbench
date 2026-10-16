@@ -1,0 +1,230 @@
+---
+// Step through tiled attention for one query block: K/V tiles stream from HBM into SRAM,
+// the running max (m), running sum (l) and unnormalized output (o) update, and the final
+// O matches exact softmax(S)V. Tiny sizes so every number is visible.
+// Usage: <FlashTiles />
+---
+<div class="ftl" data-fig="flash-tiles">
+  <div class="ftl-hbm">
+    <span class="label">HBM (slow, big)</span>
+    <div class="ftl-row"><span class="ftl-k">Q</span><div class="ftl-cells" data-cells="q"></div></div>
+    <div class="ftl-row"><span class="ftl-k">K</span><div class="ftl-cells" data-cells="k"></div></div>
+    <div class="ftl-row"><span class="ftl-k">V</span><div class="ftl-cells" data-cells="v"></div></div>
+    <div class="ftl-row"><span class="ftl-k">O</span><div class="ftl-cells" data-cells="o"></div></div>
+  </div>
+
+  <div class="ftl-sram">
+    <span class="label">SRAM (one program, fast, tiny)</span>
+    <div class="ftl-mats" data-mats></div>
+  </div>
+
+  <div class="ftl-state">
+    <span class="label">Running state, one entry per query row (lives in registers)</span>
+    <table>
+      <thead><tr><th>row</th><th>m (max)</th><th>l (sum)</th><th>o (unnormalized)</th><th>rescale <span style="text-transform:none">α</span></th></tr></thead>
+      <tbody data-state></tbody>
+    </table>
+  </div>
+
+  <p class="ftl-note" data-note></p>
+
+  <div class="ctl">
+    <button class="btn" type="button" data-act="prev">Prev</button>
+    <button class="btn" type="button" data-act="next">Next</button>
+    <button class="btn" type="button" data-act="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-act="new">New numbers</button>
+    <span>step <output data-out="step">0</output> / 5</span>
+    <span>HBM elements moved <output data-out="reads">0</output></span>
+    <span>N×N written <output data-out="nn">0</output></span>
+  </div>
+</div>
+
+<style is:global>
+  .ftl { font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .ftl .label { display: block; font-size: 10.5px; margin-bottom: 6px; }
+  .ftl-hbm { border: 1px solid var(--ink); background: var(--paper); padding: 10px 12px; }
+  .ftl-row { display: flex; align-items: center; gap: 10px; margin-top: 4px; }
+  .ftl-k { width: 14px; flex: none; color: var(--ink); font-weight: 600; }
+  .ftl-cells { display: flex; gap: 4px; flex-wrap: wrap; }
+  .ftl-cell { width: 44px; text-align: center; padding: 3px 0; border: 1px solid var(--rule); color: var(--ink-3); background: var(--paper); font-size: 11px; }
+  .ftl-cell.mine { border-color: var(--ink-2); color: var(--ink-2); }
+  .ftl-cell.done { background: var(--paper-2); color: var(--ink-3); border-color: var(--ink-3); }
+  .ftl-cell.on { background: var(--blue); color: var(--paper); border-color: var(--blue); }
+  .ftl-sram { margin-top: 10px; border: 1px solid var(--blue); background: var(--blue-wash); padding: 10px 12px; }
+  .ftl-mats { display: flex; flex-wrap: wrap; gap: 12px 18px; }
+  .ftl-mat { min-width: 0; }
+  .ftl-mat b { display: block; font-weight: 600; color: var(--blue); font-size: 10.5px; letter-spacing: 0.06em; margin-bottom: 3px; }
+  .ftl-mat table, .ftl-state table { border-collapse: collapse; }
+  .ftl-mat td { border: 1px solid var(--rule); background: var(--paper); padding: 2px 6px; text-align: right; color: var(--ink); min-width: 46px; }
+  .ftl-mat td.empty { color: var(--ink-3); text-align: center; }
+  .ftl-state { margin-top: 10px; overflow-x: auto; }
+  .ftl-state th { font-weight: 400; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-3); text-align: left; padding: 4px 12px 4px 0; border-bottom: 1px solid var(--ink); white-space: nowrap; }
+  .ftl-state td { padding: 5px 12px 5px 0; border-bottom: 1px solid var(--rule); color: var(--ink); white-space: nowrap; }
+  .ftl-state td.hot { color: var(--warn); font-weight: 600; }
+  .ftl-note { margin: 12px 0 0; font-family: var(--serif); font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 4.5em; }
+  .ftl .ctl span { display: inline-flex; gap: 6px; align-items: baseline; }
+</style>
+
+<script>
+  const N = 8; // keys (and queries)
+  const BS = 2; // block size for both query rows and key columns
+  const D = 2; // head dimension
+  const NB = N / BS;
+
+  type Snap = {
+    j: number; // K/V block just processed (-1 = none yet, NB = final)
+    m: number[]; l: number[]; o: number[][]; alpha: (number | null)[];
+    S: number[][] | null; P: number[][] | null;
+    reads: number; note: string; final?: { O: number[][]; exact: number[][]; err: number };
+  };
+
+  function mulberry32(a: number) {
+    return () => {
+      a |= 0; a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const r1 = (x: number) => Math.round(x * 10) / 10;
+  const f = (x: number) => (x === -Infinity ? '−∞' : (Math.abs(x) < 0.005 && x !== 0 ? x.toExponential(1) : x.toFixed(2)));
+  const mat = (rows: number, cols: number, rnd: () => number) =>
+    Array.from({ length: rows }, () => Array.from({ length: cols }, () => r1(rnd() * 3 - 1.5)));
+
+  function simulate(seed: number) {
+    const rnd = mulberry32(seed);
+    const Q = mat(BS, D, rnd); // our program's query rows (scale 1/sqrt(d) folded in)
+    const K = mat(N, D, rnd);
+    const V = mat(N, D, rnd);
+    const snaps: Snap[] = [];
+    let m = [-Infinity, -Infinity], l = [0, 0], o = [[0, 0], [0, 0]];
+    let reads = BS * D;
+    snaps.push({ j: -1, m: [...m], l: [...l], o: o.map((r) => [...r]), alpha: [null, null], S: null, P: null, reads,
+      note: 'Load this program\'s query block Q0 (rows 0 and 1) into SRAM, once. Each row starts with m = −∞, l = 0, o = 0. The scale 1/√d is already folded into Q.' });
+    let maxChanges = 0;
+    for (let j = 0; j < NB; j++) {
+      const Kj = K.slice(j * BS, j * BS + BS);
+      const Vj = V.slice(j * BS, j * BS + BS);
+      reads += 2 * BS * D;
+      const S = Q.map((q) => Kj.map((k) => q[0] * k[0] + q[1] * k[1]));
+      const mNew = S.map((row, r) => Math.max(m[r], ...row));
+      const P = S.map((row, r) => row.map((s) => Math.exp(s - mNew[r])));
+      const alpha = m.map((mo, r) => Math.exp(mo - mNew[r]));
+      const parts: string[] = [];
+      for (let r = 0; r < BS; r++) {
+        if (j === 0) parts.push(`Row ${r}: first block, old m was −∞ so α = 0 (nothing to rescale); m = ${f(mNew[r])}.`);
+        else if (mNew[r] > m[r]) { maxChanges++; parts.push(`Row ${r}: max rises ${f(m[r])} → ${f(mNew[r])}, so the old l and o shrink by α = e^(${f(m[r])} − ${f(mNew[r])}) = ${f(alpha[r])}.`); }
+        else parts.push(`Row ${r}: max stays ${f(m[r])}, α = 1, just add the new terms.`);
+        l[r] = l[r] * alpha[r] + P[r].reduce((a, b) => a + b, 0);
+        for (let c = 0; c < D; c++) o[r][c] = o[r][c] * alpha[r] + P[r][0] * Vj[0][c] + P[r][1] * Vj[1][c];
+      }
+      m = mNew;
+      snaps.push({ j, m: [...m], l: [...l], o: o.map((x) => [...x]), alpha: [...alpha], S, P, reads,
+        note: `Load K${j} and V${j}. S = Q0·K${j}ᵀ is a 2×2 tile of scores that exists only in SRAM. P̃ = e^(S − m_new). ` + parts.join(' ') });
+    }
+    // final normalization + exact check
+    const O = o.map((row, r) => row.map((x) => x / l[r]));
+    const exact = Q.map((q) => {
+      const s = K.map((k) => q[0] * k[0] + q[1] * k[1]);
+      const mx = Math.max(...s);
+      const e = s.map((x) => Math.exp(x - mx));
+      const z = e.reduce((a, b) => a + b, 0);
+      return [0, 1].map((c) => e.reduce((acc, w, i) => acc + (w / z) * V[i][c], 0));
+    });
+    let err = 0;
+    O.forEach((row, r) => row.forEach((x, c) => (err = Math.max(err, Math.abs(x - exact[r][c])))));
+    reads += BS * D;
+    snaps.push({ j: NB, m: [...m], l: [...l], o: o.map((x) => [...x]), alpha: [null, null], S: null, P: null, reads,
+      note: `Done with every block. Divide each o by its l and write O0 to HBM: the only output write. Exact softmax(Q0Kᵀ)V, computed the slow way over all 8 keys: [${exact.map((r) => r.map(f).join(', ')).join(' | ')}]. Largest difference: ${err === 0 ? '0' : err.toExponential(1)}. That is floating-point rounding, not approximation.`,
+      final: { O, exact, err } });
+    return { Q, K, V, snaps, maxChanges };
+  }
+
+  function pickSeed(start: number) {
+    // prefer examples where the max changes at least twice after the first block, so rescaling is visible
+    for (let s = start; s < start + 500; s++) if (simulate(s).maxChanges >= 2) return s;
+    return start;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="flash-tiles"]').forEach((root) => {
+    let seed = pickSeed(7);
+    let sim = simulate(seed);
+    let step = 0;
+    let timer: number | undefined;
+    const q = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const playBtn = q<HTMLButtonElement>('[data-act="play"]');
+
+    const cells = (key: string, labels: string[], cls: (i: number) => string) => {
+      const box = q<HTMLElement>(`[data-cells="${key}"]`);
+      box.replaceChildren(...labels.map((t, i) => { const d = document.createElement('span'); d.className = 'ftl-cell ' + cls(i); d.textContent = t; return d; }));
+    };
+    const matEl = (title: string, M: number[][] | null, rows = BS, cols = BS) => {
+      const w = document.createElement('div'); w.className = 'ftl-mat';
+      const b = document.createElement('b'); b.textContent = title; w.appendChild(b);
+      const t = document.createElement('table');
+      for (let r = 0; r < rows; r++) {
+        const tr = document.createElement('tr');
+        for (let c = 0; c < cols; c++) {
+          const td = document.createElement('td');
+          if (M) td.textContent = f(M[r][c]); else { td.textContent = '·'; td.className = 'empty'; }
+          tr.appendChild(td);
+        }
+        t.appendChild(tr);
+      }
+      w.appendChild(t);
+      return w;
+    };
+
+    const render = () => {
+      const s = sim.snaps[step];
+      const blk = (i: number) => (i === s.j && s.j < NB ? 'on' : i < s.j || s.j === NB ? 'done' : '');
+      cells('q', ['Q0', 'Q1', 'Q2', 'Q3'], (i) => (i === 0 ? (step === 0 ? 'on' : 'mine') : ''));
+      cells('k', ['K0', 'K1', 'K2', 'K3'], blk);
+      cells('v', ['V0', 'V1', 'V2', 'V3'], blk);
+      cells('o', ['O0', 'O1', 'O2', 'O3'], (i) => (i === 0 && s.j === NB ? 'on' : ''));
+      const jj = s.j >= 0 && s.j < NB ? s.j : null;
+      const mats = q<HTMLElement>('[data-mats]');
+      mats.replaceChildren(
+        matEl('Q0 (2 ROWS × d)', sim.Q),
+        matEl(jj === null ? 'Kj' : `K${jj} (2 KEYS × d)`, jj === null ? null : sim.K.slice(jj * BS, jj * BS + BS)),
+        matEl(jj === null ? 'Vj' : `V${jj}`, jj === null ? null : sim.V.slice(jj * BS, jj * BS + BS)),
+        matEl('S = Q0·Kjᵀ', s.S),
+        matEl('P̃ = e^(S − m)', s.P),
+        ...(s.final ? [matEl('O0 = o / l', s.final.O)] : []),
+      );
+      const tb = q<HTMLElement>('[data-state]');
+      tb.replaceChildren(...[0, 1].map((r) => {
+        const tr = document.createElement('tr');
+        const a = s.alpha[r];
+        const vals = [String(r), f(s.m[r]), f(s.l[r]), `[${f(s.o[r][0])}, ${f(s.o[r][1])}]`, a === null ? '–' : f(a)];
+        vals.forEach((v, i) => { const td = document.createElement('td'); td.textContent = v; if (i === 4 && a !== null && step > 1 && a < 0.9999) td.className = 'hot'; tr.appendChild(td); });
+        return tr;
+      }));
+      q<HTMLElement>('[data-note]').textContent = s.note;
+      q<HTMLOutputElement>('[data-out="step"]').textContent = String(step);
+      q<HTMLOutputElement>('[data-out="reads"]').textContent = String(s.reads);
+      q<HTMLOutputElement>('[data-out="nn"]').textContent = '0';
+      q<HTMLButtonElement>('[data-act="prev"]').disabled = step === 0;
+      q<HTMLButtonElement>('[data-act="next"]').disabled = step === sim.snaps.length - 1;
+    };
+    const stop = () => { if (timer !== undefined) { clearInterval(timer); timer = undefined; } playBtn.setAttribute('aria-pressed', 'false'); playBtn.textContent = 'Play'; };
+
+    q('[data-act="prev"]').addEventListener('click', () => { stop(); step = Math.max(0, step - 1); render(); });
+    q('[data-act="next"]').addEventListener('click', () => { stop(); step = Math.min(sim.snaps.length - 1, step + 1); render(); });
+    q('[data-act="new"]').addEventListener('click', () => { stop(); seed = pickSeed(seed + 1); sim = simulate(seed); step = 0; render(); });
+    playBtn.addEventListener('click', () => {
+      if (timer !== undefined) { stop(); return; }
+      if (step === sim.snaps.length - 1) step = 0;
+      playBtn.setAttribute('aria-pressed', 'true'); playBtn.textContent = 'Pause';
+      const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      if (reduce) { step = sim.snaps.length - 1; render(); stop(); return; }
+      render();
+      timer = window.setInterval(() => {
+        step++;
+        render();
+        if (step >= sim.snaps.length - 1) stop();
+      }, 2200);
+    });
+    render();
+  });
+</script>

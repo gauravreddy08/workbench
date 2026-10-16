@@ -1,0 +1,132 @@
+---
+// Forward KL vs reverse KL vs direct α, for a student too small to copy the teacher.
+// Teacher p: two bumps over 40 bins (second bump weight w). Student q: one discretized bump
+// (a mean and a width). For each objective, grid-search the best (mean, width) and report
+// α = Σ min(p, q) and whether q's top token is p's top token (what greedy acceptance needs).
+// Usage: <DraftFit />
+---
+<div class="dfit" data-fig="draft-fit">
+  <svg viewBox="0 0 560 250" role="img" aria-label="A two-bump target distribution and the best one-bump student under the chosen objective, with the shared mass in solid blue">
+    <g data-layer="plot"></g>
+  </svg>
+  <div class="ctl">
+    <span>student trained with</span>
+    <button class="btn" type="button" data-obj="fkl" aria-pressed="true">Forward KL(p‖q)</button>
+    <button class="btn" type="button" data-obj="rkl" aria-pressed="false">Reverse KL(q‖p)</button>
+    <button class="btn" type="button" data-obj="tv" aria-pressed="false">α directly</button>
+  </div>
+  <div class="ctl">
+    <label>second bump weight <input type="range" min="0.05" max="0.5" step="0.05" value="0.35" data-in="w" /> <output data-out="w">0.35</output></label>
+  </div>
+  <table class="dfit-tab">
+    <thead><tr><th>objective</th><th>α = Σ min(p,q)</th><th>q's top = p's top?</th></tr></thead>
+    <tbody>
+      <tr data-row="fkl"><td>forward KL</td><td class="readout" data-a="fkl">-</td><td data-g="fkl">-</td></tr>
+      <tr data-row="rkl"><td>reverse KL</td><td class="readout" data-a="rkl">-</td><td data-g="rkl">-</td></tr>
+      <tr data-row="tv"><td>α directly</td><td class="readout" data-a="tv">-</td><td data-g="tv">-</td></tr>
+    </tbody>
+  </table>
+  <p class="dfit-note" aria-live="polite"></p>
+</div>
+
+<style>
+  .dfit svg { width: 100%; }
+  .dfit-tab { width: 100%; border-collapse: collapse; margin-top: 14px; font-family: var(--mono); font-size: 12px; }
+  .dfit-tab th { text-align: left; font-weight: 400; color: var(--ink-3); border-bottom: 1px solid var(--ink); padding: 4px 8px 4px 0; font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .dfit-tab td { border-bottom: 1px solid var(--rule); padding: 5px 8px 5px 0; color: var(--ink-2); }
+  .dfit-tab tr.on td { color: var(--ink); background: var(--blue-wash); }
+  .dfit-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const B = 40;
+  const X = Array.from({ length: B }, (_, i) => i);
+  const bump = (mu: number, s: number) => {
+    const w = X.map((x) => Math.exp(-0.5 * ((x - mu) / s) ** 2));
+    const z = w.reduce((a, b) => a + b, 0);
+    return w.map((v) => Math.max(v / z, 1e-12));
+  };
+  const norm = (v: number[]) => { const z = v.reduce((a, b) => a + b, 0); return v.map((x) => x / z); };
+  const target = (w: number) => {
+    const a = bump(11, 2.5), b = bump(28, 2.5);
+    return norm(a.map((v, i) => Math.max((1 - w) * v + w * b[i], 1e-12)));
+  };
+  const alpha = (p: number[], q: number[]) => p.reduce((s, v, i) => s + Math.min(v, q[i]), 0);
+  const argmax = (v: number[]) => v.reduce((bi, x, i, arr) => (x > arr[bi] ? i : bi), 0);
+  type Obj = 'fkl' | 'rkl' | 'tv';
+  const score = (o: Obj, p: number[], q: number[]) => {
+    let s = 0;
+    if (o === 'fkl') for (let i = 0; i < B; i++) s += p[i] * Math.log(p[i] / q[i]);
+    else if (o === 'rkl') for (let i = 0; i < B; i++) s += q[i] * Math.log(q[i] / p[i]);
+    else s = -alpha(p, q);
+    return s;
+  };
+  const cands: number[][] = [];
+  for (let mu = 0; mu <= B - 1; mu += 0.25) for (let s = 0.6; s <= 15; s += 0.1) cands.push(bump(mu, s));
+  const best = (o: Obj, p: number[]) => {
+    let bv = Infinity, bq = cands[0];
+    for (const q of cands) { const v = score(o, p, q); if (v < bv) { bv = v; bq = q; } }
+    return bq;
+  };
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="draft-fit"]').forEach((root) => {
+    const G = root.querySelector<SVGGElement>('[data-layer="plot"]')!;
+    const wIn = root.querySelector<HTMLInputElement>('[data-in="w"]')!;
+    const wOut = root.querySelector<HTMLElement>('[data-out="w"]')!;
+    const note = root.querySelector<HTMLElement>('.dfit-note')!;
+    let obj: Obj = 'fkl';
+
+    const render = () => {
+      const w = Number(wIn.value);
+      wOut.textContent = w.toFixed(2);
+      const p = target(w);
+      const fits: Record<Obj, number[]> = { fkl: best('fkl', p), rkl: best('rkl', p), tv: best('tv', p) };
+      const pTop = argmax(p);
+      (['fkl', 'rkl', 'tv'] as Obj[]).forEach((o) => {
+        root.querySelector(`[data-a="${o}"]`)!.textContent = alpha(p, fits[o]).toFixed(3);
+        const qt = argmax(fits[o]);
+        root.querySelector(`[data-g="${o}"]`)!.textContent = qt === pTop ? 'yes' : `no (q's top has p = ${p[qt].toFixed(3)})`;
+        root.querySelector(`[data-row="${o}"]`)!.classList.toggle('on', o === obj);
+      });
+      root.querySelectorAll<HTMLButtonElement>('[data-obj]').forEach((b) => b.setAttribute('aria-pressed', String(b.dataset.obj === obj)));
+
+      const q = fits[obj];
+      const x0 = 20, x1 = 540, y0 = 30, y1 = 210;
+      const yMax = Math.max(...p, ...q) * 1.1;
+      const bw = (x1 - x0) / B;
+      const Y = (v: number) => y1 - (v / yMax) * (y1 - y0);
+      G.replaceChildren();
+      G.appendChild(mk('line', { x1: x0, y1: y1, x2: x1, y2: y1, class: 'ink', 'stroke-width': 1 }));
+      for (let i = 0; i < B; i++) {
+        const m = Math.min(p[i], q[i]);
+        const x = x0 + i * bw + 1;
+        if (q[i] > m) G.appendChild(mk('rect', { x, y: Y(q[i]), width: bw - 2, height: Y(m) - Y(q[i]), class: 'fill-wash', 'stroke-width': 0.8 }));
+        G.appendChild(mk('rect', { x, y: Y(m), width: bw - 2, height: y1 - Y(m), class: 'fill-blue' }));
+      }
+      const pts = p.map((v, i) => `${(x0 + (i + 0.5) * bw).toFixed(1)},${Y(v).toFixed(1)}`).join(' ');
+      G.appendChild(mk('polyline', { points: pts, class: 'ink', 'stroke-width': 1.5 }));
+      G.appendChild(mk('text', { x: x0, y: 18, class: 'strong' }, 'TEACHER p (LINE) · ONE-BUMP STUDENT q (BARS)'));
+      G.appendChild(mk('text', { x: x1, y: 18, 'text-anchor': 'end', class: 'blue-t' }, `α = ${alpha(p, q).toFixed(3)}`));
+      const qt = argmax(q);
+      G.appendChild(mk('line', { x1: x0 + (qt + 0.5) * bw, y1: y1 + 4, x2: x0 + (qt + 0.5) * bw, y2: y1 + 14, class: 'blue', 'stroke-width': 1.5 }));
+      G.appendChild(mk('text', { x: x0 + (qt + 0.5) * bw, y: y1 + 28, 'text-anchor': 'middle', class: 'blue-t' }, "q'S TOP"));
+      G.appendChild(mk('text', { x: x1, y: y1 + 28, 'text-anchor': 'end' }, 'VOCABULARY →'));
+
+      if (obj === 'fkl') note.textContent = 'Forward KL punishes q hard wherever p has mass and q has almost none, so q stretches to cover both bumps. It covers the mass but wastes a lot of it in the valley between them, and its top token sits in the valley: a greedy draft from it would almost never match.';
+      else if (obj === 'rkl') note.textContent = 'Reverse KL punishes q for putting mass where p has little, so q hides inside one bump and gives up the other. Here that keeps more overlap, and its top token is p\'s top token. When the two bumps are equal size (slide to 0.50), it still keeps only one.';
+      else note.textContent = 'Maximize α itself, the quantity speculative decoding pays out on. It is the right target, but its gradient only says, token by token, whether q is above or below p, not by how much, so it is a rough signal to train on. Most people train with a KL and measure α. Slide the weight: neither KL wins everywhere.';
+    };
+
+    root.querySelectorAll<HTMLButtonElement>('[data-obj]').forEach((b) => b.addEventListener('click', () => { obj = b.dataset.obj as Obj; render(); }));
+    wIn.addEventListener('input', render);
+    render();
+  });
+</script>

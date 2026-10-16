@@ -1,0 +1,720 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import LBSimulator from '../components/figures/LBSimulator.astro';
+import LBHashRing from '../components/figures/LBHashRing.astro';
+
+## Today
+
+- Explain the difference between making one machine bigger and adding more machines, and why the second one forces you to think about state.
+- Say what a load balancer actually does, and what an L4 balancer can and can't see compared to an L7 one.
+- Pick a balancing algorithm on purpose: round robin, least connections, power of two random choices, consistent hashing, and the prefix-aware routing LLM servers use to hit their KV caches.
+- Explain why sticky sessions are a trap, and what "stateless servers, state in a shared store" actually means in code.
+- Take a server out of rotation without dropping requests, and find the single points of failure in a diagram.
+
+Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) (what lives in a process's memory, and lost updates) and [How slow is slow?](/lessons/latency-numbers/) (network round trips). [Why do people care about p99?](/lessons/tail-latency/) helps for the Measure section. Rough time: one evening.
+
+## The Problem
+
+You already got the core of this right in the diagnostic. Here's the scene, so we can build on it.
+
+Your FastAPI app works. You log in, it creates a session (who you are, what's in your cart, the conversation so far) and keeps it in a Python dict. Traffic grows, so you run three copies behind a load balancer. You log in. Your next click says "who are you?". You refresh and it knows you again. Refresh again: gone.
+
+You already know why. The login landed on server A, so the session lives in A's memory. The next request landed on B, whose dict has never heard of you. Three copies means three separate heaps, and from [the threads lesson](/lessons/processes-threads-gil/) you know one process can't see another's memory.
+
+The interesting part is everything after that. Should the balancer pin you to A forever? What happens when A crashes, or restarts for a deploy? Why do LLM servers deliberately *want* your next request on the same machine, and why is that fine there but a trap for shopping carts? And how should the balancer choose, when one LLM request takes 40 ms and the next takes 40 seconds?
+
+<Origin year="1994-2011" title="From DNS tricks to stateless processes">
+
+In 1994, NCSA's web server (home of the Mosaic browser) outgrew one machine. Their fix, written up by Katz, Butler and McGrath, was several identical servers, with DNS handing each visitor a different machine's address in rotation. DNS round robin is still around.
+
+It had two problems. DNS answers get cached for minutes, so a dead server kept receiving visitors. And it couldn't send a returning visitor back to the same machine, which mattered once app servers kept logins and carts in memory. Dedicated load balancer boxes appeared in the late 1990s to fix both: they checked which servers were alive, and they could pin a user to one server.
+
+Pinning worked until servers had to restart. In 2011 Heroku's Adam Wiggins wrote *The Twelve-Factor App*. Factor VI says processes should be stateless and share nothing, and names sticky sessions as a violation. Anything that must outlive a request goes in a backing store like a database or Redis. That's where this lesson ends up.
+
+</Origin>
+
+## The Idea
+
+### Bigger machine, or more machines
+
+When one server can't keep up, you have two choices.
+
+<Term w="Vertical scaling">Making one machine bigger: more cores, more RAM, faster disks. Also called scaling up.</Term> means buying a bigger box. It is underrated. No code changes, no new failure modes, and a single modern server is enormous: hundreds of cores and terabytes of RAM are a cloud API call away. The catches are that there's a ceiling (the biggest machine you can buy), the price per unit of capacity rises as you approach it, and it's still one machine: when it reboots, you're down.
+
+<Term w="Horizontal scaling">Adding more machines that each do the same job, and spreading work across them. Also called scaling out.</Term> means running many copies. No ceiling in principle, cheap machines, and one dying is a partial loss instead of a total one. The catch is everything in this lesson: someone has to decide which copy gets each request, and any data a copy keeps in its own memory is invisible to the others.
+
+<Figure n="001" title="SCALE UP VS SCALE OUT" caption="Scaling up replaces one machine with a bigger one: simple, but there's a ceiling and it's still one machine. Scaling out adds identical copies behind a load balancer: no ceiling, survives a crash, but each copy has its own private memory.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Left: a small server becomes a large server. Right: a load balancer in front of three equal servers">
+  <text x="150" y="20" text-anchor="middle" class="strong">SCALE UP (VERTICAL)</text>
+  <rect x="30" y="150" width="60" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="60" y="184" text-anchor="middle">8 CORE</text>
+  <line x1="98" y1="180" x2="140" y2="180" class="ink" stroke-width="1.2" marker-end="url(#lb1-arr)" />
+  <rect x="150" y="60" width="130" height="150" class="fill-wash" stroke-width="1.2" />
+  <text x="215" y="120" text-anchor="middle" class="strong">192 CORE</text>
+  <text x="215" y="138" text-anchor="middle">2 TB RAM</text>
+  <text x="215" y="190" text-anchor="middle" class="blue-t">STILL ONE BOX</text>
+  <line x1="150" y1="44" x2="280" y2="44" class="ink dash" stroke-width="1" />
+  <text x="215" y="38" text-anchor="middle">CEILING</text>
+  <line x1="320" y1="10" x2="320" y2="240" class="ink dash" stroke-width="1" />
+  <text x="490" y="20" text-anchor="middle" class="strong">SCALE OUT (HORIZONTAL)</text>
+  <rect x="440" y="40" width="100" height="32" class="fill-paper" stroke-width="1.2" />
+  <text x="490" y="61" text-anchor="middle" class="strong">BALANCER</text>
+  <line x1="490" y1="72" x2="390" y2="140" class="ink" stroke-width="1" />
+  <line x1="490" y1="72" x2="490" y2="140" class="ink" stroke-width="1" />
+  <line x1="490" y1="72" x2="590" y2="140" class="ink" stroke-width="1" />
+  <rect x="350" y="140" width="80" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="390" y="166" text-anchor="middle" class="strong">APP 1</text>
+  <text x="390" y="196" text-anchor="middle">own heap</text>
+  <rect x="450" y="140" width="80" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="490" y="166" text-anchor="middle" class="strong">APP 2</text>
+  <text x="490" y="196" text-anchor="middle">own heap</text>
+  <rect x="550" y="140" width="80" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="590" y="166" text-anchor="middle" class="strong">APP 3</text>
+  <text x="590" y="196" text-anchor="middle">own heap</text>
+  <text x="490" y="236" text-anchor="middle" class="blue-t">ADD MORE AS NEEDED</text>
+  <defs>
+    <marker id="lb1-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+</svg>
+</Figure>
+
+Do both, in order: scale up until it hurts, then scale out the parts that are easy to copy. "Easy to copy" means one thing: the part holds no state of its own.
+
+### What a load balancer is
+
+A <Term w="load balancer">A program (or box) that receives every incoming request or connection and forwards it to one of several backend servers, choosing which one each time.</Term> is a traffic cop. Clients only know its address. Behind it sits a pool of <Term w="backend">One of the servers behind the load balancer that actually does the work. Also called an upstream (nginx's word), a target, or a replica.</Term>s, and for every request it answers one question: who gets this one?
+
+It also answers two quieter questions: which backends are alive right now, and how do we retire one without dropping its work? First, the state problem drawn out.
+
+<Figure n="002" title="WHERE DID MY CART GO" caption="Request 1 logs in on app 1, so the session lives in app 1's memory. The browser gets back a cookie holding only the session ID. Request 2 carries that cookie, but the balancer sends it to app 2, which has an empty dict and answers 401.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Login on app 1 stores session in its memory; next request lands on app 2 which has no session">
+  <rect x="10" y="110" width="90" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="136" text-anchor="middle" class="strong">BROWSER</text>
+  <text x="55" y="154" text-anchor="middle">cookie sid=7f</text>
+  <rect x="180" y="110" width="100" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="230" y="144" text-anchor="middle" class="strong">BALANCER</text>
+  <line x1="100" y1="130" x2="178" y2="130" class="ink" stroke-width="1.2" />
+  <line x1="100" y1="150" x2="178" y2="150" class="ink" stroke-width="1.2" />
+  <text x="104" y="124">1 POST /login</text>
+  <text x="104" y="166">2 POST /cart</text>
+  <rect x="380" y="20" width="250" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="392" y="40" class="strong">APP 1 · MEMORY</text>
+  <text x="392" y="60">SESSIONS = </text>
+  <text x="392" y="76" class="blue-t">"7f": user gaurav, cart [gpu]</text>
+  <rect x="380" y="110" width="250" height="70" class="fill-wash" stroke-width="1.2" />
+  <text x="392" y="130" class="strong">APP 2 · MEMORY</text>
+  <text x="392" y="150">SESSIONS = (empty)</text>
+  <text x="392" y="168" class="blue-t">401: who are you?</text>
+  <rect x="380" y="200" width="250" height="60" class="fill-wash" stroke-width="1.2" />
+  <text x="392" y="220" class="strong">APP 3 · MEMORY</text>
+  <text x="392" y="240">SESSIONS = (empty)</text>
+  <line x1="280" y1="125" x2="378" y2="58" class="blue" stroke-width="1.5" />
+  <text x="300" y="80" class="blue-t">1</text>
+  <line x1="280" y1="148" x2="378" y2="146" class="blue dash" stroke-width="1.5" />
+  <text x="320" y="140" class="blue-t">2</text>
+  <text x="230" y="200" text-anchor="middle">SAME COOKIE,</text>
+  <text x="230" y="216" text-anchor="middle">DIFFERENT HEAP</text>
+</svg>
+</Figure>
+
+Two words in that picture. A <Term w="session">Everything the server remembers about one logged-in user between requests: who they are, their cart, their conversation so far.</Term> is the memory. A <Term w="cookie">A small string the server asks the browser to store and send back on every later request to the same site. Here it holds only a random session ID, the key into the server's session dict.</Term> is how the browser carries a key to that memory. The cookie travels with every request. The data it points to does not.
+
+<Term w="State">Any data a server keeps that a later request depends on. If you could kill the process and restart it with no one noticing, it had no state.</Term> is the general name: sessions, but also in-memory caches, rate-limit counters, files on local disk, open WebSockets. There are two ways out:
+
+1. **Make the balancer send each user back to the same server.** That's a <Term w="sticky session">Also called session affinity. The balancer routes every request from one user to the same backend, usually by hashing a cookie or the client's IP, so in-memory state keeps working.</Term>.
+2. **Make the servers forget.** Keep the session somewhere every server can read, like Redis or a database, so any server can handle any request. That's a <Term w="stateless server">A server that keeps nothing between requests in its own memory or disk. Everything a later request needs is either in the request itself or in a shared store.</Term>.
+
+Option 1 is a patch, option 2 is the fix. You'll build both and break the patch. First, the balancer itself.
+
+### L4 and L7: what the balancer can see
+
+A request is a stack of envelopes: IP (addresses), inside it TCP (ports, a connection), inside that usually TLS (encrypted), and only then the HTTP request with its path, headers, cookies and your prompt. Balancers are named after how many envelopes they open, using the old <Term w="OSI layers">A numbering of network protocol layers. The ones that matter here: layer 3 is IP (addresses), layer 4 is TCP/UDP (ports, connections), layer 7 is the application protocol, like HTTP.</Term> numbering.
+
+<Figure n="003" title="WHAT EACH BALANCER CAN SEE" caption="An L4 balancer reads only addresses and ports and forwards whole TCP connections. An L7 balancer terminates the connection (and TLS), reads the HTTP request, and can route each request by path, header or cookie. It sees more, so it can do more, at more CPU per request.">
+<svg viewBox="0 0 640 220" role="img" aria-label="A packet's layers: IP, TCP, TLS, HTTP headers, body; L4 reads the first two, L7 reads all">
+  <rect x="20" y="60" width="100" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="82" text-anchor="middle" class="strong">IP</text>
+  <text x="70" y="100" text-anchor="middle">src/dst addr</text>
+  <rect x="120" y="60" width="100" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="170" y="82" text-anchor="middle" class="strong">TCP</text>
+  <text x="170" y="100" text-anchor="middle">ports, conn</text>
+  <rect x="220" y="60" width="90" height="56" class="fill-paper dash" stroke-width="1.2" />
+  <text x="265" y="82" text-anchor="middle" class="strong">TLS</text>
+  <text x="265" y="100" text-anchor="middle">encrypted</text>
+  <rect x="310" y="60" width="190" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="405" y="82" text-anchor="middle" class="strong">HTTP</text>
+  <text x="405" y="100" text-anchor="middle">POST /v1/chat · Cookie</text>
+  <rect x="500" y="60" width="120" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="560" y="82" text-anchor="middle" class="strong">BODY</text>
+  <text x="560" y="100" text-anchor="middle">model, prompt</text>
+  <line x1="20" y1="40" x2="220" y2="40" class="blue" stroke-width="1.5" />
+  <line x1="20" y1="34" x2="20" y2="46" class="blue" stroke-width="1.5" />
+  <line x1="220" y1="34" x2="220" y2="46" class="blue" stroke-width="1.5" />
+  <text x="120" y="28" text-anchor="middle" class="blue-t">L4 SEES THIS</text>
+  <line x1="20" y1="140" x2="620" y2="140" class="ink" stroke-width="1.5" />
+  <line x1="20" y1="134" x2="20" y2="146" class="ink" stroke-width="1.5" />
+  <line x1="620" y1="134" x2="620" y2="146" class="ink" stroke-width="1.5" />
+  <text x="320" y="160" text-anchor="middle" class="strong">L7 SEES ALL OF IT (AFTER DECRYPTING)</text>
+  <text x="20" y="196">L4: ONE CHOICE PER CONNECTION · FAST · NLB, MAGLEV, IPVS</text>
+  <text x="20" y="212">L7: ONE CHOICE PER REQUEST · RETRIES, COOKIES · NGINX, ENVOY, ALB</text>
+</svg>
+</Figure>
+
+An <Term w="L4 load balancer">Balances at the transport layer: picks a backend when a TCP connection opens, then shovels its bytes back and forth without reading them. Examples: AWS NLB, Google's Maglev, Linux IPVS, HAProxy in TCP mode.</Term> makes one choice per *connection*. It's fast, handles millions of packets per second, and doesn't need your TLS certificate. But it can't read a cookie, can't tell `/healthz` from a 30-second generation, and can't retry a request, because it never sees where one request ends.
+
+That bites with HTTP/2 and gRPC, which send many requests over one long-lived connection. Behind an L4 balancer, all of a client's requests go wherever its one connection landed, forever. This is the classic "gRPC load balancing doesn't work" complaint.
+
+An <Term w="L7 load balancer">Balances at the application layer: accepts the client's connection, decrypts TLS, parses each HTTP request, then opens (or reuses) its own connection to a backend of its choice. Examples: nginx, Envoy, HAProxy in HTTP mode, AWS ALB.</Term> is really a <Term w="reverse proxy">A server that accepts requests on behalf of other servers and forwards them. "Reverse" because it represents the servers, not the clients (a normal proxy represents clients).</Term>. It holds one connection to the client and one to the backend and reads everything in between, so it can route by path, balance per request, add headers, and retry on another backend. It costs more CPU per request and needs your TLS keys. Big systems use both: L4 at the edge spreading connections over a fleet of L7 proxies. nginx is L7 in its `http` block (and L4 in its `stream` block).
+
+### How to choose: the algorithms
+
+Now the interesting question. A request arrives. Three healthy, stateless backends. Who gets it?
+
+**Round robin.** A, B, C, A, B, C. No information needed, perfectly fair by *count*. nginx's default, and nearly perfect if every request costs the same.
+
+**Random.** Fair on average but streaky: sometimes three in a row land on one server while another idles. Worse than round robin for equal-cost requests.
+
+**Least connections.** Send it to the backend with the fewest requests in progress. The balancer knows this for free: requests it forwarded and hasn't heard back from. This is the first algorithm that *reacts*. A backend stuck on a slow request piles up open connections and stops getting new ones.
+
+That matters because round robin is fair by count, not cost, and LLM requests are the extreme case of uneven cost: a one-word classification, then a 2,000-token essay, a factor of a hundred apart. Round robin gives A the next request whether or not A is still writing that essay, and every short request behind a long one waits for it.
+
+<Predict id="rr-vs-lc">
+Three servers, each handles one request at a time and queues the rest (like one GPU running one batch). Requests are 90% short (40 ms of work) and 10% long (1,000 ms). The servers are about 75% busy overall. Under round robin, what's the median latency, roughly? Under least connections? Pick numbers, not adjectives.
+<Fragment slot="answer">
+
+On my Mac (native nginx, three uvicorn backends, the exact app from the Build), round robin gave a **median of 725 ms**, and least connections gave **83 ms**. The p99 went from 3.6 s to 2.2 s.
+
+The median is the shocking one. A short request only needs 40 ms of work, so a median of 725 ms means the typical request spent most of its life waiting behind a long one that round robin blindly queued it after. Least connections steers short requests away from servers that are busy with a long one, so most of them run almost immediately. The tail improves less because some unlucky requests still land behind a long one: the balancer counts requests, it doesn't know their sizes.
+
+</Fragment>
+</Predict>
+
+Play with the toy version. It's four servers, each doing one request at a time. Start on round robin with the LLM mix, then switch to least conn and watch the queue lengths flatten. Then flip to "All same size": round robin becomes as good as anything, because now count *is* cost. Finally turn on "S1 half speed" with round robin and watch S1's queue climb off the top.
+
+<Figure n="004" title="BALANCER SIMULATOR" caption="Four servers, one request at a time each. Live numbers are from the last 600 finished requests. The table re-runs 20,000 requests with every algorithm under your current settings, so you can compare without luck getting in the way. With one slow server, round robin's numbers keep growing the longer it runs: that server's queue never stops growing." wide>
+
+<LBSimulator />
+
+</Figure>
+
+About that last one: with S1 at half speed, round robin still sends it a quarter of the requests, but S1 has only a seventh of the capacity (0.5 of 3.5). It gets more work than it can ever finish, its queue grows without bound, and a quarter of your users wait forever. Least connections sees the pile of open requests and routes around it. Degraded machines (a noisy neighbour, a throttling GPU, a cold cache) are common in real fleets. That's the strongest argument for load-aware balancing.
+
+**Power of two random choices.** Least connections assumes one balancer with perfect, current counts. Real systems have many balancers (nginx worker processes, dozens of proxy machines), each with a partial, slightly stale view. If they all send to "the least loaded server", they all pick the *same* one at once and flatten it. This is a <Term w="herd effect">When many independent decision-makers react to the same signal at the same time and all pile onto the same choice, overloading it.</Term>.
+
+The fix is beautifully cheap: pick two backends at random, and send the request to whichever of those two has fewer connections. That's it.
+
+<Term w="Power of two choices">Pick two servers at random and send the request to the less loaded one. Almost as good as checking every server, much more robust to stale information, and costs O(1).</Term> sounds too simple to matter. It matters exponentially. Throw *n* balls into *n* bins at random and the fullest bin gets about ln *n* / ln ln *n*. Let each ball pick the emptier of two random bins and the fullest drops to about ln ln *n* / ln 2. Azar, Broder, Karlin and Upfal proved it, and Michael Mitzenmacher's thesis carried it to load balancing. One extra random look gets most of the benefit of looking at everything, and because the picks are random, a hundred balancers with stale counts don't converge on one victim. Envoy's "least request" balancer uses it by default; nginx calls it `random two least_conn`.
+
+In the simulator, two choices lands between random and least conn, because it models one balancer with perfect information. Two choices earns its place with many balancers and stale counts.
+
+**Weights.** Any of these can be weighted, e.g. `server app1:8000 weight=2;` for the box with twice the GPUs.
+
+### Hashing: when you *want* the same server
+
+Sometimes you want a key to always land on the same backend, because that backend has something useful loaded: a cache, a model, a shard of data. The obvious way is `server = hash(key) % N`.
+
+<Predict id="mod-n">
+60 users are spread over 3 servers with `hash(user) % 3`. You add a fourth server and switch to `% 4`. What fraction of users now land on a different server than before?
+<Fragment slot="answer">
+
+About **75%**. A user stays put only if `h % 3 == h % 4`, and looking at the 12 possible values of `h % 12`, that happens for just 3 of them (0, 1, 2). So adding one server reshuffles three quarters of everyone. If each server held a warm cache for its users, you just made 75% of the caches cold at the moment you were adding capacity because you were overloaded. In general going from N to N+1 moves about N/(N+1) of the keys.
+
+</Fragment>
+</Predict>
+
+<Term w="Consistent hashing">Put both servers and keys on a circle by hashing them. Each key belongs to the first server clockwise from it. Adding or removing a server only moves the keys in its slice of the circle, about 1/N of them.</Term> (Karger and colleagues at MIT, 1997, the idea behind Akamai) fixes this. A new server takes over one arc of the circle, stealing keys from one neighbour; everyone else stays put. One mark per server gives lumpy arcs, so each server is placed on the ring many times, as <Term w="virtual nodes">Many hashed positions on the ring for each real server (say 100-200). Smooths out the slice sizes so each server gets close to its fair share, and lets you give bigger servers more positions.</Term>. Try it: move the slider one step in each mode and compare the "keys that moved" readout.
+
+<Figure n="005" title="HASH RING" caption="With hash mod N, changing the server count moves most keys. On the ring, only the keys in the arc the new server takes over move. With one mark per server the arcs are uneven (look at the busiest server); virtual nodes even them out.">
+
+<LBHashRing />
+
+</Figure>
+
+nginx has it built in: `hash $cookie_uid consistent;` puts whatever variable you name on a ring (the "ketama" scheme). Google's Maglev, an L4 balancer, uses its own consistent hashing so every Maglev machine independently picks the same backend for a connection.
+
+### Why LLM serving routes by prefix
+
+Here hashing becomes central to your work. You know the KV cache: the keys and values for every prompt token, kept on the GPU so they aren't recomputed per new token. Engines like vLLM and SGLang go further with <Term w="prefix caching">Keeping the KV cache for prompts the server has already processed, so a new request that starts with the same tokens (same system prompt, same conversation so far) skips recomputing that part.</Term> (see [the prefix caching lesson](/lessons/prefix-caching/)). A chat resends the whole conversation every turn; an agent resends its system prompt and tools every step. If the server still has that prefix's KV, most of <Term w="prefill">The first phase of generating: running the whole prompt through the model at once to build its KV cache. Cost grows with prompt length. Its time is most of the time-to-first-token.</Term> is skipped. Illustrative numbers: a 10,000-token history at a few thousand tokens per second of prefill is seconds of time-to-first-token cold, well under a second if 9,800 tokens are cached.
+
+Put eight replicas behind round robin and turn 2 has a 1-in-8 chance of finding turn 1's KV. Seven times in eight the prefix is recomputed, and seven GPUs fill their caches with copies of it. Least connections is just as blind.
+
+So LLM routers are <Term w="cache-aware routing">Routing each request to the replica most likely to already hold its prompt prefix in KV cache, while still avoiding overloaded replicas. Also called prefix-aware or KV-aware routing.</Term>. Simple version: consistent-hash on the conversation ID or the first chunk of the prompt. Better version, used by SGLang's router (with similar ideas in NVIDIA Dynamo and llm-d): keep an approximate tree of the prefixes sent to each replica, route to the longest match, and *fall back to the least-loaded replica* when the match is too busy. Pure affinity would recreate Figure 004's slow-server disaster: one popular system prompt, one melting GPU.
+
+This is a sticky session, and it's fine. Why? Because the KV cache is a **cache**. If that replica dies, the next request goes elsewhere, the prefix is recomputed, and the user waits a bit longer. Nothing is lost. Stickiness for *speed* is good. Stickiness for *correctness*, where the only copy of the data lives on one server, is the trap. That's the line to remember.
+
+### Why sticky sessions are a trap
+
+With in-memory sessions and a sticky balancer, everything works in testing. Then:
+
+- **A server crashes.** Everyone pinned to it loses their session, mid-checkout.
+- **You deploy.** Each restart is a small crash on purpose, so every deploy logs people out, and the team starts deploying less.
+- **You scale.** Pinned users don't move to a new server, so it idles while the hot ones stay hot.
+- **Load goes lumpy.** One heavy user, or one office behind one IP, pins a lot of work to one machine, and the balancer isn't allowed to help.
+- **It's quietly fragile.** You'll see this live: pin by session cookie, and the login request that created the session wasn't routed by it.
+
+Same root cause each time: the data has one copy, in a place designed to be disposable.
+
+### Stateless servers, state in a shared store
+
+So move the data out, into one shared place, usually <Term w="Redis">An in-memory key-value server. Clients send small commands over TCP (SET, GET, RPUSH, EXPIRE...) and get answers in well under a millisecond on a local network. Popular for sessions, caches, rate limits and queues.</Term> for sessions, or the database for anything that must never be lost. Any server can look up the session ID, the balancer can send each request anywhere, and killing a server bothers nobody.
+
+The cost is one network round trip per request. From [How slow is slow?](/lessons/latency-numbers/), that's on the order of 100-500 µs inside a data centre or between containers on one machine: under 1% of a 40 ms model call. You'll measure it. Two things it doesn't solve:
+
+- **You moved the state, you didn't remove it.** Redis must now not lose it, and must not become the new single point of failure. See [Why do we need databases?](/lessons/why-databases/).
+- **Concurrency is back.** Two tabs add to the same cart at once, on two servers. If each reads the session, appends, and writes it all back, one item vanishes: the lost update from the threads lesson, across machines, where no Python lock can help. Same fix: make it one atomic step in the store (Redis's `RPUSH` appends in one command). More in [Transactions](/lessons/transactions/).
+
+<Figure n="006" title="STATELESS FLEET" caption="Two balancers share one address so either can fail. App servers keep nothing, so any of them can take any request and can be added, removed or killed freely. All state sits in the shared stores, which now need their own replication: you moved the single point of failure, so you have to deal with it there.">
+<svg viewBox="0 0 640 330" role="img" aria-label="Clients to two load balancers sharing a virtual IP, to four stateless app servers, to Redis and a database with replicas">
+  <rect x="250" y="8" width="140" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="28" text-anchor="middle" class="strong">CLIENTS</text>
+  <line x1="320" y1="38" x2="320" y2="60" class="ink" stroke-width="1.2" />
+  <text x="330" y="54">ONE ADDRESS (VIP / DNS)</text>
+  <rect x="180" y="62" width="120" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="240" y="80" text-anchor="middle" class="strong">LB A</text>
+  <text x="240" y="95" text-anchor="middle">active</text>
+  <rect x="340" y="62" width="120" height="40" class="fill-paper dash" stroke-width="1.2" />
+  <text x="400" y="80" text-anchor="middle" class="strong">LB B</text>
+  <text x="400" y="95" text-anchor="middle">standby</text>
+  <line x1="300" y1="82" x2="340" y2="82" class="ink dash" stroke-width="1" />
+  <line x1="240" y1="102" x2="100" y2="150" class="ink" stroke-width="1" />
+  <line x1="240" y1="102" x2="250" y2="150" class="ink" stroke-width="1" />
+  <line x1="240" y1="102" x2="400" y2="150" class="ink" stroke-width="1" />
+  <line x1="240" y1="102" x2="550" y2="150" class="ink" stroke-width="1" />
+  <rect x="40" y="150" width="120" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="100" y="172" text-anchor="middle" class="strong">APP 1</text>
+  <text x="100" y="188" text-anchor="middle">no state</text>
+  <rect x="190" y="150" width="120" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="250" y="172" text-anchor="middle" class="strong">APP 2</text>
+  <text x="250" y="188" text-anchor="middle">no state</text>
+  <rect x="340" y="150" width="120" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="400" y="172" text-anchor="middle" class="strong">APP 3</text>
+  <text x="400" y="188" text-anchor="middle">draining</text>
+  <rect x="490" y="150" width="120" height="50" class="fill-paper dash" stroke-width="1.2" />
+  <text x="550" y="172" text-anchor="middle" class="strong">APP 4</text>
+  <text x="550" y="188" text-anchor="middle">just added</text>
+  <line x1="100" y1="200" x2="200" y2="250" class="ink" stroke-width="1" />
+  <line x1="250" y1="200" x2="220" y2="250" class="ink" stroke-width="1" />
+  <line x1="400" y1="200" x2="420" y2="250" class="ink" stroke-width="1" />
+  <line x1="550" y1="200" x2="440" y2="250" class="ink" stroke-width="1" />
+  <line x1="250" y1="200" x2="410" y2="250" class="ink dash" stroke-width="1" />
+  <line x1="400" y1="200" x2="230" y2="250" class="ink dash" stroke-width="1" />
+  <rect x="130" y="250" width="160" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="210" y="272" text-anchor="middle" class="strong">REDIS</text>
+  <text x="210" y="288" text-anchor="middle">sessions · + replica</text>
+  <rect x="350" y="250" width="160" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="430" y="272" text-anchor="middle" class="strong">DATABASE</text>
+  <text x="430" y="288" text-anchor="middle">users · + replica</text>
+  <text x="320" y="320" text-anchor="middle" class="blue-t">STATE LIVES HERE, AND ONLY HERE</text>
+</svg>
+</Figure>
+
+### Health checks: knowing who's alive
+
+The balancer finds out a backend is dead in one of two ways. A <Term w="passive health check">Judging a backend's health from real traffic: if forwarding a request fails (connection refused, timeout), count a failure, and after enough failures stop using that backend for a while.</Term> watches real requests. Open-source nginx does this: `max_fails` failures within `fail_timeout` (defaults 1 and 10 s) benches a backend for `fail_timeout`, then tries it again. Free, but a real request had to fail first. An <Term w="active health check">The balancer probes each backend on a timer (say, GET /healthz every 5 s) and removes it after a few failures in a row, before a user hits it. Supported by HAProxy, Envoy, NGINX Plus, cloud balancers and Kubernetes probes.</Term> polls in the background. Detection time is interval times threshold: probe every 5 s, remove after 3 failures, and a dead backend gets traffic for up to 15 s. Two design choices hide in "what does `/healthz` check?":
+
+- **Shallow vs deep.** Shallow: is this process up and answering HTTP? Deep: can it also reach Redis, the database, the model? Deep is dangerous. When Redis hiccups for two seconds, *every* backend fails at once, the balancer removes all of them, and a blip becomes an outage. Balancers defend against this by <Term w="failing open">When every backend looks unhealthy, ignore the health checks and send traffic to all of them anyway, on the theory that the checks are more likely wrong than everything being dead. Envoy calls this the panic threshold.</Term>. Keep the routing check about *this* process.
+- **Liveness vs readiness.** Kubernetes made this split explicit. <Term w="Liveness">"Is this process stuck? If not live, restart it." Should only fail if the process truly can't recover by itself.</Term> asks whether to restart the process. <Term w="Readiness">"Should this process receive traffic right now?" Fails while starting up (model still loading), while draining, or while overloaded. Failing it removes the backend from rotation without restarting it.</Term> asks whether to route to it. An LLM server loading weights for two minutes is alive but not ready; confuse the two and it gets restarted in a loop.
+
+### Retries, and why POST is special
+
+When nginx can't connect to a backend, it quietly tries the next one (`proxy_next_upstream`, on by default for errors and timeouts). But if the request was already *sent* and the backend died mid-work, retrying is only safe if doing it twice is harmless: <Term w="idempotent">Doing it twice has the same effect as doing it once. GET, PUT and DELETE are supposed to be; POST is not (two POSTs to /orders make two orders).</Term>. nginx retries in-flight GETs elsewhere, but not POSTs; a POST whose backend died mid-request gets a <Term w="502">HTTP status "Bad Gateway": the proxy couldn't get a valid response from the backend. A 504 is the timeout version.</Term>. Every LLM API (`/v1/chat/completions`, `/v1/messages`) is a POST. You'll see the difference in the Build.
+
+### Draining: leaving without dropping anything
+
+Deploys and scale-downs remove backends on purpose. Done carelessly, everything in flight fails. Done properly it's called <Term w="draining">Taking a backend out of rotation gracefully: stop sending it new requests, let the ones it already has finish, then shut it down. Google's SRE book calls the in-between state "lame duck".</Term>, and it has four steps:
+
+1. **Stop being chosen**: readiness starts failing, or it's deregistered.
+2. **Wait for the balancer to notice**, still serving whatever arrives meanwhile.
+3. **Finish in-flight work**, with a deadline longer than your longest request. For LLM streaming that can be minutes.
+4. **Exit.**
+
+At the process level, `docker stop` and Kubernetes send <Term w="SIGTERM">The polite "please shut down" signal. A process can catch it and clean up. If it doesn't exit within the grace period (10 s for docker stop, 30 s by default in Kubernetes), it gets SIGKILL, which cannot be caught.</Term>. Uvicorn catches it, stops accepting connections, finishes in-flight requests, and exits. `kill -9` sends SIGKILL, and everything in flight dies. One Kubernetes subtlety: SIGTERM and "remove this pod from the balancer" happen *at the same time*, so for a moment new requests still arrive at a process that stopped accepting. The usual fix is a `preStop` sleep of a few seconds.
+
+### Single points of failure
+
+A <Term w="single point of failure">One component whose failure takes the whole system down. Often abbreviated SPOF.</Term> is anything there's exactly one of in the path of every request. Put your finger on each box in the diagram: if this dies, does everything stop?
+
+Your Build has two: nginx and Redis. Three app servers so one can die, then a single balancer in front. Fixes: two balancers sharing a virtual IP that the standby takes over (VRRP, usually via `keepalived`), several balancer IPs in DNS, or a cloud balancer (itself a hidden fleet); and a replicated Redis with failover. There's always another SPOF if you look (DNS, the region, a config push to every balancer at once). The goal isn't zero; it's knowing where they are.
+
+## Build It
+
+One folder, `~/workbench/lb/`: three copies of a small FastAPI app behind nginx. The app pretends to be an LLM server: `/generate` holds a one-at-a-time lock (like a GPU running one batch) and "generates" for 2 ms per token.
+
+I verified the app, nginx configs and experiments natively on a Mac (Homebrew nginx 1.29, three uvicorns on ports 8001-8003), not under Docker. The compose files are the standard shape but untested here; note anything that differs. The native route works too: `brew install nginx redis`, three `SERVER_ID=appN uvicorn app:app --port 800N &`, and `127.0.0.1:800N` in the upstream.
+
+<Task id="t0" title="Set up the app, nginx and compose" agent="ok">
+
+The app, with sessions deliberately kept in a dict:
+
+```python
+# app.py
+import asyncio, os, secrets
+from fastapi import FastAPI, Request, Response, HTTPException
+
+SERVER = os.environ.get("SERVER_ID", "app?")
+app = FastAPI()
+
+SESSIONS: dict[str, dict] = {}   # the bug: lives in this one process's heap
+GPU = asyncio.Semaphore(1)       # pretend accelerator: one request at a time
+INFLIGHT = 0
+
+def get_session(request: Request) -> dict:
+    s = SESSIONS.get(request.cookies.get("sid", ""))
+    if s is None:
+        raise HTTPException(401, f"{SERVER}: who are you?")
+    return s
+
+@app.post("/login")
+def login(user: str, response: Response):
+    sid = secrets.token_hex(8)
+    SESSIONS[sid] = {"user": user, "cart": []}
+    response.set_cookie("sid", sid)
+    return {"sid": sid, "served_by": SERVER}
+
+@app.post("/cart")
+def add(item: str, request: Request):
+    s = get_session(request)
+    s["cart"].append(item)
+    return {"user": s["user"], "cart": s["cart"], "served_by": SERVER}
+
+@app.get("/cart")
+def cart(request: Request):
+    s = get_session(request)
+    return {"user": s["user"], "cart": s["cart"], "served_by": SERVER}
+
+@app.post("/generate")
+async def generate(tokens: int = 50):
+    global INFLIGHT
+    INFLIGHT += 1
+    try:
+        async with GPU:                          # queue here if busy
+            await asyncio.sleep(tokens * 0.002)  # 2 ms per "token"
+        return {"tokens": tokens, "served_by": SERVER}
+    finally:
+        INFLIGHT -= 1
+
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "server": SERVER, "inflight": INFLIGHT}
+```
+
+```dockerfile
+# Dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+RUN pip install --no-cache-dir fastapi uvicorn redis
+COPY app.py .
+# exec form: uvicorn is PID 1 and receives SIGTERM directly
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+```yaml
+# compose.yaml
+x-app: &app
+  build: .
+  depends_on: [redis]
+
+services:
+  app1:
+    <<: *app
+    environment: { SERVER_ID: app1, REDIS_URL: "redis://redis:6379/0" }
+  app2:
+    <<: *app
+    environment: { SERVER_ID: app2, REDIS_URL: "redis://redis:6379/0" }
+  app3:
+    <<: *app
+    environment: { SERVER_ID: app3, REDIS_URL: "redis://redis:6379/0" }
+  redis:
+    image: redis:7-alpine
+  nginx:
+    image: nginx:1.29-alpine
+    ports: ["8080:80"]
+    volumes: ["./nginx.conf:/etc/nginx/nginx.conf:ro"]
+    depends_on: [app1, app2, app3]
+```
+
+```nginx
+# nginx.conf
+events {}
+http {
+  log_format lb '"$request" $status upstream=$upstream_addr '
+                'up_status=$upstream_status time=$request_time';
+  access_log /dev/stdout lb;
+
+  upstream app {
+    zone app 64k;          # share counters across nginx worker processes
+    # the balancing method goes here (round robin is the default)
+    server app1:8000;
+    server app2:8000;
+    server app3:8000;
+  }
+  server {
+    listen 80;
+    location / {
+      proxy_pass http://app;
+      proxy_connect_timeout 1s;
+      add_header X-Upstream $upstream_addr always;
+    }
+  }
+}
+```
+
+`docker compose up --build -d`, then `curl -s localhost:8080/healthz` four times: app1, app2, app3, app1. If 8080 is taken (it was on my Mac), change the left side of `8080:80`. Apply config edits with `docker compose exec nginx nginx -s reload`; watch decisions with `docker compose logs -f nginx`.
+
+The `zone` line matters: nginx runs several worker processes, and without a shared zone each keeps its own counts, so `least_conn` means "least connections *this worker* knows about".
+
+</Task>
+
+<Task id="t1" title="Log in and watch the session break" agent="hands">
+
+Use `curl` with a cookie jar: `-c jar` saves cookies from responses, `-b jar` sends them.
+
+```bash
+rm -f jar
+curl -s -c jar -b jar -X POST 'localhost:8080/login?user=gaurav'
+curl -s -c jar -b jar -X POST 'localhost:8080/cart?item=gpu1'
+# ...repeat the cart call with gpu2, gpu3, ... gpu6
+```
+
+<Predict id="sessions-rr">
+Six cart requests after one login, three backends, round robin. How many of the six succeed, and which items end up in the cart?
+<Fragment slot="answer">
+
+Two. Round robin cycles app1, app2, app3, so only every third request lands on the server that handled the login. On my run login went to app2, the cart calls went app3, app1, app2, app3, app1, app2, and the cart ended up `["gpu3", "gpu6"]`. The other four got `401: who are you?` from a server with an empty dict. Note nginx did not retry those: a 401 is a valid answer from a healthy backend, not a failure.
+
+</Fragment>
+</Predict>
+
+Check `served_by` and the nginx log against your prediction.
+
+</Task>
+
+<Task id="t2" title="Patch it with sticky sessions, then break the patch" agent="hands">
+
+Open-source nginx has no "sticky cookie" feature (paid NGINX Plus does; HAProxy has it free), but it can hash any variable onto a ring. Add this at the top of the `upstream` block:
+
+```nginx
+hash $cookie_sid consistent;
+```
+
+Reload and rerun t1 for six users in a loop. It fails for most of them. Explain why in one sentence (hint: what cookie did the login request carry?). Then hash on something that exists from the first request: have the client send a `uid` cookie with the username every time (`-b "uid=$u"` alongside `-b jar`) and hash on `$cookie_uid`. Every cart should now fill.
+
+Now the trap. Find which backend one user is pinned to, `docker compose kill` it, and request their cart. Then `docker compose start` it and request again.
+
+</Task>
+
+<Task id="t3" title="Fix it properly: sessions in Redis" agent="review">
+
+Remove the `hash` line from nginx (back to round robin) and change the app so that `SESSIONS` disappears entirely. The shape:
+
+```python
+import json, redis
+r = redis.Redis.from_url(os.environ["REDIS_URL"], decode_responses=True)
+SESSION_TTL = 3600  # seconds
+
+def load_session(sid: str) -> dict | None:
+    """Fetch the session for sid from Redis, or None."""
+    ...
+
+def create_session(user: str) -> str:
+    """Make a new sid, store the user (and an empty cart) with a TTL, return sid."""
+    ...
+
+def add_to_cart(sid: str, item: str) -> list[str]:
+    """Append item to this session's cart ATOMICALLY and return the cart."""
+    ...
+```
+
+Hints:
+
+- One option: the user under `sess:<sid>` (`SET` with `ex=SESSION_TTL`), the cart as a Redis list `cart:<sid>` (`RPUSH`, `LRANGE`, `EXPIRE`). A list makes append one command, so concurrent appends can't lose items.
+- The tempting alternative, one JSON blob read-modified-written, is Break It #2.
+- The endpoints are plain `def` (FastAPI runs them in a thread pool), so the sync client is fine. Check the redis-py docs if a call's shape has changed.
+
+Rebuild, rerun t1 with plain round robin: all six succeed while `served_by` rotates. Kill a backend mid-session: nothing is lost. Have an agent review for any read-then-write split across two commands.
+
+</Task>
+
+<Task id="t4" title="A load generator with uneven request sizes" agent="hands">
+
+You need LLM-shaped traffic: random arrival times, very uneven sizes. Make it *open-loop*: requests fire on a schedule whether or not earlier ones finished, like real users. A closed loop (wait for each answer before sending the next) slows down when the server does and hides the queueing; that's coordinated omission from [the p99 lesson](/lessons/tail-latency/).
+
+```python
+# load.py  — usage: python load.py RATE_PER_SEC DURATION_SEC
+import asyncio, random, sys, time, collections, httpx
+
+URL = "http://localhost:8080/generate"
+
+async def one(client: httpx.AsyncClient, tokens: int, out: list) -> None:
+    """POST URL?tokens=..., record (latency_s, status_or_error_name, served_by)."""
+    ...
+
+async def main(rate: float, duration: float) -> None:
+    # every arrival: tokens = 20 with probability 0.9, else 500
+    # gap to next arrival: random.expovariate(rate)
+    # create_task for each request (do NOT await it in the loop), gather at the end
+    # print n, p50, p90, p99, max (ms), Counter of statuses, Counter of served_by
+    ...
+```
+
+Hints: one `httpx.AsyncClient(limits=httpx.Limits(max_connections=1000), timeout=60)`; a seeded `random.Random(0)` so runs compare; catch exceptions per request and record the type name. Mean cost is 0.9 × 40 + 0.1 × 1000 = 136 ms, so three backends top out near 22 requests/s. Start at 16.
+
+</Task>
+
+<Task id="t5" title="Round robin vs least_conn vs two choices" agent="hands">
+
+Write your predictions in the Measure table first. Then run `python load.py 16 40` three times, changing only the method line in the upstream block between runs (and reloading nginx):
+
+1. nothing (round robin)
+2. `least_conn;`
+3. `random two least_conn;`
+
+Then push the rate to 19 and 21 for round robin and least_conn. Which one falls apart first?
+
+</Task>
+
+<Task id="t6" title="Kill a backend under load, then drain one" agent="explain">
+
+Run `python load.py 14 20` and, five seconds in, from another terminal:
+
+```bash
+docker compose kill app2      # SIGKILL: no warning
+sleep 7; docker compose start app2
+```
+
+Check the status counter and the nginx log. Then kill a backend while six long requests are in flight:
+
+```bash
+for i in 1 2 3 4 5 6; do
+  curl -s -o /dev/null -w "%{http_code} %{time_total}\n" \
+    -X POST 'localhost:8080/generate?tokens=1000' &
+done
+sleep 1; docker compose kill app2; wait
+```
+
+Repeat with `docker compose stop app2` (SIGTERM, 10 s grace) instead of `kill`, then with GET instead of POST (in the app and the curl loop). Write your own explanation of each status code before asking an agent about any error-log line.
+
+Two Docker things I couldn't check: a killed container's IP disappears, so nginx may log "host unreachable" or hit the 1 s `proxy_connect_timeout` instead of a fast "connection refused"; and a restarted container may get a new IP that nginx (which resolved `app2` once at startup) won't see until a reload. If app2 never gets traffic again, that's why.
+
+</Task>
+
+<DoneWhen>
+
+- You watched in-memory sessions fail on round robin, and explained the failure pattern from the `served_by` fields.
+- You made sticky sessions work, found why `$cookie_sid` didn't, and lost a user's cart by killing their server.
+- Sessions live in Redis, cart appends are atomic, and killing any app server loses nothing.
+- `load.py` is open-loop and prints p50/p90/p99, and the Measure table is filled in with your predictions beside the results.
+- You can say exactly which requests got a 502 when a backend died, and why the others didn't.
+
+</DoneWhen>
+
+## Measure
+
+Fill in your numbers. Mine are from the native setup on an M-series MacBook (nginx 1.29.4, uvicorn 0.54, Python 3.14, one nginx worker), 16 requests per second for 40 s, about 650 requests per run. Expect yours to differ in the details and match in shape.
+
+| Method | Your prediction (p50) | Your p50 | Your p99 | My p50 | My p90 | My p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Round robin | | | | 725 ms | 1,948 ms | 3,569 ms |
+| `least_conn` | | | | 83 ms | 1,520 ms | 2,238 ms |
+| `random two least_conn` | | | | 137 ms | 1,581 ms | 2,517 ms |
+
+What the numbers should tell you:
+
+**Round robin's median is terrible.** A short request needs 40 ms of work; the median took 725 ms, mostly waiting behind a 1-second request. Round robin split counts perfectly (218, 218, 217), and that's the problem: even counts, uneven work.
+
+**Least connections fixes the median, helps the tail less.** Most short requests dodge busy backends and start at once. The p99 stays high because long requests take a second themselves and sometimes bunch up. The balancer counts requests, not tokens. (Routers that know prompt length or read the engine's queue depth can do better.)
+
+**Two choices sits in between.** One balancer with perfect counts does best checking everything; two choices pays off with many balancers and stale counts, which this setup doesn't have.
+
+**Utilization.** 16/s × 136 ms = 2.2 of 3 backends busy, about 73%. At 21/s it's 95%, where waiting explodes (the knee from [the p99 lesson](/lessons/tail-latency/)). Round robin hits that wall first: it can leave a backend idle while another has a queue.
+
+Then the failure experiments:
+
+| Experiment | Your status codes | Mine |
+| --- | --- | --- |
+| In-memory sessions, round robin, 6 cart calls | | 2 × 200, 4 × 401 |
+| Sticky on `$cookie_sid`, 6 users | | 5 of 6 users' first cart call was 401 |
+| Sticky on `$cookie_uid`, kill the pinned server | | 401 from a different backend (cart gone) |
+| 6 long POSTs, SIGKILL one backend | | 4 × 200, 2 × 502 |
+| 6 long POSTs, SIGTERM one backend | | 6 × 200 |
+| 14/s POST load, SIGKILL for 7 s | | 0 errors (backend was idle at the instant of the kill; try a few times) |
+
+Why each happened:
+
+- **SIGKILL with POSTs: two 502s.** The two requests on app2 (one running, one queued) died with it. nginx had sent them and POST isn't idempotent, so no retry. With GET, nginx retried them elsewhere: my GET run logged "upstream prematurely closed connection" and every client still got 200.
+- **SIGTERM: all 200s.** Uvicorn stopped accepting but finished both requests. A *new* request to app2 got "connection refused", and a connection never established is always safe to retry, so nginx sent it elsewhere.
+- **The 14/s run.** Whether anything fails depends on what the backend was doing at that instant. One clean failure test proves little; kill it several times, or while you know it's busy.
+
+Last, the price of statelessness: time a few hundred `GET /cart` calls with in-memory and with Redis sessions. Expect a fraction of a millisecond of difference (approximate; measure it), against 40-1,000 ms for `/generate`.
+
+## Break It
+
+**1. Pin by IP.** Swap in `ip_hash;` and run the load generator. Everything lands on one backend, because to nginx all your traffic comes from one address (your Mac, or Docker's gateway). The real-world version is a whole company behind one NAT address. Sticky-by-IP balances *addresses*, and addresses aren't users.
+
+**2. Lose cart items across machines.** Store the session as one JSON blob with a read-modify-write `add_to_cart` (GET, `json.loads`, append, SET), then fire 50 concurrent `POST /cart` calls for one session (`for i in $(seq 50); do curl ... & done; wait`). You should count fewer than 50 items: the lost update, across containers, where no Python lock helps. With `RPUSH` it's exactly 50. (Redis also has `WATCH`/`MULTI` and Lua scripts for multi-step atomic updates.)
+
+**3. Kill the only balancer, or the only Redis.** `docker compose kill nginx`: total outage with three healthy app servers. `docker compose kill redis`: every server up, every request failing. Circle both on your diagram and decide what you'd do about each. (Making `/healthz` check Redis just turns the second into "nginx thinks every backend is dead".)
+
+**4. Drain too fast.** Add `--timeout-graceful-shutdown 1` to the `CMD` and repeat the six-long-POSTs test with `docker compose stop app2`. Uvicorn waits a second, then cancels the running request: on my Mac the client got a `500` and the log said "Cancel 1 running task(s), timeout graceful shutdown exceeded". With `docker compose stop -t 1`, SIGKILL arrives instead and you get 502s. Your grace period must outlast your longest request, and LLM generations can run for minutes.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. You run three copies of an app that keeps sessions in memory. What breaks, and what are the two ways to fix it? Which would you pick?</summary>
+
+Each copy is a separate process with its own memory, so a session created on one server doesn't exist on the others, and whenever a user's next request lands elsewhere, they're a stranger. Fix one: sticky sessions, routing each user to the same server by hashing a cookie or IP. Fix two: stateless servers, with sessions in a shared store like Redis keyed by the cookie's session ID. I'd pick the second. With sticky sessions the only copy of the data lives on a disposable server, so crashes and deploys log users out, new servers don't pick up existing users, and load gets lumpy. Stickiness is fine only as a speed optimization on top of shared state, like routing chat turns to the replica with a warm KV cache.
+
+</details>
+
+<details>
+<summary>2. Why is round robin a bad choice for an LLM inference fleet, and what would you use instead?</summary>
+
+It's fair by count, but LLM request costs vary by 100x or more, so short requests queue behind long ones (in my test, median 725 ms vs 83 ms with least connections). It also can't route around a degraded replica, which builds an unbounded queue. Better: least outstanding requests, or power of two choices when many balancers share stale information. Best for LLMs: cache-aware routing, which sends a request to the replica most likely to hold its prompt prefix in KV cache and falls back to the least-loaded replica when that one is overloaded, ideally using the engine's own load signals (queue depth, KV cache usage) rather than connection counts.
+
+</details>
+
+<details>
+<summary>3. How does this scale? Your stateless app handles 200 requests/s per server and you need 5,000. What changes, and what becomes the bottleneck?</summary>
+
+The stateless app tier scales roughly linearly: 25 servers, plus headroom (say 30-35) to lose a few and still deploy. One nginx can proxy well beyond 5,000 simple requests/s, but you want two for redundancy. The shared stores are where it stops being linear. 5,000 session reads/s is comfortable for one Redis (simple operations commonly reach on the order of 100,000/s per instance; measure yours), but the database is usually the real limit, so you add caching, read replicas, and eventually sharding with consistent hashing. And watch latency budgets: one extra Redis round trip is nothing, ten in series isn't.
+
+</details>
+
+<details>
+<summary>4. How do you deploy a new version without dropping a single in-flight request?</summary>
+
+Drain each server before stopping it: stop being chosen (fail readiness or deregister), keep serving until every balancer has noticed (a preStop sleep in Kubernetes, since SIGTERM and endpoint removal race), finish in-flight requests with a deadline longer than the longest request (minutes for LLM streaming), then exit before SIGKILL. Roll a few servers at a time so capacity stays up. The balancer can safely retry connection failures, and idempotent requests even after sending; POSTs need idempotency keys to be retryable.
+
+</details>
+
+<details>
+<summary>5. Your active health check probes every 5 s and removes a backend after 3 failures. A backend dies. What happens to traffic, and what would you change?</summary>
+
+For up to about 15 s (3 × 5 s) it still looks healthy and keeps getting its share of requests, which fail unless they're retried elsewhere (connect failures, idempotent requests). Add passive checks, which bench it on the first failed connection. A shorter interval detects faster at the cost of more probes and false alarms. Keep the check shallow: if it checked Redis, one Redis blip would mark every backend down, and you'd want the balancer to fail open rather than route to nothing.
+
+</details>
+
+## Go Deeper
+
+- **Google, _Site Reliability Engineering_, chapters 19 and 20: "Load Balancing at the Frontend" and "Load Balancing in the Datacenter"** (free at [sre.google/books](https://sre.google/books/)). How Google actually does it: DNS and L4 at the edge, then weighted least-loaded balancing, subsetting, and the "lame duck" draining state. The best single read for this lesson.
+- **Michael Mitzenmacher, "The Power of Two Choices in Randomized Load Balancing"** (IEEE TPDS, 2001, from his 1996 thesis), and his follow-up **"How Useful Is Old Information?"** (2000). The math behind two choices, and the proof that it survives stale load information where "pick the least loaded" collapses.
+- **David Karger et al., "Consistent Hashing and Random Trees: Distributed Caching Protocols for Relieving Hot Spots on the World Wide Web"** (STOC 1997). The original consistent hashing paper, written to solve the web caching problem that became Akamai.
+- **Daniel E. Eisenbud et al., "Maglev: A Fast and Reliable Software Network Load Balancer"** (NSDI 2016). Google's L4 balancer: how a fleet of commodity machines replaces hardware balancers, with its own consistent hashing so any machine picks the same backend for a connection.
+- **Adam Wiggins, _The Twelve-Factor App_, factor VI "Processes"** ([12factor.net/processes](https://12factor.net/processes)). One page. The canonical statement of "stateless processes, state in backing services, no sticky sessions".
+- **nginx docs: [ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html)** (every method, `max_fails`, `zone`, `hash ... consistent`) and **[ngx_http_proxy_module's `proxy_next_upstream`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream)** (exactly when nginx retries, and why POST is special).
+- **Lianmin Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs"** (2024, RadixAttention), plus the SGLang router docs for its cache-aware policy. Where prefix-aware routing in LLM serving comes from. Check the current docs; this area moves fast.
+- **Martin Kleppmann, _Designing Data-Intensive Applications_, chapter 1 (scalability) and chapter 6 (partitioning)**. Scaling up vs out, and why naive hash-mod-N partitioning hurts when you rebalance.
+
+## Connections
+
+Builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/) (three copies are three walled-off address spaces; Break It #2 is the same lost update across machines), [How slow is slow?](/lessons/latency-numbers/) and [Why do people care about p99?](/lessons/tail-latency/).
+
+Sets up [Rate limits and backpressure](/lessons/rate-limits/) (what to do when even least connections can't keep up), [Caching](/lessons/caching/), [Why do we need databases?](/lessons/why-databases/) and [Transactions](/lessons/transactions/) (where the state went and how to keep it safe), and [Containers vs VMs](/lessons/containers/). On the ML side, [the KV cache](/lessons/kv-cache/), [prefix caching](/lessons/prefix-caching/), [batching](/lessons/batching/) and [serving engines](/lessons/serving-engines/) explain what each replica does with the requests you route to it, and why "connections" is a much fuzzier load signal for a batching LLM server than for this toy app.

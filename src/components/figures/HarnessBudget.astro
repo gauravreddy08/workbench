@@ -1,0 +1,89 @@
+---
+// Input-token budget of an agent loop. Call k re-sends the fixed prefix plus everything every
+// earlier step appended, so the context grows linearly and the billed total grows quadratically.
+// Caching model (approximate, Anthropic-style): the part already sent last call is a cache read
+// at 0.1x the base price, new tokens are a cache write at 1.25x. Output tokens are ignored.
+// Prices are inputs, not facts: check the provider's current pricing page.
+---
+<div class="hb" data-fig="harness-budget">
+  <svg viewBox="0 0 640 230" role="img" aria-label="Cumulative billed input tokens versus step, with and without prompt caching">
+    <line x1="60" y1="190" x2="620" y2="190" class="ink" stroke-width="1" />
+    <line x1="60" y1="20" x2="60" y2="190" class="ink" stroke-width="1" />
+    <text x="340" y="220" text-anchor="middle">STEP (MODEL CALL)</text>
+    <text x="56" y="194" text-anchor="end">0</text>
+    <text x="56" y="24" text-anchor="end" data-ymax>0</text>
+    <text x="620" y="206" text-anchor="end" data-xmax>0</text>
+    <path data-p="nocache" class="blue" stroke-width="1.5" />
+    <path data-p="cache" class="ink dash" stroke-width="1.2" />
+    <path data-p="ctx" class="ink" stroke-width="1" opacity="0.5" />
+    <text x="72" y="36" class="blue-t">BILLED INPUT, NO CACHE</text>
+    <text x="72" y="52">- - WITH PROMPT CACHING (COST-EQUIVALENT)</text>
+    <text x="72" y="68" opacity="0.7">THIN: CONTEXT SENT ON THAT CALL</text>
+  </svg>
+  <div class="ctl">
+    <label>steps <input type="range" min="5" max="150" step="1" value="30" data-in="n" /><output data-o="n">30</output></label>
+    <label>tokens added per step <input type="range" min="100" max="5000" step="100" value="800" data-in="d" /><output data-o="d">800</output></label>
+    <label>fixed prefix <input type="range" min="1000" max="20000" step="500" value="3000" data-in="s" /><output data-o="s">3000</output></label>
+    <label>$ per M input <input type="range" min="0.25" max="15" step="0.25" value="3" data-in="p" /><output data-o="p">3</output></label>
+  </div>
+  <p class="hb-read">
+    final context <span class="readout" data-r="ctx">-</span> tok ·
+    billed input <span class="readout" data-r="bill">-</span> tok ·
+    cost <span class="readout" data-r="cost">-</span> ·
+    with caching <span class="readout" data-r="ccost">-</span>
+  </p>
+  <p class="hb-read" data-r="warn"></p>
+</div>
+
+<style is:global>
+  .hb-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.7; }
+  .hb-read.warn { color: var(--warn); }
+</style>
+
+<script>
+  const WINDOW = 200_000; // an example context window size
+  const fmt = (x: number) => x >= 1e6 ? `${(x / 1e6).toFixed(2)}M` : x >= 1e3 ? `${Math.round(x / 1e3)}k` : String(Math.round(x));
+
+  document.querySelectorAll<HTMLElement>('[data-fig="harness-budget"]').forEach((root) => {
+    const val = (k: string) => +root.querySelector<HTMLInputElement>(`[data-in="${k}"]`)!.value;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const path = (k: string) => root.querySelector<SVGPathElement>(`[data-p="${k}"]`)!;
+
+    function render() {
+      const n = val('n'), d = val('d'), s = val('s'), price = val('p');
+      root.querySelectorAll<HTMLElement>('[data-o]').forEach((o) => { o.textContent = String(val(o.dataset.o!)); });
+      const ctx: number[] = [], bill: number[] = [], cbill: number[] = [];
+      let b = 0, cb = 0, prev = 0;
+      for (let k = 1; k <= n; k++) {
+        const c = s + (k - 1) * d; // what call k sends
+        b += c;
+        cb += k === 1 ? 1.25 * c : 0.1 * prev + 1.25 * (c - prev);
+        prev = c;
+        ctx.push(c); bill.push(b); cbill.push(cb);
+      }
+      const ymax = Math.max(b, 1);
+      const X = (k: number) => 60 + (560 * k) / n;
+      const Y = (v: number) => 190 - (170 * v) / ymax;
+      const line = (arr: number[], m = 1) => arr.map((v, k) => `${k ? 'L' : 'M'}${X(k + 1).toFixed(1)},${Y(Math.min(v * m, ymax)).toFixed(1)}`).join(' ');
+      path('nocache').setAttribute('d', line(bill));
+      path('cache').setAttribute('d', line(cbill));
+      path('ctx').setAttribute('d', line(ctx));
+      root.querySelector('[data-ymax]')!.textContent = fmt(ymax);
+      root.querySelector('[data-xmax]')!.textContent = String(n);
+      const last = ctx[ctx.length - 1];
+      r('ctx').textContent = fmt(last);
+      r('bill').textContent = fmt(b);
+      r('cost').textContent = `$${((b / 1e6) * price).toFixed(2)}`;
+      r('ccost').textContent = `$${((cb / 1e6) * price).toFixed(2)}`;
+      const full = ctx.findIndex((c) => c > WINDOW);
+      const w = r('warn');
+      w.classList.toggle('warn', full >= 0);
+      w.textContent = full >= 0
+        ? `Context passes a 200k-token window at step ${full + 1}. Without compaction the run dies there.`
+        : `Doubling the steps roughly quadruples the bill: the sum of 1 + 2 + ... + n grows like n²/2.`;
+    }
+
+    root.querySelectorAll('input').forEach((el) => el.addEventListener('input', render));
+    render();
+  });
+</script>

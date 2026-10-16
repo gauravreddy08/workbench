@@ -1,0 +1,732 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import TCPSequenceSim from '../components/figures/TCPSequenceSim.astro';
+
+## Today
+
+- Say what a port and a socket are, and why "IP address plus port" is how a packet finds the right program.
+- Explain UDP in one sentence, and TCP's promise (every byte, in order, exactly once) plus the five tricks that keep it: sequence numbers, acks, retransmission timers, a sliding window, and congestion control.
+- Build a reliable channel on top of UDP in Python, first stop-and-wait and then a sliding window, and push it through a lossy, reordering, delaying proxy you also write.
+- Put numbers on the costs TCP charges you: the handshake round trip, slow start, Nagle's delay, head-of-line blocking, TIME_WAIT, and the window you need to fill a long pipe.
+- Explain why QUIC (and so HTTP/3) rebuilt reliability on top of UDP, and when you'd pick UDP yourself.
+
+Prerequisites: [How does data travel?](/lessons/packets-and-ip/) (IP is best-effort: packets get lost, duplicated, reordered) and [How slow is slow?](/lessons/latency-numbers/) (round-trip times and `latency × bandwidth`). Rough time: one evening to read and build the channel, one session for tcpdump and the Spark.
+
+## The Problem
+
+IP, from the last lesson, makes one promise: it will *try*. You hand it a packet with an address on it, and it will do its best to get it there. It might not arrive. It might arrive twice. Two packets sent in order might arrive swapped. Nobody tells you which.
+
+Now look at what you actually do all day. `requests.post(...)` sends a 3 KB JSON body to the ranking service, and the service gets exactly those 3 KB, in order, with nothing missing. `scp` copies a 16 GB checkpoint to the Spark and the hash matches. A token stream from a model server arrives as `Hello`, ` world`, never ` worldHello`. Something between your code and IP is turning "probably, in some order" into "definitely, in order". That something is TCP, and it is running inside your kernel on every machine you own.
+
+It isn't free. Every new connection costs a round trip before the first byte moves, which is 150 ms to Europe. A brand-new connection starts slowly on purpose and takes several more round trips to reach full speed. One lost packet stalls everything behind it, even data that already arrived. Small writes can sit in a buffer for 40 ms on purpose. And if you open and close connections fast enough, you can run your client out of port numbers.
+
+Meanwhile some of the most latency-sensitive software in the world (DNS, video calls, games, WireGuard, Tailscale, and HTTP/3) deliberately uses UDP, the protocol that promises nothing. To understand why both exist, you're going to build the promise yourself, out of UDP, and feel each problem as it shows up.
+
+<Origin year="1986" title="The internet's throughput falls by a factor of 1,000">
+
+The first TCP specs (Cerf and Kahn's 1974 paper, then RFC 793 in 1981) already had sequence numbers, acks and retransmission. What they didn't have was any idea of *how fast* to send. A sender blasted out a full window of data, and if acks didn't come back in time, it sent everything again.
+
+In October 1986, the link between Lawrence Berkeley Lab and UC Berkeley, 400 yards and three hops apart, dropped from 32 kilobits per second to 40 bits per second. The network wasn't broken. It was full of retransmissions: routers' queues overflowed, packets were dropped, senders timed out and resent everything, which overflowed the queues further. Almost every packet on the wire was a copy of one that had already been sent. This became known as congestion collapse.
+
+Van Jacobson and Michael Karels worked out why and fixed it in the senders, without touching a single router. Their 1988 paper, "Congestion Avoidance and Control", added slow start, a much better retransmission timer, and the rule of backing off hard when you see loss. Those ideas are still in every TCP stack today. The internet works because every sender on it agrees to be polite.
+
+</Origin>
+
+## The Idea
+
+### Ports: the apartment number
+
+An IP address gets a packet to a machine. But your laptop is running a browser, Slack, an SSH session to the Spark, and a Python script talking to an API, all at once. When a packet arrives, which program gets it?
+
+The answer is a <Term w="port">A 16-bit number (0 to 65535) that names one conversation endpoint on a machine. The IP address picks the building; the port picks the apartment.</Term>. Every TCP or UDP packet carries two: the source port and the destination port. A server program asks the kernel to <Term w="listen">Tell the kernel "deliver new connections for this port to me". Only one program can normally listen on a given port and address at a time; that's the "address already in use" error.</Term> on a port: `sshd` on 22, your FastAPI app on 8000. When your client connects out, the kernel picks a temporary <Term w="ephemeral port">A port the kernel picks for the client side of a connection, from a reserved range. macOS uses 49152-65535; Linux uses 32768-60999 by default.</Term> for its side.
+
+Your program never touches ports or packets directly. It holds a <Term w="socket">The kernel object your program uses to send and receive network data. In code it's a file descriptor, a small integer, just like an open file. You read and write it; the kernel does the protocol.</Term>. `socket.socket()` in Python asks the kernel for one. Everything TCP does (the retries, the ordering, the timers) happens inside the kernel, on the far side of that socket. You see `send` and `recv`.
+
+A TCP connection is named by four numbers: source IP, source port, destination IP, destination port. That <Term w="4-tuple">The (source IP, source port, destination IP, destination port) that uniquely identifies a TCP connection. Add the protocol and you get the 5-tuple that firewalls and load balancers hash on.</Term> is why one server port can hold thousands of connections at once: they all share the server half and differ in the client half.
+
+<Figure n="001" title="PORTS AND THE 4-TUPLE" caption="One server, three listening ports. Two clients connect to the same port 8000; the kernel tells them apart by the client's IP and port. A UDP socket on 53 has no connections at all, just datagrams from anyone.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Two clients connect to port 8000 on one server; connections are identified by four numbers">
+  <defs>
+    <marker id="tcp1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="10" y="30" width="170" height="96" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="50" class="strong">LAPTOP 192.168.1.20</text>
+  <rect x="22" y="62" width="146" height="50" class="fill-wash" stroke-width="1" />
+  <text x="95" y="82" text-anchor="middle">python (requests)</text>
+  <text x="95" y="100" text-anchor="middle" class="blue-t">PORT 52814</text>
+  <rect x="10" y="170" width="170" height="96" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="190" class="strong">SPARK 100.101.7.3</text>
+  <rect x="22" y="202" width="146" height="50" class="fill-wash" stroke-width="1" />
+  <text x="95" y="222" text-anchor="middle">curl</text>
+  <text x="95" y="240" text-anchor="middle" class="blue-t">PORT 41022</text>
+  <rect x="400" y="20" width="230" height="260" class="fill-paper" stroke-width="1.2" />
+  <text x="412" y="40" class="strong">SERVER 10.0.0.7</text>
+  <rect x="412" y="54" width="206" height="40" class="fill-wash" stroke-width="1" />
+  <text x="424" y="78">:22   sshd   (TCP)</text>
+  <rect x="412" y="104" width="206" height="96" class="fill-wash" stroke-width="1" />
+  <text x="424" y="124">:8000 uvicorn (TCP)</text>
+  <rect x="424" y="134" width="182" height="24" class="fill-paper" stroke-width="1" />
+  <text x="432" y="150">CONN SOCKET #1</text>
+  <rect x="424" y="164" width="182" height="24" class="fill-paper" stroke-width="1" />
+  <text x="432" y="180">CONN SOCKET #2</text>
+  <rect x="412" y="210" width="206" height="40" class="fill-wash" stroke-width="1" />
+  <text x="424" y="234">:53   dns    (UDP)</text>
+  <line x1="168" y1="87" x2="422" y2="146" class="blue" stroke-width="1.2" marker-end="url(#tcp1-a)" />
+  <line x1="168" y1="227" x2="422" y2="176" class="blue" stroke-width="1.2" marker-end="url(#tcp1-a)" />
+  <text x="200" y="134">192.168.1.20:52814 → 10.0.0.7:8000</text>
+  <text x="200" y="196">100.101.7.3:41022 → 10.0.0.7:8000</text>
+  <text x="290" y="290" text-anchor="middle" class="blue-t">SAME SERVER PORT, DIFFERENT 4-TUPLE = DIFFERENT CONNECTION</text>
+</svg>
+</Figure>
+
+### UDP: IP plus a return address
+
+<Term w="UDP">User Datagram Protocol (RFC 768, 1980). Adds ports, a length and a checksum to an IP packet. No connection, no retries, no ordering. Each send is one packet.</Term> is almost nothing. It takes IP and adds exactly four fields, eight bytes in total: source port, destination port, length, and a <Term w="checksum">A small number computed from the packet's bytes. The receiver recomputes it; if it doesn't match, some bits got flipped on the way and the packet is thrown away.</Term>. That's the whole protocol.
+
+What you get: each `sendto()` becomes one <Term w="datagram">A self-contained packet that carries its full destination address and is delivered (or not) on its own, with no relationship to the ones before or after.</Term> and each `recvfrom()` returns exactly one, whole, with its boundaries intact. What you don't get: any guarantee it arrives, arrives once, or arrives in order. If a router drops it, nobody resends it, and nobody tells you.
+
+That sounds bad, but notice what it also means. There's no setup: the first packet carries data. There's no state on the server per client. And nothing ever waits: if packet 7 is lost, packet 8 is delivered the moment it shows up. For some jobs, those are exactly the properties you want.
+
+### TCP: the promise
+
+<Term w="TCP">Transmission Control Protocol. Gives two programs a reliable, ordered, two-way stream of bytes over unreliable IP, and slows down when the network is congested.</Term> promises something much bigger: whatever bytes you write into one end come out the other end, all of them, in the same order, exactly once, or you get an error. It looks like a pipe between two programs. It's called a <Term w="byte stream">A sequence of bytes with no built-in message boundaries. Two sends of 100 bytes might arrive as one recv of 200, or as recvs of 37 and 163. Framing messages is your job.</Term>, and that has a consequence people trip on for years: TCP doesn't know where your messages begin and end. `send(b"hello")` then `send(b"world")` might arrive as one `recv` returning `b"helloworld"`. Every protocol on top of TCP (HTTP, Postgres, Redis) has to say how long each message is.
+
+Here are both headers, to scale.
+
+<Figure n="002" title="EIGHT BYTES VS TWENTY" caption="UDP's header is four fields. TCP's is twenty bytes before options, and almost every field is one piece of the reliability machinery: where this data sits in the stream, what I've received from you, how much room I have left.">
+<svg viewBox="0 0 640 330" role="img" aria-label="UDP header of 8 bytes and TCP header of 20 bytes drawn as rows of 32 bits">
+  <text x="96" y="20" class="strong">0</text>
+  <text x="352" y="20" text-anchor="middle" class="strong">16</text>
+  <text x="608" y="20" text-anchor="end" class="strong">31  BITS</text>
+  <text x="10" y="50" class="strong">UDP</text>
+  <text x="10" y="66">8 BYTES</text>
+  <rect x="96" y="32" width="256" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="352" y="32" width="256" height="28" class="fill-wash" stroke-width="1" />
+  <text x="224" y="50" text-anchor="middle">SOURCE PORT</text>
+  <text x="480" y="50" text-anchor="middle">DESTINATION PORT</text>
+  <rect x="96" y="60" width="256" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="352" y="60" width="256" height="28" class="fill-wash" stroke-width="1" />
+  <text x="224" y="78" text-anchor="middle">LENGTH</text>
+  <text x="480" y="78" text-anchor="middle">CHECKSUM</text>
+  <text x="10" y="140" class="strong">TCP</text>
+  <text x="10" y="156">20 BYTES</text>
+  <text x="10" y="172">+ OPTIONS</text>
+  <rect x="96" y="122" width="256" height="28" class="fill-paper" stroke-width="1" />
+  <rect x="352" y="122" width="256" height="28" class="fill-paper" stroke-width="1" />
+  <text x="224" y="140" text-anchor="middle">SOURCE PORT</text>
+  <text x="480" y="140" text-anchor="middle">DESTINATION PORT</text>
+  <rect x="96" y="150" width="512" height="28" class="fill-wash" stroke-width="1" />
+  <text x="352" y="168" text-anchor="middle" class="blue-t">SEQUENCE NUMBER: WHERE MY FIRST BYTE SITS</text>
+  <rect x="96" y="178" width="512" height="28" class="fill-wash" stroke-width="1" />
+  <text x="352" y="196" text-anchor="middle" class="blue-t">ACK NUMBER: NEXT BYTE I WANT FROM YOU</text>
+  <rect x="96" y="206" width="64" height="28" class="fill-paper" stroke-width="1" />
+  <rect x="160" y="206" width="192" height="28" class="fill-wash" stroke-width="1" />
+  <rect x="352" y="206" width="256" height="28" class="fill-wash" stroke-width="1" />
+  <text x="128" y="224" text-anchor="middle">HDR LEN</text>
+  <text x="256" y="224" text-anchor="middle" class="blue-t">FLAGS SYN ACK FIN RST</text>
+  <text x="480" y="224" text-anchor="middle" class="blue-t">WINDOW: ROOM I HAVE LEFT</text>
+  <rect x="96" y="234" width="256" height="28" class="fill-paper" stroke-width="1" />
+  <rect x="352" y="234" width="256" height="28" class="fill-paper" stroke-width="1" />
+  <text x="224" y="252" text-anchor="middle">CHECKSUM</text>
+  <text x="480" y="252" text-anchor="middle">URGENT POINTER</text>
+  <rect x="96" y="262" width="512" height="28" class="fill-paper dash" stroke-width="1" />
+  <text x="352" y="280" text-anchor="middle">OPTIONS: MSS, WINDOW SCALE, SACK, TIMESTAMPS</text>
+  <text x="352" y="318" text-anchor="middle">BLUE = RELIABILITY AND FLOW CONTROL. BOTH RIDE INSIDE A 20-BYTE IP HEADER.</text>
+</svg>
+</Figure>
+
+Now let's build the promise, one trick at a time, the way you're about to in code.
+
+### Trick 1: number everything, and ack it
+
+Picture mailing a 300-page manuscript to a publisher, one page per envelope, through a postal service that loses some envelopes and delivers in random order. The first thing you'd do is number the pages. Then the publisher can put them back in order, notice gaps, and throw away duplicates.
+
+That's a <Term w="sequence number">A counter stamped on each piece of data so the receiver can put pieces in order, spot gaps and drop duplicates. TCP counts bytes, not packets.</Term>. TCP numbers every byte of the stream; your channel will number packets, which is simpler and teaches the same thing.
+
+Second, the publisher sends postcards back: "got everything up to page 41". That's an <Term w="ack">Acknowledgement. A message from the receiver saying what it has received. TCP's acks are cumulative: "I have every byte before N; send N next".</Term>. TCP's acks are <Term w="cumulative ack">An ack that says "I have everything before N", rather than listing pieces. One ack covers many packets, and a lost ack is repaired by any later one.</Term>, which is a lovely property: if one postcard is lost, the next one says the same thing and more.
+
+### Trick 2: if you don't hear back, send it again
+
+What if an envelope is lost? The publisher can't complain about a page they never knew existed. So you, the sender, start a timer when you post a page. If no postcard covering it comes back in time, you post it again. That's a <Term w="retransmission timeout">RTO. How long the sender waits for an ack before assuming the data was lost and resending it. Too short wastes bandwidth on copies; too long leaves the connection idle.</Term>.
+
+Notice the sender can't tell the difference between "my page was lost" and "the postcard was lost" and "the postcard is just slow". In all three cases it resends. So the receiver must be ready for duplicates, which is why sequence numbers come first.
+
+The simplest protocol you can build from these two tricks is <Term w="stop-and-wait">Send one packet, wait for its ack, then send the next. Correct, simple, and as slow as the round trip allows.</Term>: send page 1, wait for the postcard, send page 2. It works. It's also dreadfully slow, and you should be able to say exactly how slow before you build it.
+
+<Predict id="stop-and-wait">
+You run stop-and-wait between California and a server in Europe (round trip 150 ms) over a 1 Gb/s link, with 1,200-byte packets. What's the throughput? Then: does upgrading the link to 10 Gb/s help?
+<Fragment slot="answer">
+
+One packet per round trip: 1,200 bytes ÷ 0.150 s = **8 KB/s**. That's about 0.006% of a 1 Gb/s link (125 MB/s).
+
+Upgrading to 10 Gb/s changes nothing. The link wasn't the limit; you spent 99.99% of the time waiting for acks. This is the `latency × bandwidth` idea from [How slow is slow?](/lessons/latency-numbers/): the pipe is 150 ms long and you are putting one packet in it at a time.
+
+</Fragment>
+</Predict>
+
+### Trick 3: keep many in flight (the sliding window)
+
+The fix is to post several pages before hearing back. Allow up to `W` unacknowledged packets in flight at once. When an ack arrives, the oldest ones are done, and you can post that many new ones. The set of "sent but not yet acked" numbers slides forward along the stream: a <Term w="sliding window">The range of sequence numbers a sender may have in flight unacknowledged. As acks arrive the window slides forward and new data can be sent.</Term>.
+
+How big should `W` be? Big enough to keep the pipe full for a whole round trip. That's the <Term w="bandwidth-delay product">Bandwidth × round-trip time: how many bytes are "in the pipe" when it's full. A sender needs at least this much unacknowledged data in flight to use the link fully.</Term>, the same `bytes in flight = bandwidth × latency` from the latency lesson:
+
+```text
+1 Gb/s to Europe:  125 MB/s × 0.150 s ≈ 18.75 MB in flight
+Home Wi-Fi to Spark over Tailscale:  ~60 MB/s × 0.005 s ≈ 300 KB
+Datacenter: 12.5 GB/s (100 Gb/s) × 0.0002 s ≈ 2.5 MB
+```
+
+18.75 MB in flight, unacked, at all times, to fill one link to Europe. Remember that number; it explains several things later.
+
+When a packet in the window is lost, what do you resend? The simplest answer is <Term w="go-back-N">On timeout, resend every unacked packet from the oldest one onward. The receiver only accepts the next expected packet and drops anything out of order. Simple, but wasteful under loss.</Term>: rewind to the oldest unacked packet and send everything from there again. It's wasteful (the receiver may already have most of those) but simple, and it's the version you'll build first. The smarter version, <Term w="selective repeat">Resend only the packets that were actually lost. The receiver buffers out-of-order packets and the sender needs to know which ones arrived. TCP does this with SACK.</Term>, resends only the missing ones.
+
+Here is your build, as a picture. Start with window 1 and no loss, then raise the window until throughput stops growing, then add loss.
+
+<Predict id="window-fill">
+In the figure below, a packet takes 12 ms to put on the wire and the round trip is about 108 ms. With no loss, what's the smallest window that reaches full link speed? What happens to throughput if you double it past that?
+<Fragment slot="answer">
+
+About 108 ÷ 12 = **9 packets**. With a window of 9, the sender finishes putting packet 9 on the wire right as the ack for packet 1 comes back, so it never pauses. Window 1 gives 1/9 of the link (about 11 KB/s of 100 KB/s), window 4 about 4/9.
+
+Doubling past 9 does nothing for throughput: the link is now the bottleneck, and the extra packets just wait in line. On a real network, that line is a router's queue, and filling it adds delay for everyone. Keep that in mind for congestion control.
+
+</Fragment>
+</Predict>
+
+<Figure n="003" title="SLIDING WINDOW SIMULATOR" caption="A go-back-N sender, same design as your build. With window 1, each packet waits a full round trip. Raise the window to 9 and the pipe fills. Then add 5% loss and watch one lost packet trigger a timeout and a whole window of blue resends." wide>
+<TCPSequenceSim />
+</Figure>
+
+Things to try in the figure:
+
+- **Window 1, no loss.** A lonely zigzag: 11 KB/s, one ninth of the link. This is stop-and-wait.
+- **Window 9, no loss.** The diagonals pack together, the sender never idles, 100 KB/s.
+- **Window 9, 5% loss.** Each × costs you a quiet gap of one timeout, then a blue burst resending the whole window. Throughput drops to around 40% of the link, and roughly a third of all sends are copies. That's go-back-N's cost: one lost packet throws away up to a window of work.
+- **Window 16, 5% loss.** Higher window, more retries, barely more goodput. Under loss, a bigger window mostly buys you bigger rewinds.
+
+### What real TCP does better
+
+Your channel and TCP share the skeleton. TCP adds a few refinements that each fix a weakness you'll see in your version:
+
+**It measures the round trip and sets the timer from it.** Your timer will be a fixed number you pick. TCP times its own packets and keeps a smoothed RTT and a measure of how much it varies, then sets `RTO = smoothed RTT + 4 × variation` (Jacobson's 1988 formula, standardized in RFC 6298). After a timeout it doubles the RTO each time, so a dead link is probed less and less often. Linux won't go below 200 ms; the RFC says 1 second. That floor is why a lost packet on a 1 ms datacenter link can cost you 200 ms: a 200x stall.
+
+**It doesn't wait for the timer when it can guess.** If packet 5 is lost but 6, 7, 8 arrive, the receiver acks "I want 5" three more times. Three of these <Term w="duplicate ack">An ack repeating the same "next byte I want", which means later data arrived but a gap is still open. Three in a row tell the sender a packet was almost certainly lost.</Term>s trigger <Term w="fast retransmit">Resending a packet after three duplicate acks instead of waiting for the timeout. Repairs a single loss in about one round trip.</Term>: resend 5 right now, about one round trip after the loss instead of a full timeout. Timeouts become the rare, expensive fallback.
+
+**It resends only what's missing.** With <Term w="SACK">Selective acknowledgement (RFC 2018). An option in which the receiver lists the byte ranges it has beyond the gap, so the sender resends only the holes.</Term>, the receiver reports exactly which ranges it holds, so TCP is selective repeat, not go-back-N.
+
+**It respects the receiver's space.** Each ack carries the window field from Figure 002: "I have this many bytes of buffer left". The sender never has more than that in flight. That's <Term w="flow control">Stopping a fast sender from overrunning a slow receiver. The receiver advertises how much buffer space it has; the sender stays within it.</Term>, and it protects the receiver. The field is 16 bits, so it maxes out at 64 KB, which at 150 ms caps you at 64 KB ÷ 0.15 s ≈ 430 KB/s no matter how fast the link. Long-pipe links forced the <Term w="window scaling">A TCP option (RFC 7323) agreed during the handshake that multiplies the 16-bit window by up to 2^14, allowing windows up to about 1 GB.</Term> option. You'll make the no-flow-control failure happen in Break It.
+
+### Opening and closing: the handshake
+
+Before any data moves, both sides need to agree on starting sequence numbers and confirm each can hear the other. TCP does it in three messages: the <Term w="three-way handshake">SYN ("here's my starting number"), SYN-ACK ("got yours, here's mine"), ACK ("got yours"). After it, both sides know the other is alive and which numbers to expect.</Term>.
+
+Why three? Each side picks its own starting number and needs the other to confirm it. Client says "mine starts at x" (SYN). Server says "got x, mine starts at y" (SYN-ACK, two jobs in one packet). Client says "got y" (ACK). Two messages would confirm only one direction. The starting numbers are random, not zero, for two reasons: a stray packet from an old connection on the same 4-tuple shouldn't land inside the new one's numbers, and an attacker who can't see your traffic shouldn't be able to guess them and inject data.
+
+<Figure n="004" title="A CONNECTION'S LIFE" caption="The handshake costs one full round trip before the request can leave. The close takes four segments, and the side that closes first then sits in TIME_WAIT for twice the maximum segment lifetime: 60 s on Linux, 30 s on macOS.">
+<svg viewBox="0 0 640 520" role="img" aria-label="Sequence diagram of TCP handshake, request, response, close and TIME_WAIT">
+  <defs>
+    <marker id="tcp4-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+    <marker id="tcp4-k" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink)" /></marker>
+  </defs>
+  <text x="170" y="20" text-anchor="middle" class="strong">CLIENT</text>
+  <text x="470" y="20" text-anchor="middle" class="strong">SERVER</text>
+  <line x1="170" y1="30" x2="170" y2="500" class="ink" stroke-width="1.5" />
+  <line x1="470" y1="30" x2="470" y2="500" class="ink" stroke-width="1.5" />
+  <line x1="170" y1="40" x2="470" y2="80" class="ink" stroke-width="1.2" marker-end="url(#tcp4-k)" />
+  <text x="320" y="52" text-anchor="middle">SYN seq=x</text>
+  <line x1="470" y1="80" x2="170" y2="120" class="ink" stroke-width="1.2" marker-end="url(#tcp4-k)" />
+  <text x="320" y="92" text-anchor="middle">SYN-ACK seq=y ack=x+1</text>
+  <line x1="170" y1="120" x2="470" y2="160" class="blue" stroke-width="1.4" marker-end="url(#tcp4-a)" />
+  <text x="320" y="132" text-anchor="middle" class="blue-t">ACK + REQUEST</text>
+  <line x1="470" y1="160" x2="170" y2="200" class="blue" stroke-width="1.4" marker-end="url(#tcp4-a)" />
+  <text x="320" y="172" text-anchor="middle" class="blue-t">RESPONSE</text>
+  <line x1="120" y1="40" x2="120" y2="120" class="blue" stroke-width="1" />
+  <line x1="114" y1="40" x2="126" y2="40" class="blue" stroke-width="1" />
+  <line x1="114" y1="120" x2="126" y2="120" class="blue" stroke-width="1" />
+  <text x="108" y="76" text-anchor="end" class="blue-t">1 RTT</text>
+  <text x="108" y="92" text-anchor="end">HANDSHAKE</text>
+  <line x1="120" y1="120" x2="120" y2="200" class="blue" stroke-width="1" />
+  <line x1="114" y1="200" x2="126" y2="200" class="blue" stroke-width="1" />
+  <text x="108" y="156" text-anchor="end" class="blue-t">1 RTT</text>
+  <text x="108" y="172" text-anchor="end">REQUEST</text>
+  <text x="500" y="124">ESTABLISHED</text>
+  <text x="320" y="236" text-anchor="middle">… MORE REQUESTS ON THE SAME CONNECTION COST 1 RTT EACH …</text>
+  <line x1="170" y1="270" x2="470" y2="310" class="ink" stroke-width="1.2" marker-end="url(#tcp4-k)" />
+  <text x="320" y="282" text-anchor="middle">FIN (I'M DONE SENDING)</text>
+  <line x1="470" y1="310" x2="170" y2="350" class="ink" stroke-width="1.2" marker-end="url(#tcp4-k)" />
+  <text x="320" y="322" text-anchor="middle">ACK</text>
+  <line x1="470" y1="330" x2="170" y2="370" class="ink" stroke-width="1.2" marker-end="url(#tcp4-k)" />
+  <text x="380" y="362" text-anchor="middle">FIN (ME TOO)</text>
+  <line x1="170" y1="370" x2="470" y2="410" class="ink" stroke-width="1.2" marker-end="url(#tcp4-k)" />
+  <text x="320" y="402" text-anchor="middle">ACK</text>
+  <rect x="150" y="370" width="40" height="120" class="fill-wash" stroke-width="1" />
+  <text x="140" y="420" text-anchor="end" class="blue-t">TIME_WAIT</text>
+  <text x="140" y="436" text-anchor="end">2 × MSL</text>
+  <text x="140" y="452" text-anchor="end">THIS 4-TUPLE</text>
+  <text x="140" y="468" text-anchor="end">CAN'T BE REUSED</text>
+  <text x="500" y="424">CLOSED</text>
+</svg>
+</Figure>
+
+<Predict id="first-byte">
+You open a fresh HTTPS connection from California to a server in Europe (150 ms round trip) and send one small request. TCP takes one round trip to connect, TLS 1.3 takes one more, then the request and response take one. How long until the first byte of the response? And how long for the second request on the same connection?
+<Fragment slot="answer">
+
+Three round trips: **about 450 ms** before the server has even started to think. The second request on the same connection skips the handshakes: **about 150 ms**. That 3x difference is why every HTTP client you use keeps connections open and reuses them, and why `requests.get()` in a loop (new connection each time) is so much slower than a `requests.Session()`. QUIC, later in this lesson, folds the transport and TLS handshakes into one.
+
+</Fragment>
+</Predict>
+
+Closing is the mirror image, done once for each direction. Each side sends a <Term w="FIN">A flag that means "I'm finished sending". The other side can keep sending until it sends its own FIN. That's a half-close.</Term> when it's done writing, and the other side acks it. A <Term w="RST">Reset. A flag that kills a connection immediately, with no polite goodbye. You see it as "connection reset by peer".</Term> skips the goodbye entirely; that's what you get when you connect to a port nobody is listening on, or when a process crashes with the connection open.
+
+Then the strange part. The side that closed first doesn't forget the connection. It sits in <Term w="TIME_WAIT">The state a TCP endpoint stays in after it closes first, for twice the maximum segment lifetime, so stray old packets die off and a lost final ACK can be resent.</Term> for two times the <Term w="MSL">Maximum segment lifetime: the longest a packet is assumed to wander the network before dying. Linux hardcodes TIME_WAIT to 60 s; macOS's sysctl net.inet.tcp.msl is 15,000 ms, so 30 s.</Term>. Two reasons. If its final ACK was lost, the other side will resend its FIN, and someone has to be there to ack it again. And old, delayed packets from this connection might still be in the network; if a new connection with the same 4-tuple opened immediately, those stragglers could land in it as if they were fresh data. You will build exactly this bug by accident in your channel, and it's a good way to never forget why TIME_WAIT exists.
+
+TIME_WAIT has a cost you can compute. A client making short connections to *one* server's port can only use one 4-tuple per ephemeral port, and each port is stuck for 60 s after use. On Linux that's about 28,000 ports ÷ 60 s ≈ **470 new connections per second** to a single destination before `connect()` starts failing with "cannot assign requested address". A load tester or a scraper that doesn't reuse connections hits this wall. The fix is never a sysctl; it's reusing connections.
+
+### Keep-alive and connection reuse
+
+Two different things share the name keep-alive, and mixing them up is common.
+
+<Term w="HTTP keep-alive">Reusing one TCP connection for many HTTP requests instead of opening a new one each time. Default in HTTP/1.1. A connection pool (requests.Session, httpx.Client) does this for you.</Term> means "don't close the connection after this request; I'll send another". It saves the handshake (one or two round trips), the TLS setup, and slow start (next section) on every request after the first. It is the single cheapest latency win in most client code.
+
+<Term w="TCP keepalive">An optional kernel feature: after a connection has been idle for a while, send a tiny probe to check the other side is still there. Off by default for most sockets; when on, the default idle time is 2 hours on Linux and macOS.</Term> is a different thing. A TCP connection with nothing to say sends nothing; there is no heartbeat. If the server's machine loses power, your idle connection looks perfectly healthy until you try to write to it. Worse, NAT boxes and load balancers between you forget idle connections after a few minutes and silently drop later packets. So long-lived idle connections (database pools, SSH sessions, streaming clients) either turn on TCP keepalive with a short idle time or send their own pings. SSH's `ServerAliveInterval` is exactly this.
+
+### Congestion control: being polite
+
+Flow control protects the receiver. Nothing so far protects the *network*. Between you and the server are routers with queues. If every sender sends as fast as its window allows, the queues fill, routers drop packets, senders time out and resend, the queues fill more. That's 1986.
+
+So TCP keeps a second window, private to the sender: the <Term w="congestion window">cwnd. The sender's guess at how much data the network path can hold right now. The sender may have at most min(cwnd, receiver's window) bytes in flight.</Term>. Nobody tells the sender the right value. It has to discover it, and it uses loss as the signal that it went too far.
+
+The classic algorithm (Reno, from Jacobson's work) has two phases:
+
+1. <Term w="slow start">Start a new connection with a small cwnd and double it every round trip (add one packet per ack) until loss or a threshold. "Slow" compared to blasting the whole window at once; actually exponential.</Term>. Start with a small window (10 packets, about 14 KB, on modern stacks per RFC 6928) and double it every round trip. Exponential growth finds the right neighbourhood fast.
+2. <Term w="AIMD">Additive increase, multiplicative decrease. Grow cwnd by one packet per round trip; on loss, cut it in half. Many senders doing this converge to sharing a link fairly.</Term>. Past a threshold, grow by just one packet per round trip. On loss, cut the window in half. On a timeout (a sign things are really bad), drop back to the start.
+
+Plot the window over time and you get TCP's signature sawtooth.
+
+<Figure n="005" title="THE CWND SAWTOOTH" caption="Slow start doubles cwnd each round trip until the first loss, then congestion avoidance adds one packet per round trip and halves on each loss. Drawn from 1 for clarity; real stacks start at 10. The window, not the link, sets the speed: throughput ≈ cwnd ÷ RTT.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Congestion window over time: exponential slow start, then a linear sawtooth halving on each loss">
+  <line x1="60" y1="240" x2="620" y2="240" class="ink" stroke-width="1.2" />
+  <line x1="60" y1="240" x2="60" y2="40" class="ink" stroke-width="1.2" />
+  <text x="340" y="276" text-anchor="middle">TIME (ROUND TRIPS)</text>
+  <text x="54" y="244" text-anchor="end">0</text>
+  <text x="54" y="164" text-anchor="end">16</text>
+  <text x="54" y="84" text-anchor="end">32</text>
+  <text x="18" y="40" class="strong">CWND</text>
+  <text x="18" y="54">PACKETS</text>
+  <text x="60" y="256" text-anchor="middle">0</text>
+  <text x="190" y="256" text-anchor="middle">5</text>
+  <text x="320" y="256" text-anchor="middle">10</text>
+  <text x="450" y="256" text-anchor="middle">15</text>
+  <text x="580" y="256" text-anchor="middle">20</text>
+  <line x1="60" y1="160" x2="620" y2="160" class="ink dash" stroke-width="1" />
+  <text x="616" y="154" text-anchor="end">SSTHRESH AFTER 1ST LOSS = 16</text>
+  <polyline points="60,235 86,230 112,220 138,200 164,160 190,80 190,160 216,155 242,150 268,145 294,140 320,135 346,130 372,125 398,120 398,180 424,175 450,170 476,165 502,160 528,155 554,150 580,145 606,140" class="blue" stroke-width="1.6" />
+  <text x="196" y="74" class="blue-t">LOSS: HALVE</text>
+  <text x="404" y="114" class="blue-t">LOSS: HALVE</text>
+  <text x="80" y="140">SLOW START</text>
+  <text x="80" y="154">DOUBLE PER RTT</text>
+  <text x="230" y="182">+1 PER RTT</text>
+  <text x="440" y="200">+1 PER RTT</text>
+</svg>
+</Figure>
+
+<Predict id="slow-start">
+A fresh connection to Europe (150 ms round trip) on a 1 Gb/s link. The initial window is 10 packets of about 1,460 bytes, roughly 14.6 KB, and it doubles each round trip. How many round trips to deliver a 1 MB response (ignoring the handshake)? What effective speed is that?
+<Fragment slot="answer">
+
+Cumulative bytes after each round trip: 14.6 KB, 44 KB, 102 KB, 219 KB, 453 KB, 920 KB, then 1.9 MB. So **7 round trips**, about **1.05 s**, plus the handshake. 1 MB in a second is about 1 MB/s, less than 1% of the gigabit link. For small and medium transfers over long distances, slow start, not bandwidth, sets the speed. That's another reason to reuse warm connections: a reused connection keeps its grown cwnd (unless it sat idle long enough that the kernel resets it).
+
+</Fragment>
+</Predict>
+
+Loss-based control has a famous formula, from Mathis and colleagues in 1997: a long-running Reno-style flow gets roughly
+
+```text
+throughput ≈ (MSS / RTT) × 1.22 / sqrt(loss rate)
+```
+
+Read it as: double the distance, halve the speed; quadruple the loss, halve the speed. With 1,460-byte packets, a 150 ms round trip and 1% loss that's about 120 KB/s, *regardless of how fast your link is*. This is why a slightly lossy long-haul link feels like dial-up.
+
+Two modern variants worth knowing by name. <Term w="CUBIC">The default congestion control on Linux (since 2006) and macOS. Grows cwnd as a cubic function of time since the last loss, so it climbs back to the old level quickly on fast, long links. Still treats loss as the signal.</Term> is what your Mac and the Spark use right now (`sysctl net.inet.tcp.cubic_sockets` on the Mac counts sockets using it; `sysctl net.ipv4.tcp_congestion_control` on Linux names it). <Term w="BBR">Bottleneck Bandwidth and Round-trip propagation time. Google's 2016 algorithm: instead of waiting for loss, it measures the delivery rate and the minimum RTT and paces packets at that rate.</Term>, from Google in 2016, stops treating loss as the main signal. It keeps measuring the fastest delivery rate and the smallest round trip it has seen, multiplies them (the bandwidth-delay product again), and sends at that rate. It does much better on links with random, non-congestion loss, and it avoids filling router buffers, which keeps delay low. Google runs it for YouTube and its own services.
+
+### Nagle's algorithm, and why token streams turn it off
+
+In the early 1980s, people typed into remote terminals over TCP. Each keystroke was one byte of data in a packet with 40 bytes of headers. On a busy, slow link, these <Term w="tinygram">A packet carrying a few bytes of data and 40+ bytes of headers. Many of them waste most of the link on headers.</Term>s clogged everything.
+
+John Nagle's fix (RFC 896, 1984) is one rule: **if you have unacked data in flight, don't send a small packet. Buffer small writes until the ack comes back or you have a full packet's worth.** It is on by default in every TCP stack to this day.
+
+Now meet its partner. Receivers often use <Term w="delayed ack">Instead of acking every packet at once, the receiver waits briefly (typically 40 ms on Linux, up to 200 ms on some systems) hoping to piggyback the ack on a reply or to ack two packets with one.</Term>s: they hold the ack for a bit, hoping to combine it with a reply. Put the two together and you get a famous stall. You write a small header, then a small body. The header goes out. The body is small and there's unacked data, so Nagle holds it. The receiver got a header but no full request, so it has nothing to reply with, so it delays its ack. Both sides wait until the delayed-ack timer fires, about 40 ms on Linux.
+
+LLM token streaming is a sequence of exactly these small writes: one server-sent event of a few dozen bytes per token. With Nagle on, a token written while the previous one is unacked waits for that ack. Tokens arrive in clumps, and time-to-first-token and inter-token latency look worse than the model actually is. The fix is one socket option:
+
+```python
+sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # send small writes immediately
+```
+
+<Term w="TCP_NODELAY">A socket option that turns off Nagle's algorithm, so every write goes out as soon as the window allows. The right setting for interactive and streaming traffic.</Term> is the right setting for anything interactive: streaming, RPC, games over TCP, SSH. Many frameworks set it for you (Go's net package does by default), but don't assume: Python's plain `socket` does not (I checked: `getsockopt` returns 0 on a fresh socket on 3.14). Check yours with `getsockopt` rather than trusting a blog post.
+
+### Head-of-line blocking
+
+TCP's promise is "in order". Think about what that costs when one packet is lost. Packets 6, 7, 8, 9 have arrived and are sitting in the receiver's kernel. But 5 is missing, so the kernel can't give your program 6 through 9: that would break the order. Everything waits for 5's retransmission, a round trip at best and a full RTO at worst. That's <Term w="head-of-line blocking">When one lost or slow item at the front of an ordered queue holds up everything behind it, even items that are ready.</Term>.
+
+For one file transfer, that's fine; you needed byte 5 before byte 6 anyway. It hurts when one TCP connection carries several *independent* things. HTTP/2 does exactly that: many requests multiplexed as streams over one connection. A lost packet carrying a piece of an image stalls the JSON response and the CSS too, even though their bytes are sitting right there in the kernel. On lossy networks (mobile, bad Wi-Fi), HTTP/2 over one TCP connection can do worse than HTTP/1.1's six separate connections.
+
+<Figure n="006" title="ONE LOST PACKET, THREE STREAMS" caption="Top: three streams share one TCP byte stream. B1 is lost, so A2, C1 and C2 sit in the kernel undelivered until B1 is resent. Bottom: QUIC keeps order per stream, so only stream B waits.">
+<svg viewBox="0 0 640 300" role="img" aria-label="Head-of-line blocking in TCP versus independent streams in QUIC">
+  <text x="10" y="22" class="strong">HTTP/2 OVER TCP: ONE ORDERED STREAM</text>
+  <rect x="10" y="40" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="32" y="58" text-anchor="middle">A1</text>
+  <rect x="62" y="40" width="44" height="28" class="fill-paper dash" stroke-width="1" />
+  <text x="84" y="58" text-anchor="middle" style="fill:var(--warn)">B1 ×</text>
+  <rect x="114" y="40" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="136" y="58" text-anchor="middle">A2</text>
+  <rect x="166" y="40" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="188" y="58" text-anchor="middle">C1</text>
+  <rect x="218" y="40" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="240" y="58" text-anchor="middle">C2</text>
+  <line x1="10" y1="80" x2="54" y2="80" class="blue" stroke-width="2" />
+  <text x="10" y="96" class="blue-t">DELIVERED</text>
+  <line x1="114" y1="80" x2="262" y2="80" class="ink dash" stroke-width="1.2" />
+  <text x="114" y="96">ARRIVED, STUCK IN KERNEL</text>
+  <text x="300" y="52">APP SEES A1, THEN NOTHING</text>
+  <text x="300" y="68">UNTIL B1'S RETRANSMIT ARRIVES</text>
+  <text x="300" y="84" class="blue-t">ALL THREE STREAMS STALL</text>
+  <line x1="10" y1="130" x2="630" y2="130" class="ink dash" stroke-width="1" />
+  <text x="10" y="158" class="strong">HTTP/3 OVER QUIC: ORDER PER STREAM</text>
+  <text x="10" y="192">STREAM A</text>
+  <rect x="84" y="174" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="106" y="192" text-anchor="middle">A1</text>
+  <rect x="136" y="174" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="158" y="192" text-anchor="middle">A2</text>
+  <text x="300" y="192" class="blue-t">DELIVERED</text>
+  <text x="10" y="232">STREAM B</text>
+  <rect x="84" y="214" width="44" height="28" class="fill-paper dash" stroke-width="1" />
+  <text x="106" y="232" text-anchor="middle" style="fill:var(--warn)">B1 ×</text>
+  <text x="300" y="232">WAITS FOR B1 (ONLY B)</text>
+  <text x="10" y="272">STREAM C</text>
+  <rect x="84" y="254" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="106" y="272" text-anchor="middle">C1</text>
+  <rect x="136" y="254" width="44" height="28" class="fill-wash" stroke-width="1" />
+  <text x="158" y="272" text-anchor="middle">C2</text>
+  <text x="300" y="272" class="blue-t">DELIVERED</text>
+</svg>
+</Figure>
+
+### Why QUIC rebuilt TCP on top of UDP
+
+By the 2010s, TCP's problems were clear: the handshake round trip plus a separate TLS handshake, head-of-line blocking across streams, and connections tied to a 4-tuple, so walking from Wi-Fi to cellular (new IP address) kills every connection. The obvious fix is a new transport protocol. The problem is that you can't deploy one.
+
+TCP lives in the operating system kernel, so changing it means waiting years for every phone, laptop and server to update. Worse, the internet is full of <Term w="middlebox">Any device in the network path that inspects or rewrites packets beyond plain routing: NATs, firewalls, load balancers, corporate proxies. Many drop anything they don't recognise.</Term>es that only understand TCP and UDP and drop anything else. SCTP, a perfectly good transport with multiple streams standardized in 2000, never made it across the public internet for exactly this reason. Even new TCP options get stripped by middleboxes that "know" what TCP looks like. People call this <Term w="ossification">When a protocol can no longer change in practice, because so many devices in the path have hardcoded assumptions about what it looks like.</Term>.
+
+So Google, and then the IETF, built <Term w="QUIC">A transport protocol (RFC 9000, 2021) that runs over UDP and provides TCP-like reliability and congestion control, multiple independent streams, built-in TLS 1.3, and connection IDs that survive IP changes. HTTP/3 runs on it.</Term> on top of UDP. UDP gets through middleboxes, and it is thin enough to be a blank canvas. Everything else (sequence numbers, acks, retransmission, congestion control: the same tricks you're about to write) lives inside the QUIC library, in user space, inside your browser or server, so it ships with an app update instead of a kernel update. And almost the whole QUIC header is encrypted, so middleboxes can't build assumptions about it and it can't ossify the same way.
+
+What that buys:
+
+- **One handshake, not two.** Transport and TLS 1.3 setup happen together in one round trip. Reconnecting to a server you've seen before can send data in the very first packet (<Term w="0-RTT">Sending application data in the first packet of a resumed connection, using keys from a previous session. Saves a round trip; the data can be replayed by an attacker, so it's only for safe requests.</Term>).
+- **No head-of-line blocking across streams** (Figure 006, bottom).
+- **Connection migration.** Connections are named by an ID, not the 4-tuple, so your phone changing networks keeps its connections.
+
+<Term w="HTTP/3">HTTP over QUIC (RFC 9114, 2022). Same requests and responses as HTTP/2, new transport underneath.</Term> is HTTP on QUIC, and a large share of web traffic from big providers now uses it. The punchline for this lesson: when people needed a better TCP, they rebuilt reliability on UDP, exactly what you're about to do in Python, just with 30 more years of tricks.
+
+### So when do you pick UDP?
+
+Pick UDP when a late packet is as bad as a lost one, when a whole exchange fits in one packet, or when something above you already does reliability.
+
+- **DNS.** One small question, one small answer, usually under 512 bytes. A TCP handshake would triple the cost. If the answer doesn't come back, the client just asks again. (DNS does switch to TCP for big answers.)
+- **Games and live state.** Where a player was 100 ms ago is useless once you know where they are now. Retransmitting it would delay the fresh update behind the stale one, which is head-of-line blocking at its worst. Games send state over UDP and resend only what still matters.
+- **Voice and video calls.** A video frame that arrives after it should have been shown is garbage. WebRTC and RTP use UDP and hide losses (skip, interpolate, ask for a fresh keyframe) instead of retransmitting.
+- **Tunnels: WireGuard and Tailscale.** Your SSH connection to the Spark over Tailscale is TCP *inside* WireGuard packets that are UDP. If the tunnel were TCP, you'd have two reliability loops stacked: a loss would make both the outer and inner TCP back off and retransmit, and their timers fight. This is called TCP-over-TCP meltdown. A UDP tunnel just carries packets and lets the inner TCP handle loss, once. (When UDP is blocked entirely, Tailscale falls back to its DERP relays over HTTPS, and you'll feel it in the latency.)
+- **QUIC itself**, for everything above.
+
+## Build It
+
+You're going to write a little transport protocol. Make a folder, say `~/workbench/transport/`. Everything runs on `127.0.0.1` with standard-library Python. There are four programs: a **sender** that reads a file and sends it, a **receiver** that writes it out, a **proxy** in between that loses, delays and reorders packets on purpose, and a **benchmark** that runs them across settings.
+
+```text
+sender ──UDP──▶ proxy :9000 ──UDP──▶ receiver :9001
+       ◀──acks──        ◀──acks──
+```
+
+Write your predictions in the Measure table before you run anything.
+
+<Task id="t0" title="Set up the packet format" agent="ok">
+
+A shared module for the wire format, so the sender and receiver agree on bytes. Each packet is a 1-byte type, a 4-byte sequence number, then payload. `struct` packs them in network byte order (big-endian, the `!`).
+
+```python
+# wire.py
+import struct
+
+DATA, ACK, FIN = 0, 1, 2
+HDR = struct.Struct("!BI")   # type (1 byte), seq (4 bytes, unsigned)
+MSS = 1200                   # payload bytes per packet; keeps packets under typical MTUs
+
+def pack(kind: int, seq: int, payload: bytes = b"") -> bytes:
+    return HDR.pack(kind, seq) + payload
+
+def unpack(b: bytes) -> tuple[int, int, bytes]:
+    kind, seq = HDR.unpack_from(b)
+    return kind, seq, b[HDR.size:]
+```
+
+Conventions for your protocol, so the pieces fit together:
+
+- Sequence numbers count **packets**, starting at 0. The last packet of a file is a `FIN` whose `seq` is one past the last `DATA`.
+- An `ACK` carries the **next sequence number the receiver wants** (cumulative), like TCP. `ACK 5` means "I have 0-4".
+- Both sides bump their UDP receive buffer: `s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)`. You'll see why in Break It.
+
+Two macOS-specific notes: a single UDP datagram can't be bigger than 9,216 bytes by default (`sysctl net.inet.udp.maxdgram`), so don't raise `MSS` past that; and a test file of random bytes is easy: `head -c 2000000 /dev/urandom > blob.bin`.
+
+</Task>
+
+<Task id="t1" title="Write the evil proxy" agent="hands">
+
+The proxy listens on 9000, forwards everything from the sender to the receiver on 9001 and everything back to whoever last sent it a packet. On the way it drops each packet with probability `loss`, and holds each one for `delay` plus a random `jitter` before forwarding. Random jitter on back-to-back packets is what reorders them.
+
+```python
+# proxy.py
+import argparse, heapq, random, select, socket, time
+
+def main(loss: float, delay: float, jitter: float, seed: int) -> None:
+    """Forward UDP between a client and 127.0.0.1:9001, badly.
+
+    - One socket bound to 127.0.0.1:9000.
+    - A heap of (due_time, counter, data, dest) for packets waiting to be forwarded.
+    - Loop: select() on the socket with a timeout = time until the earliest due packet.
+      On a readable socket: recvfrom, decide dest (from server → to client, else → server,
+      remembering the client's address), maybe drop, else push with a due time.
+      Then pop and sendto everything whose due time has passed.
+    """
+    ...
+
+if __name__ == "__main__":
+    # --loss 0.01 --delay 0.005 --jitter 0.002 --seed 1
+    ...
+```
+
+Hints:
+
+- `time.monotonic()` for due times, never `time.time()` (wall clock can jump).
+- The counter in the heap tuple stops Python from comparing `bytes` when two due times tie.
+- A seeded `random.Random(seed)` makes runs repeatable, which you'll want when comparing settings.
+- Test it before writing any protocol: `nc -u -l 9001` in one terminal (the receiver), the proxy in a second, `nc -u 127.0.0.1 9000` in a third. Type lines, see some vanish with `--loss 0.5`.
+
+</Task>
+
+<Task id="t2" title="Stop-and-wait" agent="hands">
+
+The simplest correct protocol. The receiver keeps `expected`, the next sequence number it wants.
+
+```python
+# receiver.py
+def receive(port: int = 9001) -> bytes:
+    """Bind, then loop:
+    - recvfrom a packet, unpack it.
+    - if seq == expected: keep the payload (or, if FIN, remember we're done), expected += 1
+    - anything else (duplicate, out of order): ignore the payload.
+    - ALWAYS sendto(addr) an ACK carrying `expected`, even for duplicates. Why?
+    After the FIN, keep re-acking anything that arrives for ~0.5 s, then return the bytes.
+    """
+
+# sender.py
+def send_stop_and_wait(data: bytes, addr, rto: float = 0.05) -> int:
+    """Split data into MSS chunks, number them, then for each packet:
+    send it, wait up to `rto` for an ACK > seq (socket.settimeout), resend on timeout.
+    Finish with a FIN the same way. Return the number of retransmissions.
+    """
+```
+
+Print the SHA-256 of the data on both sides (`hashlib.sha256(data).hexdigest()[:12]`). Run with the proxy at `--loss 0` first, then `--loss 0.05`. The hashes must match every time. If they ever don't, you have a real bug: don't move on.
+
+Before running, write down your predicted throughput. The proxy's round trip is about `2 × (delay + jitter / 2)` plus Python overhead; at `--delay 0.005 --jitter 0.002` that's roughly 12 ms.
+
+</Task>
+
+<Task id="t3" title="Sliding window (go-back-N)" agent="hands">
+
+Same receiver (it already works for go-back-N: it only accepts `expected` and acks cumulatively). New sender:
+
+```python
+def send_window(data: bytes, addr, window: int, rto: float = 0.05) -> int:
+    """State: base (oldest unacked), next (next new seq to send), one timer for `base`.
+    Loop until base passes the FIN:
+      - while next < base + window and there are packets left: send pkts[next], next += 1;
+        if the timer isn't running, start it.
+      - wait for an ACK until the timer's deadline.
+        ACK a > base: base = a; restart the timer if anything is still unacked, else stop it.
+      - timer expired: resend pkts[base:next] (go back N), restart the timer.
+    Return retransmissions.
+    """
+```
+
+Hints:
+
+- Pre-build the whole list of packets once. Retransmissions resend the same bytes.
+- `s.settimeout(max(0, deadline - time.monotonic()))` and catch `socket.timeout` (an alias of `TimeoutError`).
+- Window 1 should behave identically to your stop-and-wait. That's your first test.
+- Optional upgrade, worth doing: make the receiver buffer out-of-order packets (a dict `seq → payload`) and drain it when the gap fills. Your go-back-N sender still works, and fewer resends are wasted.
+
+</Task>
+
+<Task id="t4" title="Benchmark it against real TCP" agent="review">
+
+Write `bench.py` that, for each loss rate in `[0, 0.01, 0.05]` and window in `[1, 8, 32, 64]`, starts a fresh receiver, runs a 2 MB transfer through the proxy, and records MB/s and retransmissions. Start a fresh receiver per run (you'll learn why in Break It 2).
+
+For the TCP baseline, write the smallest TCP pair you can: a server that `recv`s until the connection closes and counts bytes, and a client that `sendall`s the same 2 MB and calls `shutdown(socket.SHUT_WR)`. Time it on loopback.
+
+That baseline has no loss and no delay, so it isn't a fair fight. For a fair one you need the kernel to delay and drop TCP's packets too, which needs root:
+
+- **Spark (Linux):** `tc netem` on the loopback interface delays and drops *all* local traffic, TCP and UDP alike. Run your UDP sender directly against the receiver (no proxy, or proxy at zero loss and delay) and the TCP pair under the same netem settings. Commands are in Task 6.
+- **Mac:** Apple's Network Link Conditioner (in the "Additional Tools for Xcode" download) applies a profile with loss and delay to your network interfaces; check whether it affects loopback on your macOS version before trusting it.
+
+Have an agent review `bench.py` for unfair comparisons: timing process startup in one case and not the other, or counting bytes before the receiver actually confirmed them.
+
+</Task>
+
+<Task id="t5" title="Watch a real handshake and retransmissions" agent="explain">
+
+Capture the TCP baseline on the wire. On macOS, loopback is `lo0` and capturing needs `sudo`:
+
+```bash
+sudo tcpdump -i lo0 -n 'tcp port 9100'           # Mac; on the Spark use -i lo
+```
+
+Run the TCP pair on port 9100 and read the first lines. You should see the handshake: a packet with `Flags [S]`, then `[S.]` (SYN-ACK; the dot means ACK), then `[.]`. Then data with `[P.]` (push), and the close with `[F.]` in both directions. Find the `seq` and `ack` numbers and check them against Figure 004: the SYN-ACK acks the client's starting number plus one. (tcpdump shows sequence numbers relative to the start after the first packets; `-S` shows the raw random ones.) `win` is the receiver's window from Figure 002; `options [mss 16344,...,wscale ...]` is the handshake agreeing on packet size and window scaling.
+
+Then, on the Spark with netem loss on (Task 6), capture a transfer and find retransmissions. In Wireshark, the filter `tcp.analysis.retransmission` highlights them, and Statistics → TCP Stream Graphs → Stevens shows sequence number against time: the slope is throughput, and every flat step is a stall. While a transfer runs, `ss -ti` on Linux prints each connection's live `cwnd`, `rtt` and `retrans` counters. On the Mac, `netstat -s -p tcp | grep -i retrans` shows system-wide retransmission counts before and after.
+
+An agent can explain what any line of tcpdump output means. Reading them is the skill; don't ask it to summarize the capture for you.
+
+</Task>
+
+<Task id="t6" title="Optional: simulate a bad network in the kernel" agent="explain">
+
+On the Spark, netem adds delay and loss to an interface. Use `lo` only, never the interface your SSH or Tailscale session runs over, or you can lock yourself out.
+
+```bash
+sudo tc qdisc add dev lo root netem delay 10ms loss 1%      # each direction: RTT ≈ 20 ms
+sudo tc qdisc change dev lo root netem delay 10ms 5ms loss 5%  # add 5 ms jitter (reorders)
+tc qdisc show dev lo
+sudo tc qdisc del dev lo root                                 # ALWAYS clean up
+```
+
+Rerun the TCP baseline and your UDP channel (directly, no proxy) at 0%, 1% and 5% loss, and fill in the last rows of the Measure table. Also try the Nagle stall from Break It 4 under `delay 10ms`.
+
+</Task>
+
+<DoneWhen>
+
+- A 2 MB random file goes through the proxy at 5% loss with jitter and the SHA-256 matches on both ends, with both stop-and-wait and the sliding window.
+- `bench.py` fills the Measure table, and your stop-and-wait number is within about 30% of what you computed from the round trip.
+- You've seen `[S]`, `[S.]`, `[.]` and a FIN in a real tcpdump capture and can say what each one does.
+- You can explain every number in your table, including why your protocol beat or lost to TCP.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. 2 MB file, proxy at `--delay 0.005 --jitter 0.002`, RTO 50 ms, MB/s (and retransmissions).
+
+| Loss | Window 1 | Window 8 | Window 32 | Window 64 | TCP (same conditions) | Prediction (W=64) |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0% | | | | | | |
+| 1% | | | | | | |
+| 5% | | | | | | |
+
+For reference, my run on an M-series MacBook, Python 3.14, go-back-N with a receiver that buffers out-of-order packets. Yours will differ; the shape should not.
+
+| Loss | Window 1 | Window 8 | Window 32 | Window 64 |
+| --- | --- | --- | --- | --- |
+| 0% | 0.084 MB/s | 0.76 MB/s | 3.0 MB/s | 6.0 MB/s |
+| 1% | 0.076 (41 retx) | 0.49 (152) | 1.22 (420) | 2.17 (512) |
+| 5% | 0.052 (183 retx) | 0.28 (536) | 0.68 (1,094) | 1.15 (1,408) |
+
+Plain TCP on loopback, with no proxy, no loss and no delay, moved 200 MB at about **5 GB/s**. I couldn't run the netem comparison on the Mac (it needs root and Linux); the TCP column under loss is yours to fill on the Spark.
+
+What the numbers should tell you:
+
+**Window 1 is the round trip, nothing else.** 1,200 bytes ÷ about 14 ms ≈ 0.085 MB/s. Your link (loopback) can do gigabytes per second; you're using a ten-thousandth of it. Same lesson as the stop-and-wait Predict, at a smaller scale.
+
+**At 0% loss, throughput scales linearly with the window.** 8x the window, 8x the speed, all the way to 64. You never reached the bandwidth-delay product: loopback is so fast that the "pipe" at 12 ms holds far more than 64 packets. The window is the only limit, which is also why a TCP connection with a too-small window or buffer is slow on a fast long link.
+
+**Loss hurts big windows more than small ones.** At 5% loss, window 1 kept 60% of its speed; window 64 kept 19%. Every timeout idles a window-64 sender for 50 ms (three or four round trips) *and* then resends up to 64 packets. Look at the retransmission count: at 5% loss and window 64, there were 1,408 resends for 1,668 packets of data. Most of those were packets the receiver already had. That's go-back-N's waste, and why TCP uses SACK and fast retransmit.
+
+**Against TCP.** Use the Mathis formula to predict the TCP column before you measure on the Spark. With 1,448-byte packets, a 20 ms netem round trip and 1% loss: `1448 / 0.020 × 1.22 / 0.1 ≈ 0.9 MB/s`; at 5%, about 0.4 MB/s. Treat these as rough: modern stacks with SACK and CUBIC do somewhat better than the formula. You may well find your window-64 channel beats TCP under random loss. That's not because you're cleverer than TCP. It's because yours never slows down when it sees loss. TCP assumes loss means congestion and backs off to protect everyone else on the link. Your protocol, on a shared network, would be the 1986 sender.
+
+## Break It
+
+**1. Set the timer shorter than the round trip.** Run with `rto=0.005` (5 ms against a 12 ms round trip) at zero loss. On my Mac, a 1 MB transfer at window 8 still worked (hash matched, about the same speed) but sent **1,582 retransmissions for 834 packets**: nearly every packet went twice, because the timer fired before any ack could possibly have come back. Throughput barely changed, so you might never notice, but you doubled your load on the network. Now picture every sender on a congested link doing that. This is why TCP measures the RTT continuously instead of trusting a constant, and why it backs the timer off exponentially after each timeout.
+
+**2. Run two transfers against one receiver.** Make your receiver loop forever, serving one transfer after another without resetting cleanly, and run the sender twice in a row quickly. I did this by accident while writing this lesson: the receiver, still re-acking the end of transfer 1, sent the old file's final ACK number; the new sender read that as "everything up to there received", skipped most of its data, and reported a nonsense 70 MB/s while the receiver got garbage. Old packets with numbers that look valid landed in a new conversation. That is exactly what TCP's random starting sequence numbers and TIME_WAIT exist to prevent. Fix it the way TCP does: add a random connection ID (or random starting sequence number) to every packet and have each side ignore packets that don't match.
+
+**3. Remove flow control.** Shrink the receiver's buffer to 64 KB (`SO_RCVBUF`) and make it slow (a small busy loop per packet), then send directly to it with no proxy, so there is no loss at all except what the receiver causes. On my Mac, a 10 MB transfer at window 16 ran at **58.6 MB/s with zero retransmissions**. At window 256: **1.8 MB/s and 25,411 retransmissions**. The receiver's kernel buffer overflowed and silently dropped datagrams, and your sender treated it as network loss. A bigger window made it 30x slower. Real TCP avoids this because each ack advertises the receiver's free space. Add a `window` field to your ACK packets and make the sender respect it.
+
+**4. Cause the Nagle stall.** With plain TCP, write a client that sends a 10-byte "header", then a 10-byte "body", then waits for a 2-byte reply; the server replies only after it has all 20 bytes. Time 50 requests, then add `TCP_NODELAY` on the client and time again. On the Spark (Linux) you should see something like 40 ms per request with Nagle and well under a millisecond without; that's the delayed-ack timer. On my Mac's loopback I could *not* reproduce it (0.03 ms either way; macOS's delayed-ack behaviour on loopback differs), so treat the Linux number as check-it-yourself. Then fix it the other good way: build the whole message and send it in one `sendall`.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What does TCP give you that UDP doesn't, and how does it do it?</summary>
+
+UDP gives you ports and a checksum on top of IP: one packet per send, which may be lost, duplicated or reordered. TCP gives a reliable, ordered byte stream. It numbers every byte (sequence numbers), the receiver acks what it has cumulatively, the sender keeps a timer and resends anything not acked in time (or sooner, after three duplicate acks), it keeps many packets in flight with a sliding window, it never sends more than the receiver says it has room for (flow control), and it adjusts its sending rate to avoid overloading the network (congestion control: slow start, then additive increase, halve on loss). The cost is a handshake before data, per-connection state, and head-of-line blocking.
+
+</details>
+
+<details>
+<summary>2. Why is stop-and-wait slow, and how big a window do you need?</summary>
+
+Because you send one packet per round trip, throughput is packet size ÷ RTT, regardless of link speed: 1,200 bytes every 150 ms is 8 KB/s even on a 10 Gb/s link. To fill the link you need a full round trip's worth of data in flight: the bandwidth-delay product. 1 Gb/s × 150 ms is about 18.75 MB. That's why TCP needed window scaling (the original 16-bit window caps at 64 KB) and why socket buffer sizes matter on long, fast links.
+
+</details>
+
+<details>
+<summary>3. An API client makes 1,000 small requests to a service in another region, opening a new connection each time. What does that cost, and what do you change?</summary>
+
+Each new HTTPS connection pays a TCP handshake (1 RTT) and a TLS handshake (1 more RTT with TLS 1.3) before the request's own round trip, and starts in slow start. At a 70 ms RTT that's about 210 ms per request instead of 70 ms, so 3x slower, before counting server work. Each closed connection also leaves a TIME_WAIT entry on the closing side; at high rates to one destination you can exhaust ephemeral ports (about 28k on Linux, held 60 s each, so roughly 470 new connections/s). Fix: a connection pool (`requests.Session`, `httpx.Client`) so connections stay open, plus running requests concurrently if they're independent. If the connections sit idle through a NAT or load balancer, add keepalives or expect to reconnect.
+
+</details>
+
+<details>
+<summary>4. How does TCP's throughput scale with distance and loss? Why might one flow get 1 MB/s on a 1 Gb/s link?</summary>
+
+TCP's rate is about window ÷ RTT, and with loss-based congestion control the window is set by how often packets are lost. The Mathis estimate is (MSS ÷ RTT) × 1.22 ÷ √loss: double the RTT, halve the speed; four times the loss, half the speed. At 150 ms and 1% loss that's around 120 KB/s whatever the link speed. Short transfers are worse: they never leave slow start, which needs about 7 round trips to deliver 1 MB from a 10-packet initial window. Fixes: shorten the RTT (serve from closer), reuse warm connections, use several connections in parallel, or use a congestion controller like BBR that doesn't treat random loss as congestion.
+
+</details>
+
+<details>
+<summary>5. Why is HTTP/3 built on UDP instead of fixing TCP? And why does Tailscale use UDP?</summary>
+
+TCP lives in OS kernels and its shape is assumed by middleboxes (NATs, firewalls) all over the internet, so changing it takes a decade and new transport protocols get dropped. UDP passes through, and is thin enough to build on. QUIC puts reliability, congestion control and TLS 1.3 in a user-space library over UDP: one combined handshake, independent streams so one loss doesn't stall everything (no cross-stream head-of-line blocking), connection IDs that survive network changes, and an encrypted header that can't ossify. Tailscale/WireGuard tunnel your TCP traffic; if the tunnel were also TCP, a loss would trigger two stacked retransmission and backoff loops that interfere (TCP-over-TCP meltdown). A UDP tunnel delivers packets or drops them, and lets the inner TCP recover once.
+
+</details>
+
+<details>
+<summary>6. Your token stream looks bursty: tokens arrive in clumps every ~40 ms. What's your first guess?</summary>
+
+Nagle's algorithm interacting with delayed acks. The server writes one small SSE event per token; with Nagle on, a small write is held while earlier data is unacked, and the client delays its ack hoping to piggyback it, so writes go out in batches when the delayed-ack timer fires. Check `TCP_NODELAY` on the server's socket (and any proxy in between, like nginx or a load balancer) and turn it on. Also check for buffering at other layers: the web framework, a reverse proxy with response buffering on, or gzip on the stream.
+
+</details>
+
+## Go Deeper
+
+- **Van Jacobson and Michael J. Karels, "Congestion Avoidance and Control"**, SIGCOMM 1988. The paper behind the Origin box: slow start, the RTT estimator and AIMD, explained by the people who fixed the 1986 collapse. Short, readable, and the appendix has the actual timer code.
+- **James F. Kurose and Keith W. Ross, _Computer Networking: A Top-Down Approach_, Chapter 3 (Transport Layer)**. Builds reliable data transfer step by step (rdt 1.0 to 3.0, then go-back-N and selective repeat) with the same structure as your build. The best textbook treatment of what you just wrote.
+- **Ilya Grigorik, _High Performance Browser Networking_**, free at [hpbn.co](https://hpbn.co/). Chapters "Building Blocks of TCP" and "Building Blocks of UDP" cover handshake cost, slow start, head-of-line blocking and bandwidth-delay product with a latency-first, practical eye.
+- **W. Richard Stevens, _TCP/IP Illustrated, Volume 1_** (2nd edition revised by Kevin Fall). Every TCP behaviour shown as real tcpdump traces. The reference to keep next to Wireshark.
+- **Neal Cardwell, Yuchung Cheng, C. Stephen Gunn, Soheil Hassas Yeganeh, Van Jacobson, "BBR: Congestion-Based Congestion Control"**, ACM Queue, 2016. Why loss is the wrong signal on modern networks, and what to measure instead.
+- **Adam Langley et al., "The QUIC Transport Protocol: Design and Internet-Scale Deployment"**, SIGCOMM 2017. Google's account of why they built QUIC over UDP, what middleboxes did to them, and what it bought in real latency.
+- **RFC 9293 (TCP, 2022), RFC 768 (UDP, 1980), RFC 896 (Nagle, 1984), RFC 9000 (QUIC, 2021)**, at [rfc-editor.org](https://www.rfc-editor.org/). RFC 768 is three pages; read it in full just to see how little UDP is. RFC 896 is short and a lovely period piece.
+- **David Anderson, "How NAT traversal works"**, Tailscale blog, 2020. How Tailscale gets UDP through NATs and firewalls, and when it gives up and relays. The perfect bridge to [the home server lesson](/lessons/ssh-and-tailscale/).
+
+## Connections
+
+This lesson stands on [How does data travel?](/lessons/packets-and-ip/) (the unreliable packets TCP repairs) and [How slow is slow?](/lessons/latency-numbers/) (round trips and bytes in flight, which is the bandwidth-delay product with a different name).
+
+Next, [What happens when you hit enter?](/lessons/what-happens-url/) puts the handshake on a timeline next to DNS and TLS, and [How does HTTPS keep secrets?](/lessons/tls/) explains the second round trip. [HTTP from scratch](/lessons/http-from-scratch/) is where the byte-stream point bites: you'll have to find where one request ends in a TCP stream. [Polling, SSE and WebSockets](/lessons/streaming/) is where `TCP_NODELAY` and buffering stop being trivia. And [Your home server, explained](/lessons/ssh-and-tailscale/) is TCP inside UDP inside your home network, with every idea from this lesson in play.

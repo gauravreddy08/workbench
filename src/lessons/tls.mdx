@@ -1,0 +1,731 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import TLSKeyExchange from '../components/figures/TLSKeyExchange.astro';
+import TLSHandshake from '../components/figures/TLSHandshake.astro';
+
+## Today
+
+- Explain how two machines that have never met can agree on a secret key while someone records every byte between them, using paint first and then real arithmetic.
+- Say why that alone is not enough (the man in the middle), and how signatures, certificates and certificate authorities close the gap.
+- Walk through a TLS 1.3 handshake message by message, and say what 1-RTT, 0-RTT and forward secrecy mean.
+- Do a Diffie-Hellman exchange by hand in Python, encrypt with the key you derived, read a real handshake with `openssl` and Wireshark, and verify a certificate chain yourself.
+- Know exactly what HTTPS hides from someone on your Wi-Fi and what it leaves in plain sight.
+
+Prerequisites: none strictly, but [What happens when you hit enter?](/lessons/what-happens-url/) places TLS in the sequence (DNS, TCP, TLS, HTTP), and [TCP and UDP](/lessons/tcp-vs-udp/) explains the round trips we'll be counting. Rough time: one evening, plus half an hour for the home-server cert.
+
+## The Problem
+
+You're at a café. Your laptop is on the café's Wi-Fi, and you call your model endpoint with an API key in the header. Between you and the server sit the café's router, its ISP, a couple of backbone networks, maybe a load balancer. Any of them can copy every packet. The person at the next table can too, with a free program and a Wi-Fi card.
+
+So you encrypt the request. Easy: pick a key, scramble the bytes, the server unscrambles them. But the server has to know the key. You can't send it, because sending it means sending it past the same people. You have never met this server. You share no secret with it. Every byte either of you will ever send passes through hands you don't trust.
+
+That sounds impossible. It was widely believed to be impossible. And yet your browser does it hundreds of times a day, in about one network round trip, and you've never noticed. You've only noticed when it fails: `SSL: CERTIFICATE_VERIFY_FAILED`, `certificate has expired`, `hostname mismatch`, a self-signed cert on your home server that every tool refuses. Each of those errors is a specific step in this lesson going wrong. By the end you'll know which step.
+
+There are really two problems here, and they get solved by two different ideas:
+
+1. **Secrecy.** Agree on a key that eavesdroppers can't learn, even though they see everything. (Key exchange.)
+2. **Identity.** Make sure the machine you agreed the key with is actually the server, and not someone pretending. (Signatures and certificates.)
+
+<Origin year="1976" title="New Directions in Cryptography">
+
+For all of history before the mid-1970s, encryption needed a shared secret delivered in advance: a codebook, a one-time pad carried by courier, a key loaded into a machine. Militaries and banks spent fortunes moving keys around. Whit Diffie, a restless cryptography amateur, and Martin Hellman, a Stanford professor, building on an idea of Ralph Merkle's, published "New Directions in Cryptography" in November 1976. It showed two parties could create a shared secret in public, with no prior contact. It also proposed digital signatures, without having a practical way to make them. (British intelligence at GCHQ had found similar ideas a few years earlier, but kept them classified until 1997.)
+
+A year later, in 1977, Ron Rivest, Adi Shamir and Leonard Adleman at MIT found that practical scheme: RSA, which could both encrypt and sign with a public key. The tools existed. Nobody used them much until the web needed shopping carts. In 1994-95 Netscape, led on this by Taher Elgamal, designed SSL so that people would type credit card numbers into a browser. SSL 2.0 (1995) and 3.0 (1996) had serious flaws; the IETF took it over and renamed it TLS (1.0 in 1999). TLS 1.3, finished in 2018, is a near-total redesign, and it's what you'll take apart today.
+
+</Origin>
+
+## The Idea
+
+### Part one: if you already share a key, encryption is easy
+
+Start with the easy half. Suppose you and the server already had a shared key, 16 or 32 random bytes that nobody else knows. Then you'd use <Term w="symmetric encryption">Encryption where the same key both locks and unlocks. Fast, simple, and useless until both sides somehow have the key.</Term>: one key, used by both ends, to lock and unlock.
+
+The standard choice is <Term w="AES">Advanced Encryption Standard. A cipher chosen by a public competition in 2001 (the winning design was called Rijndael). It scrambles 16-byte blocks under a 128- or 256-bit key. Modern CPUs have instructions built in for it.</Term>, used in a mode called <Term w="GCM">Galois/Counter Mode. A way of using AES that both encrypts and attaches a 16-byte tag, so the receiver can detect any change to the ciphertext.</Term>. You give AES-GCM four things: the key, a <Term w="nonce">"Number used once". A 12-byte value that must be different for every message encrypted under the same key. It doesn't need to be secret, just never repeated.</Term>, the message, and optionally some extra data you want protected but not hidden (like a header). It gives back the scrambled message plus a 16-byte <Term w="authentication tag">A short checksum computed with the key. Change one bit of the ciphertext and the tag no longer matches, so decryption refuses instead of returning garbage.</Term>.
+
+<Figure n="001" title="AES-GCM, ONE MESSAGE" caption="Symmetric encryption with a shared key. The ciphertext is the same length as the message, plus a 16-byte tag. The nonce goes along in the clear. Change any byte in transit and decryption fails loudly, which is what the tag is for.">
+<svg viewBox="0 0 640 220" role="img" aria-label="Key, nonce and plaintext go into AES-GCM, which outputs ciphertext and tag">
+  <rect x="10" y="20" width="150" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="85" y="44" text-anchor="middle" class="strong">KEY (32 B, SECRET)</text>
+  <rect x="10" y="80" width="150" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="104" text-anchor="middle">NONCE (12 B, PUBLIC)</text>
+  <rect x="10" y="140" width="150" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="85" y="164" text-anchor="middle">"meet me at 9"</text>
+  <line x1="160" y1="40" x2="250" y2="90" class="ink" stroke-width="1.2" />
+  <line x1="160" y1="100" x2="250" y2="100" class="ink" stroke-width="1.2" />
+  <line x1="160" y1="160" x2="250" y2="110" class="ink" stroke-width="1.2" />
+  <rect x="250" y="60" width="130" height="80" class="fill-blue" />
+  <text x="315" y="96" text-anchor="middle" style="fill:var(--paper)" class="strong">AES-GCM</text>
+  <text x="315" y="114" text-anchor="middle" style="fill:var(--paper)">ENCRYPT</text>
+  <line x1="380" y1="100" x2="440" y2="100" class="ink" stroke-width="1.2" />
+  <rect x="440" y="70" width="120" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="500" y="96" text-anchor="middle" class="strong">CIPHERTEXT</text>
+  <text x="500" y="114" text-anchor="middle">same length</text>
+  <rect x="560" y="70" width="70" height="60" class="fill-wash" stroke-width="1.2" />
+  <text x="595" y="96" text-anchor="middle" class="strong">TAG</text>
+  <text x="595" y="114" text-anchor="middle">16 B</text>
+  <text x="535" y="160" text-anchor="middle" class="blue-t">SENT OVER THE WIRE</text>
+  <text x="535" y="176" text-anchor="middle">(with the nonce)</text>
+  <text x="315" y="200" text-anchor="middle">~7 GB/s on one M-series core (measured below)</text>
+</svg>
+</Figure>
+
+Two things to remember about this half:
+
+- **It's fast.** On this Mac, AES-GCM through Python's `cryptography` library encrypted about 7 GB per second on one core. You'll measure it. Encryption is never why HTTPS feels slow.
+- **The nonce must never repeat under the same key.** GCM works by generating a stream of pseudo-random bytes from (key, nonce) and XOR-ing it onto your message. Reuse the pair, and an eavesdropper who XORs your two ciphertexts gets the XOR of your two plaintexts. You'll do exactly that in Break It.
+
+So all of TLS reduces to one question: **how do both ends get the same key?**
+
+### Part two: agreeing on a secret in public, with paint
+
+Here's the trick Diffie and Hellman found, told with paint first (this analogy is standard, and good).
+
+Alice and Bob want a shared colour that Eve, who watches everything they pass back and forth, can't reproduce. The key fact about paint: **mixing is easy, un-mixing is practically impossible.** Give someone a pot of brownish-green and they can't tell you which two colours went in.
+
+1. In public, they agree on a common colour, say green. Eve sees it. Fine.
+2. Each secretly picks their own colour. Alice picks orange, Bob picks blue. These never leave their houses.
+3. Each mixes their secret colour into a pot of the common green. Alice gets green+orange, Bob gets green+blue.
+4. They swap pots, in public. Eve sees both mixes.
+5. Each adds their *own* secret colour to the pot they received. Alice adds orange to (green+blue). Bob adds blue to (green+orange). Both end up with green+orange+blue, in the same proportions. Same colour.
+
+Eve has green, (green+orange), and (green+blue). If she mixes the two pots she gets *two* parts green, one orange, one blue: the wrong shade. To get the right one she'd need orange or blue by themselves, which means un-mixing a pot.
+
+### The same trick, with numbers
+
+Paint is the intuition. Here is what computers actually do. We need an operation that's easy one way and very hard to undo. That operation is exponentiation <Term w="modulo">"mod p" means "keep only the remainder after dividing by p". 17 mod 5 = 2. Arithmetic mod p wraps around like a clock with p hours.</Term> a prime.
+
+Pick a prime `p = 23` and a <Term w="generator">A base number g whose powers g, g², g³, ... mod p land on every number from 1 to p-1 before repeating. Using one means the secret can be anything in that range.</Term> `g = 5`. These are public, like the green paint.
+
+1. Alice picks a secret `a = 6`. Bob picks a secret `b = 15`.
+2. Alice computes `A = 5^6 mod 23`. 5⁶ is 15,625, and 15,625 = 679 × 23 + 8, so `A = 8`. Bob computes `B = 5^15 mod 23 = 19`.
+3. They send A = 8 and B = 19 in the clear.
+4. Alice computes `B^a = 19^6 mod 23 = 2`. Bob computes `A^b = 8^15 mod 23 = 2`.
+
+Both got 2. Why must they agree? Because Alice computed (g^b)^a and Bob computed (g^a)^b, and both are g^(ab). The order you raise powers in doesn't matter, the same way it didn't matter which order the paints went in.
+
+Now Eve. She knows p = 23, g = 5, A = 8, B = 19. To get the key she needs a or b: she has to answer "5 to what power, mod 23, gives 8?" That is the <Term w="discrete logarithm">Given g, p and A = g^x mod p, find x. Like an ordinary logarithm, but on a clock that wraps around, which scrambles the pattern so no shortcut like "count the digits" works.</Term> problem. With p = 23 she can just try all 22 possibilities. With a prime 600 digits long, she can't.
+
+<Predict id="eve-mult">
+
+Eve has A = 8 and B = 19. She can do any arithmetic she likes on them. Why doesn't multiplying them, `A × B mod p`, give her the key?
+
+<Fragment slot="answer">
+
+Because `A × B = g^a × g^b = g^(a+b)`, and the key is `g^(a×b)`. Multiplying public values *adds* the secret exponents; to get the key you need to *multiply* them, and that requires knowing one of them. This is the paint problem exactly: mixing the two pots gets the wrong proportions. With our numbers, 8 × 19 mod 23 = 14, not 2.
+
+</Fragment>
+
+</Predict>
+
+Try it. Step through the exchange, drag the secrets, then let Eve attack. Switch to the bigger prime (2³¹ − 1, about 2 billion) and run her brute force again, in your browser, for real.
+
+<Figure n="002" title="DIFFIE-HELLMAN, WITH AN EAVESDROPPER" caption="Paint on the left of each cell, the real arithmetic beside it. Eve's middle column only ever gets what crossed the wire. Mixing her two pots gives the wrong shade, and multiplying A and B gives the wrong number. With p = 23 she brute-forces the secret instantly; with a 31-bit prime it takes seconds; every extra bit doubles her work." wide>
+
+<TLSKeyExchange />
+
+</Figure>
+
+That 31-bit search is the whole argument for big numbers. Each bit doubles the search. A browser doing JavaScript arithmetic gets through a few hundred million guesses a second; real attacks on the discrete log are much cleverer than trying every exponent (the best known methods for prime-modulus groups are related to the ones used for factoring), which is why the sizes used in practice are 2048 bits for this "mod a prime" version. You'll time one of those exponentiations in Python: around 15 ms on this Mac.
+
+### Elliptic curves, in one paragraph
+
+Modern TLS almost never uses "mod a prime" Diffie-Hellman. It uses the same idea on an <Term w="elliptic curve">A set of points (x, y) satisfying an equation like y² = x³ + ax + b, with arithmetic done mod a prime. There's a way to "add" two points to get a third, which gives you the easy-forward, hard-backward operation DH needs.</Term>. Instead of "multiply g by itself a times", you "add a point G to itself a times", written a·G. Adding is fast in one direction (there's a doubling trick, like square-and-multiply), and going backward, from a·G to a, is the elliptic-curve version of the discrete log. The best known attacks on it are far weaker than on the prime version, so the numbers can be far smaller: a 255-bit curve gives roughly the security of a 3000-bit prime. The curve almost everyone uses is Curve25519, designed by Daniel Bernstein; DH on it is called <Term w="X25519">Diffie-Hellman on Curve25519. Each side's secret is 32 random bytes and its public value is 32 bytes. Fast, and designed to be hard to implement wrongly.</Term>. Each public value is 32 bytes. A key pair plus an exchange took about 50 µs on this Mac, a few hundred times faster than the 2048-bit prime version.
+
+One more thing you'll see in `openssl` output: `X25519MLKEM768`. Big sites now send an X25519 share *and* a share for <Term w="ML-KEM">A key-exchange method (standardised by NIST in 2024) based on lattice problems, believed to resist future quantum computers, which would break both kinds of discrete log.</Term>, and combine the results. If either holds, the key is safe. The cost is a bigger first message: the ML-KEM share is about 1.2 KB.
+
+### Part three: the man in the middle
+
+Diffie-Hellman beats Eve, who only listens. It does nothing against Mallory, who can also *change* packets.
+
+<Predict id="mitm">
+
+You're on Mallory's café Wi-Fi. You start a DH exchange with `api.example.com`. Mallory controls the router and can drop, edit and inject packets. Using only what you've learned so far, how does she read your traffic without breaking any math?
+
+<Fragment slot="answer">
+
+She runs two exchanges. When your share A goes out, she drops it and sends the server her own share M. When the server's B comes back, she drops it and sends you her M instead. You compute a key with Mallory, thinking it's the server. The server computes a different key with Mallory, thinking it's you. She decrypts everything you send, reads it, re-encrypts it for the server, and passes responses back the same way. Both exchanges are perfect Diffie-Hellman. Nothing tells you that the number you received came from the server. That's the missing piece: authentication.
+
+</Fragment>
+
+</Predict>
+
+<Figure n="003" title="MAN IN THE MIDDLE" caption="Mallory runs two separate key exchanges, one with each side. Each side ends up with a perfectly good key, shared with Mallory. The fix is not better math; it's a way for the client to check that the server's DH share really came from the server.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Mallory intercepts Diffie-Hellman between client and server, creating two separate keys">
+  <rect x="10" y="80" width="120" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="106" text-anchor="middle" class="strong">YOU</text>
+  <text x="70" y="124" text-anchor="middle">secret a</text>
+  <rect x="260" y="80" width="120" height="60" class="fill-wash" stroke-width="1.2" />
+  <text x="320" y="106" text-anchor="middle" class="strong">MALLORY</text>
+  <text x="320" y="124" text-anchor="middle">secret m</text>
+  <rect x="510" y="80" width="120" height="60" class="fill-paper" stroke-width="1.2" />
+  <text x="570" y="106" text-anchor="middle" class="strong">SERVER</text>
+  <text x="570" y="124" text-anchor="middle">secret b</text>
+  <line x1="130" y1="92" x2="258" y2="92" class="ink" stroke-width="1.2" />
+  <text x="194" y="86" text-anchor="middle">A →</text>
+  <line x1="258" y1="128" x2="130" y2="128" class="ink" stroke-width="1.2" />
+  <text x="194" y="146" text-anchor="middle">← M</text>
+  <line x1="380" y1="92" x2="508" y2="92" class="ink" stroke-width="1.2" />
+  <text x="444" y="86" text-anchor="middle">M →</text>
+  <line x1="508" y1="128" x2="380" y2="128" class="ink" stroke-width="1.2" />
+  <text x="444" y="146" text-anchor="middle">← B</text>
+  <rect x="80" y="172" width="230" height="40" class="fill-paper dash" stroke-width="1" />
+  <text x="195" y="190" text-anchor="middle" class="blue-t">KEY 1 = g^(am)</text>
+  <text x="195" y="205" text-anchor="middle">you think: shared with server</text>
+  <rect x="330" y="172" width="230" height="40" class="fill-paper dash" stroke-width="1" />
+  <text x="445" y="190" text-anchor="middle" class="blue-t">KEY 2 = g^(bm)</text>
+  <text x="445" y="205" text-anchor="middle">server thinks: shared with you</text>
+  <text x="320" y="40" text-anchor="middle" class="strong">DECRYPT, READ, RE-ENCRYPT, FORWARD</text>
+  <line x1="320" y1="48" x2="320" y2="78" class="blue dash" stroke-width="1" />
+</svg>
+</Figure>
+
+### Signatures: proving a message came from someone
+
+The fix needs a second idea from the 1976 paper: a <Term w="digital signature">A short value computed from a message and a private key. Anyone with the matching public key can check it, but only the private key holder can produce it. Change one bit of the message and the check fails.</Term>.
+
+In <Term w="public-key cryptography">Cryptography with key pairs: a private key you keep, and a public key you can hand to anyone. Also called asymmetric cryptography, because the two keys do different jobs.</Term>, you generate a pair: a **private key** you never show anyone and a **public key** you publish. A signature scheme gives you two operations:
+
+- `sign(private_key, message) → signature`
+- `verify(public_key, message, signature) → yes / no`
+
+The analogy is a wax seal. Only you have the signet ring, but anyone who knows what your seal looks like can recognise it. Unlike a wax seal, a digital signature also covers the *content*: it's computed over the message, so moving it to another message doesn't work.
+
+The common schemes are RSA signatures (the 1977 one), <Term w="ECDSA">Elliptic Curve Digital Signature Algorithm. Signatures using elliptic-curve keys, usually the P-256 curve. Signatures are about 64-72 bytes, fast to make and check.</Term>, and Ed25519. Rough numbers measured on this Mac: an ECDSA P-256 signature takes about 13 µs to make and 40 µs to check; RSA-2048 takes about 330 µs to sign and 18 µs to verify. All tiny next to a network round trip.
+
+So: if the server signs its DH share with its private key, and you already know the server's public key, Mallory can't substitute her own share, because she can't forge the server's signature on it.
+
+Which moves the problem. **How do you know the server's public key?** You've never met. If the server just sends it, Mallory sends hers instead.
+
+### Certificates: someone you trust vouches for the key
+
+You solve it the way passports solve "how do I know this stranger is who they say they are?" You don't know the stranger. You trust a government, and the government vouches for the stranger.
+
+A <Term w="certificate">A small signed document (format: X.509) saying "this public key belongs to this domain name, valid between these dates", signed by a certificate authority.</Term> is that passport. It contains the server's public key, the names it's valid for (in a field called the <Term w="SAN">Subject Alternative Name. The list of hostnames a certificate covers, like github.com and www.github.com. Clients check the hostname they asked for is on it.</Term>), validity dates, and a signature from a <Term w="certificate authority">An organisation (Let's Encrypt, DigiCert, Sectigo, Google Trust Services...) whose job is to check that whoever asks for a certificate really controls the domain, and then sign it. Usually shortened to CA.</Term>.
+
+Your computer ships with a list of CAs it trusts, a hundred-odd organisations, each one represented by its own self-signed certificate, called a <Term w="root certificate">A CA's top-level certificate, signed by itself. It's trusted not because of any signature but because your OS or browser vendor put it in the list.</Term>. That list is the <Term w="root store">The set of root certificates your system trusts. macOS keeps one in the Keychain; Firefox, Chrome, Linux distros and Homebrew's OpenSSL each have their own (mostly derived from Mozilla's list).</Term>. Homebrew's OpenSSL on this Mac has 187 certificates in `/opt/homebrew/etc/openssl@3/cert.pem`.
+
+Roots almost never sign server certificates directly. Root private keys are kept offline in vaults; the root signs an **intermediate** CA certificate, and the intermediate signs your server's **leaf** certificate. That's a <Term w="chain of trust">The sequence leaf → intermediate(s) → root, where each certificate is signed by the next one's private key. Verify every link and you've connected the server's key to something you already trusted.</Term>.
+
+<Figure n="004" title="A REAL CHAIN: GITHUB.COM" caption="What github.com sent on 15 Oct 2026. The server sends the leaf and the intermediates. Each certificate's signature is checked with the public key of the certificate above it. The top one is not sent: it has to already be in your root store. Every link must verify, every certificate must be in date, and the hostname must be on the leaf.">
+<svg viewBox="0 0 640 330" role="img" aria-label="Certificate chain from github.com leaf through Sectigo intermediates to USERTrust root in the root store">
+  <rect x="150" y="10" width="340" height="62" class="fill-wash" stroke-width="1.2" />
+  <text x="320" y="32" text-anchor="middle" class="strong">USERTrust ECC Certification Authority</text>
+  <text x="320" y="50" text-anchor="middle">ROOT · self-signed</text>
+  <text x="320" y="64" text-anchor="middle" class="blue-t">ALREADY IN YOUR ROOT STORE</text>
+  <rect x="150" y="96" width="340" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="118" text-anchor="middle" class="strong">Sectigo Public Server Auth Root E46</text>
+  <text x="320" y="138" text-anchor="middle">INTERMEDIATE (cross-signed) · sent by server</text>
+  <rect x="150" y="176" width="340" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="198" text-anchor="middle" class="strong">Sectigo Public Server Auth CA DV E36</text>
+  <text x="320" y="218" text-anchor="middle">INTERMEDIATE · sent by server</text>
+  <rect x="150" y="256" width="340" height="64" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="276" text-anchor="middle" class="strong">CN=github.com</text>
+  <text x="320" y="292" text-anchor="middle">SAN: github.com, www.github.com</text>
+  <text x="320" y="308" text-anchor="middle">P-256 key · valid Sep 1 - Nov 29 2026</text>
+  <line x1="320" y1="96" x2="320" y2="74" class="blue" stroke-width="1.2" />
+  <line x1="320" y1="176" x2="320" y2="154" class="blue" stroke-width="1.2" />
+  <line x1="320" y1="256" x2="320" y2="234" class="blue" stroke-width="1.2" />
+  <text x="330" y="88" class="blue-t">signed by ↑</text>
+  <text x="330" y="168" class="blue-t">signed by ↑</text>
+  <text x="330" y="248" class="blue-t">signed by ↑</text>
+  <text x="140" y="290" text-anchor="end">LEAF</text>
+  <text x="500" y="200">CHECK: signature,</text>
+  <text x="500" y="216">dates, usage</text>
+  <text x="500" y="282">CHECK: hostname</text>
+  <text x="500" y="298">is in the SAN</text>
+</svg>
+</Figure>
+
+How does a CA check that you really control `example.com` before signing? Through a challenge. For <Term w="Let's Encrypt">A free, automated certificate authority run by the nonprofit ISRG, launched in 2015. It now issues most of the web's certificates.</Term>, the protocol is <Term w="ACME">Automatic Certificate Management Environment (RFC 8555). A protocol a program on your server speaks with the CA to prove domain control and fetch a certificate, with no human in the loop.</Term>: your server's ACME client (certbot, Caddy, Traefik...) asks for a cert, the CA says "put this random token at `http://example.com/.well-known/acme-challenge/...`" (or "put it in a DNS TXT record"), checks it from the internet, and if it's there, signs. Let's Encrypt certificates last 90 days, short on purpose, so renewal has to be automated and a stolen key is only useful for a while. The industry is moving to even shorter lifetimes over the next few years (check the current CA/Browser Forum rules if it matters to you).
+
+CAs can be wrong or compromised (DigiNotar, a Dutch CA, was hacked in 2011 and issued fake Google certificates; browsers removed it and it went bankrupt). The modern safety net is <Term w="Certificate Transparency">Public, append-only logs of every certificate CAs issue. Browsers require certs to appear in them, so a mis-issued cert for your domain is visible to anyone who looks.</Term>: every certificate a public CA issues goes into public logs, and browsers reject ones that don't. Keep that in mind for later: it means every name you get a public cert for is published.
+
+### Putting it together: the TLS 1.3 handshake
+
+Now we have all the pieces, the handshake is just choreography:
+
+- Diffie-Hellman (X25519) for the key, so eavesdroppers learn nothing.
+- The certificate chain, so the client learns the server's real public key.
+- A signature with that key over the handshake, so Mallory can't swap in her DH share.
+- A <Term w="hash">A function that turns any input into a short fixed-size fingerprint (32 bytes for SHA-256). Same input, same output; any change gives a totally different output; you can't run it backwards or find two inputs with the same fingerprint.</Term> of the whole conversation, and an <Term w="HMAC">Hash-based message authentication code. A hash mixed with a secret key, so only someone with the key can produce or check the fingerprint. Proves a message wasn't altered by anyone without the key.</Term> of it under the new keys, so nobody can quietly edit earlier messages.
+- AES-GCM (or ChaCha20-Poly1305 on chips without AES instructions) for everything after.
+
+The keys themselves come out of a <Term w="KDF">Key derivation function. Takes one secret (like a DH result) and stretches it into several independent keys for different jobs. TLS 1.3 uses HKDF, built from HMAC.</Term>: TLS 1.3 never uses the raw DH number as a key; it feeds it, and a hash of the messages so far, through HKDF to get separate keys for each direction and each phase.
+
+The clever part of TLS 1.3 is ordering. Older TLS spent one round trip agreeing on *which* algorithms to use, then another doing the exchange. TLS 1.3 guesses: the client sends its DH share in its very first message, for the group it thinks the server will pick (almost always X25519 or the hybrid). The server answers with its own share and immediately switches to encryption. If the guess was wrong, the server sends a `HelloRetryRequest` and it costs one extra round trip, which is rare.
+
+<Predict id="rtt">
+
+The network round trip from your Mac to letsencrypt.org is about 30 ms. Opening a TCP connection costs one round trip. How long after the TCP connection is up can your client send its first encrypted HTTP request with TLS 1.3? And how long before the response comes back, ignoring server think time?
+
+<Fragment slot="answer">
+
+About one round trip (≈ 30 ms) to be able to send, two round trips (≈ 60 ms) to get a response. ClientHello goes out, the server's whole flight (ServerHello through Finished) comes back, and then the client sends Finished *together with* its request. Add TCP's round trip and a cold HTTPS request costs ~3 round trips before the first response byte. You'll measure it: on this Mac, TCP connect to letsencrypt.org took ~31 ms and the TLS handshake ~33 ms on top.
+
+</Fragment>
+
+</Predict>
+
+Step through it. Then switch to the return visit.
+
+<Figure n="005" title="TLS 1.3 HANDSHAKE, STEP BY STEP" caption="Ink arrows are plaintext. Blue arrows are encrypted under handshake keys derived from the DH result. Thick blue is application data. On a return visit the client can send its request in the very first flight (dashed), with zero round trips of waiting, at the price of replayability." wide>
+
+<TLSHandshake />
+
+</Figure>
+
+A few details that the figure compresses:
+
+- **Everything after ServerHello is encrypted**, including the certificate. In TLS 1.2 the certificate went in the clear.
+- **CertificateVerify is the anti-Mallory step.** The server signs a hash of the *transcript*, every byte of every message so far, which includes both DH shares. If Mallory swapped in her share, the transcript the server signed won't match what you received.
+- **Finished** is an HMAC over the transcript under a key only the two ends have. It catches downgrade tricks, like a middlebox deleting the strong options from your ClientHello.
+- When you read `openssl` output, record headers will say `TLS 1.2`, and you'll see a `ChangeCipherSpec` message that does nothing. That's deliberate camouflage: lots of old firewalls dropped anything that didn't look like TLS 1.2, so TLS 1.3 dresses up as it. The real version is negotiated inside an extension.
+
+### Resumption and 0-RTT
+
+After a handshake, the server sends the client a <Term w="session ticket">A blob the server gives the client after a handshake, containing (encrypted under a key only the server knows) a secret from this session. Showing it later lets the client skip the certificate and signature steps.</Term>. Next time, the client presents it as a <Term w="PSK">Pre-shared key. A secret both sides already have, here from the previous session via the ticket.</Term> and both sides can skip the certificate check: knowing the PSK proves the server is the one you met before.
+
+With a PSK, the client can go further: send its HTTP request in the first flight, encrypted with a key derived from the PSK alone. That's <Term w="0-RTT">"Zero round-trip time" resumption. The client sends application data along with its very first handshake message, before hearing anything back. Also called early data.</Term>, and it saves a full round trip. Big CDNs offer it.
+
+The caveat is serious. The early data is encrypted with a key that depends only on the old ticket, not on anything fresh from the server. So if Mallory records that first flight, she can send it to the server again, and again, and the server will decrypt and act on it each time. That's a <Term w="replay attack">Recording a valid encrypted message and sending it again later. The attacker doesn't need to read it; the receiver just does the same thing twice.</Term>. "GET /index.html" twice is harmless. "POST /transfer?amount=100" twice is not. Rule: **only idempotent requests may go in 0-RTT data**, and servers either refuse early data or limit replays (single-use tickets, time windows). You'll watch OpenSSL's replay protection work, then turn it off and watch it fail, in Break It.
+
+### Forward secrecy
+
+Here's a question to ask about any encrypted system: **if the server's long-term private key leaks next year, what can the attacker read?**
+
+In the old way TLS often worked (before 1.3, with "RSA key exchange"), the client made up the session key, encrypted it with the server's RSA public key from the certificate, and sent it. Anyone who recorded the traffic and later stole that private key could decrypt the session key, and so *every recorded conversation*, going back years. Intelligence agencies record a lot of traffic.
+
+TLS 1.3 removed that mode entirely. Every handshake uses <Term w="ephemeral keys">Key pairs generated fresh for one connection and thrown away right after. The "E" in ECDHE.</Term> for Diffie-Hellman: fresh secrets x and y, generated for this connection and deleted when it ends. The certificate's private key is only used to *sign*, never to protect the session key. Steal it, and you can impersonate the server from then on, but you can't decrypt yesterday's traffic, because the DH secrets that made yesterday's keys no longer exist anywhere. That property is <Term w="forward secrecy">A guarantee that stealing long-term keys later doesn't expose past sessions, because each session's key came from ephemeral secrets that were deleted. Sometimes called perfect forward secrecy (PFS).</Term>.
+
+(Two footnotes. Session ticket keys weaken it: if the key that encrypts tickets leaks, resumed sessions can be exposed, which is why servers rotate those keys often. And 0-RTT data has no forward secrecy with respect to the ticket key.)
+
+### What HTTPS hides, and what it doesn't
+
+People say "HTTPS encrypts everything". It encrypts *the conversation*. A lot of facts about the conversation stay visible to anyone on the path.
+
+<Figure n="006" title="WHAT THE CAFÉ WI-FI SEES" caption="A request to https://api.example.com/v1/chat as it crosses the network. Blue is readable by anyone on the path; the hatched part is ciphertext. The URL path, headers, API key and body are hidden. Who you talk to, when, and how much, is not.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Layers of a TLS packet showing which parts are visible to an observer">
+  <rect x="10" y="20" width="110" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="65" y="42" text-anchor="middle" class="strong">IP HEADER</text>
+  <text x="65" y="58" text-anchor="middle">src, dst IP</text>
+  <rect x="120" y="20" width="100" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="170" y="42" text-anchor="middle" class="strong">TCP</text>
+  <text x="170" y="58" text-anchor="middle">ports 443</text>
+  <rect x="220" y="20" width="100" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="270" y="42" text-anchor="middle" class="strong">TLS RECORD</text>
+  <text x="270" y="58" text-anchor="middle">type, length</text>
+  <rect x="320" y="20" width="310" height="50" class="fill-paper dash" stroke-width="1.2" />
+  <text x="475" y="42" text-anchor="middle" class="strong">ENCRYPTED</text>
+  <text x="475" y="58" text-anchor="middle">path, headers, API key, body</text>
+  <text x="10" y="104" class="strong">VISIBLE ANYWAY</text>
+  <text x="10" y="124">· server IP, your IP, timing</text>
+  <text x="10" y="142">· SNI: the hostname, in the ClientHello</text>
+  <text x="10" y="160">· the DNS lookup (unless DoH / DoT)</text>
+  <text x="10" y="178">· sizes: how many bytes each way</text>
+  <text x="10" y="196">· that you use TLS 1.3, which ciphers</text>
+  <text x="340" y="104" class="strong">HIDDEN</text>
+  <text x="340" y="124">· the URL path and query string</text>
+  <text x="340" y="142">· headers, cookies, Authorization</text>
+  <text x="340" y="160">· request and response bodies</text>
+  <text x="340" y="178">· the certificate (TLS 1.3 only)</text>
+  <text x="340" y="196">· status codes</text>
+  <line x1="10" y1="220" x2="630" y2="220" class="ink dash" stroke-width="1" />
+  <text x="320" y="240" text-anchor="middle" class="blue-t">ECH (ENCRYPTED CLIENT HELLO) IS STARTING TO HIDE SNI TOO</text>
+</svg>
+</Figure>
+
+- **IP addresses.** They're in the IP header, which routers need to deliver the packet. Encryption can't hide them.
+- **SNI.** <Term w="SNI">Server Name Indication. A ClientHello field carrying the hostname you want, so one IP address can host many sites and pick the right certificate. Sent in plaintext.</Term> sits in the ClientHello, before any keys exist, so anyone on the path reads `api.openai.com` or `github.com` straight off the wire. A newer extension, <Term w="ECH">Encrypted Client Hello. Encrypts the real hostname inside the ClientHello using a public key the site publishes in DNS. Being rolled out by Cloudflare and browsers; check current support.</Term>, fixes this where both sides support it.
+- **DNS.** Before connecting you looked up the name, usually in plaintext over UDP, unless you use DNS over HTTPS or TLS.
+- **Sizes and timing.** TLS hides content, not length. A 2 MB response looks like a 2 MB response. Researchers have identified which pages people visited, and even words in voice calls, from packet sizes alone. Streaming LLM responses send one record per token or so; the sizes of those records can leak token lengths. (This has been shown in published research on chat assistants, and providers added padding in response.)
+
+## Build It
+
+Everything lives in `~/workbench/tls/`. You'll do the math yourself, use a real library for the actual encryption, then point real tools at real servers.
+
+<Task id="t0" title="Set up the folder, a venv, and the tools" agent="ok">
+
+```bash
+mkdir -p ~/workbench/tls && cd ~/workbench/tls
+python3 -m venv .venv && source .venv/bin/activate
+pip install cryptography
+brew install openssl@3          # macOS ships LibreSSL as `openssl`; you want the real one
+$(brew --prefix openssl@3)/bin/openssl version   # expect OpenSSL 3.x
+brew install --cask wireshark    # for the capture task
+```
+
+Check which `openssl` you get with `which openssl`. On this Mac it's `/opt/homebrew/bin/openssl`, OpenSSL 3.6. Some flags below (`-tls1_3`, the `X25519MLKEM768` group) need OpenSSL 3.x; the hybrid group needs 3.5 or newer.
+
+</Task>
+
+<Task id="t1" title="Diffie-Hellman by hand, small numbers" agent="hands">
+
+Write `dh_toy.py`. Use Python's three-argument `pow(base, exp, mod)`, which computes modular powers fast without ever building the giant number.
+
+```python
+# dh_toy.py
+p, g = 23, 5
+
+def public_value(secret: int) -> int:
+    """g^secret mod p"""
+    ...
+
+def shared_secret(their_public: int, my_secret: int) -> int:
+    ...
+
+def eve_brute_force(A: int) -> int:
+    """Find some x with g^x mod p == A by trying every x. Count the tries."""
+    ...
+
+if __name__ == "__main__":
+    a, b = 6, 15
+    # 1. compute A and B, print them (this is everything Eve sees)
+    # 2. compute both shared secrets, assert they are equal
+    # 3. have Eve recover a from A, then compute the key herself
+    ...
+```
+
+Check against the worked example: A = 8, B = 19, shared = 2. Then pick your own secrets. Then try `g = 2` with `p = 23` and print `[pow(2, x, 23) for x in range(1, 23)]`. Notice it only reaches 11 different values: 2 is not a generator mod 23, so the secret space is half the size. Choosing parameters is a job for experts, which is the first hint of what this lesson's warnings are about.
+
+</Task>
+
+<Task id="t2" title="Diffie-Hellman at real size" agent="hands">
+
+Real parameters are standardised. TLS's 2048-bit group is `ffdhe2048` from RFC 7919. Get its prime from OpenSSL instead of copying 600 digits from a web page:
+
+```bash
+openssl genpkey -genparam -algorithm DH -pkeyopt dh_param:ffdhe2048 -out ffdhe2048.pem
+openssl asn1parse -in ffdhe2048.pem
+```
+
+The output has two `INTEGER` lines: the first is p in hex (it starts `FFFFFFFFFFFFFFFFADF85458A2BB4A9A...`), the second is g = 2. Now write `dh_real.py`:
+
+```python
+# dh_real.py
+import secrets, subprocess, time
+
+def load_prime(path="ffdhe2048.pem") -> int:
+    """Run openssl asn1parse, take the hex after the last ':' on the first INTEGER line."""
+    ...
+
+p, g = load_prime(), 2
+# secrets with secrets.randbelow, never the random module (it's predictable)
+# time one pow(g, a, p) with time.perf_counter(); do 20 and average
+# assert both sides agree; print the shared secret's bit length
+# then: print how many tries brute force would need, as a power of 2
+```
+
+You should see each exponentiation take on the order of 10-20 ms (about 15 ms on this Mac with Python 3.14). Then do the same exchange with X25519 from the library, and time it too:
+
+```python
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+alice = X25519PrivateKey.generate()
+bob = X25519PrivateKey.generate()
+k1 = alice.exchange(bob.public_key())
+k2 = bob.exchange(alice.public_key())
+# assert k1 == k2; len(k1) is 32
+```
+
+(If you try the `cryptography` library's own finite-field DH, it prints a deprecation warning: the library is retiring it. Everyone moved to curves.)
+
+</Task>
+
+<Task id="t3" title="Turn the shared secret into a key and encrypt" agent="review">
+
+> **Never roll your own crypto in production.** Everything in this lesson's Build is for understanding. The toy DH has no authentication (Mallory wins), the nonce handling is the simplest possible, and real protocols have dozens of subtle checks you haven't seen. In real code, use TLS (Python's `ssl`, `httpx`, a reverse proxy) or a high-level, misuse-resistant library. Write your own only to learn.
+
+The raw DH output isn't a key. It's a big number with structure. Run it through HKDF, as TLS does, then encrypt with AES-GCM. Write `seal.py`:
+
+```python
+# seal.py
+import secrets
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+def derive_key(shared: bytes, label: bytes) -> bytes:
+    """HKDF-SHA256 -> 32 bytes. Use a different label for each direction."""
+    ...
+
+def seal(key: bytes, plaintext: bytes, header: bytes) -> tuple[bytes, bytes]:
+    """Return (nonce, ciphertext_with_tag). Fresh 12-byte nonce every call."""
+    ...
+
+def open_(key: bytes, nonce: bytes, ct: bytes, header: bytes) -> bytes:
+    ...
+```
+
+Use the X25519 shared secret from the last task (or your 2048-bit one, converted with `.to_bytes(256, "big")`). Encrypt a 20-byte message and check the output is 36 bytes (20 + 16-byte tag). Decrypt it. Then flip one bit of the ciphertext and confirm you get `cryptography.exceptions.InvalidTag`, not garbage. Do the same after changing one byte of `header`.
+
+Ask an agent to review it afterwards, specifically: "where could I reuse a nonce, and what happens if I do?"
+
+</Task>
+
+<Task id="t4" title="Read a real handshake with openssl" agent="explain">
+
+```bash
+echo | openssl s_client -connect letsencrypt.org:443 -servername letsencrypt.org \
+  -tls1_3 -showcerts
+```
+
+(`echo |` closes the connection right after the handshake.) Find each of these in the output, and say in one sentence what it means:
+
+- the `depth=` lines at the top, and `Verification: OK`
+- `Certificate chain`, each entry's `s:` (subject) and `i:` (issuer). Check that each `i:` is the next one's `s:`.
+- `Peer signature type` (what signed CertificateVerify)
+- `Negotiated TLS1.3 group` or `Peer Temp Key` (the DH group used)
+- `Cipher is TLS_AES_128_GCM_SHA256` (which symmetric cipher and hash)
+- `SSL handshake has read N bytes and written M bytes`
+- `Post-Handshake New Session Ticket arrived` and its `lifetime hint`
+
+Then watch the individual messages go by:
+
+```bash
+echo | openssl s_client -connect github.com:443 -servername github.com -tls1_3 -msg 2>&1 \
+  | grep -E '^(<<<|>>>)'
+```
+
+You should see `ClientHello` going out (`>>>`), then `ServerHello`, `EncryptedExtensions`, `Certificate`, `CertificateVerify`, `Finished` coming back, the decoy `ChangeCipherSpec`, and record headers claiming TLS 1.2. Try `www.google.com` and `www.cloudflare.com` too and compare the group: when I ran this, both negotiated `X25519MLKEM768` while github.com and letsencrypt.org used plain X25519.
+
+</Task>
+
+<Task id="t5" title="Verify a certificate chain yourself" agent="hands">
+
+Save the chain github.com sends, one file per certificate:
+
+```bash
+echo | openssl s_client -connect github.com:443 -servername github.com -showcerts 2>/dev/null \
+  | awk '/BEGIN CERT/{f=sprintf("cert%d.pem", n++)} /BEGIN CERT/,/END CERT/{print > f}'
+for f in cert*.pem; do openssl x509 -in $f -noout -subject -issuer -dates; done
+openssl x509 -in cert0.pem -noout -ext subjectAltName
+```
+
+Now verify the chain in Python, link by link, against your root store. `cryptography` (version 40 and later) gives each certificate a method, `verify_directly_issued_by(issuer)`, which checks the issuer name matches and the signature verifies with the issuer's public key, and raises if not.
+
+```python
+# chain.py
+from cryptography import x509
+import datetime
+
+def load(path) -> x509.Certificate: ...
+def load_roots(path="/opt/homebrew/etc/openssl@3/cert.pem") -> list[x509.Certificate]:
+    """x509.load_pem_x509_certificates reads a whole bundle."""
+    ...
+
+def verify_chain(chain: list[x509.Certificate], roots, hostname: str) -> None:
+    # 1. every adjacent pair: child.verify_directly_issued_by(parent)
+    # 2. the top cert's issuer must match the subject of some root; verify against that root
+    # 3. every cert: not_valid_before_utc <= now <= not_valid_after_utc
+    # 4. hostname must be in the leaf's SubjectAlternativeName DNS names
+    #    (a real client also handles wildcards like *.github.com and checks key usage, path length, ...)
+    ...
+```
+
+Print each link as it passes. Then compare with OpenSSL's answer:
+
+```bash
+cat cert1.pem cert2.pem > intermediates.pem
+openssl verify -show_chain -untrusted intermediates.pem cert0.pem
+```
+
+When I ran this, github.com's chain went leaf → Sectigo DV E36 → Sectigo Root E46 → USERTrust ECC (in the root store), and `openssl verify -untrusted cert1.pem cert0.pem` *without* the second intermediate failed with "unable to get local issuer certificate". That exact error is what you get when a server is misconfigured and forgets to send an intermediate.
+
+</Task>
+
+<Task id="t6" title="Decrypt your own traffic in Wireshark" agent="explain">
+
+TLS's whole point is that Wireshark can't read it. But the client knows the keys, and many TLS libraries will write them to a file if you set the `SSLKEYLOGFILE` environment variable. Wireshark reads that file and decrypts.
+
+Start a capture in Wireshark on your Wi-Fi interface (`en0` usually) with the capture filter `tcp port 443`. Then, in a terminal:
+
+```bash
+export SSLKEYLOGFILE=~/workbench/tls/keys.log
+python3 -c "import urllib.request; print(urllib.request.urlopen('https://example.com').status)"
+head -3 keys.log
+```
+
+Python's `ssl` module honours the variable (verified on this Mac: the file fills with lines like `SERVER_HANDSHAKE_TRAFFIC_SECRET <client random> <secret>`). macOS's built-in `/usr/bin/curl` did **not** write anything when I tried; Homebrew's curl, Firefox and Chrome generally do when launched with the variable set (check yourself).
+
+Stop the capture and use the display filter `tls`. You'll see `Client Hello`, `Server Hello`, then `Application Data` records you can't read. Expand the Client Hello and find the `server_name` extension: that's SNI, in plaintext, with no keys needed. Now in Wireshark go to Preferences → Protocols → TLS and set "(Pre)-Master-Secret log filename" to `keys.log`. The same packets now show `Certificate`, `CertificateVerify`, `Finished`, and the HTTP request and response.
+
+Keep `keys.log` private and delete it when done: it decrypts everything it recorded.
+
+</Task>
+
+<Task id="t7" title="Give your home server a real certificate" agent="explain">
+
+Your home server is reached over Tailscale at a name like `homebox.your-tailnet.ts.net`. Tools complain because anything you serve there uses either plain HTTP or a self-signed cert that chains to nothing in anyone's root store.
+
+Tailscale can get a real Let's Encrypt certificate for that name (it does the ACME DNS challenge for you, since it controls the `ts.net` DNS). Check the Tailscale docs for `tailscale cert` and "Enabling HTTPS": you enable MagicDNS and HTTPS for the tailnet in the admin console, then on the server run something of the shape:
+
+```bash
+sudo tailscale cert homebox.your-tailnet.ts.net
+# writes homebox.your-tailnet.ts.net.crt and .key in the current directory
+```
+
+Note the trade-off from Certificate Transparency: the docs warn that the machine name and your tailnet name end up in the public CT logs. Pick names you don't mind being public. (Tailscale's `tailscale serve` can also put HTTPS in front of a local port for you; read about it in the same docs.)
+
+Then serve something over it with nothing but the standard library:
+
+```python
+# https_server.py, run on the home server
+import ssl
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+host = "homebox.your-tailnet.ts.net"
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain(f"{host}.crt", f"{host}.key")
+srv = HTTPServer(("0.0.0.0", 8443), SimpleHTTPRequestHandler)
+srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
+srv.serve_forever()
+```
+
+From your Mac, `curl -v https://homebox.your-tailnet.ts.net:8443/` should connect with no `-k`, and `openssl s_client -connect homebox.your-tailnet.ts.net:8443 -showcerts` should show a Let's Encrypt chain. Run your `chain.py` against it too. Let's Encrypt certs expire in 90 days, so put the `tailscale cert` command on a schedule.
+
+</Task>
+
+<DoneWhen>
+
+- `dh_toy.py` reproduces A = 8, B = 19, key = 2, and Eve recovers the secret by brute force.
+- `dh_real.py` agrees on a 2048-bit secret and prints the time per exponentiation; X25519 agrees on 32 bytes.
+- `seal.py` round-trips a message, and a flipped bit raises `InvalidTag`.
+- You can point at each handshake message in `openssl s_client -msg` output and say what it's for.
+- `chain.py` verifies github.com's chain to a root in your store and rejects the wrong hostname.
+- Wireshark shows you the decrypted HTTP inside your own TLS session.
+- Your home server answers `curl https://...ts.net` with no certificate warnings.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Run each a few times and keep the median.
+
+| Thing | How | Your number | What I got (M-series Mac, Python 3.14, Oct 2026) |
+| --- | --- | --- | --- |
+| 2048-bit `pow(g, a, p)` | `dh_real.py`, 20 runs | | ~15 ms |
+| X25519: two keygens + one exchange | `timeit` around the snippet | | ~50 µs |
+| ECDSA P-256 sign / verify | `cryptography`, 500 runs | | ~13 µs / ~40 µs |
+| RSA-2048 sign / verify | same | | ~330 µs / ~18 µs |
+| AES-GCM encrypt, 100 MB | one `encrypt` call, timed | | ~7 GB/s |
+| TCP connect vs TLS handshake | script below, 3 hosts | | see below |
+| Handshake bytes read / written | `s_client` summary line | | ~3.9 KB / ~1.5 KB (letsencrypt.org) |
+
+For the handshake timing, separate DNS, TCP and TLS so you can see each one:
+
+```python
+# hs_time.py
+import socket, ssl, sys, time
+ctx = ssl.create_default_context()
+for host in sys.argv[1:]:
+    ip = socket.gethostbyname(host)          # DNS out of the way first
+    t0 = time.perf_counter()
+    raw = socket.create_connection((ip, 443))
+    t1 = time.perf_counter()
+    s = ctx.wrap_socket(raw, server_hostname=host)
+    t2 = time.perf_counter()
+    print(f"{host:18} tcp {1e3*(t1-t0):6.1f} ms  tls {1e3*(t2-t1):6.1f} ms  {s.version()}")
+    s.close()
+```
+
+`python3 hs_time.py www.google.com github.com letsencrypt.org`. My runs from home:
+
+| Host | TCP connect (≈ 1 RTT) | TLS handshake | Ratio |
+| --- | --- | --- | --- |
+| www.google.com | ~4-5 ms | ~14-24 ms | ~3-5x |
+| github.com | ~9-12 ms | ~12 ms | ~1x |
+| letsencrypt.org | ~30 ms | ~33 ms | ~1.1x |
+
+What it should tell you:
+
+- **Far servers: TLS ≈ one extra round trip.** For letsencrypt.org, the handshake took one RTT plus a few milliseconds. That's TLS 1.3's 1-RTT design, visible on a stopwatch. A TLS 1.2 server would show about two.
+- **Near servers: compute and bytes start to show.** Google is a few ms away, so the fixed costs (a bigger hybrid key share, a longer certificate chain to verify, the server's signature) are a visible fraction. Still tens of milliseconds at most.
+- **The crypto itself is cheap.** Add up the per-handshake work: an X25519 exchange (tens of µs), a signature check per chain link plus CertificateVerify (tens of µs each). Well under a millisecond. Next to a 30 ms round trip, the network dominates. That's why connection reuse (keep-alive, HTTP/2) and 0-RTT matter so much more than faster ciphers: they remove round trips.
+- **Symmetric is not the bottleneck either.** At ~7 GB/s per core, encrypting a 10 Gbit/s link (1.25 GB/s) costs a fraction of one core.
+- Note the shape of the 2048-bit vs X25519 gap: ~15 ms vs ~50 µs is a few hundred times. That gap is why the web moved to curves, especially for servers doing thousands of handshakes a second.
+
+## Break It
+
+**1. Reuse a nonce.** In `seal.py`, encrypt two different 20-byte messages with the same key and the same nonce. XOR the two ciphertexts (without the tags) together, then XOR in the first plaintext. You'll get the second plaintext back, without ever touching the key. (I ran this: it printed the second message exactly.) That's why nonce handling is the number one way people break AES-GCM in practice, and why TLS builds nonces from a per-record counter so they can't repeat.
+
+**2. Ask for the wrong name.** Connect to github.com's IP but claim a different hostname:
+
+```bash
+echo | openssl s_client -connect github.com:443 -servername github.com -verify_hostname example.com 2>&1 | grep -i verify
+```
+
+You'll get `Verify return code: 62 (hostname mismatch)`. In Python, `ctx.wrap_socket(sock, server_hostname="example.com")` against github's IP raises `CERTIFICATE_VERIFY_FAILED ... Hostname mismatch`. The chain is perfectly valid; it's just valid for someone else. A cert-checking client that forgets the hostname check is wide open to Mallory, because she can get a perfectly valid cert for *her own* domain.
+
+**3. Replay 0-RTT data.** Make a self-signed cert, run an OpenSSL test server that accepts early data, save a session, and send the same early data twice with the same ticket:
+
+```bash
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout key.pem \
+  -out crt.pem -days 30 -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost"
+printf 'GET / HTTP/1.0\r\n\r\n' > req.txt
+openssl s_server -accept 8443 -cert crt.pem -key key.pem -early_data -www &
+(sleep 1) | openssl s_client -connect localhost:8443 -sess_out sess.pem
+(sleep 1) | openssl s_client -connect localhost:8443 -sess_in sess.pem -early_data req.txt 2>&1 | grep -i early
+(sleep 1) | openssl s_client -connect localhost:8443 -sess_in sess.pem -early_data req.txt 2>&1 | grep -i early
+```
+
+(The `sleep` keeps the first client open long enough to receive its session ticket.) When I ran this, the first resumption said `Early data was accepted` and the second, reusing the same ticket, said `Early data was rejected`: OpenSSL's anti-replay. Kill the server, restart it with `-no_anti_replay`, repeat: both are accepted. The server just ran the same request twice. Now imagine it was a POST.
+
+**4. Leave out an intermediate.** In `chain.py`, drop `cert2.pem` from the chain and see which check fails. Then look at it from the server side: a server configured with only the leaf certificate often still works in browsers (they cache intermediates they've seen, and some fetch missing ones) and fails in `curl` and Python. This is one of the most common real "SSL error" causes, and now you can diagnose it in one `s_client` command.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. How can two machines agree on a secret key over a channel where everything is recorded?</summary>
+
+Diffie-Hellman. They agree publicly on a big prime p and a base g (or, in practice, an elliptic curve and a starting point). Each picks a secret number, and sends g raised to that secret, mod p. Each then raises what they received to their own secret. Both get g^(ab) mod p. An eavesdropper has g^a and g^b but combining those only gives g^(a+b); to get g^(ab) she'd need a or b, which means solving the discrete log, which is infeasible at real sizes (X25519 or 2048-bit primes). Like mixing paint: easy to mix, impossible to un-mix. The result is fed through a KDF to make the actual symmetric keys.
+
+</details>
+
+<details>
+<summary>2. If Diffie-Hellman keeps the key secret, why does TLS need certificates at all?</summary>
+
+Because DH only protects against someone who listens. Someone who can change packets (a malicious Wi-Fi router) can do two DH exchanges, one with each side, and relay everything, reading it in between. Nothing in plain DH proves who sent the share you got. TLS fixes it by having the server sign the handshake transcript (which includes both DH shares) with a private key, and proving the matching public key belongs to that hostname with a certificate, signed by a CA whose root is already in the client's root store. The client verifies the chain, the hostname, the dates, and the signature.
+
+</details>
+
+<details>
+<summary>3. Walk me through a TLS 1.3 handshake. Why is it one round trip?</summary>
+
+Client sends ClientHello: supported ciphers, SNI, and a DH key share for a group it guesses (usually X25519). Server replies with ServerHello and its own key share; both now derive handshake keys. In the same flight, encrypted, the server sends EncryptedExtensions, its Certificate chain, CertificateVerify (a signature over the transcript) and Finished (an HMAC over the transcript). The client verifies all of it, sends its own Finished, and its first HTTP request right behind it. It's one round trip because the client sends its key share up front instead of first negotiating which algorithm to use; TLS 1.2 took two. On resumption with a session ticket, the client can even send its request in the first flight (0-RTT), but that data can be replayed, so it's only safe for idempotent requests.
+
+</details>
+
+<details>
+<summary>4. What's forward secrecy, and what would break it?</summary>
+
+It means stealing the server's long-term key later doesn't let you decrypt traffic you recorded earlier. TLS 1.3 gets it because each connection's keys come from ephemeral DH secrets that are deleted after the connection; the certificate key only signs. Old TLS with RSA key exchange didn't have it: the session key was encrypted to the server's RSA key, so one stolen key decrypted years of recordings. Things that weaken it today: long-lived session-ticket encryption keys (rotate them), and 0-RTT early data, which depends only on the ticket.
+
+</details>
+
+<details>
+<summary>5. A service does 50,000 new TLS connections a second. Where does the cost go, and how do you scale it?</summary>
+
+Per handshake, the server does an X25519 (or hybrid) key exchange and one signature, tens to a few hundred microseconds of CPU depending on the algorithm (ECDSA signing ~13 µs, RSA-2048 ~330 µs on my Mac; a cert with an RSA key costs roughly 25x more server CPU per handshake than ECDSA). At 50k/s that's anywhere from under one core to many cores just for handshakes. Symmetric encryption is cheap: several GB/s per core. So: use ECDSA certs and X25519; make clients reuse connections (keep-alive, HTTP/2 multiplexing) and resume with tickets so most connections skip the full handshake; terminate TLS on a horizontally scaled tier (load balancers, a CDN), which also brings the handshake's round trip physically closer to users, since latency, not CPU, is what users feel.
+
+</details>
+
+## Go Deeper
+
+- **Whitfield Diffie and Martin Hellman, "New Directions in Cryptography"**, IEEE Transactions on Information Theory, 1976. Short and readable. The opening paragraph predicting the commercial need for this is remarkably accurate.
+- **Eric Rescorla, [RFC 8446: The Transport Layer Security (TLS) Protocol Version 1.3](https://www.rfc-editor.org/rfc/rfc8446)**. Read section 2 (protocol overview, with the handshake diagrams) and 4.4 (CertificateVerify and Finished). Clearer than most RFCs.
+- **Michael Driscoll, [The Illustrated TLS 1.3 Connection](https://tls13.xargs.org/)**. Every byte of a real handshake, annotated. Open it next to your Wireshark capture.
+- **Jean-Philippe Aumasson, _Serious Cryptography_** (No Starch Press). The book to read after this lesson: AES, GCM, hashes, DH, elliptic curves and TLS, explained for engineers with the failure modes included.
+- **Dan Boneh, Cryptography I** (Stanford, on Coursera). The course that makes "secure" a precise word. The sections on authenticated encryption and why nonce reuse is fatal are worth it alone.
+- **Let's Encrypt documentation, "How It Works"** ([letsencrypt.org/how-it-works](https://letsencrypt.org/how-it-works/)) and **RFC 8555 (ACME)**, for the domain-validation challenges.
+- **Hugo Krawczyk, "Cryptographic Extraction and Key Derivation: The HKDF Scheme"** (CRYPTO 2010) and **RFC 5869**. Why TLS never uses a raw DH output as a key.
+- **Tailscale docs, "Enabling HTTPS" and `tailscale cert`**, for the home-server task and its Certificate Transparency caveat.
+
+## Connections
+
+This sits in the middle of [What happens when you hit enter?](/lessons/what-happens-url/): after DNS and the [TCP](/lessons/tcp-vs-udp/) handshake, before the first HTTP byte. Count the round trips from both lessons together and you can predict a cold request's latency from a ping time.
+
+It sets up [HTTP from scratch](/lessons/http-from-scratch/): everything there runs inside the encrypted pipe you built here, and once you've written a plain HTTP server, wrapping its socket with `ssl` (as in the home-server task) is the only change needed for HTTPS. The round-trip arithmetic connects back to [How slow is slow?](/lessons/latency-numbers/): a handshake costs microseconds of CPU and tens of milliseconds of waiting, which is the same lesson about where time really goes.

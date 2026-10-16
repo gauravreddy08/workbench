@@ -1,0 +1,713 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import JudgeBiasSim from '../components/figures/JudgeBiasSim.astro';
+
+## Today
+
+- Explain why people grade model outputs with another model, and the three ways to ask it: score one answer, compare two, or check against a known-good answer.
+- Name the judge's known biases (position, length, self-preference, confident tone, formatting) and the specific fix for each, including which fixes do *not* work for which bias.
+- Treat a judge as what it is, a classifier, and measure it like one: agreement with your own labels, Cohen's kappa, a confusion matrix, and whether its confidence means anything.
+- Write rubrics that a model can apply consistently, for search-result relevance and for "did the agent finish the task".
+- Work out what a judging run costs before you start it, and when you should not use a judge at all.
+
+Prerequisites: [Why is the eval separate?](/lessons/why-evals-are-separate/) (why the grader must not share the model's blind spots) and ideally [Is that improvement real?](/lessons/statistics-for-evals/) (confidence intervals). Rough time: one evening to read, one evening to label 100 pairs, one to build and iterate the judge. API spend: a few dollars at most.
+
+## The Problem
+
+You have retrained the cross-encoder. You want to know if the new ranker is better than the old one, and you don't have relevance labels for this week's queries. So you do what everyone does. You take 500 queries, get the top result from each ranker, and ask a strong model: "Here is a query and two search results. Which is more relevant? Answer A or B."
+
+The new ranker wins 64% of the time. Ship it?
+
+Then, out of curiosity, you rerun the exact same 500 comparisons with the two results swapped, so the old ranker's result is shown first. Now the *old* ranker wins 58% of the time. Nothing about the results changed. Only the order on the page did.
+
+Then you notice the new ranker tends to surface longer pages with longer snippets. You trim every snippet to 40 words and rerun. The new ranker's win rate drops to 51%.
+
+So what did the judge measure? Some mix of relevance, which slot the answer sat in, and how many words it had. You can't tell how much of each, because you never checked the judge against anything. You used it as a ruler without asking whether the ruler was straight.
+
+That is this lesson. An LLM judge is genuinely useful: it's cheap, it never gets tired, and it can grade things no regex can. But it's a measuring instrument, and instruments have to be calibrated against a known reference before you trust a reading. The reference here is you, with a hundred careful labels.
+
+<Origin year="2023" title="Judging LLM-as-a-Judge">
+
+By early 2023 chat models were good enough that the old automatic metrics had stopped meaning anything. <Term w="BLEU">A 2002 metric for machine translation that counts how many short word sequences in the output also appear in a reference translation. Cheap, but it rewards copying the reference's wording, not being right.</Term> and its cousins compare an answer's words to a reference answer's words, and a great chat answer can share almost no words with the reference. Human raters were the gold standard, and they were slow and expensive: a few dollars and a few minutes per comparison.
+
+People had started quietly using GPT-4 to grade other models. In June 2023, Lianmin Zheng and colleagues at LMSYS (the group behind Vicuna and Chatbot Arena) published "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena", which named the practice and, more importantly, checked it. They built MT-Bench, 80 hard multi-turn questions, and collected expert human votes plus crowd votes from Chatbot Arena. GPT-4's verdicts agreed with human experts over 80% of the time when ties were left out, about as often as two humans agreed with each other.
+
+The same paper catalogued how the judge went wrong: it preferred whichever answer came first, it preferred longer answers even when the extra length was padding, it seemed to favour its own outputs, and it struggled to grade maths it couldn't solve itself. Every judge you build today inherits those failure modes, and the paper's fixes (swap the order, give it a reference answer, make it reason first) are still the starting point.
+
+</Origin>
+
+## The Idea
+
+### Why a model, and not a script or a person
+
+You have three ways to grade an output.
+
+1. **A program.** `assert extracted_price == 19.99`. Exact, free, instant. Works only when "correct" can be written as code.
+2. **A person.** Handles anything. Costs minutes and dollars per item, gets tired, disagrees with other people, and doesn't scale to 10,000 items every night.
+3. **A model.** Handles most open-ended things a person can, at a few tenths of a cent per item, in seconds, at any volume. But it's a model, so it has blind spots and biases, and you don't know what they are until you measure.
+
+The judge earns its place in the gap between 1 and 2: outputs too open-ended for code ("is this summary faithful?", "is this result relevant to the query?", "did the agent's final answer actually address the user's request?") and too numerous for people. Its job is to stand in for a person. So the only question that matters about any judge is: **how often does it say what a careful person would have said?** Everything else in this lesson is a way of answering that question or of making the answer better.
+
+### Three ways to ask
+
+<Figure n="001" title="THREE WAYS TO ASK" caption="Pointwise grading looks at one answer and gives it an absolute score. Pairwise grading shows two answers and asks which is better. Reference-guided grading gives the judge a known-good answer to compare against, which turns a hard judgement into an easier matching task.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Three judging formats: pointwise score, pairwise comparison, reference-guided">
+  <g>
+    <text x="105" y="20" text-anchor="middle" class="strong">POINTWISE</text>
+    <rect x="20" y="34" width="170" height="54" class="fill-paper" stroke-width="1.2" />
+    <text x="105" y="56" text-anchor="middle">QUESTION</text>
+    <text x="105" y="74" text-anchor="middle">+ ONE ANSWER</text>
+    <line x1="105" y1="88" x2="105" y2="112" class="ink" stroke-width="1.2" />
+    <rect x="45" y="112" width="120" height="36" class="fill-wash" stroke-width="1.2" />
+    <text x="105" y="135" text-anchor="middle" class="strong">JUDGE + RUBRIC</text>
+    <line x1="105" y1="148" x2="105" y2="172" class="ink" stroke-width="1.2" />
+    <text x="105" y="188" text-anchor="middle" class="blue-t">SCORE 1 TO 5</text>
+    <text x="105" y="216" text-anchor="middle">ABSOLUTE</text>
+    <text x="105" y="232" text-anchor="middle">SCALE DRIFTS</text>
+  </g>
+  <g>
+    <text x="320" y="20" text-anchor="middle" class="strong">PAIRWISE</text>
+    <rect x="235" y="34" width="170" height="54" class="fill-paper" stroke-width="1.2" />
+    <text x="320" y="56" text-anchor="middle">QUESTION</text>
+    <text x="320" y="74" text-anchor="middle">+ ANSWER A + ANSWER B</text>
+    <line x1="320" y1="88" x2="320" y2="112" class="ink" stroke-width="1.2" />
+    <rect x="260" y="112" width="120" height="36" class="fill-wash" stroke-width="1.2" />
+    <text x="320" y="135" text-anchor="middle" class="strong">JUDGE + RUBRIC</text>
+    <line x1="320" y1="148" x2="320" y2="172" class="ink" stroke-width="1.2" />
+    <text x="320" y="188" text-anchor="middle" class="blue-t">A / B / TIE</text>
+    <text x="320" y="216" text-anchor="middle">RELATIVE</text>
+    <text x="320" y="232" text-anchor="middle">ORDER MATTERS</text>
+  </g>
+  <g>
+    <text x="535" y="20" text-anchor="middle" class="strong">REFERENCE-GUIDED</text>
+    <rect x="450" y="34" width="170" height="54" class="fill-paper" stroke-width="1.2" />
+    <text x="535" y="56" text-anchor="middle">QUESTION + ANSWER</text>
+    <text x="535" y="74" text-anchor="middle">+ GOLD ANSWER</text>
+    <line x1="535" y1="88" x2="535" y2="112" class="ink" stroke-width="1.2" />
+    <rect x="475" y="112" width="120" height="36" class="fill-wash" stroke-width="1.2" />
+    <text x="535" y="135" text-anchor="middle" class="strong">JUDGE + RUBRIC</text>
+    <line x1="535" y1="148" x2="535" y2="172" class="ink" stroke-width="1.2" />
+    <text x="535" y="188" text-anchor="middle" class="blue-t">MATCHES? Y / N</text>
+    <text x="535" y="216" text-anchor="middle">EASIEST TO GET RIGHT</text>
+    <text x="535" y="232" text-anchor="middle">NEEDS A GOLD ANSWER</text>
+  </g>
+</svg>
+</Figure>
+
+**Pointwise.** Show one answer, get a score on a fixed scale, like "relevance 0 to 3" or "helpfulness 1 to 5". It's the natural fit when you want an absolute number you can track over time, or when you only have one system's outputs. Its weakness is that the scale is fuzzy: what's the difference between a 3 and a 4? Two runs of the same judge, or the same judge on different days of prompt tweaks, can drift. Models also tend to bunch their scores (lots of 4s, few 1s), which makes small differences invisible. The fix is a <Term w="rubric">The written grading instructions: what to look for, and what each score means. A good rubric describes each score level with a concrete example, so two graders would give the same score.</Term> where every level is pinned to a concrete description, an <Term w="anchor" label="anchor (rubric)">A concrete example or description attached to one score level, like "2 = the page is about the right topic but does not answer the question". Anchors stop the scale from drifting.</Term>.
+
+**Pairwise.** Show two answers, ask which is better. This is easier, for models and for people, for the same reason it's easier to say which of two coffees is stronger than to rate one coffee's strength out of 10. Relative judgements are more stable than absolute ones. Pairwise is what Chatbot Arena uses, and it's the natural fit for your actual question, "is ranker B better than ranker A?". Its weakness is the one in the opening scene: the two answers have to be shown in some order, and the order leaks into the verdict. It also scales badly if you want to rank many systems (every pair is a comparison), and a pairwise win rate tells you "better" but not "good enough".
+
+**Reference-guided.** Give the judge a known-correct answer and ask whether the candidate matches it in substance. This turns "is this right?" (hard; the judge has to know the answer) into "does this say the same thing as that?" (much easier). Zheng et al. found it mattered most for maths and reasoning, where the judge would otherwise be fooled by a confident wrong solution it couldn't check. It needs a gold answer per item, which you often have for extraction and QA tasks and rarely have for open-ended ones.
+
+You can mix them. A common pattern for agents: reference-guided where the task has a known answer, pointwise with a strict rubric where it doesn't.
+
+### The biases, and where they come from
+
+A judge is a language model reading a prompt. Everything that nudges a language model's next token nudges the verdict, including things that have nothing to do with quality. Here are the ones that have been measured, roughly in order of how much they'll hurt you.
+
+**Position bias.** The judge prefers one slot, usually the first, regardless of content. Zheng et al. measured it by asking each question twice with the order swapped and counting how often the verdict stayed the same. GPT-4 was consistent about 65% of the time in their setup; weaker judges were far worse (one was consistent under a quarter of the time and almost always picked the first answer). A separate 2023 paper, Wang et al.'s "Large Language Models are not Fair Evaluators", showed that just swapping the order could flip which of two models "won" a benchmark. Where does it come from? Partly from training data (in text, the first option listed is often the favoured one), partly from attention: the first answer is read with nothing to compare it to, the second is read in light of the first.
+
+**Length (verbosity) bias.** Longer answers win more often, even when the extra length adds nothing. Zheng et al. tested this with a "repetitive list" attack: they took answers containing lists and padded them by rephrasing items already there, adding no new information. Weaker judges preferred the padded version over 90% of the time; GPT-4 was fooled much less often, but not never. This one is subtle because length is *sometimes* a real signal: a longer answer often is more complete. The judge learned a correlation that's real on average and wrong exactly when someone is padding. This matters enormously when the thing you're judging is being *trained against* the judge. A model optimised to win judge comparisons learns to be long. AlpacaEval, a popular judge-based leaderboard, ended up publishing a "length-controlled" version in 2024 for exactly this reason.
+
+**Self-preference.** A judge tends to rate outputs from its own model family higher. Zheng et al. saw signs of it; Panickssery et al. (2024) showed that models can recognise their own outputs better than chance and that this recognition correlates with favouring them. The plain explanation: a model's own outputs are, by definition, the text it finds most likely, and "this reads naturally to me" leaks into "this is good". If you judge your fine-tuned Llama against GPT outputs using a GPT judge, the judge has a stake in the race.
+
+**Confident tone.** Answers that sound sure of themselves get rated higher than hedged ones with the same content, and fluent wrong answers can beat halting right ones. Hosking et al. (2023) found that assertiveness skews *human* ratings of factuality too, so this isn't only a model problem, but a judge has no way to check a fact it doesn't know. This is the cousin of <Term w="sycophancy">A model's tendency to tell people what they seem to want to hear, or to agree with whoever sounds most certain, instead of what's true.</Term>: the judge defers to whichever answer sounds most like an authority.
+
+**Format bias.** Markdown headers, bullet points, bold text, and citations-shaped brackets all look like effort. Judges reward them. For search snippets this shows up as preferring results with structured, list-like text over plain prose that answers the query better.
+
+Notice the pattern. Every bias is the judge using a feature that *correlates* with quality (position in a list, length, fluency, familiar style, formatting) instead of quality itself. You'd do the same if you had to grade 10,000 essays in an afternoon. The fix in each case is to break the correlation: either remove the feature from what the judge sees, or measure the judge's response to the feature and cancel it out.
+
+<Predict id="swap-fix">
+A judge has strong position bias: it picks the first answer 80% of the time. You ask every pair twice, once in each order. Which bias does that cancel: position, length, both, or neither? And if the judge also prefers longer answers, does swapping help with that?
+<Fragment slot="answer">
+
+Swapping cancels **position** bias, and does nothing for **length** bias.
+
+Position bias is a push toward a *slot*. When you swap the order, the push lands on the other answer. Ask both ways and the two pushes point in opposite directions, so averaging cancels them.
+
+Length bias is a push toward a *property of the answer*. The longer answer is longer in both orders, so the push points at the same answer both times. Averaging two verdicts that are both tilted the same way gives you a verdict that's still tilted. You need a different fix for that, like trimming lengths or measuring the length effect and subtracting it. Try both sliders in the next figure.
+
+</Fragment>
+</Predict>
+
+### The swap test
+
+The single most useful check you can run on a pairwise judge costs one extra call per item: ask twice, once in each order.
+
+<Figure n="002" title="THE SWAP TEST" caption="Ask each pair in both orders. If the same answer wins both times, the verdict is consistent. If the first slot wins both times (or the second slot both times), the judge was following the position, not the content, and the honest verdict is a tie.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A pair judged in both orders, with the four possible outcomes">
+  <rect x="10" y="30" width="110" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="47" text-anchor="middle" class="strong">ORDER 1</text>
+  <text x="65" y="63" text-anchor="middle">A then B</text>
+  <rect x="10" y="130" width="110" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="147" text-anchor="middle" class="strong">ORDER 2</text>
+  <text x="65" y="163" text-anchor="middle">B then A</text>
+  <line x1="120" y1="50" x2="160" y2="50" class="ink" stroke-width="1.2" />
+  <line x1="120" y1="150" x2="160" y2="150" class="ink" stroke-width="1.2" />
+  <rect x="160" y="30" width="70" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="195" y="55" text-anchor="middle" class="strong">JUDGE</text>
+  <rect x="160" y="130" width="70" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="195" y="155" text-anchor="middle" class="strong">JUDGE</text>
+  <line x1="230" y1="50" x2="262" y2="96" class="ink" stroke-width="1.2" />
+  <line x1="230" y1="150" x2="262" y2="104" class="ink" stroke-width="1.2" />
+  <circle cx="270" cy="100" r="8" class="fill-blue" />
+  <text x="270" y="124" text-anchor="middle">COMBINE</text>
+  <line x1="300" y1="20" x2="300" y2="210" class="ink dash" stroke-width="1" />
+  <text x="320" y="30" class="strong">ORDER 1</text>
+  <text x="400" y="30" class="strong">ORDER 2</text>
+  <text x="480" y="30" class="strong">RESULT</text>
+  <line x1="316" y1="40" x2="630" y2="40" class="ink" stroke-width="1" />
+  <text x="320" y="64">picks A</text>
+  <text x="400" y="64">picks A</text>
+  <text x="480" y="64" class="blue-t">A WINS</text>
+  <text x="320" y="96">picks B</text>
+  <text x="400" y="96">picks B</text>
+  <text x="480" y="96" class="blue-t">B WINS</text>
+  <text x="320" y="128">picks A</text>
+  <text x="400" y="128">picks B</text>
+  <text x="480" y="128">TIE: FIRST SLOT</text>
+  <text x="480" y="142">WON BOTH TIMES</text>
+  <text x="320" y="174">picks B</text>
+  <text x="400" y="174">picks A</text>
+  <text x="480" y="174">TIE: SECOND SLOT</text>
+  <text x="480" y="188">WON BOTH TIMES</text>
+  <line x1="316" y1="110" x2="630" y2="110" class="ink dash" stroke-width="1" />
+</svg>
+</Figure>
+
+Two numbers fall out of this for free, and you should report both for any pairwise judge:
+
+- **Consistency rate**: the fraction of pairs where the same answer wins in both orders. A perfect, unbiased judge on clear-cut pairs would be near 100%. On genuinely close pairs it'll be lower even without bias, because the judge is a bit noisy.
+- **First-slot win rate**: across all 2N calls, how often did the first-shown answer win? If the answers were randomly assigned to slots, this should be close to 50%. 60% means a real tilt. 80% means the judge is mostly reading the position.
+
+There are two ways to combine the two verdicts. The **hard** way: if they agree, that's the answer; if they disagree, call it a tie. The **soft** way: get the judge's probability that the first answer wins (from token <Term w="logprobs">Log-probabilities. Many APIs can return how likely the model thought each possible next token was. The probability it gave to "A" versus "B" is a free confidence score.</Term> if your API returns them, or by sampling several times), convert both to "probability A wins", and average.
+
+The soft version is better than it sounds. Model the judge's internal score for "first wins" as *quality gap + position push + noise*. In order 1 that's `gap + push`; in order 2, flipped back to A's point of view, it's `gap − push`. Averaging the two probabilities lands above 50% exactly when the sum of those two scores is positive, and in the sum the push cancels. So with a judge that gives probabilities, averaging across both orders removes a constant position bias completely, not approximately. The hard version can't do this: it throws away the "how sure" and can only shrug with a tie.
+
+Here is that model running on 60 pairs where we know the right answer. The noise is fixed, so moving a slider changes only the bias.
+
+<Figure n="003" title="A BIASED JUDGE" caption="A simulated judge grading 60 pairs with known answers. Raise position bias: one-order accuracy falls toward a coin flip, consistency collapses, and the averaged-probability verdict doesn't move. Then raise length bias instead: nothing recovers it, because the longer answer is longer in both orders. Turn on 'pad the losers' to make the worse answer always the longer one, which is what a model trained against a length-biased judge learns to do." wide>
+
+<JudgeBiasSim />
+
+</Figure>
+
+Things to try, and what they should show:
+
+1. **Both sliders at zero.** One order gets about 87% right, the hard swap about the same, and the averaged swap about 95%. Averaging two independent looks at the same pair also averages away some of the noise. That's a bonus on top of bias removal.
+2. **Position bias up to 1.0.** One-order accuracy drops to about 72%, the first slot wins 78% of calls, consistency drops to 43%. The averaged verdict stays at 95%. The hard swap stays down with one order, because every inconsistent pair becomes a tie worth half a point.
+3. **Position bias at 2.0 or more.** The judge now always picks the first slot. One order is a coin flip, consistency is near zero, and the averaged verdict is *still* 95%. That's the cancellation, working even when the bias is overwhelming. (In real life, a judge this biased has probably stopped reading carefully at all, so the "fixed noise" assumption would break. Treat this end of the slider as a thought experiment.)
+4. **Position back to zero, length bias at 1.0, pad the losers on.** Every pair now has the worse answer as the longer one. All three methods drop to around 65%, and the swap gives you no help. At length bias 2.0, all three fall below chance: the judge is now reliably picking the padded loser.
+
+The lesson in one line: **swapping fixes biases tied to the slot; it can't fix biases tied to the answer.** For those you need something else.
+
+### Mitigations, and which bias each one hits
+
+| Mitigation | What it does | Hits |
+| --- | --- | --- |
+| Swap order and average | Ask both ways; average probabilities, or call disagreement a tie | Position |
+| Length control | Trim or cap answer length before judging; or regress verdicts on the length difference and report the length-adjusted win rate (what AlpacaEval's length-controlled version does) | Length |
+| Rubric with concrete anchors | Define each verdict with examples, including "longer is not better" and "formatting does not count" said explicitly | Length, format, scale drift |
+| Reasoning before verdict | Make the judge write its analysis first, then the verdict on the last line | Snap judgements, position (somewhat) |
+| Reference answer | Give the judge a known-correct answer to compare against | Confident-but-wrong, maths |
+| Different model family | Judge with a model from a different family than the ones being compared | Self-preference |
+| Several judges | Majority vote across 3 different judge models, or across 3 samples of one | Noise, one model's quirks |
+| Hide the source | Never tell the judge which system produced which answer | Brand or name bias |
+
+Two of these deserve a closer look.
+
+**Reasoning before verdict.** If the prompt asks for the verdict first and then an explanation, the model commits to a letter in its first output token and then writes a justification for whatever it already said. That's a <Term w="post-hoc rationalisation">Explaining a decision after it was already made. The explanation sounds like reasoning but had no influence on the decision.</Term>, and it's worthless as a check. Ask for the analysis first, then the verdict on its own final line. Now the verdict token is generated *after*, and conditioned on, the reasoning. This is the same chain-of-thought effect you know from reasoning tasks. It costs output tokens, which, as you'll see in the cost section, are the expensive ones. (If your judge model thinks internally before answering, some of this happens for free, but you still pay for those thinking tokens as output.)
+
+**Different model family.** This is [Why is the eval separate?](/lessons/why-evals-are-separate/) applied to judges. A judge that shares training data, tokenizer and style with one of the contestants shares its blind spots. If you're comparing two of your own fine-tunes of the same base, this matters less (neither is "the judge's own"). If you're comparing your model against a vendor model, use a judge from a third family, or use two judges from different families and only trust verdicts they agree on.
+
+### The judge is a classifier
+
+Here's the reframe that makes everything else fall into place. A pairwise judge takes an input (query, A, B) and outputs a label (A, B, or tie). That's a classifier. Your hand labels are the ground truth. You know exactly how to evaluate a classifier: you build a confusion matrix and compute agreement metrics. People skip this for judges because the judge *feels* like an oracle. It isn't. It's a 3-class classifier with unknown accuracy, and it's about to grade the model you'll ship.
+
+<Figure n="004" title="THE JUDGE IS A CLASSIFIER" caption="Rows are your labels, columns are the judge's. The diagonal is agreement. This judge gets 74 of 100 right, but some of that is luck: if it had guessed with the same overall mix of A, B and tie, it would have matched you about 40% of the time anyway. Cohen's kappa scores it on the part above luck: 0.57. And the bottom row shows its real weakness: it almost never says tie.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Three by three confusion matrix of judge verdicts against human labels, with accuracy and kappa">
+  <text x="190" y="22" text-anchor="middle" class="strong">JUDGE SAYS</text>
+  <text x="120" y="46" text-anchor="middle">A</text>
+  <text x="190" y="46" text-anchor="middle">B</text>
+  <text x="260" y="46" text-anchor="middle">TIE</text>
+  <text x="18" y="160" class="strong" transform="rotate(-90 18 160)" text-anchor="middle">YOU SAID</text>
+  <text x="70" y="88" text-anchor="end">A</text>
+  <text x="70" y="158" text-anchor="end">B</text>
+  <text x="70" y="228" text-anchor="end">TIE</text>
+  <rect x="85" y="56" width="70" height="60" class="fill-wash" stroke-width="1.2" />
+  <rect x="155" y="56" width="70" height="60" class="fill-paper" stroke-width="1" />
+  <rect x="225" y="56" width="70" height="60" class="fill-paper" stroke-width="1" />
+  <rect x="85" y="116" width="70" height="60" class="fill-paper" stroke-width="1" />
+  <rect x="155" y="116" width="70" height="60" class="fill-wash" stroke-width="1.2" />
+  <rect x="225" y="116" width="70" height="60" class="fill-paper" stroke-width="1" />
+  <rect x="85" y="176" width="70" height="60" class="fill-paper" stroke-width="1" />
+  <rect x="155" y="176" width="70" height="60" class="fill-paper" stroke-width="1" />
+  <rect x="225" y="176" width="70" height="60" class="fill-wash" stroke-width="1.2" />
+  <text x="120" y="91" text-anchor="middle" class="strong">38</text>
+  <text x="190" y="91" text-anchor="middle">4</text>
+  <text x="260" y="91" text-anchor="middle">3</text>
+  <text x="120" y="151" text-anchor="middle">5</text>
+  <text x="190" y="151" text-anchor="middle" class="strong">32</text>
+  <text x="260" y="151" text-anchor="middle">3</text>
+  <text x="120" y="211" text-anchor="middle">6</text>
+  <text x="190" y="211" text-anchor="middle">5</text>
+  <text x="260" y="211" text-anchor="middle" class="strong">4</text>
+  <text x="310" y="91">45</text>
+  <text x="310" y="151">40</text>
+  <text x="310" y="211">15</text>
+  <text x="120" y="256" text-anchor="middle">49</text>
+  <text x="190" y="256" text-anchor="middle">41</text>
+  <text x="260" y="256" text-anchor="middle">10</text>
+  <text x="340" y="256">TOTALS</text>
+  <line x1="300" y1="196" x2="380" y2="208" class="blue" stroke-width="1" />
+  <text x="384" y="204" class="blue-t">ONLY 4 OF 15 TIES FOUND</text>
+  <rect x="420" y="56" width="210" height="120" class="fill-paper" stroke-width="1.2" />
+  <text x="434" y="80" class="strong">AGREEMENT  74 / 100</text>
+  <text x="434" y="104">BY CHANCE  ≈ 0.40</text>
+  <text x="434" y="128" class="blue-t">KAPPA = (0.74 − 0.40)</text>
+  <text x="500" y="144" class="blue-t">/ (1 − 0.40)</text>
+  <text x="500" y="164" class="strong">≈ 0.57</text>
+</svg>
+</Figure>
+
+**Accuracy** (raw agreement) is the diagonal over the total: 74/100. Easy to understand, and easy to fool. Suppose 90% of your pairs are ones where the new ranker is clearly better. A judge that always answers "A" scores 90% accuracy and has learned nothing.
+
+**Cohen's kappa** fixes that by asking how much better than luck the judge does. Write <Term w="p_o">Observed agreement: the fraction of items where the judge and you gave the same label. Just accuracy.</Term> for the observed agreement and <Term w="p_e">Expected agreement by chance: how often you'd match if the judge kept its overall label mix (say 49% A, 41% B, 10% tie) but assigned labels at random. Computed from the row and column totals.</Term> for the agreement you'd expect by chance given how often each of you uses each label. Then:
+
+```text
+kappa = (p_o − p_e) / (1 − p_e)
+```
+
+Read it as "of the room above luck, how much did the judge fill?". Here p_e is 0.45×0.49 + 0.40×0.41 + 0.15×0.10 ≈ 0.40, so kappa = (0.74 − 0.40) / 0.60 ≈ 0.57. The "always A" judge on the 90/10 set has p_o = 0.9 and p_e = 0.9, so kappa = 0. (I checked both with a few lines of Python; you'll write the same function in Build.) Kappa is 1 for perfect agreement, 0 for luck-level, negative for worse than luck. A common rough reading, from Landis and Koch in 1977, calls 0.41-0.60 "moderate" and 0.61-0.80 "substantial". Don't treat those as law. The useful comparison is with **human-human kappa on the same items**: if you and a colleague only agree at 0.65, a judge at 0.6 is about as good as a second person, and you can't expect 0.9.
+
+**The confusion matrix** tells you *how* it's wrong, which accuracy and kappa can't. In Figure 004 the judge almost never says tie: of the 15 pairs you called a tie, it found 4. That's a specific, fixable rubric problem ("say tie when neither result answers the query better; do not break ties on length"), and you'd never see it in a single number.
+
+**For pointwise scores** (say 0-3 relevance), use rank correlation between the judge's scores and yours. <Term w="Spearman correlation">Correlation between two lists after replacing each value with its rank. 1 means the two orderings agree perfectly, 0 means no relation. It only cares about order, not the exact numbers, so a judge that's consistently one point harsh still scores well.</Term> asks "does the judge put items in the same order as you?", which is usually what you need for comparing systems. If you also need the absolute numbers right (because you report "average relevance 2.3"), check exact-match agreement and a weighted kappa as well.
+
+**Calibration.** If your judge gives a probability or a confidence, check whether it means anything. Bucket the judge's verdicts by its stated confidence (say 50-60%, 60-70%, ..., 90-100%) and check accuracy in each bucket against your labels. A <Term w="calibrated">A model is calibrated if, among all the times it says "80% sure", it's right about 80% of the time.</Term> judge's 90% bucket is right about 90% of the time. This matters because calibration is what lets you *act* on confidence: auto-accept verdicts above 90%, send the rest to a human. If the 90% bucket is only right 70% of the time, that routing rule is silently wrong.
+
+**Confidence intervals.** 100 labels is not a lot. A judge with 80% agreement on 100 items has a 95% interval of roughly ±8 points (by the normal approximation, `1.96 × sqrt(0.8 × 0.2 / 100)` ≈ 0.078). So "rubric v2 got 82%, v1 got 78%" is not, on its own, evidence that v2 is better. [Is that improvement real?](/lessons/statistics-for-evals/) covers the bootstrap and the paired test that answer it properly. Use the paired version here: both rubrics graded the *same* 100 pairs, so compare them pair by pair.
+
+### Writing rubrics that hold
+
+A rubric is a specification, and the judge is a very literal, very fast, slightly lazy reader. The same rules that make a spec good for a contractor make it good for a judge: say what you mean, define the edge cases, give examples.
+
+**Search-result relevance.** Your domain. The standard way information retrieval people do this is a graded scale with written definitions, and TREC-style judging (and Bing's large-scale LLM relevance labelling, Thomas et al. 2023) uses something like this:
+
+```text
+You are judging whether a web page is a good result for a search query.
+Judge only relevance to what the searcher wanted. Ignore length, writing quality, and formatting.
+
+3 = Answers it. A searcher would stop here: the page directly gives what the query asks for.
+    e.g. query "python sort dict by value", page shows sorted(d.items(), key=lambda kv: kv[1]).
+2 = Useful. On the right topic and contains part of the answer, or leads to it in one click.
+    e.g. same query, page explains sorting lists of tuples, without dicts.
+1 = Related. Same general topic, but a searcher would not find the answer here.
+    e.g. a page about dict comprehension syntax.
+0 = Not relevant, spam, or a broken page.
+
+For a PAIR, choose the result with the higher grade. If both have the same grade, answer TIE.
+Do not break ties on length or detail.
+```
+
+The things that make this work: each level is a *behaviour of the searcher* ("would stop here"), not an adjective ("highly relevant"); each level has an example from the domain; the irrelevant features are named and excluded; and the tie rule is explicit. That last line directly attacks the tie blindness in Figure 004.
+
+**Agent task success.** For agents (TinyFish's world), "did it work?" is usually a mix of things a program can check and things it can't. Split them.
+
+```text
+Task: {task}
+Final answer from the agent: {answer}
+Final page URL: {url}
+Trajectory summary: {steps}
+
+Answer each question YES or NO, with one sentence of evidence quoted from the inputs:
+1. Did the agent reach a page where the requested information is visible?
+2. Does the final answer contain the specific information requested (not a description of where to find it)?
+3. Is every value in the final answer supported by text on the final page? Quote it.
+4. Did the agent do anything the task did not ask for that changes state (submitting forms, buying, logging in)?
+
+SUCCESS only if 1, 2 and 3 are YES and 4 is NO. Otherwise FAIL.
+```
+
+Two ideas here. First, **decompose**: four narrow yes/no questions are each much easier to judge reliably than one fuzzy "did it succeed (1-10)?", and when it fails you know *which* part failed. Second, **demand evidence**: "quote the text" forces the judge to ground its answer in the input instead of in how confident the agent sounded, which is your defence against the confident-tone bias.
+
+**General rules for any rubric:**
+
+- Binary or 3-way questions beat 1-10 scales. If you can't say what a 6 means versus a 7, neither can the judge.
+- Name the features to ignore: length, formatting, tone, which answer came first.
+- Put the verdict on the last line in a fixed format (`VERDICT: A`), and parse it strictly. If it doesn't parse, that's a failure you count, not a silent default.
+- Iterate on the rubric using a dev split of your labels and report the final number on a held-out split. Otherwise you're tuning the rubric to your 100 examples, which is overfitting by a different name.
+
+### What it costs
+
+Judging is cheap, but "cheap times a lot" is how you get surprise bills. Do the arithmetic before every run:
+
+```text
+cost = items × calls per item × (input tokens × input price + output tokens × output price)
+```
+
+A judge prompt has two parts. The **rubric** (system prompt, scale definitions, maybe a few worked examples) is identical for every item and can easily be 1,000-2,000 tokens. The **item** (query plus two results) changes every call, maybe 300-500 tokens. Then the judge writes its reasoning and verdict, maybe 100-200 output tokens.
+
+That shared rubric is exactly what <Term w="prompt caching">A provider feature that stores the processed form of a prompt's beginning. Later requests that start with the exact same text reuse it and pay a fraction of the normal input price for that part. Any change to the prefix, even one character, misses the cache.</Term> is for. Put the rubric first, byte-for-byte identical every call, and the item after it.
+
+<Figure n="005" title="WHERE THE MONEY GOES" caption="A judge prompt is a long fixed rubric followed by a short varying item. With caching, the rubric costs about a tenth as much after the first call, and the bill halves. What's left is mostly output: the reasoning you asked for. Example prices: $3 per million input tokens, $15 per million output, cache reads at 0.1x. Check your provider's current prices.">
+<svg viewBox="0 0 640 270" role="img" aria-label="Prompt layout with cached rubric prefix, and cost bars with and without caching">
+  <text x="10" y="22" class="strong">ONE JUDGE CALL</text>
+  <rect x="10" y="32" width="330" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="175" y="50" text-anchor="middle" class="strong">RUBRIC + EXAMPLES</text>
+  <text x="175" y="65" text-anchor="middle">1,500 TOK · SAME EVERY CALL</text>
+  <rect x="340" y="32" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="385" y="50" text-anchor="middle" class="strong">PAIR</text>
+  <text x="385" y="65" text-anchor="middle">400 TOK</text>
+  <rect x="440" y="32" width="190" height="40" class="fill-paper dash" stroke-width="1.2" />
+  <text x="535" y="50" text-anchor="middle" class="strong">REASONING + VERDICT</text>
+  <text x="535" y="65" text-anchor="middle">150 TOK OUT</text>
+  <line x1="10" y1="82" x2="340" y2="82" class="blue" stroke-width="1.5" />
+  <text x="175" y="98" text-anchor="middle" class="blue-t">CACHEABLE PREFIX</text>
+  <text x="10" y="134" class="strong">PER 1,000 JUDGMENTS</text>
+  <text x="10" y="164">NO CACHE</text>
+  <rect x="110" y="152" width="342" height="18" class="fill-blue" />
+  <rect x="452" y="152" width="135" height="18" class="fill-paper" stroke-width="1" />
+  <text x="600" y="166">$7.95</text>
+  <text x="10" y="202">CACHED</text>
+  <rect x="110" y="190" width="99" height="18" class="fill-blue" />
+  <rect x="209" y="190" width="135" height="18" class="fill-paper" stroke-width="1" />
+  <text x="356" y="204">$3.90</text>
+  <rect x="110" y="232" width="14" height="10" class="fill-blue" />
+  <text x="130" y="241">INPUT</text>
+  <rect x="190" y="232" width="14" height="10" class="fill-paper" stroke-width="1" />
+  <text x="210" y="241">OUTPUT ($2.25 EITHER WAY)</text>
+  <text x="10" y="264">SWAP TEST DOUBLES BOTH. BATCH APIS TYPICALLY HALVE BOTH.</text>
+</svg>
+</Figure>
+
+The numbers in Figure 005, worked out (and checked in Python):
+
+- No cache: 1,900 input tokens × $3/M = $0.0057, plus 150 output × $15/M = $0.00225, so about $0.008 per call, **$7.95 per 1,000**.
+- Cached: 400 uncached × $3/M = $0.0012, plus 1,500 cached × $0.30/M = $0.00045, plus the same $0.00225 output, so **$3.90 per 1,000**. Writing the cache the first time costs a bit more than a normal read (about 1.25x on Anthropic's API), which is noise over 1,000 calls.
+- Swap test: every pair is judged twice, so double it.
+
+Three practical things about caching. It's a prefix match, so anything that varies (the item, a timestamp, a request ID) must come *after* the cached part. Most providers have a minimum length below which nothing is cached (it varies by model, from a few hundred to a few thousand tokens), so a tiny rubric won't benefit. And the cache expires after a few minutes idle by default, so run judgments in a steady stream, not one every ten minutes. Many providers also offer a batch API at around half price if you can wait hours for results; for a nightly eval, you can.
+
+Notice what's left after caching: output tokens are now more than half the bill. "Reason before verdict" is worth it, but ask for three sentences of reasoning, not three paragraphs.
+
+### When not to use a judge
+
+The most important rubric rule is the one you apply before writing a rubric: **if a program can check it, use the program.**
+
+- Did the agent extract the right price? Compare to the value on the page. Exact.
+- Is the output valid JSON matching the schema? Parse it.
+- Did the code pass the tests? Run them.
+- Is the answer to the arithmetic problem 42? `==`.
+- Does the retrieved document contain the answer span from your labelled set? String match, or the ranking metrics from [Ranking metrics and eval sets](/lessons/ranking-metrics/).
+
+A program has kappa 1.0 with itself, costs nothing, and can't be talked into anything by a confident tone. A judge in these places adds cost, noise and bias and removes nothing. Use the judge for the remainder: relevance, faithfulness, helpfulness, "did this answer the actual question". And even there, prefer reference-guided over open-ended whenever you can write down a gold answer.
+
+There's one more case: **don't use a judge as the training reward without measuring it first.** If you optimise a model against a judge (RL from AI feedback, or picking DPO pairs by judge preference), every bias in the judge becomes a direction the model will learn to move in. A judge with length bias produces a model that pads. That's the "pad the losers" toggle in Figure 003, except the model learns to do it on purpose.
+
+## Build It
+
+You'll build a pairwise relevance judge, calibrate it against your own labels, catch it being biased, and improve it. Folder: `~/workbench/judge/`. Budget: set a hard cap of a few dollars in the code. With a small, cheap model, the whole lesson should cost well under that.
+
+<Task id="t0" title="Set up the client, with a budget and a disk cache" agent="ok">
+
+Pick any provider and a small, cheap model (Haiku-class, or whatever your provider's cheapest capable tier is). Keys go in environment variables, never in code and never in a file you might commit.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install anthropic          # or your provider's SDK
+export ANTHROPIC_API_KEY=...   # in your shell or a .env you never commit
+export JUDGE_MODEL=...         # a cheap model ID from the provider's model list
+export PRICE_IN=1.0            # $ per million input tokens, from the pricing page
+export PRICE_OUT=5.0           # $ per million output tokens
+export JUDGE_BUDGET_USD=3
+echo ".env" >> .gitignore
+```
+
+The wrapper below does three things. It caches every response to disk keyed by the exact request, so rerunning an analysis never pays twice. It tracks spend from the usage numbers the API returns and refuses to go past the budget. And it marks the system prompt (your rubric) as cacheable. This is the Anthropic Python SDK shape; other SDKs differ, so check their docs.
+
+```python
+# llm.py
+import hashlib, json, os, pathlib
+import anthropic
+
+MODEL = os.environ["JUDGE_MODEL"]
+PRICE_IN = float(os.environ["PRICE_IN"])
+PRICE_OUT = float(os.environ["PRICE_OUT"])
+BUDGET = float(os.environ.get("JUDGE_BUDGET_USD", "3"))
+CACHE = pathlib.Path(".cache"); CACHE.mkdir(exist_ok=True)
+
+client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+def spent() -> float:
+    return sum(json.loads(f.read_text())["cost"] for f in CACHE.glob("*.json"))
+
+def call(system: str, user: str, max_tokens: int = 1024) -> dict:
+    key = hashlib.sha256(json.dumps([MODEL, system, user, max_tokens]).encode()).hexdigest()
+    f = CACHE / f"{key}.json"
+    if f.exists():
+        return json.loads(f.read_text())
+    if spent() >= BUDGET:
+        raise RuntimeError(f"budget ${BUDGET} reached")
+    r = client.messages.create(
+        model=MODEL,
+        max_tokens=max_tokens,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=[{"role": "user", "content": user}],
+    )
+    u = r.usage
+    read = u.cache_read_input_tokens or 0
+    wrote = u.cache_creation_input_tokens or 0
+    cost = (u.input_tokens * PRICE_IN + read * PRICE_IN * 0.1 + wrote * PRICE_IN * 1.25
+            + u.output_tokens * PRICE_OUT) / 1e6
+    text = "".join(b.text for b in r.content if b.type == "text")
+    out = {"text": text, "in": u.input_tokens, "cache_read": read, "cache_write": wrote,
+           "out": u.output_tokens, "cost": cost}
+    f.write_text(json.dumps(out))
+    return out
+```
+
+`input_tokens` here counts only the *uncached* part of the prompt; cached tokens show up in the two `cache_*` fields. If `cache_read_input_tokens` stays at 0 across repeated calls, your rubric is either below the model's minimum cacheable length or something in it is changing between calls. Some current models don't accept a `temperature` setting, which is why it isn't here; judges are not fully deterministic anyway, which is one more reason the disk cache matters.
+
+</Task>
+
+<Task id="t1" title="Build and label 100 pairs yourself" agent="hands">
+
+This is the most important task in the lesson, and no agent can do it for you, because the whole point is that the labels are *yours*.
+
+Make `pairs.jsonl`, one object per line: `{"id": ..., "query": ..., "a": ..., "b": ...}` where `a` and `b` are two search results (title plus snippet, or the first ~150 words of the page). Good sources: your cross-encoder's eval data (a query plus candidates at different ranks), or run 30-40 of your own queries through any search API and take results at different ranks. Aim for a mix:
+
+- ~40 easy pairs (one clearly answers the query, the other clearly doesn't),
+- ~45 hard pairs (both on topic, one better),
+- ~15 genuine ties.
+
+Randomise which result goes in `a` and which in `b` when you build the file, so "the better one is usually A" can't leak in from how you collected them.
+
+Then label them blind, before the judge has seen anything. A labeller is boilerplate (an agent may write it): show the query and both results, read `a`, `b`, or `t` from the keyboard, and append `{"id": ..., "label": ...}` to `labels.jsonl`. Write down a one-line reason for the hard ones; you'll want them when you write the rubric.
+
+Two things to do while you label:
+
+- **Write your own rubric as you go.** Every time you hesitate, ask what rule you just applied. Those rules are rubric v1.
+- **Re-label 20 random pairs a day later** without looking at your first answers. Your agreement with yourself is the ceiling for any judge. If you only agree with yourself 85% of the time, a judge at 85% is as good as you.
+
+Then split: 60 pairs for `dev` (you'll look at these while improving the rubric) and 40 for `test` (you won't look at these until the end).
+
+</Task>
+
+<Task id="t2" title="Write the pairwise judge" agent="hands">
+
+```python
+# judge.py
+from llm import call
+
+RUBRIC_V0 = """Which search result is more relevant to the query? Answer A, B, or TIE."""
+
+def build_user(query: str, first: str, second: str) -> str:
+    """The per-item part of the prompt: the query and the two results labelled A and B.
+    Everything that's the same for every item belongs in the system prompt, not here."""
+    ...
+
+def parse(text: str) -> str | None:
+    """Return 'A', 'B' or 'TIE' from the judge's final line ('VERDICT: A'), or None.
+    Strict: if the last line doesn't match, return None and count it as a parse failure."""
+    ...
+
+def judge(rubric: str, query: str, a: str, b: str, swap: bool = False) -> dict:
+    """Judge one pair. If swap, show b first. Always return the verdict in terms of
+    the ORIGINAL a and b (so 'A' means the original a won, whichever slot it was in),
+    plus the raw response and usage for cost accounting."""
+    ...
+```
+
+Hints:
+
+- Start with the deliberately vague `RUBRIC_V0` above. You want a bad baseline to improve on.
+- From v1 on, ask for two or three sentences of reasoning *first* and `VERDICT: A|B|TIE` as the very last line.
+- The swap bookkeeping is where bugs live. Test `judge` with a pair where `a` is obviously right, in both orders, before running 100 of them.
+- If your API returns token log-probabilities, also grab the probability of the verdict token. You'll want it for soft swap-averaging. If it doesn't, skip that; the hard version is fine.
+
+</Task>
+
+<Task id="t3" title="Measure agreement like a classifier" agent="hands">
+
+```python
+# agree.py
+LABELS = ["A", "B", "TIE"]
+
+def confusion(human: list[str], judge: list[str]) -> list[list[int]]:
+    """3x3 counts: rows = human label, cols = judge label, in LABELS order."""
+    ...
+
+def cohen_kappa(m: list[list[int]]) -> float:
+    """p_o = diagonal / total. p_e = sum over labels of (row share × column share).
+    Return (p_o - p_e) / (1 - p_e)."""
+    ...
+
+def bootstrap_ci(human, judge, n_boot: int = 2000) -> tuple[float, float]:
+    """95% interval for accuracy: resample pairs with replacement, recompute, take the
+    2.5th and 97.5th percentiles."""
+    ...
+```
+
+Check `cohen_kappa` on the Figure 004 matrix first: it should print about 0.567. And on `[[90, 0], [10, 0]]` (the always-A judge, two classes): exactly 0.
+
+Run rubric v0 on the **dev** split in one order. Print the confusion matrix, accuracy with its interval, kappa, and the parse-failure count.
+
+</Task>
+
+<Task id="t4" title="Catch the position bias" agent="hands">
+
+Run every dev pair a second time with `swap=True`. Report:
+
+- consistency rate (same original answer won both times),
+- first-slot win rate over all calls,
+- accuracy and kappa for: order 1 only, order 2 only, and the hard swap-combined verdict (disagreement becomes TIE),
+- if you have log-probabilities, the soft combined verdict too.
+
+Write down, before you run it, what first-slot win rate you expect from a modern cheap model. Then look at the inconsistent pairs specifically. Are they mostly the ones you found hard, or the ones you labelled as ties? That tells you whether the inconsistency is bias or honest uncertainty.
+
+</Task>
+
+<Task id="t5" title="Catch the length bias with fluff" agent="hands">
+
+Write `pad(text: str, words: int) -> str` that appends content-free filler to a result: sentences that add no information about the query. For example, a pool like "This page provides a comprehensive overview of the topic.", "Readers will find a range of helpful information here.", "The content is regularly reviewed for accuracy." Draw from the pool until you've added about `words` words.
+
+Then take every dev pair where you labelled one result as better, and build two variants:
+
+1. **Pad the loser** by about 60 words. The right verdict hasn't changed. Every flip toward the padded loser is length bias.
+2. **Pad the winner** by the same amount. Count flips here too. You'd expect few; if there are many, the padding is confusing the judge in some other way.
+
+Report the flip rate for each, judged with the swap test (so position bias doesn't pollute the measurement). Then try a second kind of padding that *echoes the query's keywords* without answering it. That one tests a different bias, keyword matching, and you should expect it to fool the judge more. Real SEO spam looks like this.
+
+</Task>
+
+<Task id="t6" title="Iterate the rubric, then test once" agent="review">
+
+Improve the rubric in versions, keeping every version in the file so you can rerun any of them. A reasonable sequence:
+
+- **v1**: reasoning first, verdict on the last line, explicit TIE rule.
+- **v2**: the graded 0-3 relevance scale with anchors from the Idea section, rewritten with examples from *your* queries and the rules you wrote down while labelling.
+- **v3**: add "ignore length, formatting and writing quality" and two worked examples (one hard pair, one tie) taken from the dev set.
+
+For each version, run the swap test on dev and record accuracy, kappa, consistency, first-slot win rate and the pad-the-loser flip rate. Look at the disagreements after each version and change the rubric to address the *kind* of mistake, not the individual pair.
+
+When you're done, and only once, run your best version and v0 on the **test** split. That's your headline number. Use a paired bootstrap from [Is that improvement real?](/lessons/statistics-for-evals/) on the test pairs to say whether best beats v0 by more than noise.
+
+Ask an agent to review your rubric for ambiguities and for anything that leaks dev-set specifics into the prompt.
+
+</Task>
+
+<Task id="t7" title="Cost per 1,000 judgments" agent="hands">
+
+From the cached responses in `.cache/`, compute for your best rubric: average uncached input tokens, cached input tokens, and output tokens per call. Then compute the cost per 1,000 judgments with and without the swap test, at your model's prices. Then compute what it *would* have cost without prompt caching, by pricing the cached tokens at the full input rate. Also check how many of your calls actually hit the cache.
+
+Finally, the "how does this scale?" number: what would it cost to judge your ranker nightly on 5,000 queries with the swap test? Per night, per month.
+
+</Task>
+
+<DoneWhen>
+
+- You have 100 pairs labelled by you, split 60 dev / 40 test, plus a 20-pair self-agreement check.
+- `judge.py` judges a pair in either order and reports verdicts in terms of the original A and B.
+- You have a filled-in results table for at least four rubric versions on dev, and the best and v0 on test.
+- You've measured position bias (consistency, first-slot win rate) and length bias (pad-the-loser flip rate), and you can say which fix you applied to each.
+- You know your cost per 1,000 judgments, with and without caching and swapping.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Dev numbers use the swap test; "acc" is the hard-combined verdict.
+
+| Rubric | Split | Acc (95% CI) | Kappa | Consistent | First slot wins | Pad-loser flips | $/1k (swap) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| You vs you (20 pairs) | — | | | — | — | — | — |
+| v0 vague | dev | | | | | | |
+| v1 reason first | dev | | | | | | |
+| v2 anchored scale | dev | | | | | | |
+| v3 ignore length + examples | dev | | | | | | |
+| v0 vague | test | | | | | | |
+| best | test | | | | | | |
+
+What the numbers should look like, and why. I haven't run your data, so these are expectations to check, not results to match.
+
+**You vs you.** Probably 80-95% on 20 pairs, lower if you included a lot of near-ties. This is the ceiling. Write it next to every judge number.
+
+**v0 on dev.** Probably decent on the easy pairs and noticeably worse on hard pairs and ties, with a confusion matrix whose TIE column is nearly empty: a vague prompt gives the model no permission to say tie, so it almost never does. Kappa well below accuracy, because the easy pairs make luck-level agreement high.
+
+**Position bias.** Current models are much better than the 2023 ones, so the first-slot win rate may be only a few points above 50%. Even so, expect a meaningful number of inconsistent pairs, concentrated on the hard pairs and ties. Inconsistency on the pairs you found hard is partly honest uncertainty. Inconsistency on pairs you found *easy* is bias, and worth reading one by one.
+
+**Length bias.** With generic fluff, a cheap model will probably flip on some fraction of pad-the-loser cases; with keyword-echo fluff, more. The v3 instruction to ignore length should reduce this, but rarely to zero. If the flip rate doesn't move between v2 and v3, the instruction isn't working and you need length control instead: trim both results to the same length before judging.
+
+**Rubric iterations.** Expect the biggest jump from v0 to v1 or v2, mostly from ties being handled, and smaller gains after. Each dev gain of a few points is inside the ±8-10 point interval of 60 items, so trust the direction across several versions more than any single step. If test accuracy is well below your best dev accuracy, you've overfit the rubric to dev, which is exactly why you held test out.
+
+**Cost.** With a cheap model, a 1,500-token rubric and 150 output tokens, expect cents per hundred judgments and roughly a dollar or two per thousand with swapping (it depends heavily on the model's price). Caching should cut the input cost by most of the rubric's share; if your cache-hit count is zero, check the rubric is above the model's minimum cacheable length. The nightly 5,000-query number is the one to take to your team: it's probably a few dollars a night, which is cheap next to a human labelling budget, and that's exactly why it's worth spending one evening making sure it measures the right thing.
+
+## Break It
+
+**1. Let it judge itself.** Generate answers to 30 of your queries (short "what's the best result for this query and why" answers, or summaries of the top result) with two models: the judge's own model and one from a different family. Label which is better yourself. Then measure the judge's win rate for its own family versus your labels. Any gap is self-preference. Now swap in a judge from the other family and see whether the gap flips. This is the reason the judge should never come from the same family as a contestant.
+
+**2. Verdict first.** Change v2 so the verdict comes on the first line and the reasoning after it. Rerun. Accuracy usually drops, and when you read the reasoning on the wrong ones you'll see it confidently justifying whatever letter came first. That's what post-hoc rationalisation looks like, and it's why "explain your answer" placed after the answer is not a check.
+
+**3. Tune on the test set.** Take your best rubric, look at the test-set disagreements, and fix the rubric for them. Test accuracy goes up. Now relabel 30 *fresh* pairs and measure again. It drops back, and probably below your original test number. You've learned nothing about the judge and spent your only clean measurement. This is the same overfitting you'd catch instantly in a model; it's harder to see when the "parameters" are English sentences.
+
+**4. Confident and wrong.** Take 10 pairs where the better result is a plain, hedged answer. Rewrite the *worse* result so it sounds authoritative ("The definitive answer is...", "Experts agree..."), adding no correct information. Count flips. Then add a reference-guided line to the rubric (write a one-line correct answer for each of the 10 queries and give it to the judge) and count again. Reference answers are the defence that doesn't depend on the judge already knowing the truth.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Why use a model as a judge at all, and what's the one number that tells you whether you can trust it?</summary>
+
+Because many outputs worth grading are too open-ended for code (relevance, faithfulness, "did it answer the question") and too numerous for people. A model grades them for fractions of a cent in seconds. But it's standing in for a person, so the number that matters is how often it agrees with a careful person on the same items: agreement with human labels, ideally as Cohen's kappa so luck doesn't inflate it, compared against how often two humans (or you and yourself a day later) agree. Without that number you don't know what the judge is measuring.
+
+</details>
+
+<details>
+<summary>2. What is position bias, how do you measure it, and why does swapping fix it but not length bias?</summary>
+
+The judge favours whichever slot an answer is in, usually the first, independent of content. You measure it by asking each pair in both orders: the consistency rate (same answer wins both times) and the first-slot win rate (should be near 50% if slots were assigned randomly). Swapping fixes it because the push is toward a slot; in the other order it pushes the other answer, so averaging cancels it, exactly so if you average probabilities. Length bias pushes toward a property of an answer, and the longer answer is longer in both orders, so both verdicts are tilted the same way and averaging keeps the tilt. For length you need length control: trim, or regress the length effect out.
+
+</details>
+
+<details>
+<summary>3. Your judge has 88% accuracy against your labels. Your manager says ship the eval. What do you check first?</summary>
+
+The label balance and kappa: if most pairs have the same answer, 88% might be close to luck. The confusion matrix: which kind of mistake makes up the 12%? A judge that never says tie, or always misses one direction, is biased in a way that shifts system comparisons. The confidence interval: on 100 items 88% is roughly ±6 points. Whether 88% was measured on the same items I tuned the rubric on, or on a held-out set. Whether the judge's family matches one of the systems being compared. And the swap test, because one-order accuracy can hide strong position bias that happens to line up with how the pairs were ordered.
+
+</details>
+
+<details>
+<summary>4. How does the cost of a judge scale, and what do you do when you need to judge 100,000 items a night?</summary>
+
+Cost is items × calls per item × (input tokens × input price + output tokens × output price). The swap test doubles calls. At, say, $4 per 1,000 swapped judgments, 100,000 a night is $400 a night, about $12,000 a month, so it's worth optimising. In order: cache the rubric (it's the same every call, so with caching it costs roughly a tenth); use a batch API if results can wait (typically half price); shorten the reasoning you ask for, since output tokens are the most expensive; use the cheapest model whose kappa against your labels holds up; replace any part of the check a program can do; and judge a random sample (a few thousand items gives a tight enough interval for a win rate) instead of everything. Sampling is usually the biggest win: you rarely need every item judged to compare two systems.
+
+</details>
+
+<details>
+<summary>5. When would you refuse to use an LLM judge?</summary>
+
+When a program can verify the answer: exact values, schema validity, tests passing, a known answer span. A program is free, exact and unbiased; a judge there only adds noise. Also when I can't get any human labels to calibrate it against, because then I can't know what it measures. And I'd be very careful using it as a training reward without measuring it first, because the model being trained will learn to exploit every bias it has: a length-biased reward produces a model that pads.
+
+</details>
+
+## Go Deeper
+
+- **Lianmin Zheng et al., "Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena"** (NeurIPS 2023 Datasets and Benchmarks; arXiv 2306.05685). The paper that named and measured the practice. Read the sections on position, verbosity and self-enhancement bias, and the agreement tables.
+- **Peiyi Wang et al., "Large Language Models are not Fair Evaluators"** (2023, arXiv 2305.17926). Shows order alone can flip benchmark winners, and proposes balanced position calibration, the swap-and-average idea in this lesson.
+- **Yann Dubois et al., "Length-Controlled AlpacaEval: A Simple Way to Debias Automatic Evaluators"** (2024, arXiv 2404.04475). How to measure the length effect with a regression and remove it, done on a real leaderboard.
+- **Arjun Panickssery, Samuel R. Bowman, Shi Feng, "LLM Evaluators Recognize and Favor Their Own Generations"** (2024). The careful study of self-preference.
+- **Paul Thomas, Seth Spielman, Nick Craswell, Bhaskar Mitra, "Large language models can accurately predict searcher preferences"** (SIGIR 2024; arXiv 2309.10621). Bing's experience using LLMs for search relevance labels: how prompt details change agreement with real searchers. Your domain exactly.
+- **Eugene Yan, "Evaluating the Effectiveness of LLM-Evaluators (aka LLM-as-Judge)"** (eugeneyan.com, 2024). A long, practical survey of the research, organised by use case, with numbers.
+- **Hamel Husain, "Creating a LLM-as-a-Judge That Drives Business Results"** (hamel.dev, 2024). The practitioner's version of this lesson: one domain expert, binary verdicts with critiques, iterate until agreement is high.
+- **Jacob Cohen, "A Coefficient of Agreement for Nominal Scales"** (Educational and Psychological Measurement, 1960). Where kappa comes from. Short, and the reasoning about chance agreement is clearer than most textbook versions.
+
+## Connections
+
+This lesson is [Why is the eval separate?](/lessons/why-evals-are-separate/) made concrete: a judge is the separate system, and its independence is something you measure, not assume. Every comparison in Measure leans on [Is that improvement real?](/lessons/statistics-for-evals/): 100 labels gives wide intervals, and rubric versions should be compared with a paired test. And the relevance judge you built is a cheap labeller for [Ranking metrics and eval sets](/lessons/ranking-metrics/): once its kappa against your labels is good enough, it can grade the top-10 of thousands of queries, and NDCG on those labels is how you'll decide whether the next cross-encoder ships.

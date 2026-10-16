@@ -1,0 +1,144 @@
+---
+// Ring all-reduce, step by step. N GPUs (rows), each holding its gradient cut into N chunks (columns).
+// Phase 1 (reduce-scatter, N-1 steps): every GPU sends one chunk to its right neighbour, who adds it in.
+// Phase 2 (all-gather, N-1 steps): every GPU forwards a finished chunk, the neighbour overwrites its copy.
+// A cell's fill shows how many GPUs' contributions it holds; solid blue = the full sum.
+---
+<div class="dring" data-fig="dist-ring">
+  <svg viewBox="0 0 640 300" role="img" aria-label="Grid of GPUs by chunks showing which chunk each GPU sends at each step of ring all-reduce"></svg>
+  <div class="ctl">
+    <label>GPUs (N) <input type="range" min="2" max="8" value="4" data-k="n" /> <output data-o="n">4</output></label>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-a="back">Step back</button>
+    <button class="btn" type="button" data-a="next">Next step</button>
+    <button class="btn" type="button" data-a="play" aria-pressed="false">Play</button>
+    <button class="btn" type="button" data-a="reset">Reset</button>
+  </div>
+  <p class="dring-read">
+    Step <span class="readout" data-r="step">0</span> of <span class="readout" data-r="total">6</span> ·
+    phase <span class="readout" data-r="phase">-</span> ·
+    sent per GPU so far <span class="readout" data-r="sent">0</span> of the gradient
+    (total will be <span class="readout" data-r="final">-</span>)
+  </p>
+  <p class="dring-read" data-r="why"></p>
+</div>
+
+<style>
+  .dring-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const mod = (a: number, n: number) => ((a % n) + n) % n;
+
+  // contributions[r][c] = number of ranks whose chunk c is summed into rank r's copy, after `step` steps.
+  // Also returns which chunk each rank sends during step `step + 1` (the next one).
+  function state(n: number, step: number) {
+    const sets: Set<number>[][] = Array.from({ length: n }, (_, r) => Array.from({ length: n }, () => new Set([r])));
+    const sendIdx = (r: number, s: number) => (s < n - 1 ? mod(r - s, n) : mod(r + 1 - (s - (n - 1)), n));
+    for (let s = 0; s < step; s++) {
+      const msgs = Array.from({ length: n }, (_, r) => ({ to: mod(r + 1, n), c: sendIdx(r, s), v: new Set(sets[r][sendIdx(r, s)]) }));
+      for (const m of msgs) {
+        if (s < n - 1) m.v.forEach((x) => sets[m.to][m.c].add(x));
+        else sets[m.to][m.c] = m.v;
+      }
+    }
+    const next = step < 2 * (n - 1) ? Array.from({ length: n }, (_, r) => sendIdx(r, step)) : null;
+    return { counts: sets.map((row) => row.map((st) => st.size)), next };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="dist-ring"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const playBtn = root.querySelector<HTMLButtonElement>('[data-a="play"]')!;
+    const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    let n = 4, step = 0, timer: number | undefined;
+
+    function draw() {
+      const total = 2 * (n - 1);
+      const { counts, next } = state(n, step);
+      const X0 = 70, CW = Math.min(64, (540 - X0) / n), CH = 26, GAP = 6, TOP = 34;
+      const H = TOP + n * (CH + GAP) + 30;
+      svg.setAttribute('viewBox', `0 0 640 ${H}`);
+      svg.replaceChildren();
+      for (let c = 0; c < n; c++) svg.append(el('text', { x: X0 + c * CW + CW / 2, y: 22, 'text-anchor': 'middle' }, `CHUNK ${c}`));
+      for (let g = 0; g < n; g++) {
+        const y = TOP + g * (CH + GAP);
+        svg.append(el('text', { x: 0, y: y + 17, class: 'strong' }, `GPU ${g}`));
+        for (let c = 0; c < n; c++) {
+          const x = X0 + c * CW + 2, w = CW - 4, k = counts[g][c];
+          const full = k === n;
+          svg.append(el('rect', { x, y, width: w, height: CH, class: 'fill-paper', 'stroke-width': 1 }));
+          if (!full) svg.append(el('rect', { x, y, width: w * (k / n), height: CH, style: 'fill:var(--blue-fill)' }));
+          else svg.append(el('rect', { x, y, width: w, height: CH, class: 'fill-blue' }));
+          const t = el('text', { x: x + w / 2, y: y + 17, 'text-anchor': 'middle' }, full ? 'SUM' : `${k}/${n}`);
+          if (full) t.setAttribute('style', 'fill:var(--paper)');
+          svg.append(t);
+          if (next && next[g] === c) svg.append(el('rect', { x: x - 2, y: y - 2, width: w + 4, height: CH + 4, class: 'blue', 'stroke-width': 2 }));
+        }
+        if (next) {
+          // arrow on the right: GPU g sends to GPU g+1 (the last wraps to GPU 0)
+          const ax = X0 + n * CW + 18;
+          const y2 = g === n - 1 ? TOP + CH / 2 : y + CH + GAP + CH / 2;
+          if (g < n - 1) {
+            svg.append(el('line', { x1: ax, y1: y + CH / 2 + 3, x2: ax, y2: y2 - 5, class: 'blue', 'stroke-width': 1.2 }));
+            svg.append(el('path', { d: `M${ax - 4},${y2 - 10} L${ax},${y2 - 4} L${ax + 4},${y2 - 10}`, class: 'blue', 'stroke-width': 1.2 }));
+          } else {
+            const bx = ax + 22;
+            svg.append(el('path', { d: `M${ax},${y + CH / 2} H${bx} V${TOP + CH / 2} H${ax + 6}`, class: 'blue dash', 'stroke-width': 1.2 }));
+            svg.append(el('path', { d: `M${ax + 11},${TOP + CH / 2 - 4} L${ax + 5},${TOP + CH / 2} L${ax + 11},${TOP + CH / 2 + 4}`, class: 'blue', 'stroke-width': 1.2 }));
+            svg.append(el('text', { x: bx + 6, y: TOP + (n * (CH + GAP)) / 2 }, 'WRAP'));
+          }
+        }
+      }
+      const ly = H - 8;
+      svg.append(el('rect', { x: 0, y: ly - 10, width: 16, height: 12, class: 'blue', 'stroke-width': 2 }));
+      svg.append(el('text', { x: 22, y: ly }, 'CHUNK SENT NEXT, TO THE GPU BELOW'));
+      svg.append(el('rect', { x: 300, y: ly - 10, width: 16, height: 12, class: 'fill-blue' }));
+      svg.append(el('text', { x: 322, y: ly }, 'FULLY SUMMED'));
+
+      const phase = step === 0 ? 'start' : step <= n - 1 ? 'reduce-scatter' : step < total ? 'all-gather' : 'done';
+      r('step').textContent = String(step);
+      r('total').textContent = String(total);
+      r('phase').textContent = phase;
+      r('sent').textContent = `${step}/${n}`;
+      r('final').textContent = `${total}/${n} = ${(total / n).toFixed(2)}x`;
+      let why = '';
+      if (step === 0) why = 'Each GPU has its own gradient (1/N of the sum in every chunk). Highlighted: what each GPU sends first.';
+      else if (step < n - 1) why = 'Reduce-scatter: the receiver adds the incoming chunk to its own copy. Partial sums grow by one each hop.';
+      else if (step === n - 1) why = 'End of reduce-scatter: each GPU owns exactly one fully summed chunk. That alone is a reduce-scatter.';
+      else if (step < total) why = 'All-gather: finished chunks travel around the ring and overwrite stale copies. No more adding.';
+      else why = 'Done: every GPU holds the full sum. Each sent 2(N-1) chunks of size 1/N, whatever N is.';
+      r('why').textContent = why;
+    }
+
+    const stop = () => { if (timer) clearInterval(timer); timer = undefined; playBtn.setAttribute('aria-pressed', 'false'); playBtn.textContent = 'Play'; };
+    root.querySelector<HTMLInputElement>('input[data-k="n"]')!.addEventListener('input', (e) => {
+      n = +(e.target as HTMLInputElement).value;
+      root.querySelector<HTMLElement>('[data-o="n"]')!.textContent = String(n);
+      step = 0; stop(); draw();
+    });
+    root.querySelector('[data-a="next"]')!.addEventListener('click', () => { stop(); step = Math.min(step + 1, 2 * (n - 1)); draw(); });
+    root.querySelector('[data-a="back"]')!.addEventListener('click', () => { stop(); step = Math.max(step - 1, 0); draw(); });
+    root.querySelector('[data-a="reset"]')!.addEventListener('click', () => { stop(); step = 0; draw(); });
+    playBtn.addEventListener('click', () => {
+      if (timer) { stop(); return; }
+      if (reduce) { step = 2 * (n - 1); draw(); return; }
+      if (step >= 2 * (n - 1)) step = 0;
+      playBtn.setAttribute('aria-pressed', 'true'); playBtn.textContent = 'Pause';
+      draw();
+      timer = window.setInterval(() => {
+        if (step >= 2 * (n - 1)) { stop(); return; }
+        step++; draw();
+      }, 900);
+    });
+    draw();
+  });
+</script>

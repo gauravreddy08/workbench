@@ -1,0 +1,740 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import IndexHeight from '../components/figures/IndexHeight.astro';
+import IndexBTree from '../components/figures/IndexBTree.astro';
+
+## Today
+
+- Say exactly what a database index is, physically: a second, sorted copy of some columns, stored in pages, pointing back at the rows.
+- Explain why a B-tree finds one row among a billion in about four page reads, and do the arithmetic yourself from the page size and key size.
+- Read an `EXPLAIN ANALYZE` plan and say why Postgres chose a sequential scan, an index scan, a bitmap scan or an index-only scan, including when it ignores your index on purpose.
+- Pick column order for a composite index, and know when a covering index skips the table entirely.
+- Explain why every index makes writes slower, measure by how much, and describe the write-optimized alternative (LSM-trees) that RocksDB and Cassandra use.
+
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (RAM vs SSD, about 1,000x) and [Files, disks and fsync](/lessons/files-and-disks/) (data moves in fixed-size blocks, the page cache). Rough time: one evening for Postgres, one for the B+tree.
+
+## The Problem
+
+You log every click on your ranker's results into a table: who clicked, which document, for which query, how long they stayed. After a few months it has 5 million rows. You write the obvious query for a debugging dashboard:
+
+```sql
+SELECT * FROM clicks WHERE user_id = 4242;
+```
+
+It takes 200 ms. Fine, until the dashboard runs it for 50 users per page load, and now each page takes 10 seconds. Someone on the team says "just add an index", you run one line, and the same query takes 0.1 ms. Two thousand times faster, from a line of SQL that took one second to run.
+
+That's suspicious. Nothing about the data changed. The CPU didn't get faster. So where did 199.9 ms go? And if indexes are this good, why doesn't the database just index every column for you?
+
+It doesn't, because there's a bill. A week later the ingestion job that writes those clicks has slowed to half its speed, because someone added five indexes "to be safe". Same trade, other side.
+
+By the end of this lesson you'll know what an index is on disk, roughly byte for byte, and you'll be able to predict both numbers above before running anything.
+
+<Origin year="1970" title="Too big for memory, too slow to search">
+
+In the late 1960s, Rudolf Bayer and Edward McCreight were at Boeing's research labs, working on a plain problem: files of records too big to fit in memory, stored on disks where every random read meant physically moving an arm and waiting for the platter to spin round, tens of milliseconds each time. A sorted file let you binary search, but binary search on a million records means about 20 jumps, and 20 jumps on that disk was most of a second. Keeping the file sorted as new records arrived meant rewriting huge parts of it.
+
+Their 1970 paper, "Organization and Maintenance of Large Ordered Indices", described a tree in which every node is one disk block, packed with hundreds of keys, so the tree is very wide and very short. Search takes a handful of block reads, and inserts only ever rewrite a few blocks. Nobody is sure what the B stands for (Boeing, balanced, broad, Bayer); the authors never settled it. By 1979 Douglas Comer's survey was titled "The Ubiquitous B-Tree", and it still is. Postgres, MySQL, SQLite, SQL Server, Oracle and most filesystems use a variant of it today.
+
+</Origin>
+
+## The Idea
+
+### A phone book, and what the machine does instead
+
+Imagine a box of 5 million index cards, one per click, in the order they happened. To find all of user 4242's clicks you have to look at every card. That's a <Term w="full table scan">Reading every row of a table and checking each one against the condition. Postgres calls it a Seq Scan (sequential scan). Cost grows with the size of the table, not the size of the answer.</Term>, and its cost has nothing to do with how many cards you want. Finding one card or a thousand, you read all 5 million.
+
+A phone book is the fix everyone knows. Names are sorted, so you open near the middle, see "M", jump back toward "G", and land on the right page in a few flips. Two things make that work: the entries are **sorted by the thing you search for**, and you can **jump** to the middle of the book instead of reading from the front.
+
+But your clicks can only be sorted one way, and you want to search by user, by document, by time. So you don't sort the box. You build a second, small box next to it: one card per click, holding only `user_id` and a note saying where the real card is ("box position 1,844,210"). Sort the small box by `user_id`. Now you binary search the small box, read the notes, and pull exactly the real cards you need.
+
+That small sorted box is an <Term w="index">A separate data structure, stored alongside a table, that holds copies of one or more columns in sorted order (or hashed), each with a pointer to the row it came from. It exists only to make lookups fast.</Term>. That is the whole idea. Everything else in this lesson is about how to make the small box fast on a real disk, and what it costs to keep it sorted.
+
+### What's actually on disk
+
+Postgres stores a table as a file chopped into <Term w="pages">Fixed-size blocks that a database reads and writes as one unit. 8 KB in Postgres, 16 KB in MySQL's InnoDB, 4 KB by default in SQLite. The database never reads less than one page.</Term> of 8 KB. Rows go into pages in roughly the order they arrive, wherever there's space. This file is called the <Term w="heap">In Postgres, the table's main file: rows stored in pages in no particular order. Nothing to do with the heap data structure, or with your process's heap from the stack-and-heap lesson. It means "a pile".</Term>, meaning "a pile", nothing more. Every row has an address: which page, and which slot inside the page. Postgres calls that address the <Term w="ctid">A row's physical address in Postgres: (page number, slot number). For example (1844, 3) means slot 3 of page 1,844. Indexes store this to point at rows.</Term>, written like `(1844,3)`.
+
+An index on `user_id` is a different file. Its entries are `(user_id, ctid)` pairs, kept in `user_id` order, also stored in 8 KB pages.
+
+<Figure n="001" title="TABLE AND INDEX ARE TWO FILES" caption="Left: the table, rows in arrival order, four 8 KB pages. Right: an index on user_id, a separate structure holding only the key and the row's (page, slot) address, sorted. A full scan reads every table page. The index finds 4242 by sorting, then follows three pointers to exactly the rows it needs.">
+<svg viewBox="0 0 640 336" role="img" aria-label="Four table pages with unsorted rows, and a sorted index whose entries for user 4242 point at three rows">
+  <text x="20" y="22" class="strong">TABLE (HEAP) · ARRIVAL ORDER</text>
+  <rect x="20" y="36" width="230" height="62" class="fill-paper" stroke-width="1.2" />
+  <text x="30" y="52" class="blue-t">PAGE 0</text>
+  <text x="30" y="68">1 · user 731</text>
+  <text x="30" y="82">2 · user 12</text>
+  <text x="30" y="96" class="strong">3 · user 4242</text>
+  <rect x="20" y="104" width="230" height="62" class="fill-paper" stroke-width="1.2" />
+  <text x="30" y="120" class="blue-t">PAGE 1</text>
+  <text x="30" y="136">4 · user 88</text>
+  <text x="30" y="150" class="strong">5 · user 4242</text>
+  <text x="30" y="164">6 · user 309</text>
+  <rect x="20" y="172" width="230" height="62" class="fill-paper" stroke-width="1.2" />
+  <text x="30" y="188" class="blue-t">PAGE 2</text>
+  <text x="30" y="204">7 · user 12</text>
+  <text x="30" y="218">8 · user 5150</text>
+  <text x="30" y="232">9 · user 731</text>
+  <rect x="20" y="240" width="230" height="62" class="fill-paper" stroke-width="1.2" />
+  <text x="30" y="256" class="blue-t">PAGE 3</text>
+  <text x="30" y="272" class="strong">10 · user 4242</text>
+  <text x="30" y="286">11 · user 88</text>
+  <text x="30" y="300">12 · user 2</text>
+  <text x="380" y="22" class="strong">INDEX ON user_id · SORTED</text>
+  <rect x="380" y="36" width="240" height="266" class="fill-paper" stroke-width="1.2" />
+  <text x="392" y="56">2    → (3,3)</text>
+  <text x="392" y="76">12   → (0,2)</text>
+  <text x="392" y="96">12   → (2,1)</text>
+  <text x="392" y="116">88   → (1,1)</text>
+  <text x="392" y="136">88   → (3,2)</text>
+  <text x="392" y="156">309  → (1,3)</text>
+  <text x="392" y="176">731  → (0,1)</text>
+  <text x="392" y="196">731  → (2,3)</text>
+  <rect x="384" y="203" width="232" height="60" class="fill-wash" stroke-width="1" />
+  <text x="392" y="216" class="strong">4242 → (0,3)</text>
+  <text x="392" y="236" class="strong">4242 → (1,2)</text>
+  <text x="392" y="256" class="strong">4242 → (3,1)</text>
+  <text x="392" y="276">5150 → (2,2)</text>
+  <line x1="384" y1="212" x2="252" y2="92" class="blue" stroke-width="1.2" />
+  <line x1="384" y1="232" x2="252" y2="146" class="blue" stroke-width="1.2" />
+  <line x1="384" y1="252" x2="252" y2="268" class="blue" stroke-width="1.2" />
+  <line x1="10" y1="36" x2="10" y2="302" class="ink" stroke-width="1" />
+  <text x="20" y="324">SEQ SCAN: READ ALL 4 PAGES</text>
+  <text x="380" y="324" class="blue-t">INDEX: FIND 4242, FOLLOW 3 POINTERS</text>
+</svg>
+</Figure>
+
+Two things to notice already.
+
+**The index is a copy.** It duplicates the `user_id` column, plus 6 bytes of address and a few bytes of bookkeeping per row. On the 5-million-row table you'll build, the table is 365 MB and the primary-key index alone is 107 MB. Copies take space, and copies have to be kept in sync. Hold onto that; it's the whole write-cost story later.
+
+**Sorted isn't enough.** If the index were one long sorted file of 13,000 pages, you could binary search it: about log₂(13,000) ≈ 14 jumps, each a separate page read. From [How slow is slow?](/lessons/latency-numbers/), a random SSD read is around 80 µs, so 14 of them is about 1.1 ms, and on Bayer's spinning disk with ~10 ms seeks, 140 ms. Better than a full scan, but each jump only rules out half of what's left. We can do much better by ruling out 99.7% per jump.
+
+### B-trees: make every jump count
+
+Here's the trick. Reading one page costs the same whether you use 8 bytes of it or all 8,192. So when you read a page, make it carry as much *direction* as possible.
+
+Take the sorted index and cut it into pages of a few hundred entries each. Those are the bottom layer, the <Term w="leaf pages">The bottom level of a B-tree. Leaves hold the actual index entries (key plus row pointer), in sorted order, and each leaf links to the next one.</Term>. Now make a page that lists, for each leaf, the first key in it and the leaf's page number: "keys from 1 to 13,580: page 1; from 13,581: page 2; ...". That's a signpost page, an <Term w="inner page">A B-tree page above the leaves. It holds only separator keys and pointers to child pages, like the letter tabs on a phone book. Also called an internal or branch node.</Term>. If one signpost page can't hold all the leaves, make several, and a signpost page above *them*. Keep going until one page sits at the top: the <Term w="root">The single page at the top of a B-tree. Every search starts here.</Term>.
+
+That's a <Term w="B+tree">The B-tree variant every major database uses: inner pages hold only separator keys for steering, all entries live in the leaves, and the leaves are chained left to right so you can walk them in order.</Term>. To find a key, read the root, pick the child whose range covers your key, read it, repeat until you're at a leaf. One page per level.
+
+<Figure n="002" title="A B+TREE, ONE PAGE PER BOX" caption="Search for 270: root says go left (270 is under 500), the inner page says the middle child (between 200 and 350), and the leaf has it. Three pages. A range query, 270 to 600, does that same descent once, then walks right along the leaf chain, reading only the leaves that overlap the range.">
+<svg viewBox="0 0 640 268" role="img" aria-label="Three-level B+tree with root, two inner pages and six linked leaves, with a search path and a range scan highlighted">
+  <rect x="265" y="20" width="110" height="30" class="fill-wash" stroke-width="2" />
+  <text x="320" y="40" text-anchor="middle" class="blue-t">500</text>
+  <rect x="109" y="95" width="110" height="30" class="fill-wash" stroke-width="2" />
+  <text x="164" y="115" text-anchor="middle" class="blue-t">200 · 350</text>
+  <rect x="421" y="95" width="110" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="476" y="115" text-anchor="middle" class="blue-t">650 · 800</text>
+  <line x1="300" y1="50" x2="164" y2="95" class="blue" stroke-width="2" />
+  <line x1="340" y1="50" x2="476" y2="95" class="ink" stroke-width="1" />
+  <line x1="125" y1="125" x2="60" y2="170" class="ink" stroke-width="1" />
+  <line x1="164" y1="125" x2="164" y2="170" class="blue" stroke-width="2" />
+  <line x1="203" y1="125" x2="268" y2="170" class="ink" stroke-width="1" />
+  <line x1="437" y1="125" x2="372" y2="170" class="ink" stroke-width="1" />
+  <line x1="476" y1="125" x2="476" y2="170" class="ink" stroke-width="1" />
+  <line x1="515" y1="125" x2="580" y2="170" class="ink" stroke-width="1" />
+  <rect x="12" y="170" width="96" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="60" y="189" text-anchor="middle" class="strong">101 150 199</text>
+  <rect x="116" y="170" width="96" height="30" class="fill-wash" stroke-width="2" />
+  <text x="164" y="189" text-anchor="middle" class="strong">200 270 349</text>
+  <rect x="220" y="170" width="96" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="268" y="189" text-anchor="middle" class="strong">350 420 499</text>
+  <rect x="324" y="170" width="96" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="372" y="189" text-anchor="middle" class="strong">500 580 649</text>
+  <rect x="428" y="170" width="96" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="476" y="189" text-anchor="middle" class="strong">650 700 799</text>
+  <rect x="532" y="170" width="96" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="580" y="189" text-anchor="middle" class="strong">800 870 999</text>
+  <line x1="108" y1="185" x2="116" y2="185" class="ink" stroke-width="1" />
+  <line x1="212" y1="185" x2="220" y2="185" class="blue" stroke-width="2" />
+  <line x1="316" y1="185" x2="324" y2="185" class="blue" stroke-width="2" />
+  <line x1="420" y1="185" x2="428" y2="185" class="ink" stroke-width="1" />
+  <line x1="524" y1="185" x2="532" y2="185" class="ink" stroke-width="1" />
+  <line x1="150" y1="214" x2="400" y2="214" class="blue" stroke-width="1.2" marker-end="url(#ix-arr)" />
+  <defs><marker id="ix-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker></defs>
+  <text x="150" y="232" class="blue-t">RANGE 270..600: DESCEND ONCE, WALK RIGHT, STOP AT 649</text>
+  <text x="12" y="260">LEAVES: KEY → ROW POINTER, CHAINED LEFT TO RIGHT</text>
+  <text x="400" y="40">ROOT · 1 PAGE</text>
+  <text x="540" y="115">INNER</text>
+  <text x="12" y="160">LEAVES</text>
+</svg>
+</Figure>
+
+The drawing has three keys per page so it fits. A real page holds hundreds, and that number is everything.
+
+### Why it's always about four levels
+
+The number of children one inner page can point to is its <Term w="fan-out">How many children one B-tree page points to. Roughly page size divided by the size of one entry. High fan-out means a short tree.</Term>. Let's work it out for the primary key of your clicks table, a `bigint` (8 bytes):
+
+- One leaf entry in Postgres is the 8-byte key, plus an 8-byte header that includes the 6-byte row address, plus a 4-byte slot in the page's directory. Call it **20 bytes**.
+- A page is 8,192 bytes, minus a few dozen of header. Postgres fills leaves to 90% when it builds an index, so about 8,150 × 0.9 / 20 ≈ **367 entries per leaf**. Inner entries are about the same size, so the fan-out is also in the high 300s.
+- 5,000,000 rows / 367 ≈ 13,600 leaf pages. That's 13,600 × 8 KB = 107 MB, which is exactly the size Postgres reports for this index. The arithmetic is real.
+- 13,600 leaves / 367 ≈ 37 inner pages. 37 fits in one root. **Height: 3.**
+
+Each extra level multiplies capacity by ~367. Three levels hold about 367³ ≈ 49 million keys. Four levels: 18 billion. That's why the answer to "how deep is the index?" is almost always 2 to 4, whether the table has a thousand rows or a billion.
+
+Now turn that into time, using the latency ladder. Each level is one page read.
+
+- **All from SSD, nothing cached:** 3 or 4 reads × ~80 µs ≈ 0.3 ms.
+- **Realistically:** the root and second level are tiny (one page, then a few dozen), get touched by every query, and so stay in RAM, either in Postgres's own cache or the OS <Term w="page cache">The kernel's copy of recently used file data in spare RAM. Covered in the files-and-disks lesson. A "disk read" that hits it costs microseconds, not tens of microseconds.</Term>. A cold lookup costs maybe 1 or 2 real SSD reads, plus one for the table page. Well under a millisecond.
+- **All in RAM:** a few microseconds, mostly binary searching inside each page.
+
+Compare a full scan of a 5 GB table at ~3 GB/s: well over a second. Play with the numbers. Push rows to 10 billion. Make the key 256 bytes (a long text column). Switch to 16 KB pages like MySQL.
+
+<Figure n="003" title="HOW TALL IS THE TREE?" caption="Height of a B+tree for a given row count, key size and page size, with ~12 bytes of overhead per entry and pages 90% full (Postgres-like). Shaded levels are under 64 MB and would normally stay cached in RAM. Lookup times assume ~80 µs per random SSD read; the full-scan estimate assumes 100-byte rows read at ~3 GB/s. All approximate.">
+
+<IndexHeight />
+
+</Figure>
+
+Notice how little anything moves. Ten thousand times more rows adds about two levels. A 32x bigger key costs one or two. This is the payoff of a fan-out in the hundreds: <Term w="logarithm">How many times you multiply by a base to reach a number. log base 367 of 49 million is 3. Logarithms grow so slowly that "log of the table size" is nearly a constant in practice.</Term> base 367 grows absurdly slowly. A binary tree would be log base 2: about 23 levels for 5 million rows, 23 page reads, and that's why databases never use binary trees on disk.
+
+<Predict id="height-billion">
+Your primary key is a `bigint`. The table grows from 5 million rows to 1 billion, 200 times bigger. How many more page reads does a primary-key lookup take? How much bigger is the index?
+
+<Fragment slot="answer">
+
+**One more page read** (height 3 to 4) for a table 200x bigger. 1,000,000,000 / 367 ≈ 2.7 million leaves, / 367 ≈ 7,400, / 367 ≈ 20, then the root. Four levels.
+
+The index, though, grows exactly in proportion: about **200x**, from 107 MB to roughly 21 GB, because there's one leaf entry per row. Lookups scale with the log of the size; storage and the cost of a full scan scale with the size itself. And the top three levels are only about 7,400 + 20 + 1 pages, around 60 MB, which easily stays in RAM, so a cold lookup is still about one SSD read into the index plus one into the table.
+
+</Fragment>
+</Predict>
+
+### Keeping it sorted: inserts and page splits
+
+Searching is the easy half. The hard half is that new rows keep arriving, and the leaves must stay sorted.
+
+To insert key 42: walk down exactly as for a search, to the leaf where 42 belongs, and slide it into place inside that page. Most of the time the page has room and that's it: one page changed.
+
+When the leaf is full, the database performs a <Term w="page split">When a B-tree page is full and needs one more entry: allocate a new page, move the upper half of the entries into it, and add a separator key pointing at the new page to the parent.</Term>. Take a new empty page, move the top half of the entries into it, link it into the leaf chain, and tell the parent: "keys from here up now live in the new page", which means inserting one separator key into the parent. If the parent is full too, it splits, and pushes a separator into *its* parent. In the worst case the split climbs all the way up, the root splits, and a new root is made above it.
+
+That last step is the clever part. **A B-tree grows at the top, not the bottom.** Every leaf is always at the same depth, so the tree is always perfectly balanced, and no search is ever unlucky. Nobody has to rebalance anything.
+
+Try it below. The pages here hold 3 or 4 keys so splits happen often. Insert 22, then 23, then 24. The first splits a leaf; the third splits a leaf, which overflows its parent, which splits the root, and a new root appears: every leaf is now one level deeper at once. Then search for keys and compare the two counters: the tree reads one page per level, the scan reads leaf pages from the left until it finds the key.
+
+<Figure n="004" title="INSERT, SPLIT, SEARCH" caption="Every box is one page. Insert highlights the path taken and outlines the pages that split. Search highlights the root-to-leaf path. Fill it toward its 40-key limit, then search for big keys: the scan's cost grows with the number of leaves, the tree's only with its height. Try +5 in order a few times and look at the leaves left behind." wide>
+
+<IndexBTree />
+
+</Figure>
+
+Two things the toy shows that are true of the real thing:
+
+1. **The search cost is the height, and the height barely moves.** With 3 keys per page you'll reach height 4 at around 40 keys; with real pages of ~367 keys, height 4 holds tens of billions of rows.
+2. **Pages are often not full.** A split leaves two half-full pages. After random inserts, B-tree pages average about 70% full (a classic result, and what you'll measure in Postgres in Break It). The "+5 in order" button shows the opposite pattern: ever-increasing keys always land in the rightmost leaf. This toy splits 50/50, so ascending inserts leave a trail of half-empty leaves. Real databases detect this case and split the rightmost page unevenly, keeping the old page full, which is why an auto-incrementing key gives you a compact index.
+
+### The other half of the lookup: back to the table
+
+The index leaf gives you a `ctid`, not the row. To return `SELECT *`, Postgres must still read the table page the row lives on. So "find one row by primary key" is really 3 index pages plus 1 table page, which is exactly what you'll see in `EXPLAIN (ANALYZE, BUFFERS)`: `Buffers: shared hit=1 read=3`, four 8 KB pages, one of which (the root) was already cached.
+
+If the query matches many rows and they're scattered across the table, that's one table page per row. Fifty-six clicks for user 4242 means fifty-six different table pages, because that user's clicks arrived at fifty-six different times and landed wherever there was space. Hold that thought: it's the reason the planner sometimes refuses your index.
+
+### Clustered vs secondary indexes
+
+There are two ways to arrange the table and its indexes, and the databases you'll meet disagree.
+
+**Postgres: a heap plus secondary indexes.** The table is the unordered pile. *Every* index, the primary key included, is a separate B-tree whose leaves point at `ctid`s. That makes every index a <Term w="secondary index">An index stored separately from the table, whose leaf entries point at where the row lives. A table can have many.</Term>.
+
+**MySQL InnoDB, SQLite, SQL Server (usually): a clustered index.** The table *is* a B-tree, keyed by the primary key, and its leaves hold the entire row. That's a <Term w="clustered index">An index whose leaves contain the full rows, so the table itself is stored sorted by that key. A table can have only one, because rows can only be physically sorted one way.</Term>. Rows are physically sorted by primary key, so a primary-key range scan reads consecutive pages, with no jumping. Secondary indexes on that table store the *primary key value* instead of a physical address, so looking up by a secondary index means two descents: one down the secondary index to find the primary key, another down the clustered index to find the row.
+
+| | Postgres (heap) | InnoDB (clustered) |
+| --- | --- | --- |
+| Where rows live | Heap pages, arrival order | Leaves of the primary-key B-tree |
+| What an index leaf points to | Physical address `(page, slot)` | The primary key value |
+| PK lookup | Index descent + 1 heap page | One descent, row is in the leaf |
+| Secondary lookup | Index descent + 1 heap page | Secondary descent + PK descent |
+| Row moves (update, reorganise) | New row version, indexes get new entries | Secondary indexes unaffected |
+
+Neither is better, but it matters when you choose primary keys: on InnoDB, a random key like a UUID scatters inserts across the whole table, and every secondary index carries a copy of that 16-byte key.
+
+In Postgres, if rows happen to be stored roughly in key order, an index range scan reads neighbouring table pages anyway. Postgres measures this per column as <Term w="correlation">A statistic Postgres keeps per column, from -1 to 1: how closely the physical order of rows matches the sorted order of that column. 1 means sorted on disk. Visible in the pg_stats view.</Term>. Your `created_at` column will have correlation near 1, because clicks are inserted in time order. `user_id` will be near 0.
+
+### Covering indexes: skip the table entirely
+
+If every column the query needs is already in the index, why visit the table at all? A <Term w="covering index">An index that contains every column a particular query needs, so the database can answer from the index alone without visiting the table.</Term> lets Postgres do an <Term w="index-only scan">A plan that reads only index pages. In Postgres it still checks a small visibility map to know whether each row is visible to this transaction; after VACUUM, almost no table pages are touched.</Term>.
+
+You can make one two ways. Put the extra columns in the key, `(user_id, dwell_ms)`, or carry them as passengers that aren't part of the sort order: `CREATE INDEX ... ON clicks (user_id) INCLUDE (dwell_ms)`. On your table, averaging `dwell_ms` over 1,000 users (50,000 rows) took 66 ms with a plain index on `user_id`, reading 30,846 table pages, and 2.9 ms with the covering index, reading about 140 index pages and zero table pages.
+
+The catch is the one from before: the index is a copy, and now a bigger one.
+
+### Composite indexes and the leftmost-prefix rule
+
+A <Term w="composite index">An index on several columns at once, sorted by the first column, then by the second within ties of the first, and so on. Also called a multi-column index.</Term> on `(user_id, created_at)` is sorted like a phone book sorted by last name, then first name. All of user 12's entries are together, in time order; then all of user 88's; and so on.
+
+That ordering decides which queries it helps, and it is the most useful single fact about indexes in practice.
+
+<Figure n="005" title="COLUMN ORDER IS EVERYTHING" caption="The same eight index entries, sorted two ways. Query: user 4242's clicks since June 1. Left, sorted by user then time: the matches are one contiguous run, so descend once and read three. Right, sorted by time then user: everything since June 1 is contiguous, but user 4242 is scattered through it, so read six and throw three away. On 5M rows, that's 23 pages versus 7,322.">
+<svg viewBox="0 0 640 290" role="img" aria-label="Two sorted lists of user and date entries; in the first the matches are contiguous, in the second they are scattered">
+  <text x="20" y="22" class="strong">INDEX (user_id, created_at)</text>
+  <text x="340" y="22" class="strong">INDEX (created_at, user_id)</text>
+  <rect x="20" y="34" width="270" height="184" class="fill-paper" stroke-width="1.2" />
+  <rect x="340" y="34" width="270" height="184" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="56">12   · Jan 03</text>
+  <text x="32" y="78">12   · Jun 02</text>
+  <text x="32" y="100">12   · Jun 09</text>
+  <text x="32" y="122">4242 · Feb 01</text>
+  <rect x="24" y="129" width="262" height="66" class="fill-wash" stroke-width="1" />
+  <text x="32" y="144" class="strong">4242 · Jun 03</text>
+  <text x="32" y="166" class="strong">4242 · Jun 08</text>
+  <text x="32" y="188" class="strong">4242 · Jul 01</text>
+  <text x="32" y="210">5150 · Jun 04</text>
+  <text x="352" y="56">Jan 03 · 12</text>
+  <text x="352" y="78">Feb 01 · 4242</text>
+  <rect x="344" y="63" width="262" height="153" class="fill-paper dash" stroke-width="1" />
+  <rect x="344" y="85" width="262" height="131" style="fill:var(--blue-wash)" />
+  <text x="352" y="100">Jun 02 · 12</text>
+  <text x="352" y="122" class="strong">Jun 03 · 4242</text>
+  <text x="352" y="144">Jun 04 · 5150</text>
+  <text x="352" y="166" class="strong">Jun 08 · 4242</text>
+  <text x="352" y="188">Jun 09 · 12</text>
+  <text x="352" y="210" class="strong">Jul 01 · 4242</text>
+  <text x="296" y="166" class="blue-t">◀</text>
+  <text x="20" y="242" class="blue-t">READ 3 · KEEP 3</text>
+  <text x="20" y="260">user = 4242 jumps straight to the run,</text>
+  <text x="20" y="276">created_at narrows it inside the run</text>
+  <text x="340" y="242" class="blue-t">READ 6 · KEEP 3</text>
+  <text x="340" y="260">created_at ≥ Jun 01 is one long run,</text>
+  <text x="340" y="276">user is checked entry by entry</text>
+</svg>
+</Figure>
+
+The general rule is the <Term w="leftmost-prefix rule">A composite index on (a, b, c) can be used efficiently for conditions on a, on a and b, or on a, b and c: any prefix of its columns from the left. A condition on b alone can't use the sort order, because b is only sorted within each value of a.</Term>. An index on `(a, b, c)` is sorted by `a` first, so it helps queries that pin down `a`; or `a` and `b`; or all three. It's nearly useless for `b` alone, the way a phone book sorted by last name doesn't help you find everyone called "Wei".
+
+A good recipe for ordering columns:
+
+1. Columns compared with `=` go first.
+2. Then at most one column used for a range (`>`, `BETWEEN`) or for `ORDER BY`. After a range, later columns can't narrow the search, because within the range they aren't sorted.
+3. Then, optionally, `INCLUDE` the columns you only read, to make it covering.
+
+For the dashboard query, `WHERE user_id = ? AND created_at >= ? ORDER BY created_at LIMIT 20`, that gives `(user_id, created_at)`. The index even hands rows back already in `created_at` order, so the sort and the `LIMIT` are free: Postgres reads 20 entries and stops.
+
+### Selectivity, and why the planner ignores your index
+
+Postgres doesn't run the first plan it thinks of. Its <Term w="query planner">The part of the database that considers several ways to run a query (scan the table, use this index, use that one, in what order to join) and picks the one its cost model says is cheapest. Also called the optimizer.</Term> estimates the cost of each option and picks the cheapest. It estimates using statistics gathered by `ANALYZE`: for each column, the most common values and how often they appear, a histogram of the rest, the number of distinct values, and the correlation.
+
+The key number is <Term w="selectivity">The fraction of rows a condition matches. user_id = 4242 matches 56 of 5M rows (0.001%, very selective). country = 'US' matches 39% (not selective at all).</Term>. If a condition matches a tiny fraction of rows, the index wins by a mile. If it matches a big fraction, the index loses, for a reason you can now work out yourself:
+
+- A sequential scan reads the 46,729 table pages **in order**, which disks and the OS do at full speed (readahead, big requests).
+- An index scan reads index pages **plus one table page per matching row**, in random order. If 39% of rows match and they're spread evenly, nearly *every* page has a match. You end up reading the whole table anyway, in random order, plus the index.
+
+Postgres prices a random page read at 4x a sequential one by default (`random_page_cost = 4`, `seq_page_cost = 1`), a number chosen in the spinning-disk era. Somewhere around a few percent of rows, depending on row width and correlation, the lines cross and it switches to a scan.
+
+Between "a few rows" and "most rows" there's a middle option, the <Term w="bitmap scan">A two-step plan: first scan the index and collect the addresses of all matching rows into a bitmap of table pages, then read those pages in physical order. Turns random table reads into sorted ones. Appears as Bitmap Index Scan + Bitmap Heap Scan.</Term>, which collects all the matching addresses first, sorts them by page, and then visits each needed page once, in order.
+
+There's a subtle trap here that your measurements will show. On your table, `country = 'FR'` matches only 5.6% of rows, and the planner used a bitmap scan. It still read every one of the 46,729 table pages, because with about 107 rows per page, almost every page holds at least one French click. **Selectivity in rows isn't what matters. Selectivity in pages is.**
+
+So, the usual reasons Postgres ignores your index:
+
+1. **The condition isn't selective enough** (above). The planner is usually right.
+2. **The query wraps the column in something.** `WHERE lower(email) = ...`, `WHERE user_id + 0 = 4242`, `WHERE created_at::date = ...`. The index is sorted by the column, not by `lower(column)`. Fix: write the condition on the bare column, or build an <Term w="expression index">An index on the result of an expression, like lower(email), rather than on a raw column. Postgres can then use it for queries that contain that exact expression.</Term>.
+3. **The leftmost column isn't constrained.** A query on `created_at` alone can't use `(user_id, created_at)` for seeking.
+4. **The table is tiny.** If it fits in a few pages, reading them all is cheaper than a descent.
+5. **The statistics are stale or wrong.** After a big load, until `ANALYZE` runs (autovacuum does it eventually), the planner may think the table is empty or the value rare. Correlated columns fool it too, because it assumes conditions are independent.
+6. **The cost settings don't match your hardware.** On SSDs, random reads aren't 4x worse. Many people set `random_page_cost` to around 1.1. Change it if you measure that the index plan really is faster, not before.
+
+### The bill: what every index costs on write
+
+Now the other side. When you `INSERT` a row into a table with five indexes, Postgres:
+
+1. Writes the row into a heap page.
+2. For **each** index: descends from the root to the right leaf and inserts an entry, possibly splitting pages.
+3. Records all of those page changes in the <Term w="WAL">Write-ahead log. Postgres writes every change to this append-only log, and fsyncs it at commit, before changing data pages on disk. After a crash it replays the log. The files-and-disks lesson is the background.</Term>, so they can be replayed after a crash.
+
+So one row becomes six B-tree or heap insertions, and if the indexed values are random, each lands on a different leaf, probably one not in cache. An `UPDATE` is worse than you'd guess: Postgres never overwrites a row in place; it writes a new version of the row elsewhere, so every index needs a new entry pointing at it too. (There's an optimization, <Term w="HOT update">Heap-only tuple update. If no indexed column changed and the new row version fits on the same page, Postgres skips adding new index entries. One reason not to index columns you update constantly.</Term>, that skips the index work when no indexed column changed and the new version fits on the same page.)
+
+This gives you **write amplification**: one logical write causes many physical ones. Indexes also cost space, cache (index pages compete with table pages for RAM), and `VACUUM` time.
+
+<Predict id="insert-cost">
+You bulk-insert 1 million rows into an empty `clicks`-shaped table, three ways: no indexes at all; just a `bigint` primary key on `id` (ascending); and the primary key plus 4 more indexes on `user_id`, `doc_id`, `query` (text) and `created_at`. The no-index run takes 0.6 s. Guess the other two.
+
+<Fragment slot="answer">
+
+On my M4 Pro: **0.6 s, 1.0 s, 7.0 s.**
+
+The primary key only adds 60%, because ascending ids always go into the rightmost leaf: the same few pages stay hot in cache, and splits there are cheap. The four extra indexes add 6 seconds. `created_at` is also ascending, so it's cheap like the primary key. The expensive ones are `user_id`, `doc_id` and especially `query`: random values, so every insert lands on a different leaf of three growing B-trees, and comparing text keys is slower than comparing integers (text is usually compared using language-aware sorting rules, not raw bytes). One-row-at-a-time inserts show the same direction more gently, because each commit has its own fixed overhead: about 42k rows/s with no indexes and 22k rows/s with five, in my run.
+
+</Fragment>
+</Predict>
+
+### When writes dominate: LSM-trees
+
+A B-tree updates data **in place**: find the page, change it, write it back. Each insert is a small random write, and with many indexes and random keys, that's a lot of random I/O. Some systems take in far more writes than reads: event logs, metrics, message stores, the click log itself at large scale. For them, there's a different design.
+
+Remember the trick from [Why not a JSON file?](/lessons/why-databases/): appending to a log is the cheapest write there is. The <Term w="LSM-tree">Log-structured merge-tree. A storage design that buffers writes in a sorted in-memory table, flushes it to disk as immutable sorted files, and merges those files in the background. Used by RocksDB, LevelDB, Cassandra, ScyllaDB, HBase.</Term> (log-structured merge-tree) builds a whole index out of that idea.
+
+1. **Write:** append the change to a log on disk (for crash safety), then insert it into the <Term w="memtable">The in-memory, sorted part of an LSM-tree, usually a skip list or balanced tree. All new writes go here first. Typically tens of megabytes.</Term>, a sorted structure in RAM. That's it. No disk page was read or rewritten.
+2. **Flush:** when the memtable reaches some size (RocksDB's default is 64 MB), write it to disk in one sequential pass as an <Term w="SSTable">Sorted string table. An immutable file of key-value pairs in sorted order, with a small index of where each block starts. Written once, never modified, eventually merged away.</Term>: a sorted, immutable file. Start a fresh memtable.
+3. **Compact:** in the background, merge SSTables together (like the merge step of merge sort), keeping only the newest version of each key and dropping deleted ones. That's <Term w="compaction">Background merging of an LSM-tree's sorted files into fewer, larger ones, discarding overwritten and deleted entries. Costs disk bandwidth, keeps reads fast.</Term>. Files are organized into levels, each roughly 10x bigger than the last.
+
+<Figure n="006" title="AN LSM-TREE" caption="Writes go to a log and a sorted table in RAM, and nothing on disk is ever modified in place. Full memtables are flushed as sorted, immutable files; compaction merges them into bigger levels. A read checks the memtable, then each file from newest to oldest, and a per-file bloom filter says 'definitely not here' for most of them without reading the file.">
+<svg viewBox="0 0 640 300" role="img" aria-label="LSM-tree: writes to WAL and memtable, flush to level 0 files, compaction into levels 1 and 2, bloom filters on reads">
+  <text x="20" y="26" class="strong">WRITE</text>
+  <line x1="62" y1="22" x2="118" y2="22" class="ink" stroke-width="1.2" marker-end="url(#ix-arr2)" />
+  <defs><marker id="ix-arr2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink)" /></marker></defs>
+  <rect x="120" y="8" width="170" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="205" y="28" text-anchor="middle" class="strong">MEMTABLE · SORTED · RAM</text>
+  <rect x="320" y="8" width="170" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="405" y="28" text-anchor="middle">LOG · APPEND ONLY</text>
+  <line x1="290" y1="23" x2="318" y2="23" class="ink" stroke-width="1" />
+  <line x1="205" y1="38" x2="205" y2="74" class="blue" stroke-width="1.2" marker-end="url(#ix-arr)" />
+  <text x="214" y="62" class="blue-t">FLUSH WHEN FULL (SEQUENTIAL WRITE)</text>
+  <line x1="10" y1="84" x2="630" y2="84" style="stroke:var(--rule)" stroke-width="1" />
+  <text x="560" y="98">DISK</text>
+  <text x="20" y="122" class="strong">L0</text>
+  <rect x="60" y="104" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="105" y="122" text-anchor="middle">newest</text>
+  <rect x="160" y="104" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <rect x="260" y="104" width="90" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="305" y="122" text-anchor="middle">oldest</text>
+  <text x="20" y="182" class="strong">L1</text>
+  <rect x="60" y="164" width="400" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="260" y="182" text-anchor="middle">ONE SORTED RUN · ~10x L0</text>
+  <text x="20" y="242" class="strong">L2</text>
+  <rect x="60" y="224" width="570" height="28" class="fill-paper" stroke-width="1.2" />
+  <text x="345" y="242" text-anchor="middle">ONE SORTED RUN · ~10x L1</text>
+  <line x1="380" y1="132" x2="380" y2="162" class="ink dash" stroke-width="1" />
+  <text x="388" y="152">COMPACT (MERGE)</text>
+  <line x1="500" y1="192" x2="500" y2="222" class="ink dash" stroke-width="1" />
+  <text x="508" y="212">COMPACT</text>
+  <rect x="62" y="106" width="10" height="24" class="fill-blue" />
+  <rect x="162" y="106" width="10" height="24" class="fill-blue" />
+  <rect x="262" y="106" width="10" height="24" class="fill-blue" />
+  <rect x="62" y="166" width="10" height="24" class="fill-blue" />
+  <rect x="62" y="226" width="10" height="24" class="fill-blue" />
+  <text x="20" y="278" class="blue-t">■ BLOOM FILTER PER FILE: "NO" IS CERTAIN, "MAYBE" MEANS READ IT</text>
+  <text x="20" y="296">READ: MEMTABLE → L0 NEWEST..OLDEST → L1 → L2, STOP AT FIRST HIT</text>
+</svg>
+</Figure>
+
+Reads are where you pay. A key might be in the memtable or in any of the files, so a lookup may have to check several places, newest first. Two things keep that tolerable. Each file has a small sparse index, so checking one file costs at most one block read. And each file has a <Term w="bloom filter">A compact bit array that answers "is this key in the set?" with either "definitely not" or "maybe". With about 10 bits per key it says "maybe" wrongly about 1% of the time. Lets a reader skip files that can't contain the key.</Term>, so most files that don't contain the key are skipped without touching the disk at all.
+
+The trade, roughly:
+
+| | B-tree | LSM-tree |
+| --- | --- | --- |
+| Insert | Random page writes, in place | Sequential appends; compaction rewrites data later |
+| Point read | One descent, ~1 cold read | Memtable + bloom checks, usually ~1 file read |
+| Range read | Walk the leaves | Merge across files |
+| Space | Pages ~70% full | Compact, but old versions linger until compaction |
+| Hidden cost | Page splits, fragmentation | Compaction uses disk bandwidth in the background |
+
+Rule of thumb: read-heavy with updates to existing rows, B-tree. Ingest-heavy, append-mostly, LSM. Postgres and MySQL are B-tree databases. RocksDB is an LSM engine embedded in many systems (including as a MySQL storage engine), and Cassandra and ScyllaDB are LSM databases.
+
+### Hash indexes
+
+Last, the simplest one. If you only ever ask "is key X here, and where?", you don't need sorting at all. A <Term w="hash index">An index that hashes each key to a bucket, giving roughly one-step equality lookups. It has no order, so it can't do ranges, sorting, or prefix searches.</Term> hashes the key to a bucket and looks there. It's the dict of indexes: O(1) lookups, no order.
+
+Postgres has them (`CREATE INDEX ... USING hash`, crash-safe since version 10), but they only support `=`, and a B-tree descent is already only 3 or 4 mostly-cached pages, so B-tree stays the default. Hash indexes shine in memory: Redis is essentially a giant hash table, and the Bitcask design keeps a hash table of key → file offset in RAM over an append-only log, which is exactly the store you build in [Why not a JSON file?](/lessons/why-databases/).
+
+## Build It
+
+Everything lives in `~/workbench/indexes/`. Part one is Postgres: make a big table, feel the scan, add indexes, read the plans. Part two you write yourself: a B+tree.
+
+<Task id="t0" title="Run Postgres and load 5 million clicks" agent="ok">
+
+Either way works. Docker is easier to throw away; Homebrew is easier to leave running.
+
+```bash
+# Docker
+docker run --name pg -e POSTGRES_PASSWORD=pg -p 5432:5432 -d postgres:17
+docker exec -it pg psql -U postgres
+
+# or Homebrew
+brew install postgresql@17
+brew services start postgresql@17
+"$(brew --prefix postgresql@17)/bin/psql" postgres
+```
+
+Inside `psql`, turn on timing and load the table. `generate_series` makes the rows inside the database, so this takes seconds, not minutes.
+
+```sql
+\timing on
+CREATE TABLE clicks (
+  id         bigint PRIMARY KEY,
+  user_id    int         NOT NULL,
+  doc_id     int         NOT NULL,
+  query      text        NOT NULL,
+  dwell_ms   int         NOT NULL,
+  country    text        NOT NULL,
+  created_at timestamptz NOT NULL
+);
+
+INSERT INTO clicks
+SELECT g,
+       (random() * 99999)::int + 1,                 -- ~100k users, ~50 clicks each
+       (random() * 999999)::int + 1,                -- ~1M docs
+       'query ' || (random() * 50000)::int,
+       (random() * 60000)::int,
+       (ARRAY['US','US','US','US','IN','DE','BR','JP','GB','FR'])[1 + (random()*9)::int],
+       timestamptz '2026-01-01 00:00+00' + g * interval '5 seconds'   -- time order = insert order
+FROM generate_series(1, 5000000) AS g;
+
+VACUUM ANALYZE clicks;
+
+SELECT pg_size_pretty(pg_relation_size('clicks'))      AS table_size,
+       pg_size_pretty(pg_relation_size('clicks_pkey')) AS pk_size,
+       pg_relation_size('clicks') / 8192               AS table_pages;
+```
+
+You should see about 365 MB, 107 MB and 46,729 pages. Load took about 7 seconds on my Mac.
+
+</Task>
+
+<Task id="t1" title="Feel the scan, then add the index" agent="hands">
+
+For each query below: **write your guess for the time and the plan type first**, then run it with `EXPLAIN (ANALYZE, BUFFERS)` in front. `ANALYZE` runs the query for real; `BUFFERS` reports how many 8 KB pages it touched. `hit` means the page was already in Postgres's cache; `read` means Postgres asked the OS for it (which might still come from the OS page cache, not the SSD).
+
+1. `SELECT * FROM clicks WHERE user_id = 4242;` Note the plan, the time, and the buffers. Then run `SET max_parallel_workers_per_gather = 0;` and run it again: that's one core doing the scan. `RESET max_parallel_workers_per_gather;` afterwards.
+2. `SELECT * FROM clicks WHERE id = 3000000;` (has an index already, the primary key.) How many buffers? Can you account for each one?
+3. Create the index, timing it: `CREATE INDEX clicks_user ON clicks (user_id);` Check its size with `pg_relation_size`. Rerun query 1.
+
+Then look inside the B-tree itself. The `pageinspect` extension ships with standard Postgres builds (both Docker and Homebrew include it; check yourself):
+
+```sql
+CREATE EXTENSION pageinspect;
+SELECT level, fastroot FROM bt_metap('clicks_pkey');   -- level of the root: 2 means height 3
+SELECT * FROM bt_page_stats('clicks_pkey', 1);         -- one page: live_items, avg_item_size, free_size
+```
+
+Compare `live_items` and `avg_item_size` with the "367 entries of ~20 bytes" estimate in The Idea.
+
+Hints: the `user_id` index is a lot smaller than the primary key even though it has the same number of entries. Look up "B-tree deduplication" in the Postgres docs (added in version 13) and explain why `user_id` benefits and `id` can't.
+
+</Task>
+
+<Task id="t2" title="Make the planner say no" agent="hands">
+
+Find, by experiment, where the planner stops using an index. Create `CREATE INDEX clicks_country ON clicks (country); ANALYZE clicks;`, then `EXPLAIN ANALYZE` a `count(*), avg(dwell_ms)` for `country = 'US'` and for `country = 'FR'`. Then:
+
+- Force the index for the US query with `SET enable_seqscan = off; SET enable_bitmapscan = off;` and compare actual time to the scan. Was the planner right? Reset both afterwards.
+- Look at what the planner believed: `SELECT most_common_vals, most_common_freqs FROM pg_stats WHERE tablename = 'clicks' AND attname = 'country';`
+- Check `correlation` in `pg_stats` for `user_id`, `created_at` and `id`, and predict which range queries will be cheap before running any.
+- Write two queries that should use `clicks_user` but don't, by wrapping the column (one with arithmetic, one with a cast or function). Confirm with `EXPLAIN`.
+
+Write one sentence per result explaining *why*, in pages, not rows.
+
+</Task>
+
+<Task id="t3" title="Composite index ordering, and a covering index" agent="hands">
+
+The dashboard query is:
+
+```sql
+SELECT * FROM clicks
+WHERE user_id = 4242 AND created_at >= '2026-06-01'
+ORDER BY created_at
+LIMIT 20;
+```
+
+Plus a second query used by a daily report:
+
+```sql
+SELECT count(*) FROM clicks
+WHERE created_at >= '2026-06-01' AND created_at < '2026-06-02';
+```
+
+Drop `clicks_user` and `clicks_country`. Then, one at a time: create `(user_id, created_at)`, `EXPLAIN (ANALYZE, BUFFERS)` both queries, drop it; create `(created_at, user_id)`, run both again, drop it. Fill in the composite rows of the Measure table. Before each run, use Figure 005 to predict the buffer count to within a factor of 10.
+
+Then the covering experiment. For `SELECT avg(dwell_ms) FROM clicks WHERE user_id BETWEEN 4000 AND 4999;` compare a plain `(user_id)` index against `(user_id) INCLUDE (dwell_ms)`. Run `VACUUM clicks;` after creating the covering one and look for `Index Only Scan` and `Heap Fetches: 0`. Then run it *before* the vacuum on a fresh copy and explain the difference (hint: the visibility map).
+
+</Task>
+
+<Task id="t4" title="Measure the write bill" agent="review">
+
+Write a script (`psql -f` is fine, or Python with `psycopg`) that measures insert throughput into a copy of the table with 0, 1 and 5 indexes:
+
+- **Bulk:** `CREATE TABLE ins (LIKE clicks);` then `INSERT INTO ins SELECT * FROM clicks WHERE id <= 1000000;`, timed. Then `TRUNCATE ins;`, add the primary key, repeat. Then add indexes on `user_id`, `doc_id`, `query`, `created_at` and repeat. Run `CHECKPOINT;` between runs so leftover background writing from one run doesn't land in the next.
+- **One row per transaction:** use `pgbench` (it comes with Postgres) with a one-line custom script that inserts one row of random values, `pgbench -n -f one.sql -T 10 -c 4 -j 4 postgres`, against a table already holding 5M rows with 0, 1 and 5 indexes. Report rows per second.
+
+Then have an agent review the script for anything that makes the comparison unfair: caching from a previous run, the table not being the same size each time, autovacuum kicking in mid-run, measuring connection setup.
+
+</Task>
+
+<Task id="t5" title="Write a B+tree" agent="hands">
+
+In plain Python, no libraries beyond `bisect`. This is the core of the lesson; don't let an agent write it. Here's the shape:
+
+```python
+# bptree.py
+from bisect import bisect_left, bisect_right
+
+class Leaf:
+    __slots__ = ("keys", "vals", "next")      # next: the leaf to the right, or None
+
+class Inner:
+    __slots__ = ("keys", "kids")              # len(kids) == len(keys) + 1
+
+class BPlusTree:
+    def __init__(self, order: int = 64):
+        """order = max keys per node. Start with a single empty leaf as the root."""
+
+    def _find_leaf(self, key) -> tuple[Leaf, list[Inner]]:
+        """Descend from the root. Return the leaf where key belongs, and the path of
+        inner nodes above it (you'll need the path to push splits upward)."""
+
+    def search(self, key):
+        """Return the value for key, or None."""
+
+    def insert(self, key, val) -> None:
+        """Insert or overwrite. If the leaf overflows, split it and push a separator
+        into the parent; repeat upward; if the root splits, make a new root."""
+
+    def range(self, lo, hi):
+        """Yield (key, val) for lo <= key < hi, in order, using the leaf chain."""
+
+    def height(self) -> int: ...
+```
+
+Hints, in the order you'll need them:
+
+- In an inner node, child `i` holds keys in `[keys[i-1], keys[i])`. So the child to follow for `key` is `kids[bisect_right(node.keys, key)]`. Get this wrong by one and keys equal to a separator go missing.
+- **Leaf split:** move the upper half of keys and vals to a new leaf, fix the `next` pointers, and send the new leaf's *first key* up as the separator. The key stays in the leaf; the parent gets a copy.
+- **Inner split:** the middle key moves *up* and is removed from both halves. That asymmetry with leaf splits is the most common bug.
+- Start with `order=3` so splits happen constantly, and print the tree level by level after each insert. Compare with Figure 004 using the same inserts.
+
+Then test it against something you trust:
+
+```python
+import random, bisect
+def check(order: int, n: int = 200_000) -> None:
+    t, ref = BPlusTree(order), {}
+    for k in random.sample(range(10_000_000), n):
+        t.insert(k, k * 2); ref[k] = k * 2
+    s = sorted(ref)
+    # 1. every key found with the right value; a missing key returns None
+    # 2. 200 random ranges: list(t.range(lo, hi)) == the slice of s between lo and hi
+    # 3. print t.height()
+for order in (3, 4, 64, 256):
+    check(order)
+```
+
+</Task>
+
+<Task id="t6" title="Race your B+tree" agent="explain">
+
+Time 1 million random inserts into your tree (order 128), into a plain Python list kept sorted with `bisect.insort`, and into a `dict`. Start `insort` at 100,000 and work up; you'll see why. Then time 100,000 searches in your tree vs `bisect_left` on the sorted list. An agent can explain any result that surprises you, but write the timing code yourself.
+
+</Task>
+
+<DoneWhen>
+
+- Your Measure table has every row filled in, with a prediction written before each first run.
+- You can point at each line of an `EXPLAIN (ANALYZE, BUFFERS)` output and say what it's doing and why it touched that many pages.
+- `bt_metap` and your own arithmetic agree on the height of `clicks_pkey`.
+- Your B+tree passes the check against a sorted list for orders 3, 4, 64 and 256, and `height()` for 1M keys at order 128 is 3.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in. Run each query twice and keep the second (the first pays for loading pages into cache). Your Postgres version and disk will differ from mine; the ratios shouldn't.
+
+| Experiment | Your prediction | Your result | My result (M4 Pro, Postgres 16, warm cache) |
+| --- | --- | --- | --- |
+| `user_id = 4242`, no index, 1 worker | | | Seq Scan, 198 ms, 46,729 pages |
+| Same, default parallel scan | | | 2 workers, 64 ms |
+| `CREATE INDEX` on `user_id` | | | 0.97 s, 34 MB |
+| `user_id = 4242`, with index | | | Bitmap scan, 0.10 ms, 3 index + 56 table pages |
+| `id = 3000000` (primary key) | | | Index Scan, 0.017 ms, 4 pages |
+| `country = 'US'` (39%), planner's choice | | | Parallel Seq Scan, 112 ms |
+| `country = 'US'`, index forced | | | Index Scan, 86 ms |
+| `country = 'FR'` (5.6%) | | | Bitmap scan, 96 ms, all 46.8k pages |
+| Dashboard query, `(user_id, created_at)` | | | 0.04 ms, 23 pages |
+| Dashboard query, `(created_at, user_id)` | | | 36 ms, 7,322 pages |
+| Day count, `(user_id, created_at)` | | | Seq Scan, 81 ms |
+| Day count, `(created_at, user_id)` | | | Index Only Scan, 1.5 ms, 70 pages |
+| 1,000-user avg, plain index | | | Bitmap scan, 66 ms, 30,846 table pages |
+| 1,000-user avg, covering index | | | Index Only Scan, 2.9 ms, 0 heap fetches |
+| Bulk insert 1M: 0 / 1 / 5 indexes | | | 0.62 s / 1.01 s / 7.03 s |
+| pgbench 1-row inserts: 0 / 1 / 5 indexes | | | ~42k / ~46k / ~22.5k rows/s |
+| Your B+tree, 1M inserts (order 128) | | | 6.1 s, height 3 |
+| `bisect.insort`, 1M inserts | | | 280 s |
+| `dict`, 1M inserts | | | 0.16 s |
+
+What the numbers should tell you:
+
+**Scan vs index: about 2,000x.** The scan read 46,729 pages to return 56 rows; the index read 3 index pages and 56 table pages. That ~790x gap in pages explains most of it; the rest is CPU spent checking 5 million rows. Three processes made the scan 3x faster, but no parallelism closes a 790x gap in work.
+
+**The primary key lookup is 4 pages: 3 index levels and 1 table page.** That matches the height arithmetic exactly, and `bt_metap` should report root level 2.
+
+**The US query is the honest surprise.** The planner chose the scan, but forcing the index was a little *faster* on my Mac (86 ms vs 112 ms). Everything was already in RAM (365 MB fits easily in the page cache of a 48 GB machine), so "random" reads cost the same as sequential ones and `random_page_cost = 4` was too pessimistic. On a cold cache or slower disk the planner would be right. This is exactly when people lower `random_page_cost` on SSD machines. Check whether your run agrees.
+
+**The FR query reads every page despite matching 5.6% of rows,** because the matches are spread across all pages. Pages, not rows.
+
+**Composite order: 23 vs 7,322 pages for the same query.** With `(user_id, created_at)` the matches are contiguous and the `LIMIT 20` stops after 20 entries. With `(created_at, user_id)` Postgres walks every entry since June 1 checking `user_id`, and fetches table pages as it goes. Flip to the daily report and the winner flips too: 70 pages vs a full scan. Indexes are designed for queries, not for columns.
+
+**Covering: 66 ms to 2.9 ms** by not visiting 30,846 table pages.
+
+**Writes: the primary key is nearly free, random-key indexes aren't.** Ascending keys (`id`, `created_at`) append to the rightmost leaf. Random keys (`user_id`, `doc_id`, `query`) touch a different leaf each time. Bulk inserts got 11x slower with five indexes; single-row inserts only 2x slower, because each one also pays a commit. (On macOS, Postgres's default commit doesn't force the SSD's own cache to flush, which is why one-row commits are so cheap here; see [Files, disks and fsync](/lessons/files-and-disks/). Expect fewer rows per second on Linux with a real flush.)
+
+**Your B+tree vs a sorted list: 6 s vs 280 s.** `insort` finds the spot with a fast binary search but then has to shift every element after it one slot to the right. On average that's a quarter of a million pointers, about 2 MB of memory moved per insert, around 2 TB in total. That is exactly why databases don't keep one big sorted array on disk: each insert would rewrite half the file. The B+tree only ever shifts entries inside one small node. And the `dict` beats both by 40x, because hashing doesn't keep anything in order. That's the hash index trade, measured.
+
+## Break It
+
+**1. Random primary keys.** Create three tables with a two-column schema (`id`, `v int`) and insert 3 million rows into each: `id` as ascending `bigint`; as `(random() * 1e15)::bigint`; as `uuid` from `gen_random_uuid()`. Time each and compare index sizes. On my Mac: 9.5 s and 64 MB; 29 s and 79 MB; 96 s and 123 MB. Then `REINDEX` the random-bigint table and check again (it shrank to 64 MB). The random keys produced pages about 73% full on average instead of 90%, from splits all over the tree, and the UUID index is bigger again because each key is 16 bytes. Every insert dirties a different leaf, and Postgres writes a full copy of each page into the WAL the first time it changes after a checkpoint, so random keys also multiply WAL volume. This is why people use time-ordered IDs (UUIDv7, snowflake IDs) for big tables.
+
+**2. Stale statistics.** Create a new table, insert 1 million rows where every `country` is `'US'`, run `ANALYZE`, then insert 1 million `'FR'` rows and immediately `EXPLAIN` a query for `'FR'` before autovacuum notices. Watch the estimated rows (`rows=`) differ wildly from the actual. Run `ANALYZE` and see the plan change. Most "Postgres randomly picked a terrible plan" stories are this.
+
+**3. Break your B+tree on purpose.** Change the inner-node split to keep the middle key in the right half (as the leaf split does) instead of moving it up. Run your checker. Which test fails first, and why does search still work for most keys? Then put the off-by-one in `_find_leaf` (use `bisect_left`) and find which keys go missing. Your checker should catch both; if it doesn't, it isn't checking enough.
+
+**4. Index everything.** Index every column of `clicks` and rerun the bulk insert. Compare `pg_indexes_size('clicks')` to the table size (indexes bigger than the table is common), then check `pg_stat_user_indexes.idx_scan` after your dashboard queries: most were never used once, and every one was paid for on every insert.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. What is a database index, physically? Why does it make reads fast?</summary>
+
+A separate structure next to the table, usually a B+tree, stored in the same fixed-size pages as the table. It holds a copy of the indexed columns in sorted order, each with a pointer to where the row lives. Without it, finding rows means reading every page of the table. With it, the database descends the tree from the root: each page it reads holds hundreds of separator keys, so each read narrows the search a few-hundred-fold, and it reaches the right leaf in 3 or 4 page reads even for billions of rows. Then it follows the pointer to the one table page with the row. You go from reading the whole table to reading about 4 pages.
+
+</details>
+
+<details>
+<summary>2. How does a B-tree lookup scale from a million rows to ten billion? Show the arithmetic.</summary>
+
+The fan-out is about page size divided by entry size: an 8 KB page with ~20-byte entries for a bigint key holds roughly 370 entries. Height is about log base 370 of the row count. A million rows: ~2,700 leaves, 8 inner pages, a root: height 3. Ten billion: 27 million leaves, then 74,000 inner pages, then 200, then the root: height 4. So 10,000x more data costs one more page read. The top levels are small and hot, so they're in RAM; a cold lookup is about one or two SSD reads, ~100-200 µs. What does scale linearly is the index's size on disk (one entry per row, ~20 bytes plus slack, so roughly 200 GB at ten billion), its insert cost in total, and any full scan.
+
+</details>
+
+<details>
+<summary>3. You added an index and Postgres still does a sequential scan. Give four possible reasons and how you'd check each.</summary>
+
+(1) The condition matches too many rows, or rather too many pages, so reading the table in order is cheaper; check the estimated vs actual rows in `EXPLAIN ANALYZE` and the value's frequency in `pg_stats`. (2) The query wraps the column in a function, cast or arithmetic (`lower(email)`, `created_at::date`), so the sorted order doesn't apply; rewrite the condition or build an expression index. (3) It's a composite index and the query doesn't constrain the leftmost column. (4) The statistics are stale (fresh bulk load, no `ANALYZE` yet), or the cost settings assume spinning disks; run `ANALYZE`, and if `EXPLAIN ANALYZE` with `enable_seqscan = off` is consistently faster, consider lowering `random_page_cost`. Also: the table is tiny, so a scan is genuinely cheaper.
+
+</details>
+
+<details>
+<summary>4. Your ingestion job got 2x slower after someone added indexes. Explain why and what you'd do.</summary>
+
+Every insert writes the row and then one entry into every index: descend each B-tree, insert into a leaf, sometimes split pages, and log all of it to the WAL. Indexes on random values (user IDs, UUIDs, text) put each insert on a different leaf page, often not in cache, so they cost far more than indexes on ascending values like an id or timestamp. Updates are expensive too: Postgres writes a new row version, so every index gets a new entry unless it's a HOT update. What I'd do: drop indexes `pg_stat_user_indexes` shows nobody scans; merge overlapping ones (`(user_id, created_at)` makes `(user_id)` redundant); for big backfills, drop secondary indexes, load, and rebuild them in one sorted pass; prefer time-ordered keys. If the workload is overwhelmingly writes, an LSM-tree store is built for exactly that.
+
+</details>
+
+<details>
+<summary>5. B-tree vs LSM-tree: what's the trade, in one minute?</summary>
+
+A B-tree keeps one sorted structure on disk and updates pages in place: reads are one predictable descent, but each write is a small random write somewhere in the tree. An LSM-tree never updates in place: writes go to a log and a sorted in-memory table, which is flushed as an immutable sorted file when full; background compaction merges files into bigger sorted levels. Writes become cheap sequential appends, but a read may need to check the memtable and several files (bloom filters skip most of them), and compaction keeps rewriting data in the background, using disk bandwidth. B-tree for read-heavy and update-heavy; LSM for write-heavy ingestion.
+
+</details>
+
+## Go Deeper
+
+- **Martin Kleppmann, _Designing Data-Intensive Applications_, Chapter 3: "Storage and Retrieval".** The best single explanation of hash indexes, SSTables, LSM-trees and B-trees side by side, and where this lesson's LSM section comes from. Read it next.
+- **Markus Winand, [Use The Index, Luke!](https://use-the-index-luke.com/)** A free online book about indexing for developers. The chapters on the leaf chain, composite index column order and "functions in the where clause" are the practical companion to this lesson.
+- **PostgreSQL docs: [Chapter 11, Indexes](https://www.postgresql.org/docs/current/indexes.html) and [Using EXPLAIN](https://www.postgresql.org/docs/current/using-explain.html).** Covers multicolumn indexes, index-only scans, expression indexes, and how to read every line of a plan. The B-tree chapter also explains deduplication.
+- **Douglas Comer, "The Ubiquitous B-Tree", ACM Computing Surveys, 1979.** The classic survey: B-trees, B+trees, why they won. Short and readable.
+- **Patrick O'Neil, Edward Cheng, Dieter Gawlick and Elizabeth O'Neil, "The Log-Structured Merge-Tree (LSM-Tree)", Acta Informatica, 1996.** The original LSM paper. Read the introduction for the cost argument; it's still the clearest statement of why batching writes wins.
+- **Alex Petrov, _Database Internals_ (O'Reilly, 2019), Part I.** Goes deep on B-tree page layouts, splits, merges, and LSM compaction strategies, with diagrams. The book to read if you want to build a storage engine.
+- **CMU 15-445/645 Database Systems (Andy Pavlo), the B+tree and index lectures.** Free on YouTube. Fast, opinionated, and full of what real systems actually do.
+- **The Postgres source: `src/backend/access/nbtree/README`.** How Postgres's B-tree handles many readers and writers at once (the Lehman and Yao design). Read it once your own B+tree works and you wonder what happens when two inserts split the same page.
+
+## Connections
+
+This lesson stands on [How slow is slow?](/lessons/latency-numbers/): the whole B-tree design is "minimise the number of ~80 µs page reads". It's also [Files, disks and fsync](/lessons/files-and-disks/) one layer up: pages, the page cache and the WAL are the same machinery.
+
+Next, [Transactions](/lessons/transactions/) explains why Postgres writes new row versions instead of updating in place, which is where the HOT-update detail came from. [Caching and Redis](/lessons/caching/) is the hash-index idea taken to its extreme, entirely in RAM. And [Nearest neighbors at scale](/lessons/vector-search/) asks the question this lesson can't answer: B-trees work because keys can be *sorted*. Embeddings can't be sorted in any useful way, so how do you index 100 million of them?

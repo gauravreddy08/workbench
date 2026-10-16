@@ -1,0 +1,190 @@
+---
+// A simulated pairwise judge over 60 fixed pairs with known right answers.
+// Its score for "the answer shown first wins" is:
+//   quality gap + position bias + length bias x (length difference) + noise
+// Sliders set the two biases. The judge is asked each pair twice (A first, then B first),
+// and the figure compares three ways of reading the two verdicts.
+---
+<div class="jb" data-fig="judge-bias">
+  <div class="ctl">
+    <label>position bias <input type="range" min="0" max="3" step="0.1" value="0" data-pos /> <output data-pos-out>0.0</output></label>
+    <label>length bias <input type="range" min="0" max="2" step="0.1" value="0" data-len /> <output data-len-out>0.0</output></label>
+    <button class="btn" type="button" data-pad aria-pressed="false">Pad the losers: off</button>
+  </div>
+
+  <div class="jb-bars">
+    <div class="jb-row">
+      <span class="jb-name">One order (A first)</span>
+      <span class="jb-track"><span class="jb-fill" data-bar="one"></span><span class="jb-base" data-base></span></span>
+      <span class="readout" data-val="one">-</span>
+    </div>
+    <div class="jb-row">
+      <span class="jb-name">Swap, ties if they disagree</span>
+      <span class="jb-track"><span class="jb-fill" data-bar="hard"></span><span class="jb-base" data-base></span></span>
+      <span class="readout" data-val="hard">-</span>
+    </div>
+    <div class="jb-row">
+      <span class="jb-name">Swap, average probabilities</span>
+      <span class="jb-track"><span class="jb-fill" data-bar="soft"></span><span class="jb-base" data-base></span></span>
+      <span class="readout" data-val="soft">-</span>
+    </div>
+  </div>
+
+  <div class="jb-stats">
+    <span>consistent across swap <span class="readout" data-val="cons">-</span></span>
+    <span>first slot wins <span class="readout" data-val="first">-</span></span>
+    <span>unbiased judge <span class="readout" data-val="base">-</span></span>
+  </div>
+
+  <div class="ctl jb-modes" role="group" aria-label="Which verdicts to show in the grid">
+    <span>grid shows</span>
+    <button class="btn" type="button" data-mode="one" aria-pressed="false">One order</button>
+    <button class="btn" type="button" data-mode="hard" aria-pressed="true">Swap: hard</button>
+    <button class="btn" type="button" data-mode="soft" aria-pressed="false">Swap: average</button>
+  </div>
+
+  <div class="jb-grid" data-grid aria-label="60 pairs, coloured by whether the judge got each right"></div>
+
+  <div class="jb-legend">
+    <span><i class="jb-cell ok"></i>right</span>
+    <span><i class="jb-cell bad"></i>wrong</span>
+    <span><i class="jb-cell tie"></i>tie (orders disagreed)</span>
+    <span><i class="jb-cell"><b class="jb-dot"></b></i>longer answer is the worse one</span>
+  </div>
+</div>
+
+<style>
+  .jb-bars { margin-top: 18px; display: grid; gap: 8px; }
+  .jb-row { display: grid; grid-template-columns: minmax(0, 11.5em) 1fr 3.2em; gap: 10px; align-items: center; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .jb-track { position: relative; height: 14px; border: 1px solid var(--rule); background: var(--paper); }
+  .jb-fill { position: absolute; left: 0; top: 0; bottom: 0; background: var(--blue); width: 0; transition: width 0.18s; }
+  .jb-base { position: absolute; top: -4px; bottom: -4px; width: 0; border-left: 1.5px dashed var(--ink); }
+  .jb-row .readout { text-align: right; }
+  .jb-stats { display: flex; flex-wrap: wrap; gap: 6px 22px; margin-top: 14px; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
+  .jb-modes { margin-top: 18px; }
+  .jb-modes .btn { padding: 5px 9px; font-size: 10.5px; }
+  .jb-grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: 4px; margin-top: 12px; max-width: 420px; }
+  .jb-cell { display: inline-grid; place-content: center; aspect-ratio: 1; border: 1px solid var(--rule); background: var(--paper); position: relative; }
+  .jb-grid .jb-cell { width: 100%; }
+  .jb-cell.ok { background: var(--blue-fill); border-color: var(--blue); }
+  .jb-cell.bad { background: var(--paper); border: 1.5px solid var(--warn); }
+  .jb-cell.bad::after { content: ''; position: absolute; inset: 3px; background: linear-gradient(45deg, transparent 45%, var(--warn) 45%, var(--warn) 55%, transparent 55%); }
+  .jb-cell.tie { background: var(--paper-2); border: 1px dashed var(--ink-3); }
+  .jb-dot { display: block; width: 5px; height: 5px; border-radius: 50%; background: var(--ink); position: relative; z-index: 1; }
+  .jb-legend { display: flex; flex-wrap: wrap; gap: 6px 18px; margin-top: 12px; font-family: var(--mono); font-size: 11px; color: var(--ink-2); }
+  .jb-legend span { display: inline-flex; gap: 6px; align-items: center; }
+  .jb-legend .jb-cell { width: 14px; height: 14px; }
+  .jb-legend .jb-dot { width: 4px; height: 4px; }
+  @media (max-width: 520px) {
+    .jb-row { grid-template-columns: 1fr 3.2em; }
+    .jb-row .jb-name { grid-column: 1 / 3; }
+    .jb-row .jb-track { grid-column: 1; }
+  }
+  @media (prefers-reduced-motion: reduce) { .jb-fill { transition: none; } }
+</style>
+
+<script>
+  // Fixed, seeded pairs so every reader sees the same 60.
+  function mulberry32(a: number) {
+    return () => {
+      a |= 0; a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  type Pair = { d: number; L: number; e1: number; e2: number };
+  const rnd = mulberry32(20231009);
+  const gauss = () => Math.sqrt(-2 * Math.log(1 - rnd())) * Math.cos(2 * Math.PI * rnd());
+  const N = 60;
+  const signs = Array.from({ length: N }, (_, i) => (i < N / 2 ? 1 : -1));
+  for (let i = N - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); [signs[i], signs[j]] = [signs[j], signs[i]]; }
+  const PAIRS: Pair[] = signs.map((s) => ({
+    d: s * (0.15 + 1.45 * rnd()), // true quality gap; > 0 means A is better
+    L: 2 * rnd() - 1,              // (length of A - length of B), scaled to [-1, 1]
+    e1: 0.6 * gauss(),             // judge noise when A is shown first
+    e2: 0.6 * gauss(),             // judge noise when B is shown first
+  }));
+  const sig = (x: number) => 1 / (1 + Math.exp(-x));
+
+  type Verdict = 'ok' | 'bad' | 'tie';
+  function judge(pos: number, len: number, pad: boolean) {
+    let one = 0, hard = 0, soft = 0, cons = 0, first = 0;
+    const cells: { one: Verdict; hard: Verdict; soft: Verdict; longerWorse: boolean }[] = [];
+    for (const p of PAIRS) {
+      const L = pad ? -Math.sign(p.d) * Math.abs(p.L) : p.L;
+      const truthA = p.d > 0;
+      const s1 = p.d + pos + len * L + p.e1;   // A first: > 0 means "first wins" = A
+      const s2 = -p.d + pos - len * L + p.e2;  // B first: > 0 means "first wins" = B
+      const v1A = s1 > 0, v2A = !(s2 > 0);
+      first += (s1 > 0 ? 1 : 0) + (s2 > 0 ? 1 : 0);
+      const cOne: Verdict = v1A === truthA ? 'ok' : 'bad';
+      let cHard: Verdict;
+      if (v1A === v2A) { cons++; cHard = v1A === truthA ? 'ok' : 'bad'; } else cHard = 'tie';
+      const pA = (sig(s1) + (1 - sig(s2))) / 2;
+      const cSoft: Verdict = (pA > 0.5) === truthA ? 'ok' : 'bad';
+      one += cOne === 'ok' ? 1 : 0;
+      hard += cHard === 'ok' ? 1 : cHard === 'tie' ? 0.5 : 0;
+      soft += cSoft === 'ok' ? 1 : 0;
+      cells.push({ one: cOne, hard: cHard, soft: cSoft, longerWorse: (L > 0) !== truthA && Math.abs(L) > 0.15 });
+    }
+    return { one: one / N, hard: hard / N, soft: soft / N, cons: cons / N, first: first / (2 * N), cells };
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="judge-bias"]').forEach((root) => {
+    const posIn = root.querySelector<HTMLInputElement>('[data-pos]')!;
+    const lenIn = root.querySelector<HTMLInputElement>('[data-len]')!;
+    const padBtn = root.querySelector<HTMLButtonElement>('[data-pad]')!;
+    const grid = root.querySelector<HTMLElement>('[data-grid]')!;
+    const modeBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-mode]')];
+    let pad = false;
+    let mode: 'one' | 'hard' | 'soft' = 'hard';
+
+    const cellEls = PAIRS.map(() => {
+      const c = document.createElement('i');
+      c.className = 'jb-cell';
+      grid.appendChild(c);
+      return c;
+    });
+    const pct = (x: number) => `${Math.round(x * 100)}%`;
+    const set = (k: string, v: string) => { root.querySelector<HTMLElement>(`[data-val="${k}"]`)!.textContent = v; };
+
+    function render() {
+      const pos = +posIn.value, len = +lenIn.value;
+      root.querySelector('[data-pos-out]')!.textContent = pos.toFixed(1);
+      root.querySelector('[data-len-out]')!.textContent = len.toFixed(1);
+      const r = judge(pos, len, pad);
+      const base = judge(0, 0, pad).soft;
+      (['one', 'hard', 'soft'] as const).forEach((k) => {
+        root.querySelector<HTMLElement>(`[data-bar="${k}"]`)!.style.width = pct(r[k]);
+        set(k, pct(r[k]));
+      });
+      root.querySelectorAll<HTMLElement>('[data-base]').forEach((b) => { b.style.left = pct(base); });
+      set('cons', pct(r.cons));
+      set('first', pct(r.first));
+      set('base', pct(base));
+      r.cells.forEach((c, i) => {
+        const el = cellEls[i];
+        el.className = `jb-cell ${c[mode]}`;
+        el.replaceChildren();
+        if (c.longerWorse) { const dot = document.createElement('b'); dot.className = 'jb-dot'; el.appendChild(dot); }
+        el.title = `pair ${i + 1}: ${c[mode]}`;
+      });
+    }
+
+    posIn.addEventListener('input', render);
+    lenIn.addEventListener('input', render);
+    padBtn.addEventListener('click', () => {
+      pad = !pad;
+      padBtn.setAttribute('aria-pressed', String(pad));
+      padBtn.textContent = pad ? 'Pad the losers: on' : 'Pad the losers: off';
+      render();
+    });
+    modeBtns.forEach((b) => b.addEventListener('click', () => {
+      mode = b.dataset.mode as typeof mode;
+      modeBtns.forEach((o) => o.setAttribute('aria-pressed', String(o === b)));
+      render();
+    }));
+    render();
+  });
+</script>

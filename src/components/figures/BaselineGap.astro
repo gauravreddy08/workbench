@@ -1,0 +1,71 @@
+---
+// Static figure: each gap on the scoreboard wired to the cause and the lesson that attacks it.
+---
+<svg viewBox="0 0 720 330" role="img" aria-label="Wiring diagram from scoreboard symptoms, through their cause, to the lesson that moves each number.">
+  <defs>
+    <marker id="bg-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" class="fill-blue" />
+    </marker>
+  </defs>
+
+  <text x="10" y="18" class="label" style="fill:var(--ink-3)">ON YOUR SCOREBOARD</text>
+  <text x="285" y="18" style="fill:var(--ink-3)">BECAUSE</text>
+  <text x="710" y="18" text-anchor="end" style="fill:var(--ink-3)">LESSON</text>
+  <line x1="10" y1="26" x2="710" y2="26" class="ink" stroke-width="1" />
+
+  <!-- row template: symptom box | cause text on wire | lesson box -->
+  <g>
+    <rect x="10" y="38" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="57">tok/s below the 17 tok/s line</text>
+    <line x1="260" y1="53" x2="548" y2="53" class="blue" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="285" y="48">Python + launch overhead</text>
+    <rect x="550" y="38" width="160" height="30" class="fill-wash" stroke-width="1" />
+    <text x="630" y="57" text-anchor="middle" class="blue-t">serving-engines</text>
+  </g>
+  <g>
+    <rect x="10" y="80" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="99">the 17 tok/s line itself</text>
+    <line x1="260" y1="95" x2="548" y2="95" class="blue" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="285" y="90">16 GB of weights read per token</text>
+    <rect x="550" y="80" width="160" height="30" class="fill-wash" stroke-width="1" />
+    <text x="630" y="99" text-anchor="middle" class="blue-t">quantization</text>
+  </g>
+  <g>
+    <rect x="10" y="122" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="141">one token per weight read</text>
+    <line x1="260" y1="137" x2="548" y2="137" class="blue" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="285" y="132">a pass can check many guesses</text>
+    <rect x="550" y="122" width="160" height="30" class="fill-wash" stroke-width="1" />
+    <text x="630" y="141" text-anchor="middle" class="blue-t">speculative-decoding</text>
+  </g>
+  <g>
+    <rect x="10" y="164" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="183">throughput flat as c grows</text>
+    <line x1="260" y1="179" x2="548" y2="179" class="blue" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="285" y="174">one request per weight read</text>
+    <rect x="550" y="164" width="160" height="30" class="fill-wash" stroke-width="1" />
+    <text x="630" y="183" text-anchor="middle" class="blue-t">batching</text>
+  </g>
+  <g>
+    <rect x="10" y="206" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="225">TTFT p99 explodes at c = 16</text>
+    <path d="M260,221 L330,221 L330,186 L548,186" class="blue dash" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="340" y="232">waits behind c − 1 requests</text>
+  </g>
+  <g>
+    <rect x="10" y="248" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="267">slow TTFT, same system prompt</text>
+    <line x1="260" y1="263" x2="548" y2="263" class="blue" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="285" y="258">re-prefills the same prefix</text>
+    <rect x="550" y="248" width="160" height="30" class="fill-wash" stroke-width="1" />
+    <text x="630" y="267" text-anchor="middle" class="blue-t">prefix-caching</text>
+  </g>
+  <g>
+    <rect x="10" y="290" width="250" height="30" class="fill-paper" stroke-width="1" />
+    <text x="20" y="309">how many users fit? long prompts?</text>
+    <line x1="260" y1="305" x2="548" y2="305" class="blue" stroke-width="1" marker-end="url(#bg-arr)" />
+    <text x="285" y="300">KV cache memory, attention cost</text>
+    <rect x="550" y="290" width="160" height="30" class="fill-wash" stroke-width="1" />
+    <text x="630" y="309" text-anchor="middle" class="blue-t">kv-cache · memory-math</text>
+  </g>
+</svg>

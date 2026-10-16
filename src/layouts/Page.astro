@@ -1,0 +1,12 @@
+---
+import Base from './Base.astro';
+const { frontmatter } = Astro.props;
+---
+<Base title={`${frontmatter.title.replace(/\.$/, '')} · Workbench`}>
+  <main class="page">
+    <span class="label">Workbench</span>
+    <h1 style="margin-top:14px">{frontmatter.title}</h1>
+    <div class="ticks" style="margin:24px 0 8px"></div>
+    <article class="prose"><slot /></article>
+  </main>
+</Base>

@@ -1,0 +1,219 @@
+---
+// The speculative sampling accept/reject rule on a toy 6-token vocabulary.
+// Draft q proposes, target p accepts with prob min(1, p/q), rejections resample from the
+// normalized residual max(0, p - q). Sample 10,000 times and compare the histogram to p.
+// Usage: <SpecAcceptReject />
+---
+<div class="sar" data-fig="spec-accept-reject">
+  <svg viewBox="0 0 560 372" role="img" aria-label="Four bar charts: the draft distribution q, the target distribution p split into accepted and residual parts, the residual distribution, and the empirical histogram of outputs compared with p">
+    <g data-layer="panels"></g>
+  </svg>
+  <p class="sar-note" aria-live="polite"></p>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="one">Sample 1</button>
+    <button class="btn" type="button" data-act="many">Sample 10,000</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+    <button class="btn" type="button" data-act="bug" aria-pressed="false">Bug: on reject, sample p</button>
+  </div>
+  <div class="ctl">
+    <span>draft</span>
+    <button class="btn" type="button" data-base="toy" aria-pressed="true">Small model</button>
+    <button class="btn" type="button" data-base="onehot">One guess (lookup)</button>
+    <label>closer to p <input type="range" min="0" max="1" step="0.05" value="0" data-in="t" /> <output data-out="t">0.00</output></label>
+  </div>
+  <div class="ctl">
+    <span>α = Σ min(p,q) <span class="readout" data-out="alpha">-</span></span>
+    <span>samples <span class="readout" data-out="n">0</span></span>
+    <span>accepted <span class="readout" data-out="acc">-</span></span>
+    <span>max |emp − p| <span class="readout" data-out="err">-</span></span>
+    <span>χ² <span class="readout" data-out="chi">-</span></span>
+  </div>
+</div>
+
+<style>
+  .sar svg { width: 100%; }
+  .sar-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const TOK = ['THE', 'A', 'CAT', 'DOG', 'SAT', 'ON'];
+  const P = [0.4, 0.25, 0.15, 0.1, 0.06, 0.04];
+  const BASES: Record<string, number[]> = {
+    toy: [0.2, 0.4, 0.1, 0.05, 0.2, 0.05],
+    onehot: [1, 0, 0, 0, 0, 0],
+  };
+  // chi-square critical values at the 5% level, by degrees of freedom
+  const CRIT: Record<number, number> = { 1: 3.84, 2: 5.99, 3: 7.81, 4: 9.49, 5: 11.07 };
+  const NS = 'http://www.w3.org/2000/svg';
+  const mk = (tag: string, a: Record<string, string | number>, text?: string) => {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(a)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  };
+  const draw = (w: number[]) => {
+    let u = Math.random(), i = 0;
+    for (; i < w.length - 1; i++) { u -= w[i]; if (u < 0) return i; }
+    return i;
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-fig="spec-accept-reject"]').forEach((root) => {
+    const q$ = <T extends Element>(s: string) => root.querySelector<T>(s)!;
+    const G = q$<SVGGElement>('[data-layer="panels"]');
+    const note = q$<HTMLElement>('.sar-note');
+    const out = (k: string) => q$<HTMLElement>(`[data-out="${k}"]`);
+    const tIn = q$<HTMLInputElement>('[data-in="t"]');
+    const bugBtn = q$<HTMLButtonElement>('[data-act="bug"]');
+    let base = 'toy';
+    let bug = false;
+    let q: number[] = [];
+    let res: number[] = [];
+    let alpha = 0;
+    let counts = [0, 0, 0, 0, 0, 0];
+    let n = 0, nAcc = 0;
+    let last: { d: number; o: number; ok: boolean } | null = null;
+
+    const recompute = () => {
+      const t = Number(tIn.value);
+      const b = BASES[base];
+      q = b.map((v, i) => (1 - t) * v + t * P[i]);
+      const mins = P.map((p, i) => Math.min(p, q[i]));
+      alpha = mins.reduce((s, x) => s + x, 0);
+      const r = P.map((p, i) => Math.max(0, p - q[i]));
+      const rs = r.reduce((s, x) => s + x, 0);
+      res = rs > 1e-12 ? r.map((x) => x / rs) : r.map(() => 0);
+      counts = [0, 0, 0, 0, 0, 0]; n = 0; nAcc = 0; last = null;
+      out('t').textContent = t.toFixed(2);
+    };
+
+    const once = () => {
+      const d = draw(q);
+      const ok = Math.random() < Math.min(1, P[d] / q[d]);
+      let o = d;
+      if (!ok) o = bug ? draw(P) : draw(res);
+      counts[o]++; n++; if (ok) nAcc++;
+      return { d, o, ok };
+    };
+
+    // panel geometry
+    const PW = 268, PH = 150;
+    const panel = (x0: number, y0: number, title: string, sub: string) => {
+      G.appendChild(mk('rect', { x: x0, y: y0, width: PW, height: PH + 18, class: 'fill-paper', 'stroke-width': 1 }));
+      G.appendChild(mk('text', { x: x0 + 8, y: y0 + 15, class: 'strong' }, title));
+      G.appendChild(mk('text', { x: x0 + PW - 8, y: y0 + 15, 'text-anchor': 'end' }, sub));
+    };
+    const BW = 30, GAP = 12;
+    const barX = (x0: number, i: number) => x0 + 18 + i * (BW + GAP);
+    const baseY = (y0: number) => y0 + PH - 6;
+    const H = 96;
+
+    const render = () => {
+      G.replaceChildren();
+      const sc = (vals: number[]) => Math.max(0.5, ...vals);
+      // Panel 1: draft q
+      {
+        const x0 = 6, y0 = 4, s = sc(q), by = baseY(y0);
+        panel(x0, y0, 'DRAFT q · PROPOSES', 'SOLID = KEPT');
+        q.forEach((v, i) => {
+          const x = barX(x0, i), h = (v / s) * H, hk = (Math.min(v, P[i]) / s) * H;
+          if (h > 0) G.appendChild(mk('rect', { x, y: by - h, width: BW, height: h, class: 'ink dash', 'stroke-width': 1 }));
+          if (hk > 0) G.appendChild(mk('rect', { x, y: by - hk, width: BW, height: hk, class: 'fill-blue' }));
+          if (last && last.d === i) G.appendChild(mk('rect', { x: x - 3, y: by - Math.max(h, 2) - 3, width: BW + 6, height: Math.max(h, 2) + 6, class: 'blue', 'stroke-width': 1.5 }));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by - h - 4, 'text-anchor': 'middle' }, v.toFixed(2)));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by + 14, 'text-anchor': 'middle' }, TOK[i]));
+        });
+      }
+      // Panel 2: target p split into min(p,q) and max(0,p-q)
+      {
+        const x0 = 286, y0 = 4, s = sc(P), by = baseY(y0);
+        panel(x0, y0, 'TARGET p', 'SOLID + WASH = p');
+        P.forEach((v, i) => {
+          const x = barX(x0, i), h = (v / s) * H, hk = (Math.min(v, q[i]) / s) * H;
+          G.appendChild(mk('rect', { x, y: by - h, width: BW, height: h, class: 'fill-wash', 'stroke-width': 1 }));
+          if (hk > 0) G.appendChild(mk('rect', { x, y: by - hk, width: BW, height: hk, class: 'fill-blue' }));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by - h - 4, 'text-anchor': 'middle' }, v.toFixed(2)));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by + 14, 'text-anchor': 'middle' }, TOK[i]));
+        });
+      }
+      // Panel 3: residual
+      {
+        const x0 = 6, y0 = 194, by = baseY(y0);
+        panel(x0, y0, 'RESIDUAL max(0, p−q)', 'RESCALED');
+        const s = Math.max(0.5, ...res);
+        if (res.every((x) => x === 0)) {
+          G.appendChild(mk('text', { x: x0 + PW / 2, y: y0 + 80, 'text-anchor': 'middle' }, 'EMPTY: q = p, NEVER REJECTS'));
+        }
+        res.forEach((v, i) => {
+          const x = barX(x0, i), h = (v / s) * H;
+          if (h > 0) G.appendChild(mk('rect', { x, y: by - h, width: BW, height: h, class: 'fill-wash', 'stroke-width': 1 }));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by - h - 4, 'text-anchor': 'middle' }, v.toFixed(2)));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by + 14, 'text-anchor': 'middle' }, TOK[i]));
+        });
+      }
+      // Panel 4: empirical histogram vs p
+      {
+        const x0 = 286, y0 = 194, by = baseY(y0);
+        panel(x0, y0, 'OUTPUT', 'TICK = p');
+        const emp = counts.map((c) => (n ? c / n : 0));
+        const s = Math.max(0.5, ...emp, ...P);
+        if (!n) G.appendChild(mk('text', { x: x0 + PW / 2, y: y0 + 60, 'text-anchor': 'middle' }, 'PRESS SAMPLE'));
+        emp.forEach((v, i) => {
+          const x = barX(x0, i), h = (v / s) * H, hp = (P[i] / s) * H;
+          if (h > 0) G.appendChild(mk('rect', { x: x + 4, y: by - h, width: BW - 8, height: h, class: last && last.o === i && n < 50 ? 'fill-blue' : 'fill-wash', 'stroke-width': 1 }));
+          G.appendChild(mk('line', { x1: x - 2, y1: by - hp, x2: x + BW + 2, y2: by - hp, class: 'ink', 'stroke-width': 1.5 }));
+          if (n) G.appendChild(mk('text', { x: x + BW / 2, y: by - Math.max(h, hp) - 4, 'text-anchor': 'middle' }, v.toFixed(2)));
+          G.appendChild(mk('text', { x: x + BW / 2, y: by + 14, 'text-anchor': 'middle' }, TOK[i]));
+        });
+      }
+
+      out('alpha').textContent = alpha.toFixed(3);
+      out('n').textContent = n.toLocaleString('en-US');
+      out('acc').textContent = n ? `${((100 * nAcc) / n).toFixed(1)}%` : '-';
+      if (n) {
+        const emp = counts.map((c) => c / n);
+        out('err').textContent = Math.max(...emp.map((e, i) => Math.abs(e - P[i]))).toFixed(4);
+        const chi = counts.reduce((s, c, i) => s + (c - P[i] * n) ** 2 / (P[i] * n), 0);
+        const crit = CRIT[P.length - 1];
+        out('chi').textContent = `${chi.toFixed(1)} ${chi < crit ? '< ' : '> '}${crit} ${chi < crit ? '(looks like p)' : '(NOT p)'}`;
+      } else {
+        out('err').textContent = '-';
+        out('chi').textContent = '-';
+      }
+
+      if (last && n < 50) {
+        const d = last.d;
+        const ratio = P[d] / q[d];
+        const ap = Math.min(1, ratio);
+        note.textContent = `Draft proposed ${TOK[d]} (q = ${q[d].toFixed(2)}). Target says p = ${P[d].toFixed(2)}, so keep it with probability min(1, ${P[d].toFixed(2)}/${q[d].toFixed(2)}) = ${ap.toFixed(2)}. ` +
+          (last.ok ? `Kept: output ${TOK[last.o]}.` : `Rejected, so ${bug ? 'sample again from p (the bug)' : 'sample from the residual'}: output ${TOK[last.o]}.`);
+      } else if (n) {
+        const biased = P.map((p, i) => Math.min(p, q[i]) + (1 - alpha) * p - p);
+        const lo = biased.indexOf(Math.min(...biased)), hi = biased.indexOf(Math.max(...biased));
+        note.textContent = bug
+          ? (alpha > 0.999
+            ? 'q equals p here, so nothing is ever rejected and the bug never fires. Move the slider back.'
+            : `With the bug, rejected draws go back into all of p instead of into the part of p the draft under-covered. ${TOK[lo]} comes out too rarely and ${TOK[hi]} too often: the output is min(p,q) + (1−α)·p, not p.`)
+          : `${n.toLocaleString('en-US')} outputs. Every bar sits on its tick: the solid part came from kept drafts, the rest from the residual, and together they rebuild p exactly.`;
+      } else {
+        note.textContent = `About ${(alpha * 100).toFixed(0)}% of drafts will be kept: that is the overlap of the two bar charts, the solid blue. Press Sample 1 a few times, then Sample 10,000.`;
+      }
+    };
+
+    q$('[data-act="one"]').addEventListener('click', () => { last = once(); render(); });
+    q$('[data-act="many"]').addEventListener('click', () => { for (let k = 0; k < 10000; k++) last = once(); render(); });
+    q$('[data-act="reset"]').addEventListener('click', () => { recompute(); render(); });
+    bugBtn.addEventListener('click', () => {
+      bug = !bug;
+      bugBtn.setAttribute('aria-pressed', String(bug));
+      recompute(); render();
+    });
+    root.querySelectorAll<HTMLButtonElement>('[data-base]').forEach((b) => b.addEventListener('click', () => {
+      root.querySelectorAll('[data-base]').forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      base = b.dataset.base!;
+      recompute(); render();
+    }));
+    tIn.addEventListener('input', () => { recompute(); render(); });
+    recompute();
+    render();
+  });
+</script>

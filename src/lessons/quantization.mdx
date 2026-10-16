@@ -1,0 +1,737 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import QuantGrid from '../components/figures/QuantGrid.astro';
+
+## Today
+
+- Quantize and dequantize a weight matrix by hand: pick a scale and a zero-point, round, and say exactly how big the error can be.
+- Explain why one huge weight can ruin a whole tensor, and how per-channel and per-group scales (group size 128) contain the damage.
+- Say which formats speed up decode (fewer bytes: W4A16, W8A16) and which also speed up prefill (cheaper math: W8A8, FP8, FP4), and why.
+- Read the alphabet soup: FP8 E4M3 and E5M2, NVFP4, MXFP4, GPTQ, AWQ, SmoothQuant, LLM.int8(), Q4_K_M.
+- Serve the same model in bf16, fp8 and 4-bit on the Spark, check each speed against the bandwidth prediction, measure what quality you paid, and add the rows to `SCOREBOARD.md`.
+
+Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bytes per token sets decode speed) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your `bench.py` and scoreboard). It helps to have skimmed [fp32, bf16, fp16, fp8](/lessons/number-formats/), but this lesson explains what it needs. Time: an evening on your Mac for the hand-built part, an evening on the Spark for serving and evals.
+
+## The Problem
+
+Your scoreboard has a ceiling on it. Llama 3.1 8B in bf16 is about 16 GB, the Spark's spec sheet says 273 GB/s, and you can't decode faster than about 17 tokens per second no matter how clever the server is. The bandwidth lesson told you the cheapest way past it: read fewer bytes. Store each weight in 4 bits instead of 16 and the same pipe should carry you to something like 55 tok/s.
+
+So you try the obvious thing. Take every weight matrix, find its biggest value, divide everything so the biggest value lands on 7, round to the nearest whole number, and store integers from −8 to 7. Four bits each. That is a real quantizer, and on paper it is fine.
+
+I did exactly that to Qwen2.5 0.5B on my Mac. Its <Term w="perplexity">A score for how surprised a language model is by real text: e raised to the average negative log-probability per token. Lower is better. A perplexity of 14 means the model is, on average, about as unsure as picking among 14 equally likely tokens.</Term> on Wikipedia text went from **14.4** to **79 million**. The model was not slightly worse. It was gone: it predicted tokens about as well as a random number generator with opinions.
+
+Then I changed one thing. Instead of one scale for each whole matrix, I used one scale for every 128 weights. Same 4 bits. Perplexity: **20.0**. Add a zero-point to each group and it was 17.2. And a popular 4-bit file of Llama 3.1 8B (llama.cpp's Q4_K_M) is used by thousands of people every day and, on most chat tasks, is hard to tell from the original.
+
+Same bit count, results that range from "unchanged" to "destroyed". The whole lesson is about the gap between those, which comes down to three questions: **which numbers share a scale, which numbers you quantize at all, and how you round.**
+
+<Origin year="2018–2022" title="From phones to 175 billion parameters">
+
+Quantization is older than LLMs. In 2017-2018 a team at Google (Benoit Jacob and colleagues) wanted image models to run on phone CPUs, which do 8-bit integer math far faster than floating point. Their paper, "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference," wrote down the scheme everybody still uses: every real number is stored as a small integer plus a shared *scale* and *zero-point*. It worked well for CNNs at 8 bits and became the standard in TensorFlow Lite and later PyTorch.
+
+Then models got enormous. In 2022, OPT-175B and BLOOM-176B needed about 350 GB just to hold their weights in fp16, several data-center GPUs' worth. Two papers that year made big models small. Tim Dettmers' **LLM.int8()** found that the old 8-bit recipe broke on large transformers because of a handful of giant "outlier" activation features, and worked around them. Elias Frantar's **GPTQ** squeezed OPT-175B to 3-4 bits in about four GPU-hours on a single GPU by rounding cleverly instead of naively. Within a year, llama.cpp was running 4-bit LLaMA on laptops, and "which quant?" became the first question anyone asked about an open model.
+
+</Origin>
+
+## The Idea
+
+### A ruler with fewer marks
+
+Think of a ruler. A good one has marks every millimetre. A cheap one has marks every centimetre. Measure a pencil with the cheap one and you write down the nearest mark: 14 cm instead of 14.3. You can never be off by more than half a centimetre, and you only need to remember a small whole number.
+
+<Term w="quantization">Storing numbers with fewer bits by snapping each one to the nearest point on a coarse grid, and remembering only which grid point it was.</Term> is a cheap ruler for weights. A bf16 weight can be any of about 65,000 values. A 4-bit weight can be one of exactly 16. You choose where those 16 marks go, snap every weight to its nearest mark, and store the mark's number. When you need the weight again you look up where mark number 9 was; that step is called <Term w="dequantization">Turning the stored small integer back into an approximate real number, usually by multiplying by the scale. It happens on the fly, inside the kernel, right before the math.</Term>.
+
+The only question is where to put the marks. Put them too far apart and every weight moves a lot. Put them too close and the biggest weights fall off the end of the ruler.
+
+### Scale and zero-point
+
+The standard ruler has evenly spaced marks, which makes it a <Term w="uniform quantizer">A quantizer whose grid points are evenly spaced. Every step between neighbouring levels is the same size.</Term>. Two numbers describe it completely.
+
+- The <Term w="scale">The distance between neighbouring grid points, in real units. Usually written s or Δ. Dequantizing is (integer − zero-point) × scale.</Term> is the step between marks.
+- The <Term w="zero-point">The integer that stands for the real number 0.0. It lets the grid sit off-centre, so a range like −0.6 to 0.9 can use all 16 levels instead of wasting some.</Term> is which integer means "zero".
+
+With b bits you have 2^b integers, 0 through 2^b − 1. To cover the range from the smallest value to the largest:
+
+```text
+s  = (max − min) / (2^b − 1)              the step
+z  = round(−min / s)                       the integer that means 0.0
+
+quantize:    q  = clamp(round(x / s) + z, 0, 2^b − 1)
+dequantize:  x̂  = s × (q − z)
+```
+
+<Term w="clamp">Force a value into a range: anything below the bottom becomes the bottom, anything above the top becomes the top.</Term> only matters for values outside the range you planned for. This is called <Term w="affine quantization">Uniform quantization with both a scale and a zero-point, so the grid can be shifted. Also called asymmetric. "Affine" means "multiply, then shift".</Term>. Here it is on a number line, with a range of −0.6 to 0.9 and 4 bits.
+
+<Figure n="001" title="AFFINE 4-BIT, ON A NUMBER LINE" caption="Sixteen evenly spaced marks cover the range from −0.6 to 0.9. The step is 0.1, and integer 6 stands for exactly 0.0. The value 0.33 rounds to integer 9, which dequantizes to 0.30. No value inside the range can be off by more than half a step.">
+<svg viewBox="0 0 560 216" role="img" aria-label="A real number line from minus 0.6 to 0.9 mapped onto integers 0 to 15">
+  <text x="10" y="18" class="strong">REAL VALUES x</text>
+  <line x1="40" y1="50" x2="520" y2="50" class="ink" stroke-width="1.2" />
+  <g class="ink" stroke-width="1">
+    <line x1="40" y1="44" x2="40" y2="56" /><line x1="72" y1="44" x2="72" y2="56" /><line x1="104" y1="44" x2="104" y2="56" /><line x1="136" y1="44" x2="136" y2="56" />
+    <line x1="168" y1="44" x2="168" y2="56" /><line x1="200" y1="44" x2="200" y2="56" /><line x1="232" y1="40" x2="232" y2="60" /><line x1="264" y1="44" x2="264" y2="56" />
+    <line x1="296" y1="44" x2="296" y2="56" /><line x1="328" y1="44" x2="328" y2="56" /><line x1="360" y1="44" x2="360" y2="56" /><line x1="392" y1="44" x2="392" y2="56" />
+    <line x1="424" y1="44" x2="424" y2="56" /><line x1="456" y1="44" x2="456" y2="56" /><line x1="488" y1="44" x2="488" y2="56" /><line x1="520" y1="44" x2="520" y2="56" />
+  </g>
+  <text x="40" y="36" text-anchor="middle">−0.6</text>
+  <text x="232" y="36" text-anchor="middle" class="strong">0.0</text>
+  <text x="520" y="36" text-anchor="middle">0.9</text>
+  <text x="136" y="36" text-anchor="middle">−0.3</text>
+  <text x="328" y="36" text-anchor="middle">0.3</text>
+  <text x="424" y="36" text-anchor="middle">0.6</text>
+
+  <line x1="40" y1="56" x2="40" y2="140" class="blue dash" stroke-width="1" />
+  <line x1="232" y1="60" x2="232" y2="140" class="blue dash" stroke-width="1" />
+  <line x1="520" y1="56" x2="520" y2="140" class="blue dash" stroke-width="1" />
+  <circle cx="338" cy="50" r="4" class="fill-blue" />
+  <text x="344" y="76" class="blue-t">x = 0.33</text>
+  <line x1="338" y1="54" x2="328" y2="140" class="blue" stroke-width="1.2" />
+
+  <text x="10" y="128" class="strong">STORED q (4 BITS)</text>
+  <g>
+    <rect x="28" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="60" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+    <rect x="92" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="124" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+    <rect x="156" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="188" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+    <rect x="220" y="140" width="24" height="22" class="fill-wash" stroke-width="1" /><rect x="252" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+    <rect x="284" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="316" y="140" width="24" height="22" class="fill-wash" stroke-width="1.5" />
+    <rect x="348" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="380" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+    <rect x="412" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="444" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+    <rect x="476" y="140" width="24" height="22" class="fill-paper" stroke-width="1" /><rect x="508" y="140" width="24" height="22" class="fill-paper" stroke-width="1" />
+  </g>
+  <text x="40" y="155" text-anchor="middle">0</text><text x="72" y="155" text-anchor="middle">1</text><text x="104" y="155" text-anchor="middle">2</text><text x="136" y="155" text-anchor="middle">3</text>
+  <text x="168" y="155" text-anchor="middle">4</text><text x="200" y="155" text-anchor="middle">5</text><text x="232" y="155" text-anchor="middle" class="strong">6</text><text x="264" y="155" text-anchor="middle">7</text>
+  <text x="296" y="155" text-anchor="middle">8</text><text x="328" y="155" text-anchor="middle" class="strong">9</text><text x="360" y="155" text-anchor="middle">10</text><text x="392" y="155" text-anchor="middle">11</text>
+  <text x="424" y="155" text-anchor="middle">12</text><text x="456" y="155" text-anchor="middle">13</text><text x="488" y="155" text-anchor="middle">14</text><text x="520" y="155" text-anchor="middle">15</text>
+  <text x="232" y="176" text-anchor="middle" class="blue-t">z = 6</text>
+  <text x="10" y="190">s = (0.9 − (−0.6)) / 15 = 0.1</text>
+  <text x="10" y="206">q = round(0.33 / 0.1) + 6 = 9 · x̂ = 0.1 × (9 − 6) = 0.30</text>
+</svg>
+</Figure>
+
+Two things fall out of this picture.
+
+**The worst-case error is half a step.** Any value inside the range is at most s/2 from a mark. If the weights are spread out in a reasonable way, the rounding error behaves like a random number spread evenly between −s/2 and +s/2, whose typical size (its root-mean-square) is s/√12, about 0.29 s. Every extra bit doubles the number of marks, halves the step, and halves the error. Going from 8 bits to 4 makes the error roughly 16 times bigger.
+
+**Zero is exact.** Integer 6 decodes to exactly 0.0. That sounds like a nicety, but neural networks are full of real zeros (padding, ReLU outputs, masked entries), and a grid that can't represent zero turns every one of them into a small wrong number.
+
+When the values are roughly centred on zero, as weights almost always are, people drop the zero-point and use a grid symmetric around 0: integers −7 to 7 (or −8 to 7) with s = max|x| / 7. That is <Term w="symmetric quantization">Affine quantization with the zero-point fixed at 0. One number (the scale) per group instead of two, and the math in the kernel gets a little simpler. The cost is wasted levels if the values are lopsided.</Term>. It wastes a little range when the values are lopsided, and saves storing the zero-point and a subtraction in the kernel. Most int8 and many int4 schemes are symmetric; most 4-bit GPTQ/AWQ checkpoints and llama.cpp's k-quants use a zero-point or a "min" offset.
+
+The simple scheme of computing s from the range and rounding every weight to its nearest mark has a name: <Term w="round-to-nearest">Quantize each weight independently to its closest grid point. No data, no optimization. Abbreviated RTN. The baseline every smarter method compares against.</Term>, or RTN. It is what I did to Qwen above. Keep it in mind; we'll do better later.
+
+<Predict id="outlier-scale">
+A row of 4,096 weights is roughly bell-shaped with a standard deviation of 0.02, so almost all of them are between −0.06 and 0.06. One weight is 0.5. You quantize the row to symmetric int4 with s = max|x| / 7. Roughly what fraction of the weights get rounded to exactly 0?
+
+<Fragment slot="answer">
+
+Most of them. The one big weight sets s = 0.5 / 7 ≈ 0.071. A weight rounds to 0 when its size is below s/2 ≈ 0.036, which is about 1.8 standard deviations. For a bell curve, that's around **93%** of the weights. All of them become 0, and the row is now mostly the outlier plus a few survivors. On a real Qwen2.5 0.5B MLP matrix quantized per-tensor to int4 (its biggest weight is about 21 standard deviations out), I measured **88%** of weights rounded to zero, and a reconstruction error of 78%. The scale is set by the one number you care least about representing precisely.
+
+</Fragment>
+</Predict>
+
+### Who shares a scale
+
+That prediction is the outlier problem in one line. A shared scale is only as good as the widest value it has to cover. So the most important design choice in quantization is not the bit count: it is **how many weights share each scale**. There are three standard answers.
+
+- <Term w="per-tensor">One scale for an entire weight matrix. Cheapest to store, but the single largest value in the whole matrix sets the step for millions of weights.</Term>: one scale for the whole matrix.
+- <Term w="per-channel">One scale per output channel, meaning per row of the weight matrix (the weights that produce one output number). One outlier only hurts its own row.</Term>: one scale per row. A 4,096 × 4,096 matrix gets 4,096 scales.
+- <Term w="per-group">Each row is cut into blocks of g consecutive weights (g = 128 is the common choice for 4-bit) and each block gets its own scale. An outlier only hurts its own 128 neighbours.</Term>: each row cut into blocks of g weights, usually 128, each with its own scale. Same matrix, 131,072 scales.
+
+<Figure n="002" title="WHO SHARES A SCALE" caption="The same weight matrix with three granularities. Each shaded region shares one scale. A single outlier (the dot) widens the grid for everything in its region, so the smaller the region, the fewer weights pay. The cost is storing more scales.">
+<svg viewBox="0 0 560 250" role="img" aria-label="Three copies of a weight matrix: one scale for the whole matrix, one per row, and one per block of 128 within each row">
+  <text x="10" y="16" class="strong">PER-TENSOR</text>
+  <rect x="10" y="28" width="160" height="128" class="fill-wash" stroke-width="1.2" />
+  <circle cx="44" cy="44" r="4" class="fill-blue" />
+  <text x="90" y="98" text-anchor="middle" class="blue-t">ONE s</text>
+  <text x="10" y="176">4096 × 4096: 1 SCALE</text>
+  <text x="10" y="192">+0 BITS/WEIGHT</text>
+  <text x="10" y="216" class="strong">OUTLIER HURTS: 16.8M</text>
+
+  <text x="200" y="16" class="strong">PER-CHANNEL (ROW)</text>
+  <g stroke-width="1">
+    <rect x="200" y="28" width="160" height="16" class="fill-blue" /><rect x="200" y="44" width="160" height="16" class="fill-paper" />
+    <rect x="200" y="60" width="160" height="16" class="fill-wash" /><rect x="200" y="76" width="160" height="16" class="fill-paper" />
+    <rect x="200" y="92" width="160" height="16" class="fill-wash" /><rect x="200" y="108" width="160" height="16" class="fill-paper" />
+    <rect x="200" y="124" width="160" height="16" class="fill-wash" /><rect x="200" y="140" width="160" height="16" class="fill-paper" />
+  </g>
+  <circle cx="234" cy="36" r="4" class="fill-paper" />
+  <text x="372" y="40" class="blue-t">s₀</text>
+  <text x="372" y="56">s₁ …</text>
+  <text x="200" y="176">4096 SCALES</text>
+  <text x="200" y="192">+0.004 BITS/WEIGHT</text>
+  <text x="200" y="216" class="strong">OUTLIER HURTS: 4,096</text>
+
+  <text x="400" y="16" class="strong">PER-GROUP, g = 128</text>
+  <g stroke-width="1">
+    <rect x="400" y="28" width="40" height="16" class="fill-blue" /><rect x="440" y="28" width="40" height="16" class="fill-paper" /><rect x="480" y="28" width="40" height="16" class="fill-wash" /><rect x="520" y="28" width="30" height="16" class="fill-paper" />
+    <rect x="400" y="44" width="40" height="16" class="fill-paper" /><rect x="440" y="44" width="40" height="16" class="fill-wash" /><rect x="480" y="44" width="40" height="16" class="fill-paper" /><rect x="520" y="44" width="30" height="16" class="fill-wash" />
+    <rect x="400" y="60" width="40" height="16" class="fill-wash" /><rect x="440" y="60" width="40" height="16" class="fill-paper" /><rect x="480" y="60" width="40" height="16" class="fill-wash" /><rect x="520" y="60" width="30" height="16" class="fill-paper" />
+    <rect x="400" y="76" width="40" height="16" class="fill-paper" /><rect x="440" y="76" width="40" height="16" class="fill-wash" /><rect x="480" y="76" width="40" height="16" class="fill-paper" /><rect x="520" y="76" width="30" height="16" class="fill-wash" />
+    <rect x="400" y="92" width="40" height="16" class="fill-wash" /><rect x="440" y="92" width="40" height="16" class="fill-paper" /><rect x="480" y="92" width="40" height="16" class="fill-wash" /><rect x="520" y="92" width="30" height="16" class="fill-paper" />
+    <rect x="400" y="108" width="40" height="16" class="fill-paper" /><rect x="440" y="108" width="40" height="16" class="fill-wash" /><rect x="480" y="108" width="40" height="16" class="fill-paper" /><rect x="520" y="108" width="30" height="16" class="fill-wash" />
+    <rect x="400" y="124" width="40" height="16" class="fill-wash" /><rect x="440" y="124" width="40" height="16" class="fill-paper" /><rect x="480" y="124" width="40" height="16" class="fill-wash" /><rect x="520" y="124" width="30" height="16" class="fill-paper" />
+    <rect x="400" y="140" width="40" height="16" class="fill-paper" /><rect x="440" y="140" width="40" height="16" class="fill-wash" /><rect x="480" y="140" width="40" height="16" class="fill-paper" /><rect x="520" y="140" width="30" height="16" class="fill-wash" />
+  </g>
+  <circle cx="414" cy="36" r="4" class="fill-paper" />
+  <text x="400" y="176">131,072 SCALES</text>
+  <text x="400" y="192">+0.125 BITS/WEIGHT</text>
+  <text x="400" y="216" class="strong">OUTLIER HURTS: 128</text>
+  <text x="10" y="242">SCALES STORED IN FP16 · MORE SCALES = FINER GRIDS = MORE BYTES</text>
+</svg>
+</Figure>
+
+Why rows and not columns? Because of how the matrix multiply adds things up. Output number i is the dot product of row i of W with the input vector. If every weight in row i shares one scale s_i, you can pull it out of the sum: compute the dot product in integers, then multiply the result by s_i once. A scale that changes along a column would land inside the sum and cost a multiply per weight. Groups cut a row into pieces, so the kernel does a small integer dot product per group and rescales each partial sum, a bit more work for a lot more accuracy.
+
+And the cost of all those scales is not zero. A group of 128 weights at 4 bits is 512 bits; one fp16 scale is 16 more, so 4 + 16/128 = **4.125 bits per weight**, and a 4-bit zero-point adds 4/128 more. That is why "4-bit" models are never exactly a quarter of the bf16 size. Keep this arithmetic handy, because it decides your speed: tokens per second is bandwidth divided by *all* the bytes, scales included.
+
+Here it is on a real matrix. I took the first MLP matrix of Qwen2.5 0.5B (`gate_proj` in layer 0, 4,864 × 896) and quantized it with symmetric RTN at different granularities. The number is the relative reconstruction error, the size of the error matrix divided by the size of the original (lower is better):
+
+| Granularity | int8 | int4 |
+|---|---|---|
+| Per-tensor | 4.8% | 78.2% |
+| Per-channel | 0.85% | 15.3% |
+| Group 128 | 0.68% | 12.3% |
+| Group 32 | 0.55% | 9.9% |
+| Group 128, affine | 0.61% | 10.3% |
+
+At 8 bits even per-tensor is survivable. At 4 bits the granularity is everything: going from one scale to one per row cuts the error five-fold, and groups of 128 cut it a bit more. Now play with it yourself.
+
+<Figure n="003" title="THE QUANTIZATION GRID" caption="A toy weight matrix: 4 output channels × 512 inputs, bell-shaped, each row with its own spread. Top: the histogram of whichever group contains weight [0, 40], with the grid's levels drawn as blue lines. Bottom: one cell per scale, darker meaning more error in that group. Turn on the outlier at 4 bits with per-tensor scales, then switch to per-channel and group 128. Then drag the bits." wide>
+
+<QuantGrid />
+
+</Figure>
+
+Things to try, in order:
+
+1. **4 bits, group 128, no outlier.** The histogram fills the grid nicely. Error around 13%.
+2. **Turn on the outlier.** In the focus group, the bell collapses into a thin spike in the middle and almost all of it lands on one level: over 90% of that group rounds to 0. But the other groups' cells don't change at all. The damage is contained to 128 weights.
+3. **Switch to per-tensor.** Now the outlier's scale applies to all 2,048 weights. Overall error jumps to about 70%. That's my 79-million-perplexity Qwen.
+4. **Per-tensor, outlier off.** Still bad (about 29%), because row 1 is spread wider than the others and its range sets the step for everyone. Per-channel fixes that even without outliers.
+5. **Drag bits from 4 to 8** with the outlier on, per-tensor. 256 levels instead of 16 shrinks the step 17-fold; the spike spreads across many levels again. This is why 8-bit is forgiving and 4-bit is not.
+6. **Toggle affine.** It helps the most when a group's values are lopsided, and costs a few more bits per weight in the readout.
+
+### Outliers are real, and they live in activations
+
+The planted outlier was a toy. Are real models like that? Weights mostly aren't badly: in that Qwen matrix the largest weight is about 21 standard deviations out, enough to ruin per-tensor 4-bit but easily handled by groups.
+
+**Activations** are a different animal. The <Term w="activations">The numbers flowing between layers for a specific input: the vectors that get multiplied by the weights. Unlike weights, they change with every token, so you can't inspect them all ahead of time.</Term> going into some layers have a few channels that are hundreds or thousands of times larger than the rest, on almost every token. I hooked the inputs of every linear layer in Qwen2.5 0.5B on 512 tokens of Wikipedia. Going into the MLP down-projection of layer 2, the typical activation had size 0.04, and channel 813 hit **1,631**. That is 37,000 times the median.
+
+Dettmers found the same thing in 2022 and called them <Term w="outlier features">A few hidden dimensions whose activations are consistently huge (he used magnitude 6 or more as the cut-off) across most tokens and layers. In the OPT models they appeared suddenly around 6.7B parameters and then dominated.</Term>. In his OPT experiments they showed up abruptly around the 6.7-billion-parameter scale, sat in the same few hidden dimensions across layers and tokens, and the model's quality depended on them: zero them out and performance collapses. They are not noise. The model uses them on purpose, as a kind of control signal.
+
+Here is what they do to activation quantization. I quantized the *input* of every linear layer of Qwen2.5 0.5B to int8 on the fly, weights untouched:
+
+| Activations | Perplexity |
+|---|---|
+| Unquantized | 14.45 |
+| int8, one scale per token | 14.73 |
+| int8, one scale per tensor | 76.6 |
+
+Per-token scales mostly survive; one scale for the whole activation matrix is wrecked by the outlier channels. And you can't fix it with per-channel scales the way you did for weights, because of the row rule: for activations, a channel is a *column* of the input, which sits inside the dot product. Two papers found two ways out.
+
+**LLM.int8()** (Dettmers, Lewis, Belkada, Zettlemoyer, 2022) splits the matrix multiply in two: the few outlier columns go through in fp16, the other 99.9% in int8, and the results are added. Accurate, and it made 175B models fit on far fewer GPUs, but the split makes it slower than plain fp16 at small batch. It is a memory saver, not a speed-up.
+
+**SmoothQuant** (Xiao, Lin and colleagues, 2022) uses a bit of algebra. For any per-channel factors s_j, `X W = (X / s) (s W)`: divide input channel j of the activations by s_j and multiply the weights that channel feeds by the same s_j, and the output is unchanged. Choose s_j large for the outlier channels and the activation spikes shrink, while the weights, which were easy to quantize, get a little harder. The paper picks s_j = max|X_j|^α / max|W_j|^(1−α) with α around 0.5, "migrating" the difficulty from activations to weights, and gets accurate int8 for both. Then the scales are folded into the previous layer, so at runtime it costs nothing.
+
+### Weights only, or weights and activations?
+
+That distinction, weights only versus both, decides *which* part of inference gets faster. The naming convention is W for weights and A for activations, with bit counts:
+
+- <Term w="W4A16">Weights stored in 4 bits, activations kept in 16-bit (bf16/fp16). Weights are unpacked to 16-bit inside the kernel and the math is ordinary 16-bit math. Also W8A16 for 8-bit weights.</Term> and W8A16 are **weight-only**. The weights are stored small; inside the kernel each one is unpacked back to bf16 and multiplied with bf16 activations on the normal bf16 <Term w="tensor cores">Dedicated matrix-multiply units on NVIDIA GPUs. Each generation supports a menu of input formats (bf16, fp8, int8, fp4...), and narrower formats run at proportionally higher rates.</Term>.
+- <Term w="W8A8">Both weights and activations in 8 bits (int8 or fp8), so the multiply itself runs on 8-bit tensor cores, which on recent GPUs do about twice as many operations per second as bf16.</Term> (int8 or FP8), and W4A4 / FP4, quantize **both**. The math itself runs in the narrow format, on tensor cores that do roughly twice the operations per second for each halving of width.
+
+Now recall the two halves of a request from the bandwidth lesson. Decode reads every weight once per token and does almost no math per byte: it's memory-bound. Prefill reuses every weight across hundreds of prompt tokens: it's compute-bound.
+
+<Figure n="004" title="WHERE THE BITS GET UNPACKED" caption="Weight-only formats shrink what crosses the memory pipe, then unpack to bf16 before the math. That wins in decode, where the pipe is the bottleneck, and does nothing for prefill, where the math is. Weight-and-activation formats shrink both the bytes and the math." wide>
+<svg viewBox="0 0 640 296" role="img" aria-label="Two data paths: W4A16 unpacks 4-bit weights to bf16 before bf16 tensor cores; W8A8 feeds 8-bit weights and activations straight into 8-bit tensor cores">
+  <text x="10" y="18" class="strong">WEIGHT-ONLY · W4A16</text>
+  <rect x="10" y="30" width="120" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="52" text-anchor="middle" class="strong">MEMORY</text>
+  <text x="70" y="70" text-anchor="middle">int4 W + scales</text>
+  <line x1="130" y1="58" x2="190" y2="58" class="blue" stroke-width="3" />
+  <text x="160" y="48" text-anchor="middle" class="blue-t">¼ BYTES</text>
+  <rect x="190" y="30" width="146" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="263" y="52" text-anchor="middle" class="strong">UNPACK</text>
+  <text x="263" y="70" text-anchor="middle">s × (q − z) → bf16</text>
+  <line x1="336" y1="58" x2="380" y2="58" class="ink" stroke-width="1.2" />
+  <rect x="380" y="30" width="130" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="445" y="52" text-anchor="middle" class="strong">BF16 TENSOR CORES</text>
+  <text x="445" y="70" text-anchor="middle">bf16 W × bf16 X</text>
+  <line x1="445" y1="104" x2="445" y2="86" class="ink" stroke-width="1" />
+  <text x="445" y="118" text-anchor="middle">bf16 activations</text>
+  <text x="10" y="106" class="blue-t">DECODE: UP TO ~4× FASTER</text>
+  <text x="10" y="122">PREFILL: SAME OR A LITTLE SLOWER</text>
+
+  <line x1="10" y1="140" x2="630" y2="140" class="ink dash" stroke-width="1" />
+
+  <text x="10" y="166" class="strong">WEIGHTS + ACTIVATIONS · W8A8 / FP8 (FP4 ON BLACKWELL)</text>
+  <rect x="10" y="178" width="120" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="200" text-anchor="middle" class="strong">MEMORY</text>
+  <text x="70" y="218" text-anchor="middle">fp8 W + scales</text>
+  <line x1="130" y1="206" x2="380" y2="206" class="blue" stroke-width="2" />
+  <text x="255" y="196" text-anchor="middle" class="blue-t">½ BYTES · NO UNPACK</text>
+  <rect x="210" y="222" width="140" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="280" y="240" text-anchor="middle" class="strong">QUANTIZE X</text>
+  <text x="280" y="255" text-anchor="middle">bf16 → fp8 + scale</text>
+  <line x1="350" y1="236" x2="380" y2="226" class="ink" stroke-width="1.2" />
+  <rect x="380" y="178" width="130" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="445" y="200" text-anchor="middle" class="strong">FP8 TENSOR CORES</text>
+  <text x="445" y="218" text-anchor="middle">~2× BF16 RATE</text>
+  <text x="445" y="252" text-anchor="middle">→ fp32 sum × s_W × s_X</text>
+  <text x="10" y="252" class="blue-t">DECODE: UP TO ~2×</text>
+  <text x="10" y="268" class="blue-t">PREFILL: UP TO ~2×</text>
+  <text x="10" y="288">THE MATH IS ALWAYS ACCUMULATED IN FP32 (OR INT32) AND RESCALED AT THE END</text>
+</svg>
+</Figure>
+
+So:
+
+- **For decode, bytes are everything.** W4A16 reads about a quarter of the bytes and is the fastest single-user format you can run on most hardware, even though its math is plain bf16. W8A8 reads half the bytes; its faster math doesn't matter much, because decode was never waiting on math.
+- **For prefill, math is everything.** W4A16 does exactly as much bf16 math as the original model, plus unpacking. Time to first token on a long prompt does not improve and can get slightly worse. W8A8 and FP8 really do run the matrix multiplies on faster units, so prefill gets faster too.
+- **For batching, both matter.** As you batch more users, decode moves up the roofline towards compute-bound. A weight-only kernel's advantage shrinks with batch size, because the unpacking work is repeated and the bf16 math starts to dominate; W8A8/FP8 keeps helping at large batch. This is why big serving fleets love FP8, and why single-user local setups love 4-bit weight-only formats.
+
+<Predict id="w4-vs-fp8">
+Llama 3.1 8B on the Spark, one user. Compare W4A16 (group 128) with FP8 W8A8. Which has the higher decode ceiling, and which has the faster time to first token on a 4,000-token prompt?
+
+<Fragment slot="answer">
+
+**Decode: W4A16.** Roughly 4.7 GB per token (7 billion layer weights at 4.125 bits, plus the output projection, which is usually kept in bf16 at about 1 GB) versus about 8 GB for FP8. At 273 GB/s that is about 58 versus 34 tok/s ceilings.
+
+**Prefill: FP8.** A 4,000-token prompt is far above the ridge point, so it's limited by matrix-multiply speed. FP8 tensor cores run at roughly twice the bf16 rate; W4A16 does bf16 math after unpacking, so it is no faster than the bf16 model, and its unpacking costs a bit extra. The best format depends on which number your users feel.
+
+</Fragment>
+</Predict>
+
+### Floats in 8 bits and 4 bits
+
+Everything so far used integers on a uniform grid. The other family uses tiny floating-point numbers. A float has an <Term w="exponent">The bits that say which power of two the number sits near. More exponent bits mean a wider range, from tiny to huge.</Term> and a <Term w="mantissa">The bits that say where between two powers of two the number sits. More mantissa bits mean finer precision. Also called the significand.</Term>. Its grid is not uniform: the marks are dense near zero and spread out as numbers grow, so the *relative* error stays roughly constant. That suits bell-shaped weights well, since most of them are small.
+
+<Term w="FP8">8-bit floating point. Two standard flavours: E4M3 (4 exponent, 3 mantissa bits, more precision) and E5M2 (5 exponent, 2 mantissa bits, more range). Supported in tensor cores since Hopper (H100) and Ada.</Term> comes in two flavours, standardised by NVIDIA, Arm and Intel in "FP8 Formats for Deep Learning" (Micikevicius et al., 2022):
+
+- **E4M3**: 1 sign, 4 exponent, 3 mantissa bits. Largest value 448. More precision, less range. The usual choice for weights and activations at inference.
+- **E5M2**: 1 sign, 5 exponent, 2 mantissa bits. Largest value 57,344. Less precision, more range. Mostly used for gradients in training, which swing wildly.
+
+Even with FP8 you still keep a scale (per tensor, per channel, or per block), because 448 is the largest number you can write: you scale each tensor so its biggest value lands near the top of the format's range, exactly like the integer case.
+
+Four-bit floats go further. <Term w="FP4">4-bit floating point, E2M1: 1 sign, 2 exponent bits, 1 mantissa bit. Its only positive values are 0, 0.5, 1, 1.5, 2, 3, 4 and 6. Useless alone; usable only with a fine-grained block scale.</Term> (E2M1) has exactly 15 values: ±0, 0.5, 1, 1.5, 2, 3, 4, 6, and the negatives. That is so few that it only works with small blocks, each carrying its own scale. Two block formats matter:
+
+- <Term w="MXFP4">The Open Compute Project's "microscaling" FP4 (2023): blocks of 32 FP4 values sharing one 8-bit scale that can only be a power of two (format E8M0). About 4.25 bits per weight.</Term>: from the OCP Microscaling spec. Blocks of 32, each with an 8-bit power-of-two scale. OpenAI shipped gpt-oss's expert weights in MXFP4.
+- <Term w="NVFP4">NVIDIA's FP4 format for Blackwell: blocks of 16 FP4 values, each block with an FP8 (E4M3) scale, plus one FP32 scale for the whole tensor. About 4.5 bits per weight, finer scales than MXFP4.</Term>: NVIDIA's. Blocks of 16, each with an FP8 E4M3 scale (a real number, not just a power of two), plus one fp32 scale per tensor. Smaller blocks and finer scales make it more accurate than MXFP4, at about 4.5 bits per weight.
+
+<Figure n="005" title="THE FORMATS, BIT BY BIT" caption="Bit layouts (sign, exponent, mantissa) and the largest value each can hold. Bottom: the eight positive values of FP4 next to the eight of INT4. The float grid is dense near zero, where most weights live; the integer grid is even. Both need a block scale to be useful: MXFP4 shares one per 32 values, NVFP4 one per 16.">
+<svg viewBox="0 0 560 330" role="img" aria-label="Bit layouts for BF16, FP8 E4M3, FP8 E5M2, INT8, INT4 and FP4 E2M1, with a comparison of FP4 and INT4 value grids">
+  <text x="10" y="18" class="strong">FORMAT</text>
+  <text x="340" y="18" class="strong">MAX</text>
+  <text x="420" y="18" class="strong">TENSOR CORES</text>
+
+  <text x="10" y="44">BF16</text>
+  <rect x="80" y="32" width="14" height="16" class="fill-blue" />
+  <rect x="94" y="32" width="112" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="206" y="32" width="98" height="16" class="fill-paper" stroke-width="1" />
+  <text x="150" y="44" text-anchor="middle">8 EXP</text><text x="255" y="44" text-anchor="middle">7 MAN</text>
+  <text x="340" y="44">3.4e38</text><text x="420" y="44">AMPERE+</text>
+
+  <text x="10" y="74">FP8 E4M3</text>
+  <rect x="80" y="62" width="14" height="16" class="fill-blue" />
+  <rect x="94" y="62" width="56" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="150" y="62" width="42" height="16" class="fill-paper" stroke-width="1" />
+  <text x="122" y="74" text-anchor="middle">4</text><text x="171" y="74" text-anchor="middle">3</text>
+  <text x="340" y="74">448</text><text x="420" y="74">HOPPER, ADA+</text>
+
+  <text x="10" y="104">FP8 E5M2</text>
+  <rect x="80" y="92" width="14" height="16" class="fill-blue" />
+  <rect x="94" y="92" width="70" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="164" y="92" width="28" height="16" class="fill-paper" stroke-width="1" />
+  <text x="129" y="104" text-anchor="middle">5</text><text x="178" y="104" text-anchor="middle">2</text>
+  <text x="340" y="104">57,344</text><text x="420" y="104">HOPPER, ADA+</text>
+
+  <text x="10" y="134">INT8</text>
+  <rect x="80" y="122" width="112" height="16" class="fill-paper" stroke-width="1" />
+  <text x="136" y="134" text-anchor="middle">8 BITS</text>
+  <text x="340" y="134">127</text><text x="420" y="134">TURING+</text>
+
+  <text x="10" y="164">INT4</text>
+  <rect x="80" y="152" width="56" height="16" class="fill-paper" stroke-width="1" />
+  <text x="108" y="164" text-anchor="middle">4 BITS</text>
+  <text x="340" y="164">7</text><text x="420" y="164">MOSTLY UNPACKED</text>
+
+  <text x="10" y="194">FP4 E2M1</text>
+  <rect x="80" y="182" width="14" height="16" class="fill-blue" />
+  <rect x="94" y="182" width="28" height="16" class="fill-wash" stroke-width="1" />
+  <rect x="122" y="182" width="14" height="16" class="fill-paper" stroke-width="1" />
+  <text x="340" y="194">6</text><text x="420" y="194">BLACKWELL</text>
+  <text x="146" y="194">+ BLOCK SCALE</text>
+
+  <rect x="80" y="210" width="14" height="10" class="fill-blue" /><text x="100" y="219">SIGN</text>
+  <rect x="150" y="210" width="14" height="10" class="fill-wash" stroke-width="1" /><text x="170" y="219">EXPONENT</text>
+  <rect x="250" y="210" width="14" height="10" class="fill-paper" stroke-width="1" /><text x="270" y="219">MANTISSA</text>
+
+  <text x="10" y="254" class="strong">FP4</text>
+  <line x1="60" y1="250" x2="540" y2="250" class="ink" stroke-width="1" />
+  <circle cx="60" cy="250" r="4" class="fill-blue" /><circle cx="100" cy="250" r="4" class="fill-blue" /><circle cx="140" cy="250" r="4" class="fill-blue" /><circle cx="180" cy="250" r="4" class="fill-blue" />
+  <circle cx="220" cy="250" r="4" class="fill-blue" /><circle cx="300" cy="250" r="4" class="fill-blue" /><circle cx="380" cy="250" r="4" class="fill-blue" /><circle cx="540" cy="250" r="4" class="fill-blue" />
+  <text x="60" y="240" text-anchor="middle">0</text><text x="100" y="240" text-anchor="middle">.5</text><text x="140" y="240" text-anchor="middle">1</text><text x="180" y="240" text-anchor="middle">1.5</text>
+  <text x="220" y="240" text-anchor="middle">2</text><text x="300" y="240" text-anchor="middle">3</text><text x="380" y="240" text-anchor="middle">4</text><text x="540" y="240" text-anchor="middle">6</text>
+
+  <text x="10" y="294" class="strong">INT4</text>
+  <line x1="60" y1="290" x2="540" y2="290" class="ink" stroke-width="1" />
+  <circle cx="60" cy="290" r="4" class="fill-paper" /><circle cx="128.6" cy="290" r="4" class="fill-paper" /><circle cx="197.1" cy="290" r="4" class="fill-paper" /><circle cx="265.7" cy="290" r="4" class="fill-paper" />
+  <circle cx="334.3" cy="290" r="4" class="fill-paper" /><circle cx="402.9" cy="290" r="4" class="fill-paper" /><circle cx="471.4" cy="290" r="4" class="fill-paper" /><circle cx="540" cy="290" r="4" class="fill-paper" />
+  <text x="60" y="310" text-anchor="middle">0</text><text x="128.6" y="310" text-anchor="middle">1</text><text x="197.1" y="310" text-anchor="middle">2</text><text x="265.7" y="310" text-anchor="middle">3</text>
+  <text x="334.3" y="310" text-anchor="middle">4</text><text x="402.9" y="310" text-anchor="middle">5</text><text x="471.4" y="310" text-anchor="middle">6</text><text x="540" y="310" text-anchor="middle">7</text>
+  <text x="300" y="326" text-anchor="middle">POSITIVE HALF OF EACH GRID, STRETCHED TO THE SAME WIDTH</text>
+</svg>
+</Figure>
+
+**What the Spark can do with these.** GB10 is a Blackwell-generation GPU, and NVIDIA's spec sheet lists FP4 support for its fifth-generation tensor cores; the headline "1 petaFLOP" is FP4, with sparsity. So, in hardware, the Spark can run NVFP4 and MXFP4 math natively, as well as FP8. Two cautions. First, the fast numbers are spec-sheet numbers and you should measure them, as you did for bf16 in the bandwidth lesson. Second, GB10 is not the same chip as the data-center B200: it reports a different CUDA compute capability (sm_121, if I have it right; check with `nvidia-smi --query-gpu=compute_cap --format=csv`), and some FP4 and FP8 kernels in vLLM, TensorRT-LLM and FlashInfer were written for the data-center parts first. Whether a given engine's FP4 path runs on your Spark *today* is a docs-and-release-notes question, not a hardware question. Check the DGX Spark playbooks, which include tested quantized setups, before assuming.
+
+For decode on one user, FP4 and INT4 weight-only land in the same place: about 4.5 bits per weight, about the same bandwidth ceiling. NVFP4's real advantage is that the math also runs in 4 bits, which helps prefill and large batches.
+
+### Rounding smarter: GPTQ and AWQ
+
+Round-to-nearest treats every weight alone. But a layer's job is to produce outputs, not to preserve weights. If rounding one weight up pushes an output too high, you could round a *neighbour* down to compensate, and the output would barely move. Two methods do this kind of thing, using a small batch of real text called <Term w="calibration data">A few hundred example inputs (typically 128 sequences of a few thousand tokens) run through the model once, to see what activations each layer actually receives. Used to choose scales and rounding, not to train.</Term>.
+
+**GPTQ** (Frantar, Ashkboos, Hoefler, Alistarh, 2022) quantizes a layer one column at a time. After it rounds a column, it measures the error that rounding introduces *in the layer's outputs on the calibration data*, and nudges all the not-yet-quantized columns to cancel as much of it as possible. Which nudge is best depends on how the input features move together, captured in the matrix XᵀX of the calibration inputs (the <Term w="Hessian">Here: the matrix 2XᵀX built from calibration inputs X. It says how much the layer's output error grows when you perturb each pair of weights, so GPTQ can tell which errors other weights can cancel.</Term> of the layer's squared error). The idea comes from 1990s pruning work ("Optimal Brain Surgeon"); GPTQ's contribution was making it fast enough to run on 175 billion weights in a few hours. It is still a one-shot procedure: no gradient descent, no retraining.
+
+**AWQ** (Lin, Tang and colleagues, MIT, 2023) starts from an observation: a small fraction of weights, around 1%, matter far more than the rest, and you can find them by looking at the *activations*, not the weights. The <Term w="salient">Here: the input channels whose activations are typically large, so errors in the weights they multiply get amplified in the output.</Term> input channels are the ones whose activations are large. Keeping that 1% in fp16 would work but breaks the neat kernel. Instead AWQ uses the SmoothQuant trick in reverse: scale those weight columns *up* by a factor before quantizing (and divide the matching activations by the same factor), so they use more of the grid and lose less relative precision. A small grid search over the scaling strength per layer, on calibration data, and you're done. No reconstruction, no Hessian, quick to run. AWQ and GPTQ both typically use 4-bit, group 128 with a zero-point, and both are supported by vLLM and others with fast kernels.
+
+On small models, both clearly beat RTN at 4 bits; at 8 bits RTN is already nearly lossless, which is why FP8 checkpoints are usually just "compute a scale and round."
+
+### GGUF and k-quants
+
+If you've downloaded models for llama.cpp you've seen names like `Q4_K_M`. <Term w="GGUF">The single-file model format used by llama.cpp (and Ollama, LM Studio): weights, tokenizer and metadata in one file, with many quantization types per tensor.</Term> files hold weights in one of llama.cpp's own block formats, all of them per-group quantization with different packing:
+
+- **Q8_0**: blocks of 32 int8 weights with one fp16 scale. 8 + 16/32 = **8.5 bits per weight**. Practically lossless.
+- **Q4_0**: blocks of 32 int4 weights with one fp16 scale, 4.5 bits per weight. The old simple one.
+- <Term w="k-quants">llama.cpp's second-generation formats (Q2_K to Q6_K), added in 2023 by Iwan Kawrakow. Weights are grouped in "super-blocks" of 256, split into small sub-blocks, and even the sub-block scales are themselves quantized to save bits.</Term> (Q2_K through Q6_K): <Term w="super-block">In k-quants, a block of 256 weights holding several sub-blocks (of 16 or 32). Each sub-block has a small quantized scale (and min); the super-block has one fp16 scale for those scales.</Term>s of 256 weights split into sub-blocks of 32 (or 16), each with its own 6-bit scale and min, and one fp16 scale for the scales. Q4_K works out to exactly **4.5 bits per weight**, Q6_K to 6.5625.
+- The **_S / _M / _L** suffix is a mix: Q4_K_M uses Q4_K for most tensors and the higher-precision Q6_K for some sensitive ones (parts of the attention value and MLP down projections, and usually the output layer). That's why Llama 3.1 8B Q4_K_M is about 4.9 GB, about 4.9 bits per weight, not 4.5.
+
+llama.cpp can also take an **importance matrix** (`imatrix`), computed from calibration text, which weights the rounding error of each column by how much its activations matter: the same instinct as AWQ and GPTQ. The "IQ" formats (IQ4_XS, IQ3, IQ2) push this further, with non-uniform grids, and are where to look if you want to fit a 70B model into less memory. Check llama.cpp's docs for the current list; it grows.
+
+### What you lose, and how to tell
+
+Here is what RTN did to Qwen2.5 0.5B, weights only, perplexity on 40,960 tokens of WikiText-2 (lower is better):
+
+| Weights | Perplexity |
+|---|---|
+| fp32 original | 14.45 |
+| int8, per-channel | 14.49 |
+| int8, per-tensor | 15.12 |
+| int4, per-channel | 31.7 |
+| int4, group 128, symmetric | 20.0 |
+| int4, group 128, affine | 17.2 |
+| int3, group 128, symmetric | 206 |
+
+8 bits is nearly free. 4 bits with groups and a zero-point costs real but survivable quality, *on a 0.5B model*. Small models suffer more from quantization than large ones; an 8B model at 4-bit group 128 typically loses far less, and that's part of what you'll measure on the Spark. At 3 bits RTN falls off a cliff, which is exactly where GPTQ, AWQ and llama.cpp's importance-weighted formats earn their keep.
+
+But perplexity is a blunt instrument, and the losses that matter are often not where it looks:
+
+- **Perplexity on generic text** measures how well the model predicts average tokens. A model can keep its perplexity and still get worse at the rare, precise steps that decide whether an answer is right.
+- <Term w="KL divergence">A measure of how different two probability distributions are. Here: for each token position, how far the quantized model's next-token distribution is from the original's. Zero means identical. Much more sensitive than perplexity.</Term> compares the quantized model's predicted distribution against the original's at every position. llama.cpp's `llama-perplexity` tool can compute it against saved logits from the full-precision model (look for the `--kl-divergence` options in its docs). It catches changes that cancel out in perplexity.
+- **Flips.** On a multiple-choice or math benchmark, the score can stay the same while many individual answers change: some right answers go wrong and some wrong go right. A 2024 Microsoft paper, "Accuracy is Not All You Need" (Dutta et al.), argued for reporting the fraction of answers that flip, because two models with equal accuracy can disagree a lot. Your own users experience flips, not averages.
+- **Task accuracy where precision matters.** Multi-step math (GSM8K-style), code that must run, and exact recall from a long context are commonly reported to degrade first under aggressive quantization, since one slightly wrong token early derails everything after it. Measure your own tasks; don't trust the summary table.
+- **Long context.** Long prompts mean many more steps for small errors to compound, and quantizing the KV cache (a separate choice, `--kv-cache-dtype` in vLLM, cache types in llama.cpp) adds error exactly where long-context recall lives. Test with a long-context retrieval task if you care about it.
+
+The honest way to report a quantized model is: bits per weight including overhead, method, granularity, perplexity *and* KL vs the original, accuracy on a task you care about with a confidence interval, and the flip rate. [Is that improvement real?](/lessons/statistics-for-evals/) covers the confidence interval part.
+
+### The cost of unpacking
+
+Dequantization isn't free. For each weight the kernel has to pull out 4 bits, convert to bf16, subtract the zero-point and multiply by the scale. If that's done carelessly (unpack the whole matrix to bf16 in memory, then multiply) you've written the full bf16 matrix back to memory and read it again, and you'd be *slower* than bf16. The point of a good <Term w="kernel">A function that runs on the GPU. A quantized matmul kernel reads packed weights, unpacks them in registers, and multiplies, all in one launch so the unpacked weights never touch main memory.</Term> is to fuse it: read packed bytes, unpack in registers right before the tensor-core instruction, never write the bf16 copy anywhere.
+
+<Term w="Marlin">A fast mixed-precision (int4 weights × fp16 activations) matrix-multiply kernel by Elias Frantar and Dan Alistarh, 2024. Designed to stay near the ideal 4× speed-up over fp16 up to batch sizes of about 16-32. Used in vLLM.</Term> (Frantar and Alistarh) is the reference example: it lays out the int4 weights in memory in exactly the order the tensor cores want them, overlaps loading the next tile with computing the current one, and stays close to the ideal ~4× decode speed-up up to batches of 16 to 32. Past that, the matmul becomes compute-bound and W4A16's edge fades. llama.cpp has its own CUDA kernels for each GGUF type, which matter just as much: the same Q4_K_M file can run at quite different speeds depending on build flags and version.
+
+The practical upshot: a quantized model is only as fast as its kernel on *your* GPU. The bandwidth prediction is a ceiling. If you're far below it, suspect the kernel (a fallback path, an unsupported compute capability, unfused dequant) before you suspect the format.
+
+## Build It
+
+Two halves. On your Mac, you build quantization by hand on a small real model and see each effect from The Idea yourself. On the Spark, you serve Llama 3.1 8B Instruct (the scoreboard model) in several formats and measure speed and quality.
+
+```text
+inference/
+  quant/
+    q.py            # your quantize / dequantize functions
+    recon.py        # reconstruction error table
+    outliers.py     # find outlier channels in weights and activations
+    rtn_ppl.py      # quantize a whole model by RTN, perplexity sweep
+    eval_small.py   # quality eval against any OpenAI-compatible server
+  results/          # bench.py output for each format
+  SCOREBOARD.md
+```
+
+<Task id="t0" title="Set up a small model and some text" agent="ok">
+
+Everything on the Mac runs on CPU in float32; it's slow but fine for a 0.5B model.
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install torch transformers datasets numpy
+python -c "
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset
+AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B'); AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B')
+load_dataset('Salesforce/wikitext', 'wikitext-2-raw-v1', split='test')
+print('ok')"
+```
+
+Qwen2.5 0.5B uses plain `torch.nn.Linear` layers with weight shape `[out_features, in_features]`, so "a row" is one output channel. (GPT-2 in transformers uses a `Conv1D` with the transpose; avoid it here to keep your head straight.) Each of its hidden sizes (896 and 4,864) divides by 128 and by 32.
+
+</Task>
+
+<Task id="t1" title="Write quantize and dequantize yourself" agent="hands">
+
+In `q.py`, write the four functions below. Work in PyTorch on a 2-D weight `w` of shape `[out, in]`. Return the *dequantized* tensor (same shape and dtype as `w`) so you can compare directly; also return the integer codes and scales if you want to inspect them.
+
+```python
+import torch
+
+def quant_sym(w: torch.Tensor, bits: int, group: str | int) -> torch.Tensor:
+    """Symmetric RTN. group is 'tensor', 'channel', or an int group size along `in`.
+    Levels are -2**(bits-1) .. 2**(bits-1)-1, s = max|w| / (2**(bits-1)-1) per group."""
+    ...
+
+def quant_affine(w: torch.Tensor, bits: int, group: int) -> torch.Tensor:
+    """Affine RTN per group: s = (max-min)/(2**bits-1), z = round(-min/s), q in [0, 2**bits-1]."""
+    ...
+
+def rel_err(w: torch.Tensor, w_hat: torch.Tensor) -> float:
+    """||w - w_hat|| / ||w|| (Frobenius norms)."""
+    ...
+
+def bits_per_weight(bits: int, group: int, scale_bits: int = 16, zero_bits: int = 0) -> float:
+    ...
+```
+
+Hints:
+
+- For groups, `w.reshape(out, in // g, g)` makes the last axis one group. `amax(dim=-1, keepdim=True)` gives the per-group max with a shape that broadcasts. Reshape back at the end.
+- `torch.round` rounds halves to even. That's fine, just know it.
+- Guard against a group of all zeros (s = 0): `s.clamp_min(1e-12)` or similar.
+- Test on something you can check by hand first: the Figure 001 example. `torch.tensor([[-0.6, 0.0, 0.33, 0.9]])` with affine 4-bit and one group of 4 should give back `[-0.6, 0.0, 0.3, 0.9]`.
+
+Then `recon.py`: load the model, take `model.model.layers[0].mlp.gate_proj.weight`, and print the table from The Idea for int8 and int4 at per-tensor, per-channel, group 128 and group 32, plus affine group 128. Then plant an outlier, `w[0, 0] = 20 * w.abs().max()`, and rerun int4 per-tensor, per-channel and group 128. Before you run, predict which numbers move.
+
+</Task>
+
+<Task id="t2" title="Find the outliers in a real model" agent="hands">
+
+`outliers.py` has two parts.
+
+**Weights.** For every `nn.Linear` in the model (skip `lm_head`), compute `w.abs().max() / w.std()`: how many standard deviations the biggest weight sits out. Print the ten worst layers. Then for the worst one, find *which* input columns hold the biggest weights (`w.abs().amax(dim=0).topk(5)`).
+
+**Activations.** Register a forward hook on every linear layer that records, for its *input*, the max absolute value per channel across all tokens, and the median absolute value overall:
+
+```python
+stats = {}
+def make_hook(name):
+    def hook(module, inputs, output):
+        x = inputs[0].detach().reshape(-1, inputs[0].shape[-1]).abs()
+        ...  # stats[name] = (per-channel max over tokens, overall median)
+    return hook
+handles = [m.register_forward_hook(make_hook(n)) for n, m in model.named_modules()
+           if isinstance(m, torch.nn.Linear) and "lm_head" not in n]
+```
+
+Run 512 tokens of WikiText through the model under `torch.no_grad()`, remove the hooks, and print the layers with the biggest max ÷ median ratio, with the channel indices. Questions to answer in your notes: are the same channel indices big across different layers? Across different input texts (try a code snippet)? Which layer types (q/k/v projections, `o_proj`, `gate_proj`/`up_proj`, `down_proj`) have the worst inputs, and why might `down_proj`, whose input is the output of the gated MLP's multiply, be special?
+
+</Task>
+
+<Task id="t3" title="RTN a whole model and watch perplexity" agent="hands">
+
+`rtn_ppl.py`: write a perplexity function, then quantize every linear layer's weight in place (keep a copy of the originals so you can restore between runs) and sweep formats.
+
+```python
+def perplexity(model, ids: torch.Tensor, n_tokens: int = 40_960, ctx: int = 1024) -> float:
+    """Non-overlapping windows of ctx tokens over the first n_tokens of ids.
+    model(x, labels=x).loss is the mean NLL over the window's predicted tokens (ctx - 1 of them).
+    Weight each window's loss by its token count, average, exponentiate."""
+    ...
+```
+
+Sweep: original; int8 per-channel; int8 per-tensor; int4 per-tensor; int4 per-channel; int4 group 128 symmetric and affine; int3 group 128. Predict the ordering before you run. On an M-series Mac each perplexity pass takes on the order of 30 seconds; the whole sweep took me about four minutes.
+
+Then the activation experiment: add a `register_forward_pre_hook` to every linear that replaces its input with an int8-quantized-and-dequantized copy, once with one scale per token (max over the last dimension) and once with one scale for the whole tensor. Weights unquantized. You should be able to reproduce the "76" row.
+
+</Task>
+
+<Task id="t4" title="Stretch: a tiny AWQ" agent="review">
+
+Make RTN int4 group 128 better without changing the format. For each linear layer, from the activation stats you collected in t2, compute the mean absolute activation per input channel, `a_j`. Then, for a strength α in `[0, 0.25, 0.5, 0.75, 1.0]`:
+
+1. Multiply column j of W by `s_j = a_j ** α` (normalize s so its mean or geometric mean is 1).
+2. Quantize the scaled W with your int4 group-128 function, then divide column j back by `s_j`. (In a real deployment you'd fold `1/s_j` into the previous layer instead; here dividing back is mathematically the same thing.)
+3. Measure the layer's *output* error on calibration inputs, `‖X Wᵀ − X Ŵᵀ‖`, and keep the best α for that layer.
+
+Then rerun perplexity. Did it beat plain RTN group 128? Have an agent review your code for the classic mistake (calibrating and evaluating on the same tokens, which flatters the result) and for whether you scaled columns or rows.
+
+</Task>
+
+<Task id="t5" title="Serve the same model in bf16, fp8 and 4-bit on the Spark" agent="explain">
+
+Now the real thing, with Llama 3.1 8B Instruct so it lines up with your scoreboard. You want at least these, each serving the same OpenAI-compatible API your `bench.py` already speaks:
+
+| Format | How (shape only; check current docs) |
+|---|---|
+| bf16 | vLLM: `vllm serve meta-llama/Llama-3.1-8B-Instruct` |
+| FP8 (W8A8) | vLLM's online FP8: add `--quantization fp8` (dynamic per-tensor scales computed at load time), or a pre-quantized FP8 checkpoint from Hugging Face |
+| 4-bit weight-only | vLLM with an AWQ or GPTQ int4 checkpoint of the same model (search Hugging Face; vLLM detects the format from the checkpoint's config) |
+| GGUF Q8_0 and Q4_K_M | llama.cpp's `llama-server -m model.gguf`, which also speaks the OpenAI API |
+| NVFP4 (optional) | Only if your engine's release notes say FP4 works on GB10. NVIDIA publishes NVFP4 checkpoints for some models. |
+
+Before anything: read the **DGX Spark playbooks** and user guide on NVIDIA's site. They include tested containers and commands for vLLM and llama.cpp on GB10, and they are much more likely to be right than this table: the ARM64 + Blackwell combination is new enough that the generic install instructions often don't apply. Confirm the GPU's compute capability and which quantization kernels the engine actually selected: vLLM logs the quantization method and kernel at startup. Read them, and write them down.
+
+For each format, record the **actual bytes**: the size of the checkpoint on disk, or better, the weight memory the engine reports after loading. That's your bytes per token for the prediction.
+
+Then run your harness from the baseline lesson against each one, at c = 1 and c = 16, short prompts, 256 tokens, `ignore_eos`, and once with `prompts/long.jsonl` at c = 1 to see prefill. Keep everything else fixed: same prompts, same sampling, same server flags apart from the format.
+
+</Task>
+
+<Task id="t6" title="A small quality eval you can trust" agent="hands">
+
+Speed without quality is meaningless. Write `eval_small.py`: it takes a base URL and model name, runs a fixed set of questions through the chat API at temperature 0, and scores them.
+
+- **Math:** the first 200 problems of the GSM8K test set (on Hugging Face as `openai/gsm8k`). Prompt for step-by-step reasoning ending in "The answer is N". Extract the last number; compare to the reference. Allow 512 output tokens.
+- **Flips:** save every answer per format. Report not just accuracy but how many questions changed from right to wrong and wrong to right compared with bf16.
+- **Confidence:** a bootstrap 95% interval on accuracy (resample the 200 questions with replacement 1,000 times). With n = 200 the interval will be several points wide; that's the point. Two formats whose intervals overlap heavily are not demonstrably different. For a sharper comparison, a paired test on the per-question results is more powerful than comparing intervals.
+
+```python
+def score(answers: list[str], refs: list[str]) -> list[bool]: ...
+def bootstrap_ci(correct: list[bool], n_boot: int = 1000) -> tuple[float, float]: ...
+def flips(base: list[bool], other: list[bool]) -> tuple[int, int]:
+    """(right->wrong, wrong->right)"""
+```
+
+Optional, and more sensitive: for the GGUF files, run llama.cpp's `llama-perplexity` on the WikiText-2 test file for each quant, with the KL-divergence mode against the F16/BF16 model's saved logits. Its docs describe the two-step process (save base logits, then compare).
+
+If you'd rather use a standard harness, EleutherAI's `lm-evaluation-harness` can talk to an OpenAI-compatible local server; check its docs for the current model type name. Write your own first anyway: you should know exactly what is being scored.
+
+</Task>
+
+<Task id="t7" title="Append to the scoreboard" agent="ok">
+
+One row per format, using `scoreboard.py` from the baseline lesson. Put the format, its bits per weight, the engine and its quantization kernel in the notes column, plus the GSM8K accuracy with its interval:
+
+```markdown
+|      | spark | vLLM bf16 |  |  |  | bf16, 16.1 GB weights |
+|      | spark | vLLM FP8 (W8A8, online) |  |  |  | ~8.0 GB, GSM8K __ ± __ |
+|      | spark | vLLM AWQ int4 g128 |  |  |  | ~4.7 GB, kernel: __, GSM8K __ ± __ |
+|      | spark | llama.cpp Q4_K_M |  |  |  | 4.9 GB, GSM8K __ ± __ |
+```
+
+Note that the vLLM bf16 row is itself a big change from the naive server: [Inside vLLM and SGLang](/lessons/serving-engines/) covers why. The rows that isolate *this* lesson are the format rows compared with the vLLM bf16 row, all on the same engine.
+
+</Task>
+
+<DoneWhen>
+
+- Your `quant_affine` reproduces Figure 001 exactly, and `recon.py` prints a granularity table close to the one in The Idea.
+- You can name the worst outlier channel in Qwen2.5 0.5B's activations and say which layer type it feeds.
+- `rtn_ppl.py` prints the perplexity sweep, including the per-tensor int4 disaster and the activation per-tensor row.
+- At least three formats of Llama 3.1 8B served on the Spark, each with a measured decode speed, a prediction next to it, and a GSM8K accuracy with an interval and a flip count against bf16.
+- `SCOREBOARD.md` has the new rows.
+
+</DoneWhen>
+
+## Measure
+
+**On the Mac**, compare against my numbers (Qwen2.5 0.5B, fp32 base, CPU, WikiText-2 test, first 40,960 tokens, 1,024-token windows):
+
+| Format (weights, RTN) | My perplexity | Yours |
+|---|---|---|
+| original | 14.45 | |
+| int8 per-channel | 14.49 | |
+| int8 per-tensor | 15.12 | |
+| int4 per-tensor | ~7.9e7 | |
+| int4 per-channel | 31.7 | |
+| int4 g128 symmetric | 20.0 | |
+| int4 g128 affine | 17.2 | |
+| int3 g128 symmetric | 206 | |
+| activations int8 per-token (weights original) | 14.73 | |
+| activations int8 per-tensor (weights original) | 76.6 | |
+
+Your numbers should match closely if your windows and token counts match; small differences in how you count tokens at window edges shift the second decimal.
+
+**On the Spark**, predict first, using the bandwidth lesson's formula with the spec-sheet 273 GB/s and with your measured bandwidth. Bytes per token ≈ weights read per token: everything except the embedding table, which is just a lookup. For Llama 3.1 8B that's about 7.0 billion layer weights plus the 0.53-billion-weight output projection, which most quantized checkpoints keep in bf16.
+
+| Format | Bytes / token (approx.) | Ceiling @ 273 | Ceiling @ measured BW | Measured tok/s (c=1) | % of ceiling | TTFT, long prompt | Throughput (c=16) | GSM8K (95% CI) | Flips vs bf16 |
+|---|---|---|---|---|---|---|---|---|---|
+| bf16 | ~15.0 GB | ~18 | | | | | | | — |
+| FP8 W8A8 | ~8.0 GB | ~34 | | | | | | | |
+| int4 AWQ/GPTQ g128 | ~4.7 GB | ~58 | | | | | | | |
+| GGUF Q8_0 | ~8.5 GB | ~32 | | | | | | | |
+| GGUF Q4_K_M | ~4.9 GB | ~56 | | | | | | | |
+| NVFP4 (if it runs) | ~5.0 GB | ~55 | | | | | | | |
+
+How these were estimated: 7.0e9 × 1 byte + 1.05 GB for FP8; 7.0e9 × 4.125/8 + 1.05 GB for int4 group 128; the file size for GGUF. Use the engine's reported weight memory instead if it differs.
+
+What you should see, and why:
+
+- **Decode tok/s goes up roughly in proportion to fewer bytes**, but not perfectly. The smaller the model's bytes, the larger the share of each step taken by fixed costs (kernel launches, attention over the KV cache, sampling, and unpacking), so 4-bit lands at a lower percentage of its ceiling than bf16. Something like 4-bit giving 2.5-3.5× bf16's speed, rather than a clean 4×, would be a normal result; measure it.
+- **TTFT on the long prompt** should improve for FP8 (faster math) and stay roughly flat for int4 weight-only (the same bf16 math). If int4 prefill is clearly *faster* than bf16, find out why before believing it. If it is a lot slower, the engine may have picked a slow kernel.
+- **Throughput at c = 16**: every format improves over the naive server because vLLM batches. Between formats, the 4-bit edge should be smaller at c = 16 than at c = 1, and FP8 should hold up well.
+- **Quality**: Q8_0 and FP8 should be within noise of bf16 on GSM8K. The 4-bit formats may cost a few points, or nothing measurable at n = 200, while still showing a noticeable number of flips. If a 4-bit model loses 10+ points, check its chat template and your answer extraction before blaming quantization; a broken template is the most common cause of mysteriously bad evals.
+- **llama.cpp vs vLLM at the same bits** will differ, because they are different engines with different kernels. Compare formats *within* an engine; compare engines in the serving-engines lesson.
+
+## Break It
+
+**1. Quantize per-tensor at 4 bits.** You already did it on the Mac. Now do it on purpose with a story: print the fraction of weights that round to zero for the worst layer, and generate a few sentences from the model. Read the output. This is what "one scale shared by too many weights" feels like.
+
+**2. Go down to 2 or 3 bits with RTN, then with GPTQ.** RTN at 3 bits on the 0.5B model gave me a perplexity of 206. If you have time on the Spark, quantize a model to 3-bit with a GPTQ tool (several libraries do it; check which currently support your setup) and compare with RTN at the same bits and group size. The gap between them is the value of error compensation, and it grows as bits shrink.
+
+**3. Calibrate on the wrong data.** Calibrate an AWQ or GPTQ quantization (or your tiny AWQ from t4) on 128 samples of Python code, then evaluate perplexity on Wikipedia, and the other way round. Then try 8 calibration samples instead of 128. Calibration data decides which channels count as important; the wrong data makes the wrong ones important.
+
+**4. Quantize what you shouldn't.** Quantize the embedding table and the output projection (`lm_head`) too, per-tensor, and watch what happens to perplexity. Then, on the Spark, quantize the KV cache to 8-bit (vLLM's `--kv-cache-dtype fp8`, check docs) and run a long-context retrieval test: hide a sentence in a 30,000-token document and ask for it. The bytes saved are real (see the bandwidth lesson's KV numbers); so are the errors.
+
+## Explain It Back
+
+<details>
+<summary>1. What is quantization, in one breath, and what does the scale do?</summary>
+
+Storing each number with fewer bits by snapping it to the nearest point on a coarse, evenly spaced grid and storing only the point's integer index. The scale is the spacing of the grid in real units: dequantizing is integer times scale (minus the zero-point first, if there is one). The scale sets the trade-off: a big scale covers a wide range but rounds coarsely; the maximum rounding error for in-range values is half the scale. Each bit halves the scale for the same range, so 4-bit has 16× the error of 8-bit.
+
+</details>
+
+<details>
+<summary>2. Why does one outlier ruin per-tensor quantization, and what do people do about it?</summary>
+
+The scale has to stretch to cover the biggest value, so one weight 20× larger than the rest makes the step 20× coarser for everyone sharing that scale, and most ordinary weights round to zero. The fixes: share scales among fewer weights (per-channel, then per-group of 128 or 32, so an outlier only damages its own group); keep outliers in higher precision (LLM.int8() for activation outlier channels); move the difficulty somewhere easier with an exact rescaling (SmoothQuant moves activation outliers into the weights; AWQ scales up important weight columns); or round cleverly so neighbouring weights compensate (GPTQ). Activation outliers are harder than weight outliers because they show up per input channel, which is inside the dot product, and change per token.
+
+</details>
+
+<details>
+<summary>3. Which format would you pick for a single-user chat on the Spark, and which for a busy server on H100s? Why are they different?</summary>
+
+Single user: decode dominates and it's memory-bound, so the fewest bytes wins: a 4-bit weight-only format (AWQ/GPTQ int4 group 128, or GGUF Q4_K_M) gets close to 4× the bf16 decode ceiling, and its unchanged bf16 math doesn't matter because the math units are idle anyway. Busy server: large batches push decode towards compute-bound, and prefill is a big share of the work, so you want the math itself to be cheaper. FP8 W8A8 halves both bytes and math cost and loses almost nothing in quality, which is why it's the default for big fleets on Hopper, with FP4 (NVFP4) on Blackwell the next step. On the Spark, which is Blackwell, NVFP4 is attractive for both if the engine supports it on GB10.
+
+</details>
+
+<details>
+<summary>4. How does the speed-up from quantization scale with batch size?</summary>
+
+At batch 1, tokens/sec is bandwidth over bytes, so halving bytes nearly doubles speed (minus fixed overheads). As batch grows, each weight read serves more tokens, so arithmetic intensity grows and you move up the roofline. Once you are near the ridge point, the matmul is limited by math, not bytes. A weight-only format then has no advantage left (its math is bf16, plus unpacking) and can be slower than bf16; a W8A8/FP8 format still runs about twice as fast as bf16 because its math is cheaper. In between, the KV cache also grows with batch and isn't touched by weight quantization, which shrinks the share of bytes the weight format controls. So: weight-only quantization is a small-batch win; weight-and-activation quantization keeps paying at scale.
+
+</details>
+
+<details>
+<summary>5. Someone says "4-bit is lossless, perplexity only went up 2%." What do you ask?</summary>
+
+Which model size (small models suffer more), which method and group size, and how many bits per weight really, including scales. Then: perplexity on what text, and what's the KL divergence against the original, which catches changes perplexity averages away. On a task I care about, what's the accuracy with a confidence interval, and how many answers flipped compared with the original; equal accuracy can hide many changed answers. And does it hold at long context and on multi-step math or code, where small errors compound. "Lossless" should mean "no difference I can detect with this eval at this sample size," and I'd want to know the sample size.
+
+</details>
+
+## Go Deeper
+
+- **Benoit Jacob et al., "Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference"** (CVPR 2018). The scale-and-zero-point scheme everyone uses, derived carefully, including how to do the whole matmul in integers.
+- **Tim Dettmers, Mike Lewis, Younes Belkada, Luke Zettlemoyer, "LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale"** (2022). The discovery of emergent outlier features, with the plots. Dettmers' blog post accompanying it, "LLM.int8() and Emergent Features," is a gentler read.
+- **Elias Frantar, Saleh Ashkboos, Torsten Hoefler, Dan Alistarh, "GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers"** (2022, ICLR 2023). Error-compensating rounding at 175B scale. Read section 3 for the algorithm.
+- **Ji Lin, Jiaming Tang et al., "AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration"** (2023, MLSys 2024). The "1% of weights matter" observation and the scaling trick. Short and clear.
+- **Guangxuan Xiao, Ji Lin et al., "SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models"** (2022, ICML 2023). The one-equation idea of moving difficulty from activations to weights; the figure of activation channels vs weight channels is worth the read alone.
+- **Paulius Micikevicius et al., "FP8 Formats for Deep Learning"** (2022), and the **OCP Microscaling Formats (MX) specification** (2023). The definitions of E4M3/E5M2 and MXFP4. For NVFP4, NVIDIA's Blackwell architecture material and developer blog posts on NVFP4.
+- **Abhinav Dutta et al., "Accuracy is Not All You Need"** (Microsoft Research, 2024). Why you should count flips and measure KL divergence, not just accuracy, when comparing a compressed model with the original.
+- **llama.cpp repository**: the quantization README and the pull requests by Iwan Kawrakow (ikawrakow) introducing k-quants and the importance matrix, which document the block layouts and their bits per weight. Plus the **vLLM docs, "Quantization"** section, for which formats and kernels it supports on which GPUs, and the **NVIDIA DGX Spark playbooks** for what is tested on GB10.
+
+## Connections
+
+This lesson is the first escape route from [Why ~17 tokens per second?](/lessons/bandwidth-bound/): fewer bytes per weight. The predictions are the same division, with a smaller numerator, and the rows go on the scoreboard from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/).
+
+The float formats get their full treatment in [fp32, bf16, fp16, fp8](/lessons/number-formats/), and the same 8-bit ideas show up for optimizer states in [Why training needs so much memory](/lessons/training-memory/). How much memory quantization frees, and how many more users and how much more context fit, is [How much memory does a model need?](/lessons/memory-math/). Why weight-only formats lose their edge at high batch is [Batching](/lessons/batching/). The kernels that make all of this fast, and why a naive dequantize is slower than bf16, are the subject of [FlashAttention and kernels](/lessons/flash-attention/) and [Inside vLLM and SGLang](/lessons/serving-engines/). And deciding whether a 2-point drop on GSM8K is real is [Is that improvement real?](/lessons/statistics-for-evals/).

@@ -1,0 +1,758 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import DPOLossSurface from '../components/figures/DPOLossSurface.astro';
+
+## Today
+
+- Explain why preference data ("A is better than B") is easier to collect and often more useful than demonstrations, and what the Bradley-Terry model turns it into.
+- Draw the classic RLHF pipeline (SFT, reward model, PPO with a KL penalty) and say exactly why PPO is heavy: four models in memory, and a training loop that breaks easily.
+- Derive the DPO loss yourself, step by step, from "maximize reward without drifting too far from the reference", and say in plain words what β and the "implicit reward" are.
+- Write the DPO loss and a correct sequence log-prob function in PyTorch, check them by hand, then preference-tune a 0.5B instruct model on the Spark and match TRL's `DPOTrainer`.
+- Recognise the failure modes on a training dashboard (both log-probs falling, overfitting, answers getting longer) and know which variant (IPO, KTO, SimPO, ORPO) was invented to fix which.
+
+Prerequisites: [Train a tiny LM](/lessons/tiny-lm/) (log-probs, cross-entropy, a training loop), [Why training needs so much memory](/lessons/training-memory/) (the bytes-per-parameter bill), and ideally [LoRA](/lessons/lora/) and [LLM judges](/lessons/llm-judges/), which this lesson uses as tools. Rough time: one evening for the idea and the math, one for the build, one for training and evaluation on the Spark.
+
+## The Problem
+
+You want your relevance-labelling model to write better explanations. Not just the label, but a short reason a human reviewer can trust. You try the obvious thing first: write a few hundred perfect explanations yourself and fine-tune on them.
+
+It goes badly in a way you didn't expect. Writing a perfect explanation takes you four minutes. After forty of them you are tired, they all start to sound the same, and you are not sure your fortieth is better than what the model already writes. The model learns your tired style.
+
+Then a colleague shows you two of the model's explanations side by side and asks "which is better?". You answer in three seconds, and you're confident. You could do two hundred of those in the time it took to write twenty perfect answers. And your judgment of "better" is sharper than your ability to produce "best".
+
+That's the whole motivation. **Judging is easier than writing.** A wine critic can't make a great wine, but can reliably tell you which of two glasses is better. If you could train a model on "this one, not that one", you'd get far more signal per hour of human time, and the signal would be about quality, not about copying one person's phrasing.
+
+The catch is that "A is better than B" is not a target you can do cross-entropy against. There is no single right answer to imitate. You need some way to turn a pile of comparisons into gradient updates. For five years the answer was reinforcement learning, and it was painful. In 2023 a paper showed that, with one algebra trick, the painful part disappears and what's left is a loss function shorter than this sentence.
+
+<Origin year="2017–2023" title="From robot backflips to a one-line loss">
+
+In 2017 Paul Christiano and colleagues at OpenAI and DeepMind taught a simulated robot to do a backflip without ever writing down what a backflip is. Humans watched pairs of short clips and clicked the one that looked more like a backflip. A small network learned to predict those clicks, and that network served as the reward for reinforcement learning. About 900 clicks were enough.
+
+The same recipe moved to language: fine-tuning GPT-2 on human preferences (Ziegler et al., 2019), then summarization (Stiennon et al., 2020), then InstructGPT (Ouyang et al., 2022), where a 1.3B model trained this way was preferred by human raters over the 175B GPT-3 it was built from. That pipeline, reward model plus PPO, became "RLHF", and it is what made ChatGPT feel like an assistant.
+
+It was also notoriously hard to run. Many labs simply couldn't get PPO to train stably on language models. In May 2023 Rafael Rafailov, Archit Sharma, Eric Mitchell and colleagues at Stanford published "Direct Preference Optimization: Your Language Model is Secretly a Reward Model". They showed that the reward model and the RL loop could be folded into one supervised loss on the preference pairs. Within months, many open models (Zephyr, Tülu, and later Llama 3's post-training) used DPO or a close relative.
+
+</Origin>
+
+## The Idea
+
+### What a preference pair looks like
+
+A preference dataset is a list of triples. A <Term w="prompt">The input text the model responds to. Written x in the papers.</Term> `x`, and two responses to it: the one a person (or a strong model) liked better, `y_w` for "winner" or <Term w="chosen">The preferred response in a pair. Written y_w.</Term>, and the other, `y_l` for "loser" or <Term w="rejected">The less preferred response in a pair. Written y_l. It need not be bad, only worse than the chosen one.</Term>.
+
+```json
+{
+  "prompt":   "Explain why the sky is blue to a ten-year-old.",
+  "chosen":   "Sunlight is a mix of all colors. When it hits the air, blue light bounces around ...",
+  "rejected": "The sky is blue because of Rayleigh scattering, which is inversely proportional to ..."
+}
+```
+
+Two things to notice. The rejected answer is not wrong, it's just worse for this audience. And nobody wrote a "perfect" answer: both came from a model, and a human only had to pick. That's the economics. In InstructGPT the labellers ranked 4 to 9 model outputs per prompt at once, and every ranking of K answers gives K·(K−1)/2 pairs for free.
+
+### From comparisons to a score: Bradley-Terry
+
+Before you can train on comparisons, you need a model of how comparisons come about. The standard one is from 1952, built for ranking chess players and sports teams.
+
+Imagine every response has a hidden quality score, a single number, `r(x, y)`, the <Term w="reward">A single number saying how good a response y is for prompt x. Higher is better. In RLHF it comes from a learned reward model.</Term>. When a person compares two responses, they don't always pick the higher one, they're noisy. The <Term w="Bradley-Terry model">A 1952 model of paired comparisons: the chance that A beats B depends only on the difference of their scores, through the sigmoid. Elo ratings in chess are built on the same idea.</Term> says the chance they pick A over B is the sigmoid of the score difference:
+
+```text
+P(A beats B) = σ( r(A) − r(B) )        where σ(z) = 1 / (1 + e^(−z))
+```
+
+A difference of 0 means a coin flip. A difference of +2 means A wins about 88% of the time. A difference of +5, about 99%. Only differences matter, so adding 100 to every score changes nothing. Hold onto that last fact, it's the trick that makes DPO work.
+
+Train a network to output `r`, and the loss is just "maximize the probability of the comparisons you actually saw":
+
+```text
+loss_RM = − log σ( r(x, y_w) − r(x, y_l) )
+```
+
+That's logistic regression on the difference of two scores. It is exactly the loss you'd use to train a pairwise ranker, which you've done: a cross-encoder trained with a pairwise loss on (query, better doc, worse doc) is a Bradley-Terry reward model with a different name.
+
+### The classic pipeline: SFT, reward model, PPO
+
+InstructGPT's recipe has three stages.
+
+1. **SFT.** <Term w="supervised fine-tuning">SFT. Ordinary next-token training on example (prompt, good response) pairs written by people. Teaches the format and basic behavior.</Term> on human-written demonstrations. You get a model that answers like an assistant, roughly. Call it `π_SFT`.
+2. **Reward model.** Sample several answers from `π_SFT`, have people rank them, train a model (InstructGPT used a 6B one) with the Bradley-Terry loss above. It reads a prompt and a response and prints one number.
+3. **RL.** Let the model write answers, score each with the reward model, and nudge the model toward higher-scoring answers. The algorithm is <Term w="PPO">Proximal Policy Optimization (Schulman et al., 2017). A reinforcement learning method that improves a policy using sampled attempts and their rewards, while clipping each update so the policy can't change too much in one step.</Term>.
+
+In RL language the language model is now a <Term w="policy">The thing that chooses actions. For a language model: the model itself, choosing the next token. Written π (pi), and πθ when we mean the version with trainable weights θ.</Term>, written `πθ`. Stage 3 maximizes this:
+
+```text
+maximize over πθ:   E[ r(x, y) ]  −  β · KL( πθ(·|x) ‖ π_ref(·|x) )
+                    ↑ be good        ↑ but don't wander far from where you started
+```
+
+The second term is the important one. `π_ref` is the <Term w="reference model">A frozen copy of the model from before preference training (usually the SFT model). The trained model is penalized for drifting away from it.</Term>, a frozen copy of the SFT model. <Term w="KL divergence">Kullback-Leibler divergence. A measure of how different two probability distributions are; 0 when they are identical. Here: how differently the trained model and the reference spread probability over responses.</Term> measures how far the policy's distribution has moved from it. β is the price of moving.
+
+Why have that term at all? Because the reward model is a learned approximation, trained on a few tens of thousands of comparisons. Push a policy hard against it and the policy finds the reward model's blind spots: answers that score high and are garbage. This is <Term w="reward hacking">When the model gets high reward by exploiting flaws in the reward signal instead of doing what the reward was meant to measure.</Term>, and the KL leash is the main defence. Stay close to a model that already writes sensible text, and you can only exploit the reward model so much.
+
+<Figure n="001" title="RLHF WITH PPO VS DPO" caption="Top: the InstructGPT pipeline. Stage 3 keeps four models busy at once: the policy being trained, a frozen reference for the KL penalty, a frozen reward model, and a value model that is also being trained. Bottom: DPO skips the reward model and the sampling loop entirely and trains on the pairs directly, with only the policy and a frozen reference." wide>
+<svg viewBox="0 0 760 330" role="img" aria-label="RLHF pipeline with SFT, reward model and PPO with four models, compared with DPO with two models">
+  <text x="10" y="18" class="strong">RLHF (INSTRUCTGPT, 2022)</text>
+  <rect x="10" y="32" width="120" height="58" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="54" text-anchor="middle" class="strong">1 · SFT</text>
+  <text x="70" y="72" text-anchor="middle">demonstrations</text>
+  <line x1="130" y1="61" x2="160" y2="61" class="ink" stroke-width="1.2" marker-end="url(#dpo1-a)" />
+  <rect x="164" y="32" width="150" height="58" class="fill-paper" stroke-width="1.2" />
+  <text x="239" y="54" text-anchor="middle" class="strong">2 · REWARD MODEL</text>
+  <text x="239" y="72" text-anchor="middle">pairwise B-T loss</text>
+  <line x1="314" y1="61" x2="344" y2="61" class="ink" stroke-width="1.2" marker-end="url(#dpo1-a)" />
+  <rect x="348" y="24" width="402" height="150" class="fill-wash" stroke-width="1.2" />
+  <text x="360" y="42" class="strong">3 · PPO LOOP · FOUR MODELS IN MEMORY</text>
+  <rect x="360" y="54" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="405" y="72" text-anchor="middle" class="strong">POLICY</text>
+  <text x="405" y="88" text-anchor="middle" class="blue-t">TRAINED</text>
+  <rect x="456" y="54" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="501" y="72" text-anchor="middle" class="strong">REFERENCE</text>
+  <text x="501" y="88" text-anchor="middle">FROZEN</text>
+  <rect x="552" y="54" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="597" y="72" text-anchor="middle" class="strong">REWARD</text>
+  <text x="597" y="88" text-anchor="middle">FROZEN</text>
+  <rect x="648" y="54" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="693" y="72" text-anchor="middle" class="strong">VALUE</text>
+  <text x="693" y="88" text-anchor="middle" class="blue-t">TRAINED</text>
+  <text x="360" y="120">sample answers → score → KL to reference</text>
+  <text x="360" y="136">→ advantages from value → clipped update</text>
+  <text x="360" y="158" class="blue-t">REPEAT: GENERATION IN THE TRAINING LOOP</text>
+
+  <line x1="10" y1="196" x2="750" y2="196" class="ink dash" stroke-width="0.8" />
+
+  <text x="10" y="222" class="strong">DPO (RAFAILOV ET AL., 2023)</text>
+  <rect x="10" y="236" width="120" height="58" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="258" text-anchor="middle" class="strong">1 · SFT</text>
+  <text x="70" y="276" text-anchor="middle">(same)</text>
+  <line x1="130" y1="265" x2="160" y2="265" class="ink" stroke-width="1.2" marker-end="url(#dpo1-a)" />
+  <rect x="164" y="236" width="150" height="58" class="fill-paper dash" stroke-width="1" />
+  <text x="239" y="258" text-anchor="middle">PAIRS ONLY</text>
+  <text x="239" y="276" text-anchor="middle">no reward model</text>
+  <line x1="314" y1="265" x2="344" y2="265" class="ink" stroke-width="1.2" marker-end="url(#dpo1-a)" />
+  <rect x="348" y="228" width="402" height="92" class="fill-wash" stroke-width="1.2" />
+  <text x="360" y="246" class="strong">2 · ONE LOSS · TWO MODELS</text>
+  <rect x="360" y="256" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="405" y="274" text-anchor="middle" class="strong">POLICY</text>
+  <text x="405" y="290" text-anchor="middle" class="blue-t">TRAINED</text>
+  <rect x="456" y="256" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="501" y="274" text-anchor="middle" class="strong">REFERENCE</text>
+  <text x="501" y="290" text-anchor="middle">FROZEN</text>
+  <text x="560" y="272">log-probs of fixed</text>
+  <text x="560" y="288">pairs, no sampling</text>
+  <defs>
+    <marker id="dpo1-a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink)" />
+    </marker>
+  </defs>
+</svg>
+</Figure>
+
+### Why PPO is heavy
+
+Look at stage 3 in Figure 001 and count.
+
+- **The policy**, being trained: weights, gradients, optimizer state.
+- **The reference**, frozen, needed for the KL term on every sampled answer.
+- **The reward model**, frozen, needed to score every sampled answer.
+- **The value model**, being trained too. PPO needs a <Term w="value model">Also called the critic. A network that predicts how much reward the policy will end up with from a given point in a response. Used to judge whether a particular token choice was better or worse than expected.</Term> to work out which tokens deserved the credit. A response gets one reward at the end; the value model's predictions turn that into a per-token signal called the <Term w="advantage">How much better an action turned out than the value model expected. Positive: do more of this. Negative: do less.</Term>.
+
+Put numbers on it, using [the 16-bytes-per-parameter rule](/lessons/training-memory/) for anything trained with Adam in mixed precision and 2 bytes per parameter for anything frozen in bf16. For a 7B model with all four networks the same size: two trained models at 16 × 7B ≈ 112 GB each, two frozen ones at 14 GB each. About 250 GB before a single activation. That's two Sparks' worth of memory, and real setups add a fast generation engine on top, because stage 3 also has to *sample* answers in every step, which is the slow, memory-bound decoding from [Why ~17 tokens per second?](/lessons/bandwidth-bound/).
+
+Then there's the instability. Each PPO step depends on answers sampled from the current policy, scored by a learned reward, credited by a learned value model that is itself chasing a moving target. There are a dozen knobs (clip range, KL coefficient, value loss weight, temperature, reward scaling), and wrong settings don't raise an error. They give you a model that slowly turns into repetitive nonsense the reward model loves.
+
+Hold that picture. Now the trick.
+
+### The key insight: the best policy has a formula
+
+Go back to the objective: be good, but pay β for every unit of drift from the reference. Forget neural networks for a moment and ask a pure math question. **Over all possible policies, which one scores best on this objective?**
+
+It has an exact answer:
+
+```text
+π*(y|x) = π_ref(y|x) · exp( r(x,y) / β ) / Z(x)
+```
+
+In words: **take the reference model's probabilities and tilt them by the reward.** Every possible response gets its old probability multiplied by `exp(reward / β)`. Good answers get boosted, bad ones shrunk. Then divide by `Z(x)`, the <Term w="partition function">A normalizing number, Z(x): the sum of π_ref(y|x)·exp(r(x,y)/β) over every possible response y. Dividing by it makes the probabilities add up to 1. For language it's a sum over every possible text, so nobody can compute it.</Term>, so everything still adds up to 1.
+
+Why is this the optimum? A short, honest sketch. You can rewrite the objective as `−β · KL(π ‖ π*) + β·log Z(x)`. The second piece doesn't depend on π at all. KL is never negative and is zero only when the two distributions are equal. So the best you can do is make `π = π*`. (Appendix A.1 of the DPO paper does the algebra in full, and it's worth twenty minutes with a pen.)
+
+β shows up as a temperature. Small β: the reward is divided by a small number, the tilt is extreme, and π* piles all its probability on the highest-reward answers. Large β: the tilt is gentle, and π* stays close to the reference.
+
+This formula was known well before DPO. It's useless on its own, because `Z(x)` is a sum over every possible piece of text. You can't sample from π* or evaluate it. That's why people did RL instead.
+
+### Flip it around
+
+Here's the move that makes the paper. Take that formula and solve it for the reward instead of the policy. Take the log of both sides and rearrange:
+
+```text
+r(x,y) = β · log( π*(y|x) / π_ref(y|x) )  +  β · log Z(x)
+```
+
+Read it in words: **the reward of a response equals β times how much more likely the optimal policy makes it, compared to the reference, plus a constant that depends only on the prompt.**
+
+If the optimal policy is twice as likely as the reference to say `y`, then `y`'s reward is `β·log 2` plus the constant. If it's ten times less likely, the reward is `β·log(1/10)` plus the constant. The policy *is* the reward model, read off through a log-ratio. Hence the paper's title.
+
+We still have that nasty `Z(x)`. But remember what Bradley-Terry cares about: only differences between two responses' rewards. And both responses in a pair share the same prompt `x`, so they share the same `β·log Z(x)`. In the difference, it cancels.
+
+<Predict id="z-cancels">
+Plug the "reward in terms of policy" formula into the Bradley-Terry probability, `σ(r(x,y_w) − r(x,y_l))`. Write down what's left. Which terms disappear, and why can you now compute everything that remains?
+<Fragment slot="answer">
+
+```text
+r(x,y_w) − r(x,y_l) = β·log(π*(y_w|x)/π_ref(y_w|x)) + β·log Z(x)
+                    − β·log(π*(y_l|x)/π_ref(y_l|x)) − β·log Z(x)
+```
+
+The two `β·log Z(x)` terms cancel, because both answers answer the same prompt. What's left is four log-probabilities of specific, known texts: the chosen and rejected answers under the policy and under the reference. You can compute each one with a single forward pass, the same way you compute a training loss. No sum over all possible texts, no sampling.
+
+</Fragment>
+</Predict>
+
+### The DPO loss, step by step
+
+Now assemble it. Replace the unknown π* with the model we're training, πθ, and train it to make the observed preferences likely. Step by step:
+
+1. **How much did the policy move the chosen answer?** `log πθ(y_w|x) − log π_ref(y_w|x)`. Positive means the policy now likes the chosen answer more than the reference did. Call it `a`.
+2. **How much did it move the rejected answer?** `log πθ(y_l|x) − log π_ref(y_l|x)`. Call it `b`.
+3. **Multiply each by β.** These are the <Term w="implicit reward">β times the log-ratio of policy to reference for one response: β·(log πθ(y|x) − log π_ref(y|x)). DPO's stand-in for the reward model's score. It's only meaningful compared with another response to the same prompt.</Term>s: `β·a` for the chosen, `β·b` for the rejected. They're what the reward model would have said, read straight off the policy.
+4. **Take the difference.** `β·(a − b)`, the reward margin. Positive means the policy agrees with the human.
+5. **Squash with the sigmoid.** `σ(β·(a − b))` is the probability, under Bradley-Terry, that the policy's implicit reward model agrees with the label.
+6. **Take minus the log.** That's the loss for one pair. Average over the batch.
+
+```text
+L_DPO = − log σ( β · [ (log πθ(y_w|x) − log π_ref(y_w|x)) − (log πθ(y_l|x) − log π_ref(y_l|x)) ] )
+```
+
+That's it. It's the reward-model loss from earlier, with the reward model replaced by a ratio of two language models. No sampling, no value model, no reward model, no RL loop. Two forward passes on the policy (chosen and rejected), two on the frozen reference, one backward pass.
+
+<Figure n="002" title="FOUR LINES OF ALGEBRA" caption="The whole derivation. Start from the KL-constrained objective, write down its exact optimum, solve that for the reward, and substitute into Bradley-Terry. The intractable normalizer Z(x) cancels because both answers share a prompt, which leaves a loss you can compute from four log-probs.">
+<svg viewBox="0 0 640 400" role="img" aria-label="Derivation chain from the RLHF objective to the DPO loss">
+  <rect x="20" y="10" width="600" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="30" class="strong">1 · OBJECTIVE</text>
+  <text x="32" y="52">max E[r(x,y)] − β·KL(π ‖ π_ref)</text>
+  <text x="608" y="52" text-anchor="end">be good, stay close</text>
+  <line x1="320" y1="66" x2="320" y2="88" class="ink" stroke-width="1.2" marker-end="url(#dpo2-a)" />
+  <rect x="20" y="92" width="600" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="112" class="strong">2 · EXACT OPTIMUM</text>
+  <text x="32" y="134">π*(y|x) = π_ref(y|x) · exp(r/β) / Z(x)</text>
+  <text x="608" y="134" text-anchor="end">tilt reference by reward</text>
+  <line x1="320" y1="148" x2="320" y2="170" class="ink" stroke-width="1.2" marker-end="url(#dpo2-a)" />
+  <rect x="20" y="174" width="600" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="194" class="strong">3 · SOLVE FOR THE REWARD</text>
+  <text x="32" y="216">r = β·log(π*/π_ref) + β·log Z(x)</text>
+  <text x="608" y="216" text-anchor="end">policy IS a reward model</text>
+  <line x1="320" y1="230" x2="320" y2="252" class="ink" stroke-width="1.2" marker-end="url(#dpo2-a)" />
+  <rect x="20" y="256" width="600" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="276" class="strong">4 · INTO BRADLEY-TERRY</text>
+  <text x="32" y="298">σ(r_w − r_l): the β·log Z(x) terms cancel</text>
+  <text x="608" y="298" text-anchor="end">same prompt, same Z</text>
+  <line x1="320" y1="312" x2="320" y2="334" class="blue" stroke-width="1.5" marker-end="url(#dpo2-b)" />
+  <rect x="20" y="338" width="600" height="56" class="fill-wash" stroke-width="1.5" />
+  <text x="32" y="358" class="strong">DPO LOSS</text>
+  <text x="32" y="380" class="blue-t">−log σ(β·[(log πθ_w − log πref_w) − (log πθ_l − log πref_l)])</text>
+  <defs>
+    <marker id="dpo2-a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" style="fill:var(--ink)" />
+    </marker>
+    <marker id="dpo2-b" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" style="fill:var(--blue)" />
+    </marker>
+  </defs>
+</svg>
+</Figure>
+
+### What the loss actually does
+
+The loss only sees two numbers, `a` and `b` (the two log-ratios), plus β. So you can draw it completely. Play with it. Start at "Step 0", where the policy is an exact copy of the reference. Then try the other presets, and move β.
+
+<Predict id="step-zero">
+At the very first training step, the policy is a copy of the reference. What's the loss on every pair, to three decimal places? What fraction of pairs count as "correct" (chosen reward greater than rejected)?
+<Fragment slot="answer">
+
+Both log-ratios are exactly 0, so the margin is 0, `σ(0) = 0.5`, and the loss is `−log 0.5 = ln 2 ≈ 0.693` on every pair, regardless of β. Accuracy, if you count "chosen reward strictly greater than rejected", is 0%: every pair is a tie. (TRL and most dashboards use strict `>`.) So the first logged point of any DPO run should read loss 0.693, accuracy 0, margin 0. If it doesn't, the policy and reference aren't the same model at step 0, and the usual culprit is dropout, which you'll break on purpose later.
+
+</Fragment>
+</Predict>
+
+<Figure n="003" title="THE DPO LOSS FOR ONE PAIR" caption="a is how much the policy raised the chosen answer's log-prob relative to the reference, b the same for the rejected answer. The loss depends only on a − b, so every diagonal line is a contour. The gradient always points the same way, chosen up and rejected down by equal amounts; only its size changes. Nothing in the loss cares whether you get there by raising the chosen answer or by sinking both." wide>
+
+<DPOLossSurface />
+
+</Figure>
+
+Four things the figure makes obvious.
+
+**1. The gradient is a weighted "push chosen up, push rejected down".** Differentiate the loss and you get:
+
+```text
+∇L = − β · σ( r̂_l − r̂_w ) · [ ∇ log πθ(y_w|x) − ∇ log πθ(y_l|x) ]
+```
+
+where `r̂` is the implicit reward. The bracket is "make the chosen answer more likely, the rejected one less likely", which is ordinary log-likelihood gradients with a plus and a minus. The weight `σ(r̂_l − r̂_w)` is the probability the policy currently has the pair *wrong*. Pairs it already gets right by a wide margin get almost no push. Pairs it gets wrong get pushed hardest. That weight is what separates DPO from just doing "SFT on chosen, unlikelihood on rejected", which the paper tried and found makes the model degenerate.
+
+**2. Only the difference matters.** Every point on a diagonal has the same loss. The point (+2, 0), "chosen up, rejected unchanged", and the point (−4, −6), "both fell, rejected fell more", are equally good to DPO. That will matter a lot in Break It.
+
+**3. The loss never reaches zero.** It keeps rewarding a bigger margin forever. On a pair with a clear winner, DPO will happily push `a − b` toward infinity unless something stops it. In practice what stops it is that you train for one or a few epochs at a small learning rate.
+
+**4. β sets the scale.** Move the β slider. With small β, the same log-ratio margin earns a small reward margin, so the loss stays high and the push stays strong for longer. The policy has to move *further* from the reference before the loss is satisfied. With large β, a tiny margin already saturates the sigmoid, the push dies off quickly, and the policy stays close to the reference.
+
+### What β means
+
+In the original objective, β was the price per unit of drift: big β, stay close to the reference. In the loss, the same β multiplies the log-ratios. The two views agree. To reach a reward margin of, say, 2 (which Bradley-Terry reads as "88% sure"), the log-ratio margin has to be `2/β`. At β = 0.5 that's 4 nats of movement. At β = 0.1 it's 20.
+
+Typical values are 0.01 to 0.5, with 0.1 the default in the DPO paper and in TRL. Lower β means more aggressive changes to the model and more risk of drifting into weird text; higher β means gentler changes that may not move behavior enough. It is the single most important hyperparameter after the learning rate, and the two interact: a learning rate that's fine at β = 0.1 can wreck the model at β = 0.01.
+
+Two honest caveats. First, DPO keeps the model "close to the reference" only *on the data you train on*. The KL term in RLHF is measured on answers the policy itself writes, everywhere. DPO's leash only applies through the pairs, so on texts far from your dataset the model can drift in ways nothing measured. Second, the derivation assumed we reach the exact optimum π*. A real network trained for one epoch on a few thousand pairs does not. The algebra explains what the loss is aiming at, not where it lands.
+
+### The implicit reward, and what to watch
+
+Every DPO step hands you, for free, the numbers that a reward model would have produced. Libraries log them, and they are your dashboard:
+
+| Metric | What it is | Healthy run |
+| --- | --- | --- |
+| `rewards/chosen` | mean `β·a` over the batch | starts at 0; may go up or down a little |
+| `rewards/rejected` | mean `β·b` | starts at 0; goes down |
+| `rewards/margins` | mean `β·(a − b)` | starts at 0; rises steadily |
+| `rewards/accuracies` | fraction of pairs with `β·a > β·b` | starts at 0 (ties); rises fast, then plateaus |
+| `logps/chosen`, `logps/rejected` | mean sequence log-prob under the policy | watch these: see Break It |
+| loss | `−log σ(margin)` averaged | starts at 0.693, falls |
+
+Accuracy means "the policy's implicit reward model agrees with the label on this pair". On training pairs it eventually nears 100% and tells you little; on held-out pairs it tells you whether the preference generalizes.
+
+### Sequence log-probs: where most bugs live
+
+The loss needs `log πθ(y|x)`, the log-probability of a whole response given its prompt. Language models give you probabilities one token at a time, so by the chain rule:
+
+```text
+log π(y|x) = log p(y₁|x) + log p(y₂|x, y₁) + ... + log p(y_T|x, y₁..y_{T−1})
+```
+
+A <Term w="sequence log-prob">The log-probability a model assigns to a whole response: the sum of the log-probs of each of its tokens, each conditioned on the prompt and the tokens before it.</Term> is the sum of token log-probs, **over the response tokens only**. Three details, and every one of them has bitten real implementations.
+
+<Figure n="004" title="WHICH TOKENS COUNT" caption="Prompt and response are concatenated into one sequence. The logits at position t predict the token at position t + 1, so shift by one. Then keep only the response tokens, including the end-of-turn token (the model should learn when to stop), and drop the prompt and the padding. The sum of what's left is log π(y|x).">
+<svg viewBox="0 0 640 260" role="img" aria-label="Token sequence with prompt and response, a shifted label mask, and a sum over response tokens">
+  <text x="10" y="18" class="strong">INPUT IDS</text>
+  <g>
+    <rect x="10" y="28" width="62" height="34" class="fill-paper" stroke-width="1" />
+    <text x="41" y="50" text-anchor="middle">user</text>
+    <rect x="72" y="28" width="62" height="34" class="fill-paper" stroke-width="1" />
+    <text x="103" y="50" text-anchor="middle">Name</text>
+    <rect x="134" y="28" width="62" height="34" class="fill-paper" stroke-width="1" />
+    <text x="165" y="50" text-anchor="middle">a</text>
+    <rect x="196" y="28" width="62" height="34" class="fill-paper" stroke-width="1" />
+    <text x="227" y="50" text-anchor="middle">color</text>
+    <rect x="258" y="28" width="62" height="34" class="fill-paper" stroke-width="1" />
+    <text x="289" y="50" text-anchor="middle">asst</text>
+    <rect x="320" y="28" width="62" height="34" class="fill-wash" stroke-width="1" />
+    <text x="351" y="50" text-anchor="middle">Deep</text>
+    <rect x="382" y="28" width="62" height="34" class="fill-wash" stroke-width="1" />
+    <text x="413" y="50" text-anchor="middle">blue</text>
+    <rect x="444" y="28" width="62" height="34" class="fill-wash" stroke-width="1" />
+    <text x="475" y="50" text-anchor="middle">.</text>
+    <rect x="506" y="28" width="62" height="34" class="fill-wash" stroke-width="1" />
+    <text x="537" y="50" text-anchor="middle">&lt;eot&gt;</text>
+    <rect x="568" y="28" width="62" height="34" class="fill-paper dash" stroke-width="1" />
+    <text x="599" y="50" text-anchor="middle">pad</text>
+  </g>
+  <text x="10" y="80">◄──────── PROMPT x ─────────►</text>
+  <text x="320" y="80" class="blue-t">◄──── RESPONSE y ────►</text>
+  <text x="10" y="112" class="strong">LOGITS AT t PREDICT TOKEN t+1</text>
+  <line x1="289" y1="122" x2="345" y2="160" class="blue" stroke-width="1.2" marker-end="url(#dpo4-a)" />
+  <line x1="351" y1="122" x2="407" y2="160" class="blue" stroke-width="1.2" marker-end="url(#dpo4-a)" />
+  <line x1="413" y1="122" x2="469" y2="160" class="blue" stroke-width="1.2" marker-end="url(#dpo4-a)" />
+  <line x1="475" y1="122" x2="531" y2="160" class="blue" stroke-width="1.2" marker-end="url(#dpo4-a)" />
+  <line x1="227" y1="122" x2="283" y2="160" class="ink dash" stroke-width="1" />
+  <text x="10" y="186" class="strong">MASK</text>
+  <text x="103" y="186" text-anchor="middle">0</text>
+  <text x="165" y="186" text-anchor="middle">0</text>
+  <text x="227" y="186" text-anchor="middle">0</text>
+  <text x="289" y="186" text-anchor="middle">0</text>
+  <text x="351" y="186" text-anchor="middle" class="blue-t">1</text>
+  <text x="413" y="186" text-anchor="middle" class="blue-t">1</text>
+  <text x="475" y="186" text-anchor="middle" class="blue-t">1</text>
+  <text x="537" y="186" text-anchor="middle" class="blue-t">1</text>
+  <text x="599" y="186" text-anchor="middle">0</text>
+  <rect x="320" y="204" width="248" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="444" y="224" text-anchor="middle" class="strong">Σ log p(token) OVER MASK = 1</text>
+  <text x="444" y="240" text-anchor="middle">= log π(y|x), one number</text>
+  <text x="10" y="224">prompt tokens: given, not scored</text>
+  <text x="10" y="240">padding: not real text</text>
+  <defs>
+    <marker id="dpo4-a" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 z" style="fill:var(--blue)" />
+    </marker>
+  </defs>
+</svg>
+</Figure>
+
+**Shift by one.** The model's output at position `t` is its guess for the token at `t + 1`. So you compare `logits[:, :-1]` against `input_ids[:, 1:]`, and the mask shifts with the labels. Forget the shift and you score every token against itself, which gives a large, meaningless number that still trains, badly.
+
+**Mask the prompt.** The prompt is shared by chosen and rejected, so including it seems harmless: it cancels in `a − b`. But only if both sequences keep exactly the same prompt tokens, and it pollutes the `logps/chosen` numbers you'll be watching. Score only what the model wrote. Tokenize prompt and response separately and concatenate the ids; tokenizing the joined string can merge tokens across the boundary.
+
+**Sum, don't average.** DPO as derived uses the true log-probability of the response, which is a sum. Averaging over tokens is a different objective (it's what SimPO and ORPO use, on purpose). Summing has a consequence you should know about: a long response has a much more negative log-prob than a short one, and its log-ratio can move a lot more in absolute terms, simply because there are more tokens to move. That's one root of the length problem below.
+
+Also include the end-of-turn token in the response. It's how the model learns that the chosen answer *stops* where it stops.
+
+### What goes wrong
+
+Three failure modes you will see, in increasing order of sneakiness.
+
+**Overfitting.** DPO usually runs 1 to 3 epochs at small learning rates (for full fine-tuning, 5e-7 is common, 10 to 100 times lower than for SFT). Run longer and training accuracy hits 100%, margins keep climbing, held-out accuracy stalls, and the text gets strange. That's point 3 above: the loss always wants a bigger margin. The IPO paper (Azar et al., 2023) makes it precise: when preferences in the data are near-deterministic, DPO's optimum ignores β and drifts arbitrarily far from the reference.
+
+**Both log-probs fall.** Watch `logps/chosen`. You'd expect it to go up: you're training the model to prefer the chosen answer. Often it goes *down*, along with the rejected one, just more slowly. In Figure 003 that's the bottom-left region: loss looks great, both answers are less likely than before, and the probability went somewhere else, to responses that are in neither column. Sometimes that's harmless. Sometimes the "somewhere else" is worse than both. This has been studied under names like likelihood displacement, and you'll make it happen on purpose in Break It, dramatically, with a tiny model.
+
+**Length exploitation.** In many preference datasets, the chosen answer is longer on average than the rejected one, because raters (human and model) like thorough answers. DPO learns the cheapest feature that separates chosen from rejected, and "longer" is very cheap. Train on UltraFeedback and the average response length of your model will very likely go up. A judge that also likes length (see [LLM judges](/lessons/llm-judges/)) will then report a big win that is partly just more words. Park et al. (2024) measured this directly for DPO; benchmarks like AlpacaEval added a length-controlled win rate for the same reason.
+
+<Predict id="length">
+You DPO-train Qwen2.5-0.5B-Instruct on 5,000 UltraFeedback pairs. Before training, its mean answer length on 100 held-out prompts is 300 tokens. Guess the mean after training. Then guess how a pairwise LLM judge's win rate (DPO vs base) changes if you truncate both models' answers to the same length before judging.
+<Fragment slot="answer">
+
+There's no number to look up, it depends on your β, learning rate and steps, so measure it. The *direction* is the prediction: longer, often noticeably (a 10-50% increase would not be surprising), because chosen answers in UltraFeedback skew longer than rejected ones and length is an easy signal for the loss to pick up. When you equalize lengths, the win rate usually drops toward 50%. Whatever is left is the part of the improvement that isn't just more words. If your run shows no length increase at all, check that it actually moved the model (margins rising, held-out accuracy above 50%).
+
+</Fragment>
+</Predict>
+
+### The family: IPO, KTO, SimPO, ORPO
+
+DPO started a small industry of variants. You don't need them all, but you should know what each one changed and why. All four below are real papers; read the original before trusting a one-line summary, including this one.
+
+| Variant | What it changes | Why |
+| --- | --- | --- |
+| **IPO** (Azar et al., 2023) | Replaces `−log σ(β·h)` with a squared loss that pulls the log-ratio margin `h` toward a fixed target, `1/(2β)` in TRL's convention, instead of pushing it to infinity | Fixes the overfitting-to-deterministic-preferences problem: margins can't grow forever |
+| **KTO** (Ethayarajh et al., 2024) | Works on single responses labelled "good" or "bad", no pairs. Loss shaped after prospect theory from behavioral economics, with a reference point estimated from the batch | Thumbs-up/thumbs-down data is far more plentiful than paired comparisons |
+| **SimPO** (Meng, Xia, Chen, 2024) | No reference model. Uses the *average* token log-prob as the implicit reward, and adds a target margin γ inside the sigmoid | Saves the reference model's memory and compute; length normalization counters the length bias of summed log-probs |
+| **ORPO** (Hong, Lee, Thorne, 2024) | No reference model and no separate SFT stage. Adds a log-odds-ratio penalty between chosen and rejected to the ordinary SFT loss on the chosen answer | Does SFT and preference tuning in one pass |
+
+Notice the pattern. Two of them drop the reference model, which removes the "stay close" anchor and replaces it with something else (length normalization, or the SFT loss). Several practical recipes also add an SFT-style term on the chosen answers to DPO itself, which directly fights the "both log-probs fall" problem. There's no consensus winner: published comparisons depend heavily on tuning, and the variants are close to each other when each is well tuned. DPO is still the baseline everyone compares against, which is why you implement it.
+
+One more distinction worth having in your head. Everything above is <Term w="offline">Training on a fixed dataset collected beforehand, usually from a different model. The opposite of online, where the model being trained generates the data it learns from.</Term>: the pairs were written by other models and labelled once. PPO is <Term w="online">The model being trained generates fresh samples during training, and those get scored and learned from. PPO and GRPO are online.</Term>: it learns from its own fresh samples. A popular middle ground is iterative DPO: generate pairs from your current model, label them with a judge or reward model, run DPO, repeat. That brings back some of the "learn from your own mistakes" benefit of RL without PPO's machinery. The next lesson, [GRPO](/lessons/grpo/), goes fully online.
+
+## Build It
+
+Everything goes in `~/workbench/dpo/`. The core (Tasks 1 and 2) runs on your Mac in seconds. Training (Tasks 4-6) runs on the Spark. Keep one environment for both: `torch`, `transformers`, `datasets`, and later `trl` and `peft`.
+
+<Task id="t0" title="Set up the environment and look at the data" agent="ok">
+
+```bash
+mkdir -p ~/workbench/dpo && cd ~/workbench/dpo
+uv venv && source .venv/bin/activate
+uv pip install torch transformers datasets accelerate
+# later, for the parity check and LoRA:
+uv pip install trl peft
+```
+
+On the Spark, use the PyTorch build that matches its CUDA and ARM64 (NVIDIA's containers or wheels; see the [containers](/lessons/containers/) lesson). The dataset is `HuggingFaceH4/ultrafeedback_binarized`, the version of UltraFeedback used to train Zephyr: about 60k prompts, each with a chosen and a rejected response picked from four model completions using GPT-4 ratings. The preference splits are `train_prefs` and `test_prefs`. Check the dataset card for the exact column names and sizes before you rely on them.
+
+```python
+# peek.py
+from datasets import load_dataset
+ds = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs")
+print(ds)
+ex = ds[0]
+print(ex["prompt"][:300])
+print("CHOSEN:", ex["chosen"][-1]["content"][:300])     # chosen/rejected are chat message lists
+print("REJECTED:", ex["rejected"][-1]["content"][:300])
+print(ex["score_chosen"], ex["score_rejected"])
+```
+
+Read twenty pairs. Would you have picked the same winner every time? Write down how many you disagree with. That number is a rough floor on the noise in your labels, and it'll come back when you see held-out accuracy plateau.
+
+</Task>
+
+<Task id="t1" title="Write the sequence log-prob function" agent="hands">
+
+This is the part most likely to be subtly wrong, so it's yours. Inputs are the model's logits for a batch of concatenated (prompt + response) sequences, the input ids, and a mask that is 1 on response tokens and 0 on prompt and padding.
+
+```python
+# dpo_core.py
+import torch
+import torch.nn.functional as F
+
+def sequence_logps(logits: torch.Tensor,     # (B, T, V)
+                   input_ids: torch.Tensor,  # (B, T)
+                   response_mask: torch.Tensor  # (B, T), 1 on response tokens
+                   ) -> torch.Tensor:        # (B,)
+    """Sum of log p(token) over response tokens only.
+    Remember: logits at position t predict the token at t + 1."""
+    ...
+```
+
+Hints:
+
+- Shift: drop the last logit position and the first label position. Shift the mask the same way as the labels.
+- `torch.log_softmax(..., dim=-1)` then `.gather(-1, labels.unsqueeze(-1))` picks out the log-prob of the actual token.
+- Do the softmax in float32 (`logits.float()`). In bf16 a sum of hundreds of small log-probs loses precision, and you will compare these numbers between two models.
+- Memory: `log_softmax` over a 150k-token vocabulary for 2 × 1024 positions is about 1.2 GB in fp32 for one sequence pair. Fine on the Spark. If it isn't for you, compute `logits.gather(...) − logsumexp(logits)`, which avoids materializing the whole log-softmax.
+
+Then write the batch builder that produces those masks. For each example: render the prompt with the chat template (`apply_chat_template` with `add_generation_prompt=True` and `tokenize=False`), tokenize prompt and response **separately**, append the end-of-turn token to the response, concatenate the ids, build the mask, right-pad. Truncate the response (not the prompt) if the total exceeds your max length.
+
+Test it by hand with a fake model: random logits of shape `(1, 5, 7)`, ids `[2, 4, 1, 3, 6]`, mask `[0, 0, 1, 1, 1]`. Compute the answer manually as `log_softmax(logits[0, t−1])[ids[t]]` summed over `t = 2, 3, 4`, and assert your function matches to 1e-6.
+
+</Task>
+
+<Task id="t2" title="Write the DPO loss and check it by hand" agent="hands">
+
+```python
+def dpo_loss(policy_chosen_logps: torch.Tensor,    # (B,)
+             policy_rejected_logps: torch.Tensor,  # (B,)
+             ref_chosen_logps: torch.Tensor,       # (B,)
+             ref_rejected_logps: torch.Tensor,     # (B,)
+             beta: float = 0.1):
+    """Return (loss, chosen_rewards, rejected_rewards).
+    loss is the batch mean of −log σ(β·(a − b)); rewards are β·a and β·b, detached."""
+    ...
+```
+
+Hints:
+
+- Use `F.logsigmoid(z)`, not `torch.log(torch.sigmoid(z))`. For a large negative `z` the sigmoid underflows to 0 and the log becomes `−inf`. `logsigmoid` stays finite.
+- The reference log-probs must carry no gradient: compute them under `torch.no_grad()` (or `.detach()` them).
+
+Now check it **by hand, on paper, before running it**. One pair, β = 0.1:
+
+| | policy | reference |
+| --- | --- | --- |
+| chosen log-prob | −10.0 | −10.5 |
+| rejected log-prob | −12.0 | −11.5 |
+
+Work out `a`, `b`, the two implicit rewards, the loss, and the gradient of the loss with respect to `policy_chosen_logps`. Then run your function with `requires_grad=True` inputs and compare.
+
+<details>
+<summary>Answer (check after you've done it on paper)</summary>
+
+`a = −10.0 − (−10.5) = +0.5`, `b = −12.0 − (−11.5) = −0.5`. Rewards: `β·a = +0.05`, `β·b = −0.05`. Margin `β·(a − b) = 0.1`. Loss `= −log σ(0.1) = log(1 + e^(−0.1)) ≈ 0.6444`. The gradient with respect to the chosen log-prob is `−β·σ(−0.1) ≈ −0.1 × 0.475 = −0.0475`, and `+0.0475` for the rejected one. Equal and opposite, as Figure 003 promised. I ran exactly this in PyTorch and got `0.644397` and `∓0.047502`.
+
+</details>
+
+Also check: when all four inputs are equal, the loss is `0.6931` for any β.
+
+</Task>
+
+<Task id="t3" title="Watch DPO on a toy model" agent="hands">
+
+Before spending Spark time, run the whole loop on something that trains in a minute on your Mac. Make a tiny GPT-2 from a config (no download): `GPT2Config(vocab_size=50, n_positions=32, n_embd=64, n_layer=2, n_head=2)`, with all three dropout settings at 0. Generate 64 synthetic pairs: a random 4-token prompt, and a random 6-token response where the chosen and rejected versions are identical except the last token (token 1 for chosen, token 2 for rejected).
+
+1. Train it briefly with SFT (your `sequence_logps`, negated) on *both* chosen and rejected, so it starts out with no preference. That's your reference. Deep-copy it into the policy.
+2. Run 300 steps of DPO (AdamW, lr 1e-4, β 0.1, full batch). Every 25 steps print: loss, accuracy, mean reward margin, mean `logps/chosen` and `logps/rejected` for the policy and the reference.
+
+Predict before running: does the chosen log-prob go up?
+
+You'll use this exact toy again in Break It, so keep it in `toy.py`.
+
+</Task>
+
+<Task id="t4" title="Train Qwen2.5-0.5B-Instruct with your DPO on the Spark" agent="review">
+
+Now the real thing, with your own loop. Model: `Qwen/Qwen2.5-0.5B-Instruct` (small enough to full-fine-tune comfortably on the Spark; `Qwen2.5-1.5B-Instruct` also fits). Load it twice: policy in training mode, reference frozen in eval mode with `requires_grad_(False)`, both in bf16. Disable dropout in the policy too (`model.config` dropout fields, or set every `nn.Dropout` to `p=0`), or step 0 won't read 0.693.
+
+Data: 5,000 pairs from `train_prefs`, filtered to prompt + longest response under 1,024 tokens. 500 pairs from `test_prefs` for held-out accuracy.
+
+The loop shape:
+
+```python
+for batch in loader:                        # chosen and rejected for the same prompts
+    pol_c = sequence_logps(policy(batch.chosen_ids,   attention_mask=...).logits, ...)
+    pol_r = sequence_logps(policy(batch.rejected_ids, attention_mask=...).logits, ...)
+    with torch.no_grad():
+        ref_c = sequence_logps(ref(batch.chosen_ids, ...).logits, ...)
+        ref_r = sequence_logps(ref(batch.rejected_ids, ...).logits, ...)
+    loss, rc, rr = dpo_loss(pol_c, pol_r, ref_c, ref_r, beta=0.1)
+    ...  # backward, clip grad norm to 1.0, step, log every 10 steps
+```
+
+Starting hyperparameters (tune from here): β 0.1, AdamW with lr 5e-7 for full fine-tuning, effective batch 32 pairs (micro-batch 4 with gradient accumulation), warmup 10% of steps, 1 epoch. That's about 156 optimizer steps. Log the six metrics from the table in The Idea, plus held-out accuracy and margin every 50 steps.
+
+Two optional upgrades, each a real engineering lesson:
+
+- **Precompute the reference.** The reference never changes, so compute `ref_c` and `ref_r` for the whole dataset once and store them. Then the reference model doesn't need to be in memory during training. Compare wall-clock time.
+- **LoRA.** Wrap the policy with your adapter from [LoRA](/lessons/lora/) (or `peft`). Nice trick: with LoRA, the reference model is *the base model with the adapter switched off*, so you need only one copy of the weights. LoRA wants a much larger learning rate, something like 5e-6 to 5e-5. Check what the LoRA paper and TRL docs suggest.
+
+When it runs, ask an agent to review the loop for the classic bugs: reference computed with gradients, shift/mask off by one, padding counted in the sum, chosen and rejected batches misaligned after shuffling.
+
+</Task>
+
+<Task id="t5" title="Evaluate before and after with a judge, and measure length" agent="review">
+
+Hold out 150 prompts from `test_prefs` that you never trained on. Generate one answer per prompt from the base model and from your DPO model, same decoding settings (greedy, or temperature 0.7 with a fixed seed, max 512 new tokens).
+
+Then, using what you built in [LLM judges](/lessons/llm-judges/):
+
+1. Pairwise judge: base vs DPO, **each pair judged twice with the order swapped**. Count a win only if the judge agrees in both orders; otherwise call it a tie.
+2. Record the mean and median length in tokens of each model's answers.
+3. Rejudge with both answers truncated to the shorter one's length (cut at a sentence boundary). This crude length control tells you how much of the win is length.
+4. Read 20 pairs yourself. Does your verdict agree with the judge?
+
+Have an agent review the judge prompt and the swap logic, not the conclusion.
+
+</Task>
+
+<Task id="t6" title="Parity with TRL's DPOTrainer" agent="explain">
+
+Train the same model, same 5,000 pairs, same hyperparameters with TRL. The shape (TRL's API moves fast; check the current docs for argument names, for example the tokenizer argument has been renamed `processing_class` in recent versions):
+
+```python
+from trl import DPOConfig, DPOTrainer
+cfg = DPOConfig(output_dir="trl-dpo", beta=0.1, learning_rate=5e-7,
+                per_device_train_batch_size=4, gradient_accumulation_steps=8,
+                num_train_epochs=1, warmup_ratio=0.1, max_length=1024,
+                bf16=True, logging_steps=10, loss_type="sigmoid")
+trainer = DPOTrainer(model=model, ref_model=None, args=cfg,
+                     train_dataset=train, eval_dataset=test, processing_class=tokenizer)
+trainer.train()
+```
+
+`ref_model=None` makes TRL create a frozen copy for you. Compare three things:
+
+1. **Step 0.** Both should log loss 0.693, margin 0.
+2. **The core, exactly.** Take one fixed batch of 8 pairs, and compute `logps/chosen` and `logps/rejected` with your function and with TRL's (call its batch-logps method directly, or compare to what it logs on that batch). They should agree closely. If they don't, the difference is almost always tokenization: chat template, whether the end-of-turn token is included, truncation side.
+3. **The curves.** Overlay your loss, margin and accuracy curves on TRL's. They won't be identical (data order, padding, numerics), but they should have the same shape and similar values.
+
+Ask an agent to explain any mismatch you can't find, but find the line yourself.
+
+</Task>
+
+<DoneWhen>
+
+- `sequence_logps` and `dpo_loss` pass your hand checks (the 0.6444 example, and 0.6931 at equal inputs).
+- The toy run prints its curves and you can explain every column.
+- The 0.5B run logs all six metrics, starts at loss 0.693, and you have held-out accuracy.
+- The judge comparison is done in both orders, with length recorded and a length-controlled rerun.
+- Your log-probs match TRL's on a fixed batch, or you can name exactly why they don't.
+
+</DoneWhen>
+
+## Measure
+
+Fill this in for your 0.5B run (and the TRL run alongside it).
+
+| Metric | Prediction | Your DPO | TRL DPO |
+| --- | --- | --- | --- |
+| Loss at step 0 | | | |
+| Train loss at end | | | |
+| Held-out reward accuracy | | | |
+| Held-out reward margin | | | |
+| `logps/chosen` change (end − start) | | | |
+| `logps/rejected` change | | | |
+| Mean answer length, base → DPO (tokens) | | | |
+| Judge win / tie / loss vs base (both orders) | | | |
+| Same, lengths equalized | | | |
+| Wall clock, ref live vs precomputed | | | |
+
+And for the toy (Task 3), here's my run on the Mac: a 2-layer GPT-2 with random init, 64 pairs that differ only in their final token, β 0.1, lr 1e-4.
+
+| Step | Loss | Accuracy | Reward margin | `logps/chosen` | `logps/rejected` |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 0.693 | 0.00 | 0.00 | −0.86 | −0.85 |
+| 50 | 0.590 | 1.00 | 0.22 | −17.5 | −19.7 |
+| 100 | 0.559 | 1.00 | 0.29 | −19.1 | −22.0 |
+| 300 | 0.439 | 1.00 | 0.60 | −20.3 | −26.2 |
+
+Read that row at step 50 again. Accuracy is perfect and the loss is falling exactly as designed, and the chosen response went from a log-prob of −0.86 (probability 0.42) to −17.5 (probability about 2.5 in 100 million). The model "prefers" the chosen answer only in the sense that it now finds the rejected one even more absurd. That's the bottom-left corner of Figure 003, measured. Most of the collapse happened in the first 20 steps.
+
+<Figure n="005" title="TOY RUN: WHERE THE PROBABILITY WENT" caption="Measured on the toy from Task 3: sequence log-probs of the chosen (solid) and rejected (dashed) responses over 300 DPO steps. Ink: plain DPO, where both crash and the chosen answer ends up about 20 nats less likely than under the reference. Blue: the same run with an SFT term on the chosen answers added (Break It 2), where chosen rises toward log-prob 0 and only the rejected one falls.">
+<svg viewBox="0 0 640 260" role="img" aria-label="Line chart of chosen and rejected log-probs over training steps for plain DPO and DPO with an SFT term">
+  <line x1="70" y1="30" x2="610" y2="30" class="ink dash" stroke-width="0.6" />
+  <line x1="70" y1="100.4" x2="610" y2="100.4" class="ink dash" stroke-width="0.4" />
+  <line x1="70" y1="170.7" x2="610" y2="170.7" class="ink dash" stroke-width="0.4" />
+  <line x1="70" y1="30" x2="70" y2="226" class="ink" stroke-width="1" />
+  <line x1="70" y1="226" x2="610" y2="226" class="ink" stroke-width="1" />
+  <text x="62" y="34" text-anchor="end">0</text>
+  <text x="62" y="104" text-anchor="end">−10</text>
+  <text x="62" y="175" text-anchor="end">−20</text>
+  <text x="70" y="244" text-anchor="middle">0</text>
+  <text x="340" y="244" text-anchor="middle">STEP 150</text>
+  <text x="610" y="244" text-anchor="end">300</text>
+  <text x="76" y="20">SEQUENCE LOG-PROB (NATS)</text>
+  <path d="M70.0,36.1 L79.0,45.3 L88.0,91.9 L97.0,131.7 L106.0,152.2 L115.0,161.4 L160.0,153.4 L205.0,161.9 L250.0,164.5 L295.0,165.9 L340.0,166.9 L385.0,167.6 L430.0,168.4 L475.0,169.3 L520.0,170.2 L565.0,171.3 L610.0,172.6" class="ink" stroke-width="1.5" />
+  <path d="M70.0,36.0 L79.0,47.0 L88.0,95.5 L97.0,137.3 L106.0,159.9 L115.0,171.0 L160.0,168.6 L205.0,179.7 L250.0,184.8 L295.0,188.7 L340.0,192.2 L385.0,195.7 L430.0,199.1 L475.0,202.7 L520.0,206.4 L565.0,210.4 L610.0,214.6" class="ink dash" stroke-width="1.5" />
+  <path d="M70.0,36.1 L79.0,35.3 L88.0,34.7 L97.0,34.2 L106.0,33.7 L115.0,33.4 L160.0,32.6 L205.0,32.1 L250.0,31.8 L295.0,31.5 L340.0,31.3 L385.0,31.1 L430.0,30.9 L475.0,30.8 L520.0,30.7 L565.0,30.6 L610.0,30.6" class="blue" stroke-width="1.5" />
+  <path d="M70.0,36.0 L79.0,36.8 L88.0,37.7 L97.0,38.7 L106.0,39.6 L115.0,40.7 L160.0,45.1 L205.0,47.1 L250.0,48.9 L295.0,50.8 L340.0,52.8 L385.0,54.8 L430.0,56.8 L475.0,58.9 L520.0,61.0 L565.0,63.1 L610.0,65.3" class="blue dash" stroke-width="1.5" />
+  <text x="604" y="164" text-anchor="end" class="strong">DPO · CHOSEN</text>
+  <text x="604" y="200" text-anchor="end">DPO · REJECTED</text>
+  <text x="604" y="48" text-anchor="end" class="blue-t">+SFT · CHOSEN</text>
+  <text x="604" y="82" text-anchor="end" class="blue-t">+SFT · REJECTED</text>
+  <text x="130" y="120">REFERENCE: −0.86 / −0.85</text>
+</svg>
+</Figure>
+
+What the real numbers should look like, roughly (these are expectations, not measurements; check yourself):
+
+**Step 0: exactly 0.693.** Anything else is a bug: dropout on, policy and reference not identical, or mismatched batches.
+
+**Held-out accuracy: clearly above 50%, well below 100%.** Somewhere in the 60-80% range is plausible for UltraFeedback with a small model and one epoch. Your Task 0 disagreement count is a rough ceiling: if you disagreed with a fifth of the labels, don't expect the model to agree with more than about 80%.
+
+**`logps/rejected` falls clearly. `logps/chosen` may fall too.** On real data the drop is usually much milder than the toy, but it's common for chosen to end slightly below where it started. If chosen falls by tens of nats, your learning rate is too high or β too low.
+
+**Length goes up.** By how much depends on how far you pushed. If the judge's win rate drops a lot when you equalize lengths, a big part of your "improvement" was length.
+
+**Parity: same story, small numeric differences.** If your step-0 sequence log-probs differ from TRL's by more than about 0.1 nats per sequence, look at tokenization before anything else.
+
+## Break It
+
+**1. Turn dropout back on.** Rerun the toy with GPT-2's default dropout (0.1). I got a step-0 loss of 0.696 instead of 0.693 and accuracy 0.39 instead of 0. With dropout, the policy (in training mode) and the reference (in eval mode) are different models even at step 0, so the log-ratios are random noise from the first step. TRL disables dropout by default for exactly this reason. Small effect on a toy; on a real run it's noise injected straight into every margin.
+
+**2. Fix the falling log-probs.** Add an SFT term on the chosen responses to the toy's loss: `loss = dpo_loss + α · (−logps_chosen / response_length)`, with α = 1. In my run, chosen went from −0.86 *up* to −0.08 (probability 0.92) over 300 steps, rejected still fell to −5.0, and accuracy stayed at 1.00. The SFT term anchors the absolute level of the chosen answer, which DPO alone never looks at. This is the idea behind several published recipes (an NLL term in iterative reasoning DPO, the DPO-Positive loss in the Smaug paper). The trade-off: you're back to imitating the chosen text, which is what you were trying to avoid in The Problem, so keep α modest on real data.
+
+**3. Forget the prompt mask.** Change `sequence_logps` to sum over the prompt tokens too. The loss barely changes (the prompt cancels in `a − b` when both sequences share it), but `logps/chosen` and `logps/rejected` jump to much more negative values and no longer mean "log-prob of the response". Then break the cancellation: truncate long examples from the left so the chosen and rejected versions keep different amounts of prompt. Now the prompt no longer cancels, and the model gets credit for prompt text it didn't write.
+
+**4. Turn β down and the learning rate up.** On the 0.5B model, try β = 0.01 with lr 5e-6. Watch held-out accuracy, `logps/chosen`, and then actually read the generations. The usual result: margins explode, both log-probs dive, and the text drifts into repetition or odd formatting while the dashboard looks great. Then try β = 1: the model barely moves at all. You've now seen both ends of the leash.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Why train on preferences at all, instead of just writing better answers and doing SFT?</summary>
+
+Because judging is much cheaper and more reliable than writing. A person can say which of two answers is better in seconds, even when they couldn't write the best answer themselves, and a ranking of K answers gives K(K−1)/2 pairs. Preference data also carries information SFT can't: it tells the model what *not* to do (the rejected answer), and it's about quality relative to alternatives the model actually produces, instead of copying one person's phrasing.
+
+</details>
+
+<details>
+<summary>2. Walk me through the derivation of DPO in four steps, without equations if you can.</summary>
+
+RLHF wants the policy that gets high reward while staying close to a reference model, with β as the price of drift. That problem has an exact solution: take the reference's probabilities, multiply each response's by exp(reward/β), and renormalize. Normally that's useless because the normalizer sums over all possible texts. But you can solve the formula backwards: the reward of a response equals β times the log of how much more likely the optimal policy makes it compared to the reference, plus a per-prompt constant. Plug that into the Bradley-Terry model of preferences, which only looks at reward differences between two answers to the same prompt, and the constant cancels. What's left is a logistic loss on β times the difference of two log-ratios, all computable with forward passes. Train the policy on that and it acts as its own reward model.
+
+</details>
+
+<details>
+<summary>3. Your DPO run has 95% training accuracy and the chosen log-probs are falling. Is it working?</summary>
+
+Not necessarily. DPO only cares about the gap between chosen and rejected, not their absolute probabilities, so it can increase the gap by pushing both down, with the rejected one falling faster. Probability mass then goes to responses outside the dataset, which may be worse than both. I'd check held-out accuracy (95% on train may just be overfitting), read generations, check length, and compare against the reference with a judge. Fixes: lower learning rate or fewer steps, higher β, an SFT term on the chosen answers, or chosen/rejected pairs that are less similar to each other (near-identical pairs are a known trigger).
+
+</details>
+
+<details>
+<summary>4. How does DPO's cost scale compared with PPO, as the model grows from 0.5B to 70B?</summary>
+
+Both grow with model size; the constants differ. DPO: one trained model (about 16 bytes per parameter with Adam in mixed precision) plus a frozen reference at 2 bytes per parameter, which you can drop by precomputing its log-probs once. A 70B DPO run is roughly 1.1 TB plus activations: many GPUs, but ordinary supervised-training infrastructure. PPO: two trained models (policy, value) and two frozen ones (reference, reward), so about double the memory, plus autoregressive generation inside every step, which is slow, memory-bandwidth-bound, and usually needs a separate inference engine kept in sync with the trainer's weights. At 70B that orchestration is the hard part. The flip side: DPO only knows the pairs you collected; PPO keeps learning from the model's own new outputs.
+
+</details>
+
+<details>
+<summary>5. What does β do, and what happens at the extremes?</summary>
+
+β is the price of moving away from the reference. In the loss it multiplies the log-ratios, so the reward margin is β times the log-ratio margin. With a large β, a small change in the model already looks like a big, confident margin, the sigmoid saturates and the gradient dies, so the model stays near the reference and may barely change behavior. With a small β, the model has to move much further before the loss is satisfied, so it changes more, and risks drifting into degenerate text, especially combined with a large learning rate. Typical values are around 0.1, with 0.01 to 0.5 common.
+
+</details>
+
+## Go Deeper
+
+- **Rafael Rafailov, Archit Sharma, Eric Mitchell, Stefano Ermon, Christopher D. Manning, Chelsea Finn, "Direct Preference Optimization: Your Language Model is Secretly a Reward Model"** (NeurIPS 2023, [arXiv:2305.18290](https://arxiv.org/abs/2305.18290)). The paper. Section 4 has the derivation you did and the gradient analysis behind Figure 003; Appendix A.1 proves the closed-form optimum.
+- **Long Ouyang et al., "Training language models to follow instructions with human feedback"** (2022, [arXiv:2203.02155](https://arxiv.org/abs/2203.02155)). InstructGPT: the full SFT, reward model, PPO pipeline, with details on how labellers ranked outputs.
+- **Paul Christiano et al., "Deep Reinforcement Learning from Human Preferences"** (2017, [arXiv:1706.03741](https://arxiv.org/abs/1706.03741)). Where learning a reward from pairwise human comparisons started.
+- **Nathan Lambert, _Reinforcement Learning from Human Feedback_** (free online book, rlhfbook.com). The best single overview of the whole post-training landscape: reward models, PPO, DPO and its variants, with practical notes.
+- **Mohammad Gheshlaghi Azar et al., "A General Theoretical Paradigm to Understand Learning from Human Preferences"** (2023, [arXiv:2310.12036](https://arxiv.org/abs/2310.12036)). Introduces IPO and explains precisely when and why DPO overfits.
+- **Lewis Tunstall et al., "Zephyr: Direct Distillation of LM Alignment"** (2023, [arXiv:2310.16944](https://arxiv.org/abs/2310.16944)). DPO on UltraFeedback at 7B scale: the recipe your Build follows, written up.
+- **Hugging Face TRL documentation, "DPO Trainer"** (huggingface.co/docs/trl). The reference implementation you matched; also documents the logged metrics and the many `loss_type` variants.
+- **Ryan Park, Rafael Rafailov, Stefano Ermon, Chelsea Finn, "Disentangling Length from Quality in Direct Preference Optimization"** (2024, [arXiv:2403.19159](https://arxiv.org/abs/2403.19159)). Measures the length exploitation you saw in Task 5.
+
+## Connections
+
+This builds on [Train a tiny LM](/lessons/tiny-lm/) (log-probs and the training loop), [Why training needs so much memory](/lessons/training-memory/) (why four models is a problem), [LoRA](/lessons/lora/) (the cheap way to train the policy, and the trick that makes the base model your reference for free) and [LLM judges](/lessons/llm-judges/) (how you know the result is better, and why length fools you). The Bradley-Terry loss is the same pairwise loss you'd use to train a ranker, which ties back to your cross-encoder work and to [ranking metrics](/lessons/ranking-metrics/).
+
+It sets up [RL with verifiable rewards](/lessons/grpo/). DPO learns from a fixed pile of other models' answers. GRPO goes back to sampling from the model being trained, like PPO, but drops the value model and replaces the learned reward with a check you can run, like "did the code pass the tests". The question to carry forward: when your reward is a unit test instead of a human's opinion, what goes wrong in new ways? That's [Rewards and verifiers](/lessons/verifiers-rewards/).

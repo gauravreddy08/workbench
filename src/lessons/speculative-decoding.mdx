@@ -1,0 +1,775 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import SpecAcceptReject from '../components/figures/SpecAcceptReject.astro';
+import SpecSpeedup from '../components/figures/SpecSpeedup.astro';
+
+## Today
+
+- Say exactly what a model's "output distribution" is: a list of probabilities, one per vocabulary entry, at every step. Say what greedy decoding and sampling each do with it.
+- Explain why checking 5 guessed tokens costs your Spark about the same as generating 1, using the bandwidth math you already know.
+- State the acceptance rule (keep the draft token with probability `min(1, p/q)`, otherwise sample from the leftover `max(0, p − q)`) and prove, in four lines, that the output follows the big model's distribution exactly. Not approximately. Exactly.
+- Predict the speedup from three numbers (acceptance rate α, draft length K, draft cost c), and pick K.
+- Implement speculative sampling yourself with Llama 3.2 1B drafting for Llama 3.1 8B, test it statistically, tune it, try a draft-free variant, and add a row to `SCOREBOARD.md`.
+
+Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (decode reads every weight once per token) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server, harness and scoreboard). Helpful but not required: [The KV cache, by hand](/lessons/kv-cache/). Time: an evening for the idea and the proof, two or three evenings to build and test, one benchmark run.
+
+## The Problem
+
+Your scoreboard says the Spark decodes Llama 3.1 8B at something like 13 tokens per second, under a ceiling of about 17. You know why: every token drags all 16 GB of weights through a 273 GB/s pipe, and the GPU's math units spend more than 99% of each step waiting. You also know the cruel part. Prefill, where the model reads a whole prompt in one pass, uses the same weight read for hundreds of tokens at once. Decode can't, because token 5 depends on token 4, which doesn't exist yet.
+
+So here is a thought experiment. Suppose an oracle whispered the next four tokens to you. You could feed all four into the 8B at once, like a tiny prefill, and in one pass get the model's prediction at every position. If the oracle was right, you just made four tokens for the price of one weight read.
+
+There is no oracle. But there is Llama 3.2 1B, which reads about 2.5 GB per token instead of 16 and guesses the next word of ordinary text surprisingly often. It is wrong a lot, too. So the idea needs a second half: a way for the big model to check the small model's guesses, keep the good ones, and fix the first bad one, all in that one pass.
+
+In the diagnostic you said: "I know it follows the same distribution... a big model will stop it and correct it if it's out of distribution." Close, but it hides the interesting part. The big model doesn't throw out guesses for being "out of distribution". It throws them out *at random*, with a probability chosen so that the final text is statistically indistinguishable from what the big model would have written alone. Not nearly as good: the same distribution, provably. By the end you'll have written the proof and checked it with a chi-square test on your own hardware.
+
+<Predict id="p-what-changes">
+You run the 8B alone with greedy decoding (always pick the most likely token) and get some answer. Then you run it with a 1B draft model and speculative decoding, also greedy. How different is the text? And what changes if both runs use random sampling at temperature 1 instead?
+
+<Fragment slot="answer">
+
+With greedy decoding the text is **token for token identical**, apart from rare floating-point near-ties you will meet in the Build section. Greedy speculative decoding keeps a guess only if it is exactly what the 8B would have picked.
+
+With sampling the two runs produce different text, but so do two runs of the 8B alone. The claim is about the *distribution*: the chance of any particular answer is the same with or without the draft model. You could not tell which runs used speculation by looking at any number of outputs. The draft model changes how fast, never what.
+
+</Fragment>
+</Predict>
+
+<Origin year="2022" title="Two labs, one trick, three months apart">
+
+Guessing ahead and checking later is an old hardware idea. CPUs have long used <Term w="speculative execution">A processor guesses which way a branch in the code will go and starts running that path before it knows. If the guess was right it saves time; if wrong it throws the work away and backs up.</Term>: run the likely path before you know it's the right one, discard the work if it wasn't.
+
+For language models, Mitchell Stern, Noam Shazeer and Jakob Uszkoreit proposed "blockwise parallel decoding" in 2018: predict several tokens at once, have the model verify them, keep the longest correct run. It only worked for greedy decoding, where "correct" means "matches the top choice".
+
+The missing piece was sampling. Real products sample with a temperature, so there is no single right token to match. In November 2022 Yaniv Leviathan, Matan Kalman and Yossi Matias at Google posted "Fast Inference from Transformers via Speculative Decoding". In February 2023, independently, Charlie Chen and colleagues at DeepMind posted "Accelerating Large Language Model Decoding with Speculative Sampling". Both used the same move, borrowed from a classic statistics technique called <Term w="rejection sampling">A way to draw samples from a distribution you can evaluate but not easily sample: propose from an easier one, then keep each proposal with a carefully chosen probability.</Term>, to make speculation exact for any sampling distribution. Leviathan's group reported 2 to 3x on T5-XXL; Chen's reported 2 to 2.5x on Chinchilla 70B, with a 4B draft model. Today every serious inference engine ships some version of it.
+
+</Origin>
+
+## The Idea
+
+### First: what an output distribution is
+
+Before speculation makes sense, one word needs to become concrete. You have written the last line of a transformer: the final hidden vector times the output matrix gives one number per vocabulary entry. For Llama 3, that is 128,256 numbers. Those raw scores are <Term w="logits">The raw scores a model outputs for each possible next token, before they are turned into probabilities. Any real number; bigger means more likely.</Term>. Push them through a <Term w="softmax">The function that turns a list of scores into probabilities: exponentiate each one, then divide by the total. All results are positive and add up to 1.</Term> and you get 128,256 positive numbers that add up to exactly 1.
+
+That list is the output distribution. Not a vibe, not a style: a vector. At every step, given everything so far, the model hands you one probability per possible next token. "The capital of France is" might give " Paris" 0.82, " a" 0.05, " the" 0.04, and a long tail of tiny numbers for the other 128,253 tokens.
+
+<Figure n="001" title="ONE STEP, ONE PROBABILITY VECTOR" caption="Illustrative numbers. The model's output at each step is a list of probabilities over the whole vocabulary. Greedy takes the biggest. Sampling rolls a weighted die: draw a uniform number between 0 and 1 and see which slice it lands in.">
+
+<svg viewBox="0 0 560 270" role="img" aria-label="A prefix goes into the model, which outputs a probability for every token; greedy picks the largest and sampling picks by a weighted random draw">
+  <rect x="10" y="10" width="190" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="20" y="28" class="strong">PREFIX</text>
+  <text x="20" y="44">"THE CAPITAL OF FRANCE IS"</text>
+  <line x1="200" y1="32" x2="232" y2="32" class="ink" stroke-width="1.2" />
+  <polygon points="232,28 240,32 232,36" class="fill-blue" />
+  <rect x="242" y="10" width="86" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="285" y="36" text-anchor="middle" class="blue-t">MODEL</text>
+  <line x1="328" y1="32" x2="360" y2="32" class="ink" stroke-width="1.2" />
+  <polygon points="360,28 368,32 360,36" class="fill-blue" />
+  <text x="374" y="28" class="strong">LOGITS → SOFTMAX</text>
+  <text x="374" y="44">128,256 NUMBERS, SUM = 1</text>
+
+  <text x="10" y="88" class="strong">" PARIS"</text>
+  <rect x="120" y="77" width="328" height="13" class="fill-blue" />
+  <text x="454" y="88">0.82</text>
+  <text x="10" y="106">" A"</text>
+  <rect x="120" y="95" width="20" height="13" class="fill-wash" stroke-width="1" />
+  <text x="146" y="106">0.05</text>
+  <text x="10" y="124">" THE"</text>
+  <rect x="120" y="113" width="16" height="13" class="fill-wash" stroke-width="1" />
+  <text x="142" y="124">0.04</text>
+  <text x="10" y="142">" LOCATED"</text>
+  <rect x="120" y="131" width="12" height="13" class="fill-wash" stroke-width="1" />
+  <text x="138" y="142">0.03</text>
+  <text x="10" y="160">" NOT"</text>
+  <rect x="120" y="149" width="8" height="13" class="fill-wash" stroke-width="1" />
+  <text x="134" y="160">0.02</text>
+  <text x="10" y="178">128,251 OTHERS</text>
+  <rect x="120" y="167" width="16" height="13" class="ink dash" stroke-width="1" />
+  <text x="142" y="178">0.04 TOTAL</text>
+  <text x="490" y="88" class="blue-t">← GREEDY</text>
+
+  <text x="10" y="210" class="strong">SAMPLING: THE SAME LIST AS SLICES OF [0, 1)</text>
+  <rect x="10" y="220" width="443" height="18" class="fill-wash" stroke-width="1" />
+  <rect x="453" y="220" width="27" height="18" class="fill-paper" stroke-width="1" />
+  <rect x="480" y="220" width="22" height="18" class="fill-paper" stroke-width="1" />
+  <rect x="502" y="220" width="16" height="18" class="fill-paper" stroke-width="1" />
+  <rect x="518" y="220" width="11" height="18" class="fill-paper" stroke-width="1" />
+  <rect x="529" y="220" width="21" height="18" class="ink dash" stroke-width="1" />
+  <text x="231" y="233" text-anchor="middle" class="blue-t">PARIS · 0 TO 0.82</text>
+  <text x="466" y="233" text-anchor="middle">A</text>
+  <line x1="469" y1="244" x2="469" y2="256" class="blue" stroke-width="1.5" />
+  <polygon points="465,252 469,244 473,252" class="fill-blue" />
+  <text x="460" y="266" text-anchor="end">ROLL u = 0.85 → LANDS IN " A"</text>
+</svg>
+
+</Figure>
+
+What you do with the vector is the <Term w="decoding strategy">The rule for turning the probability vector into one chosen token. Greedy and sampling are the two basic ones; top-k, top-p and temperature are tweaks to sampling.</Term>:
+
+- **Greedy decoding** picks the biggest entry, the <Term w="argmax">"The argument of the maximum": which entry in a list is the biggest, as opposed to how big it is. argmax of [0.1, 0.7, 0.2] is position 1.</Term>. Deterministic: same prompt, same output, every time.
+- **Sampling** rolls a weighted die. Lay the probabilities end to end as slices of the interval from 0 to 1, draw a uniform random number, and take whichever slice it lands in. " Paris" comes out 82% of the time, " a" 5% of the time. <Term w="temperature">Divide the logits by a number T before softmax. T below 1 sharpens the distribution toward the top token; T above 1 flattens it. T near 0 approaches greedy.</Term> reshapes the vector before the roll.
+
+Do this once per step and you get a sequence, whose probability is the product of each token's probability given the ones before it. Two decoding procedures "follow the same distribution" if every possible output sequence has the same probability under both. That is the bar speculative decoding clears.
+
+From here on, two letters. **p** is the target model's (the 8B's) probability vector at a step. **q** is the draft model's (the 1B's) vector at the same step, given the same prefix. Both are lists of 128,256 numbers that sum to 1. p(x) means "the entry for token x".
+
+### Why checking is cheap
+
+Here is the fact that makes the whole trick worth doing, and you already own it.
+
+In [Why ~17 tokens per second?](/lessons/bandwidth-bound/), a decode step for one token reads all 16 GB of weights, does about 1 FLOP per byte, and leaves the tensor cores idle. Feeding the model 5 tokens instead of 1 in the same forward pass changes only the math side: each weight, once loaded, is used 5 times instead of once. The bytes don't change. On a machine whose <Term w="ridge point">Peak FLOP/s divided by memory bandwidth. Below it, work is limited by memory; above it, by math. On the Spark it's in the hundreds of FLOPs per byte.</Term> sits in the hundreds of FLOPs per byte, going from 1 to 5 FLOPs per byte is still deep in memory-bound territory. The step takes about the same time.
+
+So the 8B can score 5 positions in one pass: its probability vector after the current text, after the current text plus guess 1, after guesses 1 and 2, and so on. This is what <Term w="verification">Running the target model once over the draft's guessed tokens, to get its own probability vector at every guessed position. Same mechanics as prefill on a short block.</Term> means. It is a mini-prefill. The KV cache makes it cheap in the other dimension too: the past is already cached, so only the 5 new positions are computed.
+
+You will measure this in the first task: time the 8B on 1, 2, 4, 8, 16, 32 and 64 new tokens on top of a cached prompt. Expect the curve to stay nearly flat for small counts, then bend upward once there's enough math per byte to matter.
+
+### Draft, then verify
+
+The loop has two players. The <Term w="draft model">A small, fast model that guesses the next few tokens. Its guesses never appear in the output unless the target model approves them.</Term> is cheap and often right. The <Term w="target model">The big model whose output distribution you actually want. Here, Llama 3.1 8B. Also called the verifier.</Term> is the authority. One round:
+
+1. **Draft.** The 1B generates K tokens the normal way, one at a time: d1, d2, ..., dK. It records its probability vector q at each step. K small forward passes, each reading 2.5 GB instead of 16.
+2. **Verify.** The 8B runs once over the current text plus d1..dK and returns K + 1 probability vectors: p1 (what it thinks should come after the current text), p2 (after d1), ..., p(K+1) (after dK).
+3. **Accept, left to right.** Check d1 against p1 and q1 with the rule below. If it's kept, check d2 against p2 and q2. Stop at the first rejection.
+4. **Fix or bonus.** At the rejected position, sample a replacement token from a corrected distribution (next section). If all K were kept, you get one more token for free: sample it from p(K+1), which the verify pass already computed.
+
+Every round emits at least one token and at most K + 1. Even the worst round, d1 rejected immediately, still emits one correctly distributed token for one 8B pass plus the wasted drafting.
+
+<Figure n="002" title="ONE ROUND, AGAINST PLAIN DECODING" caption="Illustrative timing: each draft step costs 0.2 of an 8B pass, and verifying 5 positions costs 1.1. Three drafts are kept, the fourth is rejected and replaced. Four tokens in about 1.9 passes of time instead of 4.">
+
+<svg viewBox="0 0 560 290" role="img" aria-label="Timeline comparing four target passes for four tokens against four quick draft steps and one verification pass that emits four tokens">
+  <text x="10" y="18" class="strong">PLAIN · ONE 8B PASS PER TOKEN</text>
+  <rect x="10" y="28" width="118" height="28" class="fill-wash" stroke-width="1" />
+  <text x="69" y="46" text-anchor="middle">8B → SAT</text>
+  <rect x="132" y="28" width="118" height="28" class="fill-wash" stroke-width="1" />
+  <text x="191" y="46" text-anchor="middle">8B → ON</text>
+  <rect x="254" y="28" width="118" height="28" class="fill-wash" stroke-width="1" />
+  <text x="313" y="46" text-anchor="middle">8B → THE</text>
+  <rect x="376" y="28" width="118" height="28" class="fill-wash" stroke-width="1" />
+  <text x="435" y="46" text-anchor="middle">8B → RUG</text>
+  <line x1="496" y1="22" x2="496" y2="140" class="ink dash" stroke-width="1" />
+  <text x="500" y="70">PLAIN</text>
+  <text x="500" y="84">DONE</text>
+
+  <text x="10" y="94" class="strong">SPECULATIVE · DRAFT 4, CHECK ONCE</text>
+  <rect x="10" y="104" width="28" height="28" class="fill-paper" stroke-width="1" />
+  <text x="24" y="122" text-anchor="middle">SAT</text>
+  <rect x="40" y="104" width="28" height="28" class="fill-paper" stroke-width="1" />
+  <text x="54" y="122" text-anchor="middle">ON</text>
+  <rect x="70" y="104" width="28" height="28" class="fill-paper" stroke-width="1" />
+  <text x="84" y="122" text-anchor="middle">THE</text>
+  <rect x="100" y="104" width="28" height="28" class="fill-paper" stroke-width="1" />
+  <text x="114" y="122" text-anchor="middle">MAT</text>
+  <text x="10" y="146">1B DRAFT, 4 STEPS</text>
+  <rect x="132" y="104" width="132" height="28" class="fill-blue" />
+  <text x="198" y="122" text-anchor="middle" style="fill:var(--paper)">8B · 5 POSITIONS</text>
+  <line x1="266" y1="98" x2="266" y2="140" class="blue dash" stroke-width="1" />
+  <text x="270" y="112" class="blue-t">ROUND</text>
+  <text x="270" y="126" class="blue-t">DONE</text>
+
+  <text x="10" y="178">DRAFT GUESS</text>
+  <text x="146" y="178" text-anchor="middle">SAT</text>
+  <text x="172" y="178" text-anchor="middle">ON</text>
+  <text x="198" y="178" text-anchor="middle">THE</text>
+  <text x="224" y="178" text-anchor="middle">MAT</text>
+  <text x="250" y="178" text-anchor="middle">·</text>
+  <text x="10" y="200">VERDICT</text>
+  <text x="146" y="200" text-anchor="middle" class="blue-t">KEEP</text>
+  <text x="172" y="200" text-anchor="middle" class="blue-t">KEEP</text>
+  <text x="198" y="200" text-anchor="middle" class="blue-t">KEEP</text>
+  <text x="224" y="200" text-anchor="middle" class="strong">NO</text>
+  <text x="250" y="200" text-anchor="middle">·</text>
+  <text x="10" y="222" class="strong">EMITTED</text>
+  <text x="146" y="222" text-anchor="middle" class="strong">SAT</text>
+  <text x="172" y="222" text-anchor="middle" class="strong">ON</text>
+  <text x="198" y="222" text-anchor="middle" class="strong">THE</text>
+  <rect x="210" y="209" width="28" height="18" class="fill-wash" stroke-width="1" />
+  <text x="224" y="222" text-anchor="middle" class="strong">RUG</text>
+  <text x="224" y="244" text-anchor="middle">FIX</text>
+
+  <text x="300" y="160" class="strong">COST ≈ 4 × 0.2 + 1.1 = 1.9 PASSES</text>
+  <text x="300" y="178">EMITTED 4 TOKENS: 3 KEPT + 1 FIX</text>
+  <text x="300" y="196">PLAIN NEEDS 4 PASSES FOR THE SAME 4</text>
+  <text x="300" y="220">IF ALL 4 HAD BEEN KEPT: THE 5TH</text>
+  <text x="300" y="234">POSITION GIVES A FREE BONUS TOKEN</text>
+  <text x="10" y="276">TIME →   ONE 8B PASS ≈ 60-75 MS ON THE SPARK IN BF16</text>
+</svg>
+
+</Figure>
+
+### The acceptance rule
+
+Now the part you were fascinated by. The draft proposed token x. You have two numbers: q(x), how likely the draft thought x was, and p(x), how likely the target thinks it is. What should you do?
+
+The greedy case is easy and worth getting out of the way. With greedy decoding, the target's "distribution" puts all its weight on its argmax. Keep x if it equals the target's argmax; otherwise emit the target's argmax instead and stop. That's it. The output is token for token the same as greedy decoding with the 8B alone, because every emitted token is the 8B's argmax given the text before it.
+
+Sampling is where it gets clever. There is no single right answer to match. " Paris" is right 82% of the time and " a" is right 5% of the time. So you can't ask "is x correct?" You have to ask "how often should x come out here, and how often does the draft propose it?"
+
+<Predict id="p-accept-prob">
+At some step the target says p(" a") = 0.25. The draft proposed " a", and its own probability for it was q(" a") = 0.40. The draft over-proposes " a". With what probability should you keep it, so that " a" ends up coming out exactly 25% of the time? And what if instead q(" a") = 0.10 and p(" a") = 0.25?
+
+<Fragment slot="answer">
+
+The draft proposes " a" 40% of the time but it should only come out 25% of the time, so keep it on **0.25 / 0.40 = 62.5%** of the occasions it's proposed. 0.40 × 0.625 = 0.25. The excess 15% of probability has to be thrown back.
+
+In the second case the draft *under*-proposes " a": 10% when it should be 25%. Keep it every time it shows up (probability 1). That only gets you to 10%, so the missing 15% must come from somewhere else: the rejection step has to produce " a" extra often to make up the gap. That "somewhere else" is the residual distribution, coming up next.
+
+Together: keep with probability min(1, p(x)/q(x)).
+
+</Fragment>
+</Predict>
+
+That's the rule, stated by both papers:
+
+```text
+draft proposes x, sampled from q
+
+keep x  with probability  min(1, p(x) / q(x))
+
+if rejected, sample a replacement from the residual distribution:
+    r(y)  =  max(0, p(y) − q(y))  /  Σ_z max(0, p(z) − q(z))
+```
+
+In words: if the target likes x at least as much as the draft does, always keep it. If the target likes it less, keep it only in the fraction p/q of cases. And when you reject, don't draw from p again. Draw from the <Term w="residual distribution">The part of p the draft under-covers: for each token, how much more probability the target gives it than the draft does (zero if the draft already over-covers it), rescaled to sum to 1.</Term>, which only contains the tokens the draft was *too stingy* with.
+
+The residual is the subtle part, and the reason your diagnostic answer missed the shape. Rejection isn't "the guess was out of distribution, ask the big model again". It is "the guess landed in a region the draft over-covers, so redirect this probability to the region the draft under-covers". Every unit of probability the draft put in the wrong place gets moved, by rejection, to exactly where it was missing.
+
+The figure below is the rule with a toy six-word vocabulary. The top left is the draft's q, the top right the target's p. The solid blue in both is the same thing, `min(p, q)`: the probability that a draft is proposed and kept. The wash in p is `max(0, p − q)`: what's left for rejections to fill, drawn rescaled at bottom left. Press "Sample 1" a few times and read the trace. Then press "Sample 10,000".
+
+<Figure n="003" title="ACCEPT, REJECT, REBUILD p" caption="Toy vocabulary, exact rule. The draft overlap α = Σ min(p,q) is the fraction of drafts kept. Rejections are sampled from the residual. The output histogram lands on p's ticks; turn on the bug and it doesn't." wide>
+
+<SpecAcceptReject />
+
+</Figure>
+
+Things to try:
+
+- **The defaults.** α is 0.70: 70% of drafts are kept. The draft over-proposes A and SAT; rejections refill THE, CAT and DOG, the tokens it under-proposes. After 10,000 samples every bar sits on its tick, and χ² is usually under 11.07, the 5% threshold for 5 degrees of freedom (about 1 run in 20 will exceed it by chance; that's what 5% means).
+- **The bug.** Turn on "Bug: on reject, sample p" and sample again. This is the most natural wrong version: "if the guess is bad, let the big model just pick". It sounds right, and it is biased. After 10,000 samples χ² is in the hundreds, and it keeps growing with every batch you add.
+- **One guess.** Switch the draft to "One guess (lookup)". Now q puts all its weight on THE. The rule still works: keep THE with probability p(THE) = 0.40, otherwise sample from p with THE removed. This is how draft-free methods like prompt lookup stay exact.
+- **Closer to p.** Slide toward p. α climbs to 1 and the residual empties. A perfect draft is never rejected.
+
+### Why the output is exactly p
+
+Here is the proof. It is four lines, and it is worth being able to do on a whiteboard.
+
+Fix one step. What is the probability that the token that comes out is some particular y? There are two disjoint ways for y to come out:
+
+1. **The draft proposed y and it was kept.** The draft proposes y with probability q(y); it's kept with probability min(1, p(y)/q(y)). Multiply:
+
+```text
+q(y) · min(1, p(y)/q(y))  =  min(q(y), p(y))
+```
+
+2. **Something was rejected, then the residual produced y.** The chance of a rejection, over all possible proposals, is one minus the chance of a keep. Summing case 1 over every token, the chance of a keep is `Σ min(p, q)`, which is exactly α. So:
+
+```text
+P(reject)  =  1 − Σ_z min(p(z), q(z))
+           =  Σ_z [ p(z) − min(p(z), q(z)) ]       (because Σ_z p(z) = 1)
+           =  Σ_z max(0, p(z) − q(z))
+```
+
+That last sum is precisely the normalizer of the residual. So the probability of rejecting and then drawing y is
+
+```text
+P(reject) · r(y)  =  Σ_z max(0, p(z) − q(z))  ·  max(0, p(y) − q(y)) / Σ_z max(0, p(z) − q(z))
+                  =  max(0, p(y) − q(y))
+```
+
+3. **Add the two cases:**
+
+```text
+P(output = y)  =  min(q(y), p(y))  +  max(0, p(y) − q(y))  =  p(y)
+```
+
+The last equality is just arithmetic: if p(y) ≥ q(y) it's q(y) + p(y) − q(y); if p(y) is smaller it's p(y) + 0. Either way, p(y). The figure was this proof drawn as bars: solid blue plus wash equals p, for every token.
+
+Two things to notice. First, nothing assumed the draft was any good. q can be terrible; the output is still exactly p. A bad draft only costs speed. Second, the step that makes it work is the normalizer: the chance of rejecting is exactly the total size of the residual. That's not a coincidence of these numbers, it's forced by both p and q summing to 1.
+
+**From one token to a whole sequence.** One round emits several tokens, so you need one more step, and it's induction. Consider the first draft d1: by the argument above, the first emitted token has distribution p1, the target's distribution after the current text. If d1 was kept, then d1 *is* the text so far, and d2 was drafted from q(· | text + d1) and is checked against p(· | text + d1), so by the same argument the second emitted token follows the target's distribution given the first. Continue. When a rejection happens, the round ends and the next round starts from the true emitted text. The bonus token is sampled from p(K+1) directly. So every emitted token is distributed according to the target given all previously emitted tokens, and the probability of any full sequence is the same product of target probabilities that plain sampling gives. Same distribution, exactly.
+
+The proof also tells you the conditions it needs, which are exactly the bugs you can write:
+
+- **q must be the distribution you actually drew from.** If you draft greedily but plug the softmax of the draft's logits in as q, the rule is wrong. A greedy draft's q is one-hot.
+- **p must be computed on the true prefix.** That means the target's KV cache must not contain rejected tokens. More on that below.
+- **Temperature, top-k and top-p have to be applied to p before the rule** (and to q before drafting). Speculation reproduces whatever p you feed it, warped or not.
+
+### How many tokens per pass, and the best K
+
+Each round, how many tokens come out? Call α the <Term w="acceptance rate">The probability that one draft token is kept. For sampling it equals Σ min(p, q), the overlap of the two distributions; for greedy, how often the draft's top pick matches the target's.</Term>. To get a clean formula, pretend each draft is kept independently with the same probability α. (Real acceptance varies a lot from token to token; the formula is a good average, not an exact law.) The first draft is kept with probability α, the first two with probability α², and so on. The round always emits one extra token, the fix or the bonus. So the expected number of tokens per target pass is
+
+```text
+E[tokens per round]  =  1 + α + α² + ... + α^K  =  (1 − α^(K+1)) / (1 − α)
+```
+
+<Predict id="p-tokens-per-pass">
+Your draft is kept 70% of the time (α = 0.7). With K = 4, how many tokens do you get per 8B pass on average? With K = 8? With K = 100?
+
+<Fragment slot="answer">
+
+K = 4: 1 + 0.7 + 0.49 + 0.343 + 0.24 = **2.77**. K = 8: **3.20**. K = 100: essentially 1 / (1 − 0.7) = **3.33**. The geometric series caps out fast: the chance that all of a long run of drafts survives is tiny, so drafting further ahead gives you almost nothing extra. With α = 0.7 you will never average more than 3.33 tokens per pass, however long K is. (I checked the formula with a 20,000-round simulation at α = 0.7: 1.70, 2.18, 2.78, 3.22 for K = 1, 2, 4, 8, against 1.70, 2.19, 2.77, 3.20 predicted.)
+
+</Fragment>
+</Predict>
+
+Tokens per pass isn't speedup, because drafting isn't free. Let c be the cost of one draft step divided by the cost of one target step. A round costs K draft steps plus one verify pass, so 1 + Kc target-passes of time (assuming verifying K + 1 positions costs about one pass, which your first task checks). Leviathan et al. give the resulting speedup:
+
+```text
+speedup  =  (1 − α^(K+1))  /  ( (1 − α) · (1 + K·c) )
+```
+
+Bandwidth alone predicts c ≈ 2.5 GB / 16 GB ≈ 0.16 for the 1B drafting for the 8B. In practice it's often worse, because the small model's step is dominated by fixed costs (kernel launches, Python, sampling) that don't shrink with model size. That's the number to watch in your measurements.
+
+<Figure n="004" title="SPEEDUP CALCULATOR" caption="Leviathan et al.'s formula. Assumes independent acceptances and that verifying K+1 positions costs one target pass. The dot is your K; BEST marks the K that maximizes speedup for this α and c.">
+
+<SpecSpeedup />
+
+</Figure>
+
+Play with it until three facts feel obvious:
+
+- **α sets the ceiling.** At α = 0.5 you top out around 1.6x even with nearly free drafts. At 0.9 you can reach 4x or more.
+- **c sets the best K, and punishes greed.** At α = 0.7: c = 0.05 wants K = 6 (2.35x), c = 0.1 wants K = 4 (about 2x), c = 0.25 wants K = 2 (about 1.46x). Past the best K, extra drafts are almost never kept but always paid for.
+- **It can lose.** Low α with high c drops below 1x. Speculation with a bad, slow draft is slower than not speculating.
+
+### Where drafts come from
+
+Anything that produces guesses with a known q can be a draft. The proof doesn't care. The options are a trade-off between how good the guesses are (α) and how much they cost (c).
+
+- **A smaller model from the same family.** What you'll build. Llama 3.2 1B for Llama 3.1 8B, or Qwen2.5 0.5B for Qwen2.5 7B. The draft must use the **same tokenizer**, so that token 1234 means the same string to both. Distilling a small model specifically to imitate your target raises α further; that's the [draft-model lesson](/lessons/draft-model/), where you train your own.
+- **N-gram and prompt lookup.** No model at all. <Term w="prompt lookup decoding">Find the last few generated tokens somewhere earlier in the prompt or output, and propose whatever followed them there. Free to compute; works when the output copies from the input.</Term> (Apoorv Saxena, 2023) looks for the most recent 2-3 tokens earlier in the context and proposes what came next. Its q is one-hot, so acceptance is just p(x). Useless for open-ended writing, excellent for summarizing, editing code, answering questions about a document: anything that quotes its input. c is essentially zero.
+- **Extra heads on the target.** <Term w="Medusa">Cai et al., 2024. Several small extra output heads on the target's last hidden state, each predicting a token further ahead, trained while the base model stays frozen.</Term> drafts from the target's own computation, and usually verifies a small tree of alternative continuations in one pass instead of a single chain.
+- **Feature-level drafting.** <Term w="EAGLE">Li et al., 2024, then EAGLE-2 and EAGLE-3. A tiny draft network that reads the target's hidden features, not just its tokens.</Term> guesses much better than a separate small model of similar cost, and is among the highest-acceptance practical methods. vLLM and SGLang support it.
+- **Self-speculation.** Use the target itself, with some layers skipped, as its own draft ("Draft & Verify", Zhang et al. 2023; LayerSkip, Elhoushi et al. 2024). No second model to store, same tokenizer by construction.
+
+Some models now ship with this built in: DeepSeek-V3 was trained with a <Term w="multi-token prediction">A training objective where the model also predicts tokens 2+ positions ahead. The extra prediction module can later be used as a speculative draft.</Term> module that can serve as a draft.
+
+### The KV cache has to forget
+
+There is one piece of bookkeeping that every implementation gets wrong at least once.
+
+During verification the target writes <Term w="KV cache">The stored keys and values for every token processed so far, in every layer, so the next step doesn't recompute them. Each processed position adds one entry per layer.</Term> entries for every draft token, including the ones that will be rejected. The draft model's cache likewise contains its own guesses. If a rejected token's keys and values stay in the cache, the next step's attention will look at a token that isn't in the text. The model will be conditioning on a ghost.
+
+So after each round, both caches must be cut back to the true text, a <Term w="rollback">Truncating the KV cache back to a shorter length, discarding entries for tokens that were rejected. Cheap: it's just forgetting the last few positions.</Term>. The cleanest rule: after a round, crop each cache to length `len(text) − 1`, and at the start of every forward pass, feed the model whatever tokens of the text its cache doesn't cover yet. The fix token (or bonus token) is never in either cache, so it always gets fed at the start of the next round.
+
+<Figure n="005" title="ROLLBACK AFTER A REJECTION" caption="After the round in Figure 002. The target processed MAT during verification, but MAT was rejected. Crop it away; RUG, which was sampled, not processed, gets fed first next round.">
+
+<svg viewBox="0 0 560 210" role="img" aria-label="Target KV cache before and after cropping away the rejected token; the replacement token is fed at the start of the next round">
+  <text x="10" y="18" class="strong">TARGET CACHE AFTER VERIFY</text>
+  <rect x="10" y="28" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="32" y="45" text-anchor="middle">…</text>
+  <rect x="56" y="28" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="78" y="45" text-anchor="middle">THE</text>
+  <rect x="102" y="28" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="124" y="45" text-anchor="middle">CAT</text>
+  <rect x="148" y="28" width="44" height="26" class="fill-wash" stroke-width="1" />
+  <text x="170" y="45" text-anchor="middle">SAT</text>
+  <rect x="194" y="28" width="44" height="26" class="fill-wash" stroke-width="1" />
+  <text x="216" y="45" text-anchor="middle">ON</text>
+  <rect x="240" y="28" width="44" height="26" class="fill-wash" stroke-width="1" />
+  <text x="262" y="45" text-anchor="middle">THE</text>
+  <rect x="286" y="28" width="44" height="26" class="ink dash" stroke-width="1" />
+  <text x="308" y="45" text-anchor="middle">MAT</text>
+  <line x1="290" y1="32" x2="326" y2="50" class="ink" stroke-width="1" />
+  <text x="340" y="38">REJECTED, BUT ITS K/V</text>
+  <text x="340" y="52">ARE ALREADY WRITTEN</text>
+  <text x="148" y="72" class="blue-t">WRITTEN DURING VERIFY</text>
+
+  <line x1="170" y1="84" x2="170" y2="108" class="ink" stroke-width="1" />
+  <polygon points="166,104 170,112 174,104" class="fill-blue" />
+  <text x="182" y="102">crop(len(text) − 1)</text>
+
+  <text x="10" y="130" class="strong">AFTER CROP · NEXT ROUND</text>
+  <rect x="10" y="140" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="32" y="157" text-anchor="middle">…</text>
+  <rect x="56" y="140" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="78" y="157" text-anchor="middle">THE</text>
+  <rect x="102" y="140" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="124" y="157" text-anchor="middle">CAT</text>
+  <rect x="148" y="140" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="170" y="157" text-anchor="middle">SAT</text>
+  <rect x="194" y="140" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="216" y="157" text-anchor="middle">ON</text>
+  <rect x="240" y="140" width="44" height="26" class="fill-paper" stroke-width="1" />
+  <text x="262" y="157" text-anchor="middle">THE</text>
+  <rect x="286" y="140" width="44" height="26" class="fill-blue" />
+  <text x="308" y="157" text-anchor="middle" style="fill:var(--paper)">RUG</text>
+  <text x="340" y="150">FED FIRST NEXT ROUND,</text>
+  <text x="340" y="164">THEN THE NEW DRAFTS</text>
+  <text x="10" y="188">SAME RULE FOR THE DRAFT'S CACHE. IF ALL K WERE KEPT,</text>
+  <text x="10" y="204">THE DRAFT IS MISSING TWO TOKENS: dK AND THE BONUS.</text>
+</svg>
+
+</Figure>
+
+With a simple contiguous cache, cropping just reduces a length; Hugging Face's `DynamicCache` has a `crop` method for it (check the docs for your version). In a paged cache like vLLM's, rollback means rewinding block slots, which is fiddlier; you'll see paged caches in [Paged attention and prefix caching](/lessons/prefix-caching/).
+
+### Why it helps less with many users
+
+Speculation is a way to spend idle compute. It works because single-stream decode leaves the tensor cores idle. [Batching](/lessons/batching/) spends the same idle compute a different way: serve B users per weight read.
+
+<Predict id="p-batch">
+On the Spark, plain decoding at batch 1 is deep in memory-bound territory. With speculation at K = 4, each verify pass scores 5 positions per user. At batch 64, how many token-positions does one verify pass process, and roughly where does that put you relative to a ridge point of a few hundred FLOPs per byte?
+
+<Fragment slot="answer">
+
+64 users × 5 positions = **320 positions per pass**, so about 320 FLOPs per byte of weights. That's around the ridge point. You've left the "extra positions are free" regime: each verify pass now costs noticeably more than a plain step, and every rejected draft is math you paid for and threw away (at α = 0.7, K = 4, about 45% of verified positions are discarded). Speculation that gave you 2x at batch 1 may give little or nothing at batch 64, and can even reduce total throughput.
+
+</Fragment>
+</Predict>
+
+On top of that, acceptance is ragged: in one round user A keeps 4 drafts and user B keeps 0, so the batch has to handle texts and caches that grow at different rates. So production engines treat speculation as a latency tool for light load: turn it on, or use a larger K, when few requests are running; dial it down or off as the batch fills. That's also why your Spark is a good place to learn it. A one-user box is exactly the regime where speculation shines.
+
+## Build It
+
+Add to your `inference/` folder from [the baseline lesson](/lessons/baseline-vs-fireworks/):
+
+```text
+inference/
+  spec/
+    common.py          # load models, forward helper (given)
+    verify_cost.py     # t2
+    spec_greedy.py     # t3
+    spec_sample.py     # t4
+    dist_test.py       # t5
+    sweep.py           # t6
+    lookup.py          # t7
+  server_spec.py       # t8
+```
+
+The pair: **Llama 3.1 8B Instruct** (target, the model your scoreboard tracks) and **Llama 3.2 1B Instruct** (draft). They share the Llama 3 tokenizer, 128,256 entries. In bf16 that's about 16 GB plus 2.5 GB of weights, far under the Spark's 128 GB, which also leaves room to load the 8B in fp32 (about 32 GB) for one test. If you'd rather use Qwen, Qwen2.5 7B Instruct with Qwen2.5 0.5B Instruct is the equivalent pair; one gotcha there is in t1.
+
+<Task id="t1" title="Load both models and check they speak the same tokens" agent="ok">
+
+Run inside the same NVIDIA PyTorch container as the baseline lesson. Llama 3.2 is gated like 3.1; accept the license on its model page first.
+
+```python
+# spec/common.py
+import time, torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+
+TARGET = "meta-llama/Llama-3.1-8B-Instruct"
+DRAFT = "meta-llama/Llama-3.2-1B-Instruct"
+
+tok = AutoTokenizer.from_pretrained(TARGET)
+assert tok.get_vocab() == AutoTokenizer.from_pretrained(DRAFT).get_vocab(), "tokenizers differ"
+
+def load(name, dtype=torch.bfloat16):
+    m = AutoModelForCausalLM.from_pretrained(name, dtype=dtype).to("cuda")  # older transformers: torch_dtype=
+    return m.eval()
+
+target, draft = load(TARGET), load(DRAFT)
+print(target.config.vocab_size, draft.config.vocab_size)
+
+@torch.inference_mode()
+def forward(model, cache, ids):
+    """Feed new token ids (a Python list) on top of `cache` (updated in place).
+    Returns fp32 logits, one row per fed token: shape [len(ids), vocab]."""
+    x = torch.tensor([ids], device="cuda")
+    out = model(input_ids=x, past_key_values=cache, use_cache=True)
+    return out.logits[0].float()
+
+def sync_time():
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+def chat_ids(user_text):
+    msgs = [{"role": "user", "content": user_text}]
+    return tok.apply_chat_template(msgs, add_generation_prompt=True)
+```
+
+Check the two printed vocab sizes. For the Llama pair they match. For the Qwen2.5 pair they don't: the larger models pad their output matrix to a different size than the small ones (look at each `config.json`), even though the tokenizer is identical. If you use Qwen, slice both logits to `len(tok)` before softmax. When passing a `DynamicCache` the model computes positions from the cache length; if your transformers version complains, check its docs for `cache_position`.
+
+</Task>
+
+<Task id="t2" title="Feel it: time one target pass over n new tokens" agent="hands">
+
+Before writing any speculation, measure the claim it depends on. Build a cache for a ~512-token prompt once. Then, for n in 1, 2, 4, 8, 16, 32, 64: copy the cache (or crop it back to 512 after each trial), feed n new tokens, and time the forward pass. Warm up first, synchronize around the timer, take the median of 10 runs.
+
+```python
+def time_verify(model, prompt_ids, n, trials=10):
+    """Median seconds for one forward over n new tokens on top of a cached prompt."""
+    # build the cache once, then each trial: feed n arbitrary token ids, time it, cache.crop(len(prompt_ids))
+    ...
+```
+
+Do it for both models. Also note the draft's time for n = 1: divided by the target's n = 1 time, that's your **c**.
+
+</Task>
+
+<Predict id="p-verify-curve">
+On the Spark, in bf16 with plain Hugging Face code: if one 8B pass over 1 new token takes about 70 ms, how long will a pass over 8 new tokens take? Over 64? And for the 1B, will its 1-token pass be 6.4x faster than the 8B's (the ratio of their sizes)?
+
+<Fragment slot="answer">
+
+Expect 8 tokens to cost **within roughly 10-20% of 1 token**, because the weight read dominates and 8 FLOPs per byte is still far below the ridge. 64 tokens should start to cost visibly more, maybe tens of percent, as the math stops being negligible. Measure; these are expectations, not results.
+
+The 1B will almost certainly **not** be 6.4x faster. It reads 6.4x fewer bytes, but its per-step fixed costs (kernel launches for 16 layers, Python, the sampling call) don't shrink in proportion. A c of 0.25-0.4 in eager PyTorch would not be surprising, against 0.16 from bandwidth alone. That gap is why production engines run the draft with CUDA graphs and fused kernels.
+
+</Fragment>
+</Predict>
+
+<Task id="t3" title="Greedy speculative decoding, token-identical" agent="hands">
+
+Write `spec_greedy(prompt_ids, max_new, K)` and a plain `greedy(prompt_ids, max_new)` that uses the same `forward` helper one token at a time. The shape:
+
+```python
+def spec_greedy(prompt_ids, max_new, K):
+    seq = list(prompt_ids)
+    tc, dc = DynamicCache(), DynamicCache()
+    forward(target, tc, seq[:-1])   # invariant: each cache covers seq[:-1] or less
+    forward(draft, dc, seq[:-1])
+    stats = {"rounds": 0, "accepted": 0, "rejected": 0}
+    while len(seq) - len(prompt_ids) < max_new:
+        # 1. Draft K tokens greedily. First feed seq[dc.get_seq_length():] (the tokens the
+        #    draft hasn't seen), take argmax of the last row, then feed each draft token.
+        # 2. Verify: logits = forward(target, tc, seq[tc.get_seq_length():] + drafts).
+        #    The LAST K+1 rows are the target's predictions after seq, after d1, ..., after dK.
+        # 3. Walk left to right: keep d_i while d_i == argmax(row_i). At the first mismatch,
+        #    append argmax(row_i) instead and stop. If all K match, append argmax(row_K) (bonus).
+        # 4. Extend seq. Roll back: crop both caches to len(seq) - 1.
+        ...
+    return seq[len(prompt_ids):][:max_new], stats
+```
+
+Hints:
+
+- Get the "last K+1 rows" right. With the invariant, the target is fed exactly `[seq[-1]] + drafts`, K + 1 tokens, so all rows are the ones you want. Write an assert.
+- `cache.crop(n)` is a no-op if the cache is already shorter. That's the "all kept" case for the draft: it never processed dK, so next round's "feed what you haven't seen" picks up dK and the bonus.
+- Count rounds, accepted and rejected drafts in `stats`. You'll need them in t6.
+
+**The test.** For 20 different prompts and `max_new=128`, compare `spec_greedy` against `greedy` token by token. In bf16 you may see a rare divergence: the verify pass multiplies a block of 5 tokens while the plain loop multiplies one at a time, and the GPU may round those differently. When the target's top two logits are nearly tied, a tiny rounding difference flips the argmax. For any divergence, print the target's top-2 logit gap at that position; if it's tiny (say under 0.05), it's floating point, not your algorithm. Then load the target in fp32 (`load(TARGET, torch.float32)`) and rerun: divergences should vanish or nearly so. Wrong cache handling, by contrast, diverges right after the first rejection, every time.
+
+</Task>
+
+<Task id="t4" title="Full speculative sampling" agent="hands">
+
+Copy `spec_greedy` to `spec_sample(prompt_ids, max_new, K, temperature=1.0)`. Change three things:
+
+1. **Draft by sampling.** At each draft step compute `q = softmax(logits / T)`, sample `d = torch.multinomial(q, 1)`, and **keep the whole q vector** for that step.
+2. **Accept with the rule.** For each position i: draw `u ~ Uniform(0, 1)`; keep d_i if `u < p_i[d_i] / q_i[d_i]` (this is the same as probability `min(1, p/q)`). Here `p_i = softmax(row_i / T)`.
+3. **On rejection,** sample from `r = clamp(p_i − q_i, min=0)`, normalized. If all K are kept, sample the bonus from `p_(K+1)`.
+
+```python
+def accept_or_fix(p, q, d):
+    """p, q: fp32 probability vectors [vocab]. d: drafted token id.
+    Returns (token_to_emit, kept: bool)."""
+    ...
+```
+
+Do the softmax in fp32 (`forward` already returns fp32 logits). One numerical corner: if p and q are identical, the residual is all zeros, but then a rejection has probability zero too. Guard it anyway: if the residual sums to zero, fall back to sampling p.
+
+Write `accept_or_fix` as its own function so t5 can test it directly on toy vectors before it ever touches a model.
+
+</Task>
+
+<Task id="t5" title="Prove it empirically: a distribution test" agent="review">
+
+A proof says the output is p. A test says your *code* does. Do both levels:
+
+**Level 1: the rule on toy vectors.** Feed `accept_or_fix` the toy p and q from Figure 003, `p = [0.40, 0.25, 0.15, 0.10, 0.06, 0.04]`, `q = [0.20, 0.40, 0.10, 0.05, 0.20, 0.05]`, 100,000 times. Count outputs and run a <Term w="chi-square test">Compares observed counts with expected counts: add up (observed − expected)² / expected over the bins. Large means the counts are unlikely under the claimed distribution; the p-value says how unlikely.</Term> with `scipy.stats.chisquare(counts, p * N)`. Then do it again with a deliberately wrong version that resamples from p on rejection. I ran exactly this in numpy: the correct rule gave χ² = 7.3 (p-value 0.20, consistent with p); resampling from p gave χ² ≈ 5,000; resampling from q gave about 19,000. If your buggy version doesn't fail loudly, your test has no power.
+
+**Level 2: the real models, on a fixed prefix.** Pick a prompt with a genuinely spread-out next token, like "Name a random animal." at temperature 1.0.
+
+- **Position 1, against the exact answer.** One target forward on the prompt gives you the exact p for the first new token. Run `spec_sample(prompt, max_new=3, K=4)` N = 5,000 times, record the first token, and chi-square test it against N × p. Merge every token with expected count below 5 into one "other" bin (the test needs it). Report the statistic, degrees of freedom and p-value.
+- **Position 3, against plain sampling.** The third token tests your multi-token bookkeeping (caches, rollback, bonus), since it often comes from a later position in a round. There's no single exact p for it, so compare it with N plain samples of 3 tokens from the target alone, using a two-sample test: `scipy.stats.chi2_contingency` on a 2-row table (spec counts, plain counts) over the same bins.
+- **KL, with its noise floor.** Also report the <Term w="KL divergence">A measure of how different one probability distribution is from another, in nats or bits. Zero only if they are identical; never negative.</Term> KL(empirical ‖ p) for position 1. It will never be exactly zero: with B bins and N samples, pure sampling noise alone makes it come out around (B − 1) / (2N) nats. Check yours is near that. (In my toy check with 125 bins and 60,000 samples, I got 0.00096 against a predicted floor of 0.00103.)
+
+For plain sampling, either write a loop with your own `forward` or use `generate`, but **turn every default off**: Llama 3.1 Instruct's generation config sets its own temperature and top-p, and Hugging Face adds top-k = 50 by default. Pass `do_sample=True, temperature=1.0, top_k=0, top_p=1.0` and print `model.generation_config` to be sure. Otherwise you're comparing against a different p.
+
+Rough cost: 15-30 minutes. After it passes, have an agent review `dist_test.py` for statistical mistakes (wrong bins, wrong degrees of freedom, a test that can't fail).
+
+</Task>
+
+<Task id="t6" title="Sweep K: acceptance, tokens per pass, speedup" agent="hands">
+
+Write `sweep.py`. Use 20 prompts from your `prompts/short.jsonl`, 256 new tokens each, greedy (to match your benchmark). For K in 1, 2, 3, 4, 6, 8, record: total wall time, target passes (rounds), draft steps, accepted and rejected drafts. Also run plain `greedy` as the K = 0 baseline.
+
+Compute:
+
+- **α̂.** Not `accepted / drafted`: drafts after the first rejection were never judged, so that ratio is biased low. Under the independent-acceptance model, the right estimate is `accepted / (accepted + rejected)`, where `rejected` counts rounds that ended in a rejection. (Bonus check: for sampling, the expected acceptance at a position is exactly `Σ min(p, q)` over the vocabulary. Log it at the first draft position of each round; it's a lower-noise estimate.)
+- **Tokens per round**, measured, against `(1 − α̂^(K+1)) / (1 − α̂)`.
+- **c**, from timing draft steps and target passes separately (synchronize before each clock read).
+- **Speedup** = plain wall time ÷ speculative wall time.
+
+Then plug your α̂ and c into Figure 004 and see if it predicts your best K.
+
+</Task>
+
+<Task id="t7" title="Prompt lookup: speculation with no draft model" agent="hands">
+
+Replace the draft model with a function:
+
+```python
+def lookup_draft(seq, K, max_ngram=3):
+    """Find the most recent earlier occurrence of seq's last n tokens (try n = max_ngram down to 1).
+    Return up to K tokens that followed it, or [] if no match."""
+    ...
+```
+
+Plug it into `spec_greedy` in place of step 1. If it returns `[]`, fall back to one plain target step. Since the drafts are deterministic, q is one-hot: in greedy mode the rule is unchanged (match the argmax); in sampling mode keep d with probability p(d), and on rejection sample p with d zeroed out and renormalized (that's the residual of a one-hot q, the "one guess" case in Figure 003).
+
+Measure on two prompt sets: `prompts/short.jsonl` (open-ended chat) and `prompts/long.jsonl` (a long passage plus a question about it). Then try a third: give it a 100-line Python file and ask for the same file with one function renamed. Compare tokens per round across the three.
+
+Cross-check against Hugging Face's own versions: `generate(..., assistant_model=draft)` and `generate(..., prompt_lookup_num_tokens=10)` (check the generation docs for current names). Your speedups should be in the same neighborhood.
+
+</Task>
+
+<Task id="t8" title="Into the server, onto the scoreboard" agent="review">
+
+Copy `server_naive.py` to `server_spec.py`. Replace the `generate` thread with a thread running your `spec_greedy` loop that pushes decoded text into the same queue after each round (decode incrementally: tokens arrive in bursts of 1 to K + 1 now). Respect `max_tokens`, stop on the end-of-turn token unless `ignore_eos` is set, keep the lock, and report `usage.completion_tokens` from your own count. Use the best K from t6.
+
+Then run your harness exactly as before:
+
+```bash
+python bench.py --target spark-spec --base-url http://localhost:8000/v1 \
+  --model meta-llama/Llama-3.1-8B-Instruct --precision bf16 \
+  --prompts prompts/short.jsonl --concurrency 1,4,16 --n 200 --max-tokens 256 --ignore-eos \
+  --change "spec decoding: Llama 3.2 1B draft, K=<yours>, greedy"
+```
+
+(Use whatever flag your `bench.py` takes for the change description.) Run `scoreboard.py` on the result and append the row to `SCOREBOARD.md`, with α̂ and K in the notes. Have an agent review the server for the disconnect bug from the baseline lesson; the speculation loop has the same problem.
+
+</Task>
+
+<DoneWhen>
+
+- You can derive `P(output = y) = p(y)` on paper without looking.
+- `verify_cost.py` shows how a target pass's time grows with n new tokens, and you have measured c.
+- `spec_greedy` matches plain greedy token for token on 20 prompts in fp32, and any bf16 divergences sit at near-ties.
+- `dist_test.py` passes for the correct rule and fails loudly for the "resample from p" bug, both on toy vectors and at positions 1 and 3 with the real models.
+- You have a K sweep with α̂, tokens per round (measured and predicted), c and speedup, plus prompt lookup on three prompt sets.
+- `SCOREBOARD.md` has a speculative decoding row.
+
+</DoneWhen>
+
+## Measure
+
+**Verify cost** (t2). Median of 10, target cache at ~512 tokens.
+
+| new tokens n | 8B ms | 8B ÷ (n = 1) | 1B ms |
+|---|---|---|---|
+| 1 | | 1.00 | |
+| 2 | | | |
+| 4 | | | |
+| 8 | | | |
+| 16 | | | |
+| 32 | | | |
+| 64 | | | |
+
+**The K sweep** (t6). Greedy, 20 short prompts, 256 tokens each.
+
+| K | α̂ | tokens / round (measured) | tokens / round (formula) | c | tok/s | speedup |
+|---|---|---|---|---|---|---|
+| 0 (plain) | - | 1.00 | 1.00 | - | | 1.00 |
+| 1 | | | | | | |
+| 2 | | | | | | |
+| 3 | | | | | | |
+| 4 | | | | | | |
+| 6 | | | | | | |
+| 8 | | | | | | |
+
+**Distribution test** (t5).
+
+| test | N | bins | statistic | df | p-value | KL / noise floor |
+|---|---|---|---|---|---|---|
+| toy, correct rule | 100,000 | 6 | | 5 | | |
+| toy, resample-from-p bug | 100,000 | 6 | | 5 | | |
+| real, position 1 vs exact p | 5,000 | | | | | |
+| real, position 3 vs plain sampling | 5,000 + 5,000 | | | | | |
+
+**Prompt lookup** (t7).
+
+| prompt set | tokens / round | speedup vs plain |
+|---|---|---|
+| short chat | | |
+| long passage + question | | |
+| rename a function in a file | | |
+
+**What to expect.** These are rough expectations to check, not results.
+
+- **Verify cost.** Nearly flat from 1 to about 8 new tokens, then rising. If 8 tokens costs 2x a single token, something other than the weight read is dominating (look for a Python loop inside your forward).
+- **α̂ for 1B → 8B, greedy, chat prompts.** Plausibly somewhere around 0.6 to 0.8: the two models were trained on similar data and agree on most easy tokens (punctuation, the second half of a word, boilerplate phrases). It will vary a lot by prompt: higher on code and lists, lower on creative writing. Sampling at temperature 1 usually lowers it.
+- **c.** Between the bandwidth ratio (~0.16) and something like 0.4 in eager PyTorch. This is the number most likely to surprise you.
+- **Speedup.** With α ≈ 0.7 and c ≈ 0.3, the calculator says best K ≈ 2-3 and about 1.4x. With c ≈ 0.15 you'd see closer to 1.75x at K ≈ 3-4. A naive implementation landing between 1.3x and 2x would be a reasonable result. If you get below 1x, check c first.
+- **Measured vs formula tokens per round.** Close but not exact, because real acceptances aren't independent: easy stretches accept long runs, hard ones reject early.
+- **Prompt lookup.** Little to no gain on open chat (it often finds no match). Large gains on the rename task, where most of the output literally copies the input: many tokens per round with c ≈ 0.
+- **Scoreboard.** Tok/s at c = 1 should rise by about your speedup. TTFT should barely change (the draft's prefill is small). Throughput at c = 16 is still roughly your single-stream speed, since the lock still serializes requests: speculation made each request faster, not the server wider. Batching is still the next big lever.
+
+## Break It
+
+**Resample from p on rejection.** The most tempting bug: "if the draft is wrong, let the target pick". Make that change in `accept_or_fix` and rerun t5. On the toy vectors the output becomes `min(p, q) + (1 − α)·p`, which for the Figure 003 vectors is [0.32, 0.325, 0.145, 0.08, 0.078, 0.052] instead of p. The text still reads fine, which is the scary part: you'd never catch it by eye. Only the test catches it. Lesson: "plausible output" is not "correct distribution".
+
+**Skip the rollback.** Delete the `crop` calls. In greedy mode, the identity test now fails immediately after the first rejected draft in every prompt, and the output soon degrades: the target is attending to keys and values of tokens that aren't in the text. Notice that the *first* round is always fine. Bugs in speculative decoding hide in round two.
+
+**Draft greedily, claim softmax.** In `spec_sample`, draft with argmax but keep passing the softmax q into the accept rule. The distribution test fails. The rule's correctness depends on q being the distribution the draft *actually* sampled from; a greedy draft's real q is one-hot. Fix it either way (sample from q, or use the one-hot rule from t7) and the test passes again.
+
+**Use a draft from another family.** In greedy mode, swap the draft for Qwen2.5 0.5B (bypass the tokenizer assert, and replace any draft id of 128,256 or above with a valid one, or the target's embedding lookup crashes). Token ids now mean different strings, acceptance collapses toward zero, every round wastes K draft steps, and the speedup goes below 1. A bad draft can't break correctness, only speed.
+
+## Explain It Back
+
+Answer each out loud before opening it.
+
+<details>
+<summary>1. What is a model's "output distribution", and why can speculative sampling produce different text and still be "the same"?</summary>
+
+At every step the model outputs one probability for every token in its vocabulary, a vector that sums to 1. Greedy decoding takes the biggest entry; sampling rolls a die weighted by the entries. The distribution over whole sequences is the product of these per-step probabilities. Two sampling runs of the same model give different text, so "same" can't mean same text. It means every possible sequence has the same probability of coming out. Speculative sampling guarantees that: you could not tell from any number of outputs whether a draft model was used. With greedy decoding it's stronger: the text is identical, apart from floating-point near-ties.
+
+</details>
+
+<details>
+<summary>2. Why does checking 5 draft tokens cost about the same as generating 1?</summary>
+
+Single-stream decode is memory-bound: each step's time is set by reading all the weights once, about 16 GB for an 8B model in bf16, while the math units sit idle. Feeding 5 tokens in one forward pass reuses each weight 5 times per read instead of once. The bytes don't change, only the math, and 5 FLOPs per byte is still far below the ridge point of a few hundred. So the pass takes about the same time. This stops being true when the number of positions per pass, batch size times K + 1, approaches the ridge point.
+
+</details>
+
+<details>
+<summary>3. State the acceptance rule and prove the output follows p.</summary>
+
+Draft proposes x from q. Keep it with probability min(1, p(x)/q(x)). If rejected, sample from the residual max(0, p − q), normalized. Proof: the probability that y is proposed and kept is q(y) · min(1, p(y)/q(y)) = min(p(y), q(y)). The probability of a rejection is 1 − Σ min(p, q), which equals Σ max(0, p − q) because p sums to 1, and that's exactly the residual's normalizer, so rejecting and then drawing y has probability max(0, p(y) − q(y)). Add the two: min(p, q) + max(0, p − q) = p(y). For multiple tokens, apply it position by position: each kept draft is the real prefix for the next check, and a rejection ends the round, so every emitted token follows the target's distribution given the actual text before it. Nothing assumes q is good; a bad q only lowers the acceptance rate.
+
+</details>
+
+<details>
+<summary>4. How does this scale: you're serving 64 users at once. Should you speculate?</summary>
+
+Probably less, or not at all. Speculation spends idle compute to get more tokens per weight read. Batching spends the same idle compute serving more users. At batch 64 with K = 4, each verify pass processes 320 positions, roughly at the Spark's ridge point, so verification is no longer free, and the third to half of verified positions that get rejected are real compute taken from other users. Acceptance is also ragged: different sequences keep different numbers of tokens per round, which complicates the batch. Engines treat it as a latency tool for low load: on, with larger K, when few requests are active; smaller K or off as the batch fills.
+
+</details>
+
+<details>
+<summary>5. Your draft has α = 0.7 and costs 0.3 of a target step. What K, what speedup, and what would you improve first?</summary>
+
+Speedup is (1 − α^(K+1)) / ((1 − α)(1 + Kc)). At α = 0.7, c = 0.3: K = 1 gives 1.31x, K = 2 gives 1.37x, K = 3 about 1.33x, so K = 2 and about 1.4x. Two levers. Lower c, by making the draft step cheaper (CUDA graphs, fused kernels, a smaller or layer-skipping draft): at c = 0.1 the same α gives about 2x at K = 4. Or raise α by training a draft on the target's own outputs, which is the draft-model lesson. Lowering c is usually the cheaper first move, since a 1B model in eager PyTorch is far from its bandwidth limit.
+
+</details>
+
+<details>
+<summary>6. Prompt lookup decoding has no draft model and proposes one fixed token. How can it be exact?</summary>
+
+Its q is one-hot: all probability on the token it proposes. Plug that into the rule: keep the guess with probability min(1, p(x)/1) = p(x). On rejection the residual max(0, p − q) is p with x removed, renormalized. By the same proof the output follows p. Any proposal mechanism works, as long as you know the q you drew from. Prompt lookup's α is just p(x), which is high when the output copies the input (summaries, code edits, quoting a document) and near zero for free writing. Its cost is essentially zero, so on copy-heavy tasks it can beat a model-based draft.
+
+</details>
+
+## Go Deeper
+
+- **"Fast Inference from Transformers via Speculative Decoding"**, Yaniv Leviathan, Matan Kalman, Yossi Matias, ICML 2023 (arXiv 2211.17192). The paper. Section 3 has the rule, the proof, and the α, K, c analysis that Figure 004 implements, including the optimal-K discussion.
+- **"Accelerating Large Language Model Decoding with Speculative Sampling"**, Charlie Chen, Sebastian Borgeaud, Geoffrey Irving, Jean-Baptiste Lespiau, Laurent Sifre, John Jumper (DeepMind), 2023 (arXiv 2302.01318). The independent discovery. Short, with a clean statement of "modified rejection sampling" and results on Chinchilla 70B.
+- **"Blockwise Parallel Decoding for Deep Autoregressive Models"**, Mitchell Stern, Noam Shazeer, Jakob Uszkoreit, NeurIPS 2018. The greedy-only ancestor. Read it to see exactly what sampling-exact speculation added.
+- **"Assisted Generation: a new direction toward low-latency text generation"**, Joao Gante, Hugging Face blog, 2023. A practitioner's walk through the same loop in `transformers`, with measured latency numbers and the cache-rollback details.
+- **"Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"**, Tianle Cai et al., 2024. Extra heads instead of a draft model, plus tree-shaped verification (checking several candidate continuations in one pass).
+- **"EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty"**, Yuhui Li, Fangyun Wei, Chao Zhang, Hongyang Zhang, 2024, and its follow-ups EAGLE-2 and EAGLE-3. Why drafting on the target's hidden features beats drafting on tokens. The state of the art you'll meet in vLLM and SGLang.
+- **Prompt Lookup Decoding**, Apoorv Saxena, 2023 (GitHub: apoorvumang/prompt-lookup-decoding). A few dozen lines; the whole idea fits on a screen. Now built into `transformers` as `prompt_lookup_num_tokens`.
+- **vLLM documentation, "Speculative Decoding"**. How a production engine exposes draft models, n-gram, Medusa and EAGLE drafts, and what it says about when speculation helps or hurts under load.
+
+## Connections
+
+Built on: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the idle compute this lesson spends) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (the server and scoreboard). The cache rollback is a direct use of [the KV cache](/lessons/kv-cache/).
+
+It competes with [batching](/lessons/batching/) for the same idle compute, which is why it fades at high load. [Quantization](/lessons/quantization/) stacks with it: a 4-bit target makes every verify pass cheaper, and a 4-bit draft lowers c. [Inside vLLM and SGLang](/lessons/serving-engines/) shows how production engines combine speculation with paged caches and continuous batching.
+
+The biggest lever left is α. In [Train your own draft model](/lessons/draft-model/) you'll distill a small model on your 8B's own outputs, rerun this lesson's K sweep with it, and see how far a draft trained to imitate its target can push the acceptance rate.

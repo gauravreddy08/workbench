@@ -1,0 +1,248 @@
+---
+// Loss-curve explorer: typical train/val curves for a ~124M GPT on web text under six scenarios
+// (good, LR too high, LR too low, no warmup, targets-not-shifted bug, tiny repeated data).
+// Curves are illustrative shapes, not measurements. Usage: <TinyLMLossExplorer />
+---
+<div class="tlx" data-fig="tinylm-loss">
+  <div class="tlx-btns" role="group" aria-label="Scenario">
+    <button class="btn" type="button" data-s="good" aria-pressed="true">Good run</button>
+    <button class="btn" type="button" data-s="high" aria-pressed="false">LR too high</button>
+    <button class="btn" type="button" data-s="low" aria-pressed="false">LR too low</button>
+    <button class="btn" type="button" data-s="nowarm" aria-pressed="false">No warmup</button>
+    <button class="btn" type="button" data-s="shift" aria-pressed="false">Data bug</button>
+    <button class="btn" type="button" data-s="overfit" aria-pressed="false">Tiny data</button>
+  </div>
+  <svg viewBox="0 0 640 330" role="img" aria-label="Training and validation loss curves for the chosen scenario, with the learning-rate schedule underneath"></svg>
+  <div class="ctl">
+    <button class="btn" type="button" data-t="val" aria-pressed="true">Show val loss</button>
+    <button class="btn" type="button" data-t="log" aria-pressed="false">Log step axis</button>
+  </div>
+  <p class="tlx-read">
+    final train <span class="readout" data-r="tr">-</span> ·
+    final val <span class="readout" data-r="va">-</span> ·
+    val perplexity <span class="readout" data-r="ppl">-</span>
+  </p>
+  <div class="tlx-note">
+    <p><span class="label">What you see</span> <span data-r="see"></span></p>
+    <p><span class="label">What it means</span> <span data-r="mean"></span></p>
+    <p><span class="label">What to do</span> <span data-r="fix"></span></p>
+  </div>
+</div>
+
+<style>
+  .tlx-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .tlx-btns .btn { padding: 5px 9px; font-size: 10.5px; }
+  .tlx-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+  .tlx-note { margin-top: 12px; border-top: 1px dashed var(--rule); padding-top: 10px; }
+  .tlx-note p { margin: 0 0 8px; font-size: 15px; line-height: 1.5; color: var(--ink-2); }
+  .tlx-note .label { color: var(--blue); margin-right: 6px; font-size: 10.5px; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const STEPS = 5000;
+  const LNV = Math.log(50257); // 10.82
+  const WARM = 300;
+  const PEAK = 6e-4;
+
+  // deterministic noise so the curves don't jitter on every redraw
+  function rng(seed: number) {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296 - 0.5;
+    };
+  }
+
+  function lrAt(t: number, peak: number, warm: number) {
+    if (warm > 0 && t < warm) return (peak * (t + 1)) / warm;
+    const p = (t - warm) / (STEPS - warm);
+    const min = peak * 0.1;
+    return min + 0.5 * (peak - min) * (1 + Math.cos(Math.PI * Math.min(1, Math.max(0, p))));
+  }
+
+  // smooth "healthy" curve: fast early drop, then a slow power-law grind, with a small bonus as LR decays
+  function healthy(t: number, tau: number, floor: number) {
+    const start = 10.95;
+    const ramp = 1 - Math.exp(-t / 25); // the model needs a few steps before it moves at all
+    const body = floor + (start - floor) * Math.pow(1 + t / tau, -0.55);
+    const anneal = 0.12 * Math.pow(t / STEPS, 2);
+    return start + (body - start) * ramp - anneal;
+  }
+
+  type Sc = { lr: (t: number) => number; train: (t: number, n: () => number) => number; val: (t: number, tr: number, n: () => number) => number; see: string; mean: string; fix: string };
+
+  const SC: Record<string, Sc> = {
+    good: {
+      lr: (t) => lrAt(t, PEAK, WARM),
+      train: (t, n) => healthy(t, 40, 2.95) + n() * (0.06 + 0.25 * Math.exp(-t / 200)),
+      val: (t, tr) => healthy(t, 40, 2.95) + 0.03,
+      see: 'Starts near ln(V) ≈ 10.8, falls several nats in the first couple hundred steps, then grinds down slowly. Val sits right on top of train. A small extra drop at the end as the learning rate decays.',
+      mean: 'The model first learns which tokens are common, then short phrases, then longer-range structure. Val ≈ train means it is learning things that generalise, not memorising. This is what you want every run to look like.',
+      fix: 'Nothing. Keep it as your reference curve and compare every future run against it on the same axes.',
+    },
+    high: {
+      lr: (t) => lrAt(t, PEAK * 10, WARM),
+      train: (t, n) => {
+        let base = healthy(t, 30, 3.2) + n() * 0.12;
+        const spike = (c: number, h: number, w: number) => (t > c ? h * Math.exp(-(t - c) / w) : 0);
+        base += spike(620, 2.2, 60) + spike(1380, 3.0, 90);
+        if (t > 2100) base = 7.4 + 1.6 * Math.exp(-(t - 2100) / 120) + n() * 0.15;
+        return base;
+      },
+      val: (t, tr) => tr + 0.04,
+      see: 'Fast start, faster than the good run for a while. Then sharp spikes that recover less each time, then a jump to a flat line around 7 that never comes back down.',
+      mean: 'Each step is too big: the update overshoots, the loss jumps, and Adam\'s running averages get polluted. Eventually the weights land somewhere the model has forgotten everything but token frequencies (roughly the loss you get from a unigram guess), or it goes to NaN.',
+      fix: 'Cut the peak LR by 2-3x. If spikes are rare and recover, also check grad clipping is on (max norm 1.0) and look at the gradient-norm log right before each spike.',
+    },
+    low: {
+      lr: (t) => lrAt(t, PEAK / 10, WARM),
+      train: (t, n) => healthy(t, 420, 2.95) + n() * 0.05,
+      val: (t, tr) => tr + 0.02,
+      see: 'Smooth, stable, no drama, and slow. It is still falling steeply when the run ends, about a nat above the good run.',
+      mean: 'Nothing is broken, you just spent your compute badly. A curve still falling steeply at the end is the signature of a learning rate (or a run) that is too small for the budget.',
+      fix: 'Raise the LR 3x and rerun a short version. The best LR is usually just below the one that starts to spike, which is why you sweep.',
+    },
+    nowarm: {
+      lr: (t) => lrAt(t, PEAK, 0),
+      train: (t, n) => {
+        const bump = t < 600 ? 3.4 * Math.exp(-Math.pow((t - 70) / 55, 2)) : 0;
+        return healthy(t, 70, 3.05) + bump + n() * (0.07 + 0.3 * Math.exp(-t / 200));
+      },
+      val: (t, tr) => tr + 0.03,
+      see: 'Drops, then jumps back up within the first hundred steps, sometimes above where it started. It recovers, but ends a little worse than the good run.',
+      mean: 'At step 0 the weights are random and Adam has no history, so its first updates are huge in every direction at once. Full LR on top of that shoves the model somewhere bad. Warmup lets the early, noisy gradients settle before the big steps start.',
+      fix: 'Linear warmup over a few hundred steps (a few percent of the run). Cheap insurance; nobody trains a transformer without it.',
+    },
+    shift: {
+      lr: (t) => lrAt(t, PEAK, WARM),
+      train: (t, n) => 0.04 + 10.9 * Math.exp(-t / 70) + Math.abs(n()) * 0.03,
+      val: (t, tr) => tr + 0.01,
+      see: 'Loss plunges toward zero in a few hundred steps. Train and val agree perfectly. It looks amazing.',
+      mean: 'It is a bug. A 124M model on web text lands around 3 nats, not 0.05. Here the targets were not shifted by one, so each position is asked to predict the token it can already see, and the model learns to copy. Same family: a causal mask that leaks the future, or val data that is also in train.',
+      fix: 'Rule: if the loss is too good to be true, it is. Print a decoded (x, y) pair and check y is x moved left by one. Train on random tokens: a correct pipeline cannot go below ln(V).',
+    },
+    overfit: {
+      lr: (t) => lrAt(t, PEAK, WARM),
+      train: (t, n) => {
+        const ep = Math.floor(t / 400); // each epoch over the 200M-token subset ends with a small cliff
+        return Math.max(0.6, healthy(t, 40, 2.95) - 0.12 * ep - 0.0001 * Math.max(0, t - 1200)) + n() * 0.05;
+      },
+      val: (t, tr) => {
+        const h = healthy(t, 40, 2.95);
+        return t < 1300 ? h + 0.05 : h + 0.05 + 0.0004 * (t - 1300);
+      },
+      see: 'Train keeps falling, with a small cliff every time the data repeats. Val follows it at first, bottoms out, then turns upward while train keeps improving.',
+      mean: 'The model has seen every example several times and is memorising them. Past the val minimum, every step makes it better at the training set and worse at text it has not seen. That widening gap is overfitting.',
+      fix: 'More (fresh) data, or stop at the val minimum. Chinchilla-style runs see each token about once, so you rarely see this in pretraining unless the dataset is too small or the loader keeps replaying one shard.',
+    },
+  };
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="tinylm-loss"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const st = { s: 'good', val: true, log: false };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const X0 = 40, X1 = 628, Y0 = 16, Y1 = 236, LY0 = 262, LY1 = 306;
+    const YMAX = 12;
+
+    const xOf = (t: number) => {
+      const f = st.log ? Math.log10(1 + t) / Math.log10(1 + STEPS) : t / STEPS;
+      return X0 + f * (X1 - X0);
+    };
+    const yOf = (l: number) => Y1 - (Math.min(Math.max(l, 0), YMAX) / YMAX) * (Y1 - Y0);
+
+    function draw() {
+      const sc = SC[st.s];
+      svg.replaceChildren();
+      // axes
+      svg.append(el('line', { x1: X0, y1: Y0, x2: X0, y2: Y1, class: 'ink', 'stroke-width': 1 }));
+      svg.append(el('line', { x1: X0, y1: Y1, x2: X1, y2: Y1, class: 'ink', 'stroke-width': 1 }));
+      for (let l = 0; l <= 12; l += 2) {
+        svg.append(el('text', { x: X0 - 6, y: yOf(l) + 4, 'text-anchor': 'end' }, String(l)));
+        if (l > 0) svg.append(el('line', { x1: X0, y1: yOf(l), x2: X1, y2: yOf(l), style: 'stroke:var(--rule)', 'stroke-width': 0.6 }));
+      }
+      svg.append(el('text', { x: X0 + 4, y: Y0 + 4, class: 'strong' }, 'LOSS (NATS)'));
+      const ticks = st.log ? [0, 10, 100, 1000, 5000] : [0, 1000, 2000, 3000, 4000, 5000];
+      ticks.forEach((t) => svg.append(el('text', { x: xOf(t), y: Y1 + 14, 'text-anchor': t === 0 ? 'start' : t === 5000 ? 'end' : 'middle' }, String(t))));
+      svg.append(el('text', { x: (X0 + X1) / 2, y: Y1 + 14, 'text-anchor': 'middle', class: 'strong' }, st.log ? '' : 'STEP'));
+      // ln V line
+      svg.append(el('line', { x1: X0, y1: yOf(LNV), x2: X1, y2: yOf(LNV), class: 'blue dash', 'stroke-width': 1 }));
+      svg.append(el('text', { x: X1, y: yOf(LNV) - 5, 'text-anchor': 'end', class: 'blue-t' }, 'ln(50257) = 10.82 · RANDOM GUESSING'));
+
+      // curves
+      const n = rng(7);
+      const pts: string[] = [];
+      const vpts: string[] = [];
+      let lastTr = 0, lastVa = 0, trS = 0;
+      for (let t = 0; t <= STEPS; t += 5) {
+        const tr = sc.train(t, n);
+        trS = t === 0 ? tr : 0.9 * trS + 0.1 * tr;
+        pts.push(`${xOf(t).toFixed(1)},${yOf(tr).toFixed(1)}`);
+        if (t % 50 === 0) {
+          const va = sc.val(t, trS, n);
+          vpts.push(`${xOf(t).toFixed(1)},${yOf(va).toFixed(1)}`);
+          lastVa = va;
+        }
+        lastTr = trS;
+      }
+      svg.append(el('polyline', { points: pts.join(' '), class: 'blue', 'stroke-width': 1, style: 'opacity:0.85' }));
+      if (st.val) svg.append(el('polyline', { points: vpts.join(' '), class: 'ink', 'stroke-width': 1.5 }));
+
+      // legend
+      svg.append(el('line', { x1: X1 - 150, y1: Y0 + 24, x2: X1 - 130, y2: Y0 + 24, class: 'blue', 'stroke-width': 1.5 }));
+      svg.append(el('text', { x: X1 - 124, y: Y0 + 28 }, 'TRAIN (PER STEP)'));
+      if (st.val) {
+        svg.append(el('line', { x1: X1 - 150, y1: Y0 + 40, x2: X1 - 130, y2: Y0 + 40, class: 'ink', 'stroke-width': 1.5 }));
+        svg.append(el('text', { x: X1 - 124, y: Y0 + 44 }, 'VAL (EVERY 50)'));
+      }
+
+      // LR strip
+      svg.append(el('text', { x: X0 + 4, y: LY0 - 4, class: 'strong' }, 'LEARNING RATE'));
+      svg.append(el('line', { x1: X0, y1: LY1, x2: X1, y2: LY1, class: 'ink', 'stroke-width': 1 }));
+      const LRMAX = PEAK * 10;
+      const lp: string[] = [];
+      for (let t = 0; t <= STEPS; t += 10) {
+        const f = Math.log10(sc.lr(t) / (PEAK / 100)) / Math.log10(LRMAX / (PEAK / 100)); // log scale 6e-6 .. 6e-3
+        lp.push(`${xOf(t).toFixed(1)},${(LY1 - Math.max(0, f) * (LY1 - LY0)).toFixed(1)}`);
+      }
+      svg.append(el('polyline', { points: lp.join(' '), class: 'blue', 'stroke-width': 1.5 }));
+      const pk = sc.lr(Math.max(WARM, 1));
+      svg.append(el('text', { x: X1, y: LY0 - 4, 'text-anchor': 'end' }, `PEAK ${pk.toExponential(0).replace('e-', 'e-')} · LOG SCALE`));
+      svg.append(el('text', { x: X0 - 6, y: LY1 + 4, 'text-anchor': 'end' }, '0'));
+
+      r('tr').textContent = lastTr.toFixed(2);
+      r('va').textContent = lastVa.toFixed(2);
+      r('ppl').textContent = Math.exp(lastVa) < 1000 ? Math.exp(lastVa).toFixed(lastVa < 1 ? 2 : 0) : Math.exp(lastVa).toExponential(1);
+      r('see').textContent = sc.see;
+      r('mean').textContent = sc.mean;
+      r('fix').textContent = sc.fix;
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-s]').forEach((b) =>
+      b.addEventListener('click', () => {
+        st.s = b.dataset.s!;
+        root.querySelectorAll<HTMLButtonElement>('[data-s]').forEach((o) => o.setAttribute('aria-pressed', String(o === b)));
+        draw();
+      }),
+    );
+    root.querySelectorAll<HTMLButtonElement>('[data-t]').forEach((b) =>
+      b.addEventListener('click', () => {
+        const k = b.dataset.t as 'val' | 'log';
+        st[k] = !st[k];
+        b.setAttribute('aria-pressed', String(st[k]));
+        draw();
+      }),
+    );
+    draw();
+  });
+</script>

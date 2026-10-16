@@ -1,0 +1,810 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import DBLogIndex from '../components/figures/DBLogIndex.astro';
+
+## Today
+
+- Name the four things that go wrong when "the database" is a JSON file, and make each one happen on your Mac: rewrites that get slower as data grows, crashes mid-write, two writers erasing each other's work, and reading everything to find one record.
+- Explain what a storage engine is, and build the simplest real one: an append-only log plus an in-memory hash index, the design Riak shipped as Bitcask.
+- Make it survive `kill -9` and a torn write, using recovery-by-replay and a checksum on every record. Add compaction so the log doesn't grow forever.
+- Explain write-ahead logging as the one idea under almost every database, and sketch the two big engine shapes, B-trees and LSM-trees, in one picture each.
+- Say what a database does beyond storing bytes (concurrency control, a query language, durability promises), and when SQLite is the right answer and when you want Postgres.
+
+Prerequisites: [Why did my checkpoint come back broken?](/lessons/files-and-disks/) (the page cache, `fsync`, temp-file-plus-rename, journaling). This lesson builds directly on all four. Rough time: one evening to read, one to build.
+
+## The Problem
+
+You're writing a crawler cache for work. Before fetching a URL, the crawler checks whether it fetched it recently; after fetching, it records the status code, a content hash and a timestamp. You need it by Friday, so it's a dict, and the dict lives in `cache.json`:
+
+```python
+cache = json.load(open("cache.json"))
+cache[url] = {"status": 200, "sha": h, "ts": time.time()}
+json.dump(cache, open("cache.json", "w"))
+```
+
+It works. Then it gets used.
+
+At 5,000 URLs nobody notices anything. At 200,000 URLs the file is 30 MB and every single update rewrites all 30 MB, so the crawler spends more time saving its cache than fetching pages. Someone runs it with 8 worker processes to go faster, and entries start silently disappearing: two workers each loaded the file, each added one URL, and whoever saved second erased the other's work. Then a worker gets OOM-killed while saving and the next run dies on `json.decoder.JSONDecodeError: Unterminated string`, because `open(..., "w")` truncated the file and only half of the new one got written. And when someone asks "how many URLs returned 429 yesterday?", the only way to answer is to load all 30 MB and loop.
+
+None of this is a bug in your code exactly. It's four separate problems that every program storing data eventually hits:
+
+1. **Cost grows with size.** Changing one record costs as much as writing all of them.
+2. **Crashes.** A save that dies halfway can destroy the old data and the new data together.
+3. **Concurrency.** Two writers who each read, modify and write the whole file lose updates.
+4. **Finding things.** No structure on disk means every question is a full scan.
+
+A database is the accumulated set of answers to those four problems. This lesson builds a small one from scratch so that when you reach for SQLite or Postgres, you know what you're buying.
+
+<Origin year="1970" title="Codd: stop making programs know where the data lives">
+
+In the 1960s, a "database" meant something like IBM's IMS, built for the Apollo program's parts lists. Data was stored as trees or networks of records linked by pointers, and programs navigated them by hand: start at this customer record, follow the pointer to their first order, follow the next-order pointer, and so on. The program knew the physical layout. Change the layout, add an index, reorganize the file for speed, and every program that touched it had to be rewritten.
+
+Edgar F. Codd, a mathematician at IBM's San Jose lab, published "A Relational Model of Data for Large Shared Data Banks" in June 1970. His argument was that users should describe *what* data they want (as relations, which we now call tables, and operations on them) and the system should work out *how* to get it. He called the goal data independence: the storage underneath could change without breaking a single query. IBM was slow to act on it (IMS made a lot of money), but its System R project built a prototype and a language for it, SEQUEL, later SQL, in the mid 1970s. Berkeley's Ingres followed, and a small company called Relational Software (later Oracle) shipped the first commercial SQL database in 1979. Codd won the Turing Award in 1981.
+
+That split, a query layer that says what and a storage engine underneath that decides how, is still the shape of every database. This lesson is mostly about the bottom half.
+
+</Origin>
+
+## The Idea
+
+### Failure one: every write rewrites everything
+
+JSON is a <Term w="serialization format">A way of turning in-memory objects into a flat sequence of bytes (and back), so they can be saved to a file or sent over a network.</Term>, not a storage format. It has no way to say "change the value at byte 4,812". The bytes after any change shift, so the only safe way to update one key is to write the whole file again. That makes a single `put` cost <Term w="O(N)">Cost grows in proportion to N, the number of records. Twice the data, twice the time, for the same one-record change.</Term> instead of constant.
+
+I measured it on an M4 Pro MacBook (Python 3.14): a dict of N keys with 100-byte values, saved with the safe temp-file-plus-rename recipe from the [files lesson](/lessons/files-and-disks/) after every put.
+
+<Figure n="001" title="ONE PUT, N RECORDS" caption="Time for one put when every put rewrites the whole JSON file, measured on an M4 Pro Mac with 100-byte values. Note the log scale: each step right is 10x more data and roughly 10x more time. At 100,000 keys one put takes ~43 ms, so the store tops out near 23 writes per second. The append-only log you'll build stays near 4 µs at every size.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Bar chart: JSON put time grows linearly with record count, from 0.19 ms at 100 keys to 43 ms at 100,000 keys">
+  <line x1="150" y1="20" x2="150" y2="196" class="ink" stroke-width="1" />
+  <line x1="150" y1="196" x2="590" y2="196" class="ink" stroke-width="1" />
+  <line x1="297" y1="20" x2="297" y2="196" class="ink dash" stroke-width="0.6" />
+  <line x1="443" y1="20" x2="443" y2="196" class="ink dash" stroke-width="0.6" />
+  <line x1="590" y1="20" x2="590" y2="196" class="ink dash" stroke-width="0.6" />
+  <text x="150" y="214" text-anchor="middle">0.1 ms</text>
+  <text x="297" y="214" text-anchor="middle">1 ms</text>
+  <text x="443" y="214" text-anchor="middle">10 ms</text>
+  <text x="586" y="214" text-anchor="end">100 ms</text>
+  <text x="370" y="238" text-anchor="middle">TIME PER PUT (LOG SCALE)</text>
+  <text x="140" y="44" text-anchor="end" class="strong">N = 100</text>
+  <text x="140" y="58" text-anchor="end">20 KB file</text>
+  <rect x="150" y="32" width="41" height="26" class="fill-wash" stroke-width="1" />
+  <text x="199" y="50">0.19 ms</text>
+  <text x="140" y="88" text-anchor="end" class="strong">N = 1,000</text>
+  <text x="140" y="102" text-anchor="end">130 KB</text>
+  <rect x="150" y="76" width="106" height="26" class="fill-wash" stroke-width="1" />
+  <text x="264" y="94">0.53 ms</text>
+  <text x="140" y="132" text-anchor="end" class="strong">N = 10,000</text>
+  <text x="140" y="146" text-anchor="end">1.2 MB</text>
+  <rect x="150" y="120" width="238" height="26" class="fill-wash" stroke-width="1" />
+  <text x="396" y="138">4.2 ms</text>
+  <text x="140" y="176" text-anchor="end" class="strong">N = 100,000</text>
+  <text x="140" y="190" text-anchor="end">12 MB</text>
+  <rect x="150" y="164" width="389" height="26" class="fill-blue" />
+  <text x="532" y="182" text-anchor="end" style="fill:var(--paper)">43 ms</text>
+</svg>
+</Figure>
+
+Two details in those numbers. First, `fsync` made no visible difference at large N: the 12 MB rewrite (serializing, then copying into the page cache) dwarfs one Mac `fsync`. Second, it really is linear, which you can see coming from [back-of-the-envelope math](/lessons/back-of-envelope/): Python's `json.dump` writes on the order of a few hundred MB per second, and 12 MB at that rate is tens of milliseconds. At a million keys, extrapolate to around half a second per put. Your crawler would be doing two saves a second, and nothing else.
+
+### Failure two: a crash in the middle
+
+You already know this one from the checkpoint lesson. `open("cache.json", "w")` <Term w="truncates">Cuts the file to zero bytes immediately, before anything new is written.</Term> the file, so a crash anywhere during the dump leaves you with neither the old cache nor the new one. Temp-file-plus-fsync-plus-rename fixes it, at the cost of making every save a full copy plus an `fsync`. You can make a JSON file crash-safe. You can't make it crash-safe *and* cheap to update.
+
+### Failure three: two writers
+
+Two crawler workers, A and B. Each one does the natural thing: read the whole file, add one key, write the whole file.
+
+<Figure n="002" title="THE LOST UPDATE, ON DISK" caption="Both workers read the same version of the file. Each adds its own key to its own copy in memory. Whichever saves last wins, and the other's change is silently gone. Atomic rename doesn't help: it guarantees each save is whole, not that it includes the other worker's change.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Timeline of two processes reading, modifying and writing the same JSON file, losing one update">
+  <defs>
+    <marker id="db2-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="10" y="44" class="strong">WORKER A</text>
+  <text x="10" y="214" class="strong">WORKER B</text>
+  <rect x="230" y="108" width="380" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="240" y="130" class="strong">cache.json</text>
+  <text x="340" y="130">[x]</text>
+  <text x="470" y="130">[x, a]</text>
+  <text x="560" y="130" class="blue-t">[x, b]</text>
+  <line x1="460" y1="108" x2="460" y2="142" class="ink dash" stroke-width="1" />
+  <line x1="550" y1="108" x2="550" y2="142" class="ink dash" stroke-width="1" />
+  <rect x="100" y="28" width="100" height="26" class="fill-wash" stroke-width="1" />
+  <text x="150" y="45" text-anchor="middle">read [x]</text>
+  <rect x="230" y="28" width="110" height="26" class="fill-wash" stroke-width="1" />
+  <text x="285" y="45" text-anchor="middle">add a → [x,a]</text>
+  <rect x="400" y="28" width="110" height="26" class="fill-wash" stroke-width="1" />
+  <text x="455" y="45" text-anchor="middle">save [x,a]</text>
+  <rect x="130" y="198" width="100" height="26" class="fill-wash" stroke-width="1" />
+  <text x="180" y="215" text-anchor="middle">read [x]</text>
+  <rect x="260" y="198" width="110" height="26" class="fill-wash" stroke-width="1" />
+  <text x="315" y="215" text-anchor="middle">add b → [x,b]</text>
+  <rect x="490" y="198" width="110" height="26" class="fill-wash" stroke-width="1" />
+  <text x="545" y="215" text-anchor="middle">save [x,b]</text>
+  <line x1="150" y1="108" x2="150" y2="56" class="ink" stroke-width="1" />
+  <line x1="180" y1="142" x2="180" y2="196" class="ink" stroke-width="1" />
+  <line x1="455" y1="56" x2="462" y2="106" class="blue" stroke-width="1.2" marker-end="url(#db2-arr)" />
+  <line x1="545" y1="196" x2="552" y2="144" class="blue" stroke-width="1.2" marker-end="url(#db2-arr)" />
+  <text x="10" y="96">B READ BEFORE</text>
+  <text x="10" y="112">A SAVED, SO B'S</text>
+  <text x="10" y="128">COPY HAS NO "a"</text>
+  <text x="400" y="88" class="blue-t">"a" IS ERASED HERE →</text>
+  <text x="400" y="170">TIME →</text>
+</svg>
+</Figure>
+
+This is the same <Term w="lost update">Two writers each read a value, change their copy, and write it back. The second write overwrites the first, so one change vanishes without any error.</Term> as the `counter += 1` race in [the threads lesson](/lessons/processes-threads-gil/), just with a file instead of an integer and processes instead of threads. The fix there was a lock. You could put a lock on the file (`fcntl.flock`), but now only one worker can do anything at a time, and each turn holding the lock costs a full rewrite. The workers queue up behind a 43 ms save.
+
+<Predict id="two-writers">
+Two processes each add 2,000 distinct keys to the same JSON file, as fast as they can, each one reloading the file before every put and saving it with a per-process temp file plus atomic rename. How many of the 4,000 keys survive?
+<Fragment slot="answer">
+
+On my Mac: 2,015. Almost exactly half. The two processes ran at about the same speed, so most of the time each one was loading a file the other was about to overwrite. No errors, no corrupt JSON (the rename made every save whole), just half the data gone. The same two processes against SQLite, same loop: 4,000 of 4,000. You'll reproduce both in the Build.
+
+</Fragment>
+</Predict>
+
+### Failure four: finding one record
+
+To read one key from `cache.json`, you parse all of it. 100,000 keys took about 21 ms to `json.load` on my Mac; a dict lookup after that takes well under a microsecond. Fine if you load once and keep the dict in memory. But then you're back to failure three the moment anyone else writes the file, because your in-memory copy is stale. And "every URL that returned 429 since yesterday" is a loop over everything, every time, because nothing on disk is organized by status or time.
+
+### What a storage engine is
+
+Pull the four problems apart and a pattern shows. Problems one, two and four are about **how bytes are laid out on disk**: can you change one record without touching the others, can you tell a half-written record from a whole one, can you find a record without reading everything. Problem three, and the question-asking part of four, live a layer above.
+
+The bottom layer has a name. A <Term w="storage engine">The part of a database that stores and retrieves records on disk. Its job is a handful of operations: put, get, delete, and usually "scan a range of keys in order". It decides the on-disk layout.</Term> is the part of a database that answers exactly these calls:
+
+```text
+put(key, value)
+get(key) -> value or nothing
+delete(key)
+scan(from_key, to_key) -> records in key order     (some engines)
+```
+
+Everything a database does sits on top of this. A SQL table in SQLite is a storage-engine structure keyed by row ID; an index on a column is another one, keyed by that column. MySQL even lets you swap engines underneath the same SQL (InnoDB, MyISAM, others). So let's build one.
+
+### The simplest engine: just append
+
+The cheapest thing you can do to a file is add to the end of it. No bytes move, nothing old is rewritten, and sequential writes are what disks and the page cache are best at ([the files lesson](/lessons/files-and-disks/) measured why). So: never update in place. To put a key, append a record `key, value` to the end of a file. To change it, append another record. The newest record for a key wins. That file is an <Term w="append-only log">A file you only ever add to the end of, never modify in the middle. Each entry is a record of one change, in the order the changes happened.</Term>.
+
+Writes are now constant-time, whatever the size. Reads are terrible: to find the newest value of a key, you scan the whole log and keep the last match. Worse than JSON.
+
+The fix for reads is to keep, in RAM, a dict from every key to *where its newest record starts in the file*: a byte <Term w="offset">A position in a file, counted in bytes from the start. "Offset 4,812" means the 4,813th byte.</Term>. That dict is a <Term w="hash index">An in-memory hash table (a Python dict, basically) mapping each key to the location of its value on disk. One lookup, no scanning.</Term>. Now:
+
+- **put**: append the record, then set `index[key] = offset`.
+- **get**: `offset = index[key]`, then read that one record from the file. One hash lookup and one small read.
+- **delete**: you can't erase from an append-only log, so append a special <Term w="tombstone">A record that means "this key was deleted". It's needed because the old values are still in the log, and replaying them would bring the key back.</Term> record, and remove the key from the index.
+
+The old records for a key are still in the file. Nothing points at them. They're garbage, and we'll deal with them shortly.
+
+<Origin year="2010" title="Bitcask: Riak needed a backend it could trust">
+
+Basho was building Riak, a distributed key-value database modelled on Amazon's Dynamo paper. Each Riak node needed a local storage engine, and the options in 2009 were either slow, complicated, or hard to recover after a crash. Justin Sheehy and David Smith wrote down their requirements (low latency per read and write, high write throughput, crash friendliness, easy backups, code simple enough to reason about) and found that the simplest possible design met nearly all of them. Their short paper, "Bitcask: A Log-Structured Hash Table for Fast Key/Value Data", is exactly the design above: data files you only append to, an in-memory hash table they called the keydir, and a background merge to clean up. It became Riak's default backend. The idea itself goes back to log-structured file systems (Rosenblum and Ousterhout, 1991), which made the same bet: turn every write into a sequential append.
+
+</Origin>
+
+Play with it. Put a few keys, overwrite some, get one, delete one, compact. Then crash it and replay. Then turn on "tear the last write" and crash again.
+
+<Figure n="003" title="LOG + HASH INDEX" caption="Left, the index in RAM: each key points at a segment and a byte offset. Right, the log on disk, split into segments; only the last one is appended to. Crossed-out records are stale (nothing points at them). Crash wipes the index but not the log, and Replay rebuilds the index by reading every record in order. With a torn write, replay stops at the half-written record and truncates it." wide>
+
+<DBLogIndex />
+
+</Figure>
+
+Things to notice:
+
+1. **Every operation that changes something is an append.** Put, delete, even the tombstone. The only time old bytes are touched is compaction, and compaction writes new files rather than editing old ones.
+2. **The index is a cache of the log.** It holds nothing the log doesn't. That's why losing it in a crash costs time, not data: you can always rebuild it.
+3. **Garbage grows with overwrites, not with keys.** Put `a` fifty times and the log holds fifty `a` records, one live.
+
+### Records that can prove they're whole
+
+What does "the log survives a crash" actually mean? Go back to the layers from the files lesson. When your process calls `write()`, the bytes go into the kernel's page cache; `write` returns; much later the kernel writes them to the SSD.
+
+- If your **process** dies (`kill -9`, OOM killer, a segfault), anything already handed to `write()` is safe in the page cache. The kernel finishes writing it. What's lost is whatever was still in your own process: your Python-side buffer, and the in-memory index.
+- If the **machine** dies (power cut, kernel panic), anything not yet `fsync`ed may be lost, and it may be lost *partially*: the first 2 KB of a record made it to flash and the last 2 KB didn't. That's a <Term w="torn write">A write that was only partly saved when a crash hit, leaving a record with its beginning on disk and its end missing or garbage.</Term>.
+
+So the log can end with a half-record, and recovery must be able to tell. Each record carries its own length and a <Term w="checksum">A small number computed from a block of bytes, such that changing any byte almost certainly changes the number. Store it with the data; recompute it on read; if they differ, the data is damaged.</Term>, specifically a <Term w="CRC32">Cyclic redundancy check, 32 bits. A fast checksum built to catch accidental damage like flipped bits and truncation. Not cryptographic: it doesn't stop someone deliberately forging data. Python has it as zlib.crc32.</Term> computed over everything after it.
+
+<Figure n="004" title="ONE RECORD, AND A TORN TAIL" caption="Each record starts with a 12-byte header: a CRC32 of the rest of the record, then the key and value lengths. Recovery reads the header, checks there are enough bytes left for the body, and recomputes the CRC. The first record that fails either test is where the crash hit; everything from there to the end of the file is cut off.">
+<svg viewBox="0 0 640 260" role="img" aria-label="Record layout: crc, key length, value length, key, value; below, a log whose last record is torn and gets truncated">
+  <rect x="20" y="30" width="90" height="40" class="fill-blue" />
+  <text x="65" y="55" text-anchor="middle" class="strong" style="fill:var(--paper)">CRC32</text>
+  <rect x="110" y="30" width="90" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="155" y="55" text-anchor="middle" class="strong">KEY LEN</text>
+  <rect x="200" y="30" width="90" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="245" y="55" text-anchor="middle" class="strong">VAL LEN</text>
+  <rect x="290" y="30" width="110" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="345" y="55" text-anchor="middle" class="strong">KEY</text>
+  <rect x="400" y="30" width="220" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="510" y="55" text-anchor="middle" class="strong">VALUE</text>
+  <text x="65" y="88" text-anchor="middle">4 B</text>
+  <text x="155" y="88" text-anchor="middle">4 B</text>
+  <text x="245" y="88" text-anchor="middle">4 B</text>
+  <text x="345" y="88" text-anchor="middle">KEY LEN B</text>
+  <text x="510" y="88" text-anchor="middle">VAL LEN B (TOMBSTONE: NONE)</text>
+  <line x1="110" y1="22" x2="620" y2="22" class="blue" stroke-width="1" />
+  <line x1="110" y1="18" x2="110" y2="26" class="blue" stroke-width="1" />
+  <line x1="620" y1="18" x2="620" y2="26" class="blue" stroke-width="1" />
+  <text x="365" y="14" text-anchor="middle" class="blue-t">CRC COVERS ALL OF THIS</text>
+  <text x="20" y="130" class="strong">LOG AFTER A POWER CUT</text>
+  <rect x="20" y="142" width="130" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="85" y="164" text-anchor="middle">a=v1  CRC OK</text>
+  <rect x="150" y="142" width="130" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="215" y="164" text-anchor="middle">b=v1  CRC OK</text>
+  <rect x="280" y="142" width="130" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="345" y="164" text-anchor="middle">a=v2  CRC OK</text>
+  <rect x="410" y="142" width="90" height="34" class="fill-paper dash" stroke-width="1.2" />
+  <text x="455" y="164" text-anchor="middle">c=v1 ...</text>
+  <rect x="500" y="142" width="120" height="34" class="fill-paper dash" stroke-width="0.8" />
+  <text x="560" y="164" text-anchor="middle">NEVER WRITTEN</text>
+  <line x1="410" y1="132" x2="410" y2="200" class="ink" stroke-width="1.5" />
+  <text x="410" y="216" text-anchor="middle" class="strong">TRUNCATE HERE</text>
+  <text x="20" y="240">HEADER SAYS 112 BYTES FOLLOW; FILE HAS 40. OR: ALL BYTES THERE, CRC MISMATCH.</text>
+</svg>
+</Figure>
+
+Recovery is now a loop:
+
+1. Read 12 bytes. If there aren't 12, stop.
+2. Unpack the CRC and the two lengths. If the file doesn't have that many more bytes, stop.
+3. Recompute the CRC over the lengths, key and value. If it doesn't match, stop.
+4. Otherwise apply the record to the index (set the offset, or delete the key for a tombstone) and go to 1.
+5. Wherever you stopped, truncate the file to that point, so the next append starts on a clean boundary.
+
+Stopping at the first bad record, rather than skipping it and carrying on, matters. Records were appended in order, so everything after a torn record was written after the crash point and can't be trusted either. It also means a bug that silently corrupts a record in the middle of a big log would truncate everything after it. Real systems are more careful there (they distinguish "torn tail" from "corruption in the middle" and refuse to start on the latter), but the tail rule is the core.
+
+<Predict id="kill-tears">
+Your store does one `write()` per record of about 4 KB, then `flush()`. A writer process puts records in a tight loop and you `kill -9` it at a random moment. How often will recovery find a torn record at the end?
+<Fragment slot="answer">
+
+Essentially never. I did it three times (logs of 266 MB, 362 MB and 628 MB) and recovery found zero torn bytes every time. Each record went to the kernel in one `write()` call, and `kill -9` can only land between system calls from your process's point of view, not halfway through the kernel copying your buffer. Once the bytes are in the page cache they belong to the kernel, and the kernel writes them out.
+
+So why bother with the CRC? Three reasons. A power cut or kernel panic *can* tear, because the page cache itself is lost and the SSD may have stored only some of the pages. A record bigger than your buffer may be split across several `write()` calls, and the kill can land between them. And `write()` is allowed to write fewer bytes than you asked for. You'll make a torn tail on purpose in the Build, two ways.
+
+</Fragment>
+</Predict>
+
+### Durability: when is a put really done?
+
+The CRC tells you whether a record is whole. It doesn't make the record survive a power cut. For that, you need `fsync` after the append, exactly as in the files lesson, and then you pay for it. On my Mac, a 100-byte put was 3.7 µs without `fsync` and 28 µs with plain `fsync`. (Remember the macOS caveat: plain `fsync` doesn't flush the drive's own cache; `F_FULLFSYNC` does, and costs milliseconds.) On a Linux box with a consumer SSD, an honest `fsync` is often hundreds of microseconds to a few milliseconds. Measure the Spark.
+
+That gives you a dial with three positions, and every database has some version of it:
+
+- **No fsync.** Fast. Survives your process crashing. Loses recent writes on power loss (the log is still consistent, thanks to the CRC; it's just shorter).
+- **fsync every put.** Every acknowledged put survives anything short of the disk dying. Throughput is capped at one fsync's latency per put: at 3 ms, about 330 puts per second.
+- **fsync every N puts, or every few milliseconds**, and only tell callers "done" after the fsync covering their put returns. This is <Term w="group commit">Batching many writes into one fsync. Each writer waits a little longer, but the fsync cost is shared, so throughput goes way up while every acknowledged write is still durable.</Term>, and it's how real databases get both durability and throughput: one 3 ms fsync covering 500 puts is 6 µs per put.
+
+### Compaction
+
+The log only grows. A crawler that rechecks the same 100,000 URLs every day appends 100,000 records a day while the number of live keys stays at 100,000. After a month, 97% of the log is garbage.
+
+<Term w="Compaction">Rewriting a log to keep only the newest record for each live key, dropping overwritten values and tombstones. Also called merging.</Term> fixes it. Walk the index, copy each live record to a new file, `fsync` it, atomically rename it over the old one, `fsync` the directory. That last part is the crash-safe save recipe from the files lesson, used here because compaction is exactly "replace a file with a new version". A crash during compaction leaves the old log untouched and a partial temp file you delete on startup.
+
+My test: 1,000 keys, each overwritten 100 times. 11.6 MB of log, 116 KB live. Compaction took 5.5 ms and the result was exactly 1% of the size.
+
+Two refinements real engines add:
+
+- **Segments.** Instead of one file, the log is a series of files. Only the newest one, the *active* segment, gets appended to; when it reaches a size limit it's closed and a new one starts. Closed segments never change, so they can be compacted in the background while writes continue into the active one, and the index switches its pointers to the new files when the merge is done. That's what the segments in Figure 003 are.
+- **Hint files.** Recovery has to read the entire log. Bitcask's merge also writes a small "hint" file next to each merged data file, containing just the keys and their offsets, no values. On startup it reads the hint files instead of the data, so recovery reads megabytes instead of gigabytes.
+
+How bad is recovery without hints? Measured on my Mac, with the file freshly written (so in the page cache): 100,000 small records replayed in 48 ms; a 628 MB log of 156,000 records with 4 KB values in 156 ms. Cold from the SSD it would be bounded by read speed instead, roughly a few GB/s on a good NVMe drive, so a 50 GB log would take tens of seconds to start. That is the price of this design, and hint files are how you stop paying it.
+
+### What this design can't do
+
+Bitcask is genuinely good: one disk read per get, one sequential append per put, trivial crash recovery, and code you can fit in your head. It has two hard limits, and they're the reason it's not the only engine in the world.
+
+**Every key must fit in RAM.** The index holds every key. In my Python version, 1 million keys cost about 180 MB of index (Python dicts, strings and tuples are not compact; Bitcask's Erlang/C keydir is tighter, but still tens of bytes per key plus the key itself). A billion small keys is hundreds of GB of RAM. Values can be bigger than RAM; keys can't.
+
+**No range queries.** A hash table has no order. "All URLs starting with `https://example.com/`" or "every record between 9 am and 10 am" means walking every key. Failure four, half-solved: point lookups are fast, anything else is a scan.
+
+Fixing those two is where the two big families of storage engine come from.
+
+### Write-ahead logging: the idea under everything
+
+Before the two families, notice what you just built. The log is the truth; the index is a fast view of it you can always rebuild. Most databases keep their data in a fancier structure than a log (a tree, usually), but they keep the log too, for exactly this reason.
+
+The rule is called <Term w="write-ahead logging">Before changing the main data structure on disk, append a description of the change to a log and make that log durable. After a crash, replay the log to redo changes that hadn't reached the main structure yet. Abbreviated WAL.</Term>: before you modify the real data structure, append a record describing the change to a log, and `fsync` the log. Only then apply the change to the structure, which can happen lazily, in memory, and be written to disk whenever it's convenient. If you crash, replay the log on startup to finish whatever didn't make it.
+
+Why bother, if you have to write the change twice? Because the two writes have very different shapes. The log append is small and sequential, and it's the only thing you have to `fsync` before saying "committed". The changes to the real structure are scattered random writes all over a big file, and they can be batched up and written later in big efficient chunks, or overwritten in memory five times before they're written once. The WAL turns "durably update a complex structure" into "durably append some bytes", which is the one thing disks are fast at.
+
+You've seen this twice already. The ext4 journal in the files lesson is a WAL for filesystem metadata. And Bitcask is the degenerate case where the log *is* the data structure: there's nothing to apply later.
+
+Periodically the database does a <Term w="checkpoint">Writing all changes the log describes into the main data files, so the log up to that point is no longer needed for recovery and can be deleted or reused. Keeps recovery time bounded.</Term>: flush every changed page of the main structure to disk, note "everything before log position X is applied", and throw away the log before X. That bounds recovery time, the same job compaction and hint files do for Bitcask.
+
+### Two engine shapes, in one picture each
+
+Here are the two answers to "keys don't fit in RAM, and I want ranges". Both keep keys sorted, which gives you range scans for free. They differ in whether they update in place.
+
+<Figure n="005" title="B-TREE vs LSM-TREE" caption="Left: a B-tree keeps sorted keys in fixed-size pages on disk, linked as a shallow tree. A write finds its leaf page and changes it in place, logging to a WAL first. Right: an LSM-tree buffers writes in a sorted in-memory table (plus a WAL), flushes it as an immutable sorted file, and merges files in the background. B-trees favour reads; LSM-trees favour writes. Details in the indexes lesson." wide>
+<svg viewBox="0 0 860 330" role="img" aria-label="Left, a three-level B-tree with a WAL; right, an LSM tree with memtable, WAL, and levels of sorted files">
+  <defs>
+    <marker id="db5-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="24" class="strong">B-TREE · UPDATE IN PLACE</text>
+  <text x="20" y="40">SQLITE, POSTGRES, MYSQL INNODB</text>
+  <rect x="160" y="60" width="120" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="220" y="80" text-anchor="middle">ROOT: g | p</text>
+  <line x1="180" y1="90" x2="70" y2="130" class="ink" stroke-width="1" />
+  <line x1="220" y1="90" x2="220" y2="130" class="ink" stroke-width="1" />
+  <line x1="260" y1="90" x2="370" y2="130" class="ink" stroke-width="1" />
+  <rect x="20" y="130" width="110" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="75" y="150" text-anchor="middle">a  c  e</text>
+  <rect x="165" y="130" width="110" height="30" class="fill-blue" />
+  <text x="220" y="150" text-anchor="middle" style="fill:var(--paper)">h  k  m ←</text>
+  <rect x="310" y="130" width="110" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="365" y="150" text-anchor="middle">q  t  x</text>
+  <text x="220" y="180" text-anchor="middle" class="blue-t">put(k): REWRITE THIS 4 KB PAGE</text>
+  <text x="20" y="206">PAGES ON DISK, SORTED BY KEY. ~3-4 LEVELS</text>
+  <text x="20" y="222">COVER BILLIONS OF ROWS. A GET READS ONE</text>
+  <text x="20" y="238">PAGE PER LEVEL (TOP LEVELS STAY CACHED).</text>
+  <rect x="20" y="258" width="400" height="30" class="fill-paper dash" stroke-width="1" />
+  <text x="220" y="278" text-anchor="middle">WAL: "page 7, set k=..."  FSYNC FIRST</text>
+  <line x1="220" y1="258" x2="220" y2="186" class="blue dash" stroke-width="1" />
+  <text x="20" y="310">READS: FAST, ONE PLACE TO LOOK. WRITES: RANDOM.</text>
+  <line x1="440" y1="10" x2="440" y2="320" class="ink dash" stroke-width="0.8" />
+  <text x="460" y="24" class="strong">LSM-TREE · NEVER UPDATE IN PLACE</text>
+  <text x="460" y="40">LEVELDB, ROCKSDB, CASSANDRA</text>
+  <rect x="460" y="60" width="160" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="540" y="78" text-anchor="middle" class="strong">MEMTABLE (RAM)</text>
+  <text x="540" y="93" text-anchor="middle">sorted: b d k r</text>
+  <rect x="650" y="60" width="190" height="40" class="fill-paper dash" stroke-width="1" />
+  <text x="745" y="78" text-anchor="middle">WAL (APPEND ONLY)</text>
+  <text x="745" y="93" text-anchor="middle">for crash recovery</text>
+  <line x1="540" y1="100" x2="540" y2="134" class="blue" stroke-width="1.2" marker-end="url(#db5-arr)" />
+  <text x="550" y="122" class="blue-t">FULL → FLUSH</text>
+  <text x="460" y="152" class="strong">L0</text>
+  <rect x="490" y="138" width="100" height="24" class="fill-paper" stroke-width="1.2" />
+  <text x="540" y="155" text-anchor="middle">b d k r</text>
+  <rect x="600" y="138" width="100" height="24" class="fill-paper" stroke-width="1.2" />
+  <text x="650" y="155" text-anchor="middle">a k m z</text>
+  <line x1="600" y1="164" x2="600" y2="190" class="blue" stroke-width="1.2" marker-end="url(#db5-arr)" />
+  <text x="610" y="182" class="blue-t">MERGE (COMPACTION)</text>
+  <text x="460" y="212" class="strong">L1</text>
+  <rect x="490" y="196" width="340" height="26" class="fill-paper" stroke-width="1.2" />
+  <text x="660" y="214" text-anchor="middle">a b c d ... sorted, one copy of each key</text>
+  <text x="460" y="246">IMMUTABLE SORTED FILES (SSTABLES). A GET</text>
+  <text x="460" y="262">CHECKS MEMTABLE, THEN NEWEST FILE TO OLDEST.</text>
+  <text x="460" y="278">BLOOM FILTERS SKIP FILES WITHOUT THE KEY.</text>
+  <text x="460" y="310">WRITES: FAST, SEQUENTIAL. READS: MAY CHECK SEVERAL FILES.</text>
+</svg>
+</Figure>
+
+**B-trees** (Bayer and McCreight, early 1970s) store keys in sorted order in fixed-size <Term w="page">The fixed-size block a database reads and writes as a unit, commonly 4 KB to 16 KB. SQLite's default is 4 KB, Postgres uses 8 KB. Matches how disks and the OS page cache move data.</Term>s, arranged as a wide, shallow tree. Each page holds hundreds of keys, so three or four levels are enough for billions of rows. A write finds the right leaf page and changes it in place, after first writing the change to a WAL. Reads are predictable: one page per level, and the top levels are almost always in cache. This is SQLite, Postgres, MySQL's InnoDB, and most of the databases you'll touch.
+
+**LSM-trees** (log-structured merge trees, O'Neil and others, 1996) are the Bitcask idea grown up. Writes go to a WAL and to a sorted in-memory table, the <Term w="memtable">An in-memory sorted structure (often a skip list or balanced tree) that collects recent writes in an LSM engine. When it's big enough, it's written out to disk as one sorted file.</Term>. When the memtable fills up, it's written out as an immutable, sorted file (an <Term w="SSTable">Sorted String Table: an immutable file of key-value records sorted by key, with a small index of where each key range starts. Never modified after it's written.</Term>), in one big sequential write. Background compaction merges those files, dropping overwritten values and tombstones, exactly like Bitcask's merge except the output stays sorted. To avoid opening every file on a read, each file carries a <Term w="Bloom filter">A compact bit array that answers "is this key possibly in this file?" with either "definitely not" or "maybe". A few bits per key; lets a read skip most files without touching them.</Term>. Only a sparse sample of keys needs to be in RAM, since within a sorted file you can find a key from its neighbours. This is LevelDB, RocksDB, Cassandra, and the storage under many of the big distributed databases.
+
+The trade-off in one line: B-trees do more work on writes so reads are cheap; LSM-trees do less work on writes and pay for it on reads and in background compaction. [Indexes and B-trees](/lessons/indexes/) builds the B-tree for real.
+
+### Everything else a database does
+
+A storage engine gives you put and get that survive crashes. A database wraps three more jobs around it, and each one is a direct answer to one of the four failures.
+
+**Concurrency control (failure three).** When many clients read and write at once, someone has to decide what each one sees and stop them from erasing each other's work. The crudest answer is one big lock: one writer at a time. Better answers lock individual rows, or keep several versions of each row so readers never wait for writers (<Term w="MVCC">Multi-version concurrency control. A write creates a new version of a row instead of overwriting it, so each reader sees a consistent snapshot as of when it started, without blocking writers. Postgres works this way.</Term>). The unit of "all of these changes, or none of them, and nobody sees half" is a <Term w="transaction">A group of reads and writes the database treats as one indivisible step: either every change is applied or none is, and other clients never see it half-done.</Term>, which has [its own lesson](/lessons/transactions/).
+
+**A query language (failure four).** Codd's point: you say *what* you want, `SELECT url FROM fetches WHERE status = 429 AND ts > ?`, and a <Term w="query planner">The part of a database that turns a declarative query into an actual plan: which index to use, which order to join tables in, whether to just scan. Postgres's EXPLAIN shows you its choice.</Term> decides how, using whatever indexes exist. Add an index on `status` next month and the same query gets faster without changing a line of your code. That's data independence, fifty-five years later.
+
+**Durability guarantees (failures one and two).** A database makes an explicit promise about when "committed" means "survives a power cut", and lets you tune it. The four-letter summary of these promises is <Term w="ACID">Atomicity (all or nothing), Consistency (rules like "no negative balances" always hold), Isolation (concurrent transactions don't see each other's half-done work), Durability (committed means it survives a crash). The four promises a transactional database makes.</Term>; the transactions lesson takes it apart. Right now the important one is that the D is a setting you can change, and you should know which position your database is in.
+
+### SQLite: a file, but a real database
+
+<Term w="SQLite">An embedded SQL database: a C library linked into your program that stores an entire database (tables, indexes, everything) in one ordinary file. No server process. Python ships it as the sqlite3 module.</Term> is a full SQL database, with B-tree storage, transactions, a query planner and crash recovery, that runs as a library inside your process and keeps everything in one file. D. Richard Hipp wrote it in 2000 while working on software for a US Navy destroyer; as he tells it, the program depended on a database server, and whenever the server was down, the program was useless. Its own documentation says it "does not compete with client/server databases. SQLite competes with fopen()." In other words: it's the thing to use instead of your JSON file.
+
+It's probably the most deployed database engine there is (every iPhone and Android phone, every major browser, Python's standard library), and it's tested to an extreme: the project has hundreds of times more test code than library code, including tests that simulate power loss at every write.
+
+Two modes matter:
+
+- **Rollback journal** (the default, `journal_mode=DELETE`). Before changing a page in the database file, SQLite copies the original page to a separate `-journal` file and fsyncs it. If it crashes, the next open copies the originals back. This is an undo log rather than a redo log, but the same idea: durably record enough to recover before touching the real data. A writer locks the whole database while it commits.
+- **WAL mode** (`PRAGMA journal_mode=WAL`). Changes are appended to a `-wal` file, and readers read the database file plus whatever the WAL says has changed. Readers no longer block the writer and the writer no longer blocks readers. Still only one writer at a time; a second writer waits (Python's `sqlite3` waits up to 5 seconds by default, the `timeout` argument). Periodically, SQLite checkpoints the WAL back into the main file.
+
+And `PRAGMA synchronous` is the fsync dial. `FULL` (the default) fsyncs at every commit. `NORMAL` in WAL mode fsyncs less often: a commit survives your process crashing but the last few may be lost on power loss, and the database is never corrupted. One more Mac detail: SQLite on macOS uses plain `fsync` unless you also set `PRAGMA fullfsync=ON`, the same gap as in the files lesson.
+
+### When SQLite, when Postgres
+
+<Figure n="006" title="IN YOUR PROCESS vs A SERVER" caption="SQLite is a library: the whole database engine runs inside your program and the database is one file. Postgres is a server: your program sends SQL over a socket to separate processes that own the data directory. Both have the same layers inside; the difference is who runs them and how many writers can work at once.">
+<svg viewBox="0 0 640 330" role="img" aria-label="SQLite library inside the application process writing to one file, versus several app processes talking to a Postgres server over sockets">
+  <text x="20" y="22" class="strong">SQLITE · EMBEDDED</text>
+  <rect x="20" y="34" width="270" height="214" class="fill-paper" stroke-width="1.2" />
+  <text x="32" y="54" class="strong">YOUR PYTHON PROCESS</text>
+  <rect x="36" y="64" width="238" height="26" class="fill-paper" stroke-width="1" />
+  <text x="155" y="81" text-anchor="middle">your code · conn.execute(sql)</text>
+  <rect x="36" y="98" width="238" height="140" class="fill-wash" stroke-width="1.2" />
+  <text x="155" y="116" text-anchor="middle" class="strong">libsqlite3 (A FUNCTION CALL)</text>
+  <text x="155" y="136" text-anchor="middle">SQL parser + query planner</text>
+  <text x="155" y="154" text-anchor="middle">file locks (1 writer at a time)</text>
+  <text x="155" y="172" text-anchor="middle">B-tree storage, 4 KB pages</text>
+  <text x="155" y="190" text-anchor="middle">journal / WAL + fsync</text>
+  <text x="155" y="226" text-anchor="middle" class="blue-t">NO NETWORK HOP · ~µs PER QUERY</text>
+  <line x1="155" y1="248" x2="155" y2="272" class="ink" stroke-width="1" />
+  <rect x="70" y="272" width="170" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="155" y="292" text-anchor="middle" class="strong">app.db  (+ app.db-wal)</text>
+  <text x="155" y="322" text-anchor="middle">ONE FILE. COPY IT TO BACK IT UP*</text>
+  <text x="340" y="22" class="strong">POSTGRES · CLIENT / SERVER</text>
+  <rect x="340" y="34" width="84" height="26" class="fill-paper" stroke-width="1" />
+  <text x="382" y="51" text-anchor="middle">app 1</text>
+  <rect x="436" y="34" width="84" height="26" class="fill-paper" stroke-width="1" />
+  <text x="478" y="51" text-anchor="middle">app 2</text>
+  <rect x="532" y="34" width="90" height="26" class="fill-paper" stroke-width="1" />
+  <text x="577" y="51" text-anchor="middle">psql</text>
+  <line x1="382" y1="60" x2="382" y2="98" class="blue" stroke-width="1" />
+  <line x1="478" y1="60" x2="478" y2="98" class="blue" stroke-width="1" />
+  <line x1="577" y1="60" x2="577" y2="98" class="blue" stroke-width="1" />
+  <text x="626" y="84" text-anchor="end" class="blue-t">SQL OVER TCP / UNIX SOCKET</text>
+  <rect x="340" y="98" width="282" height="150" class="fill-wash" stroke-width="1.2" />
+  <text x="481" y="116" text-anchor="middle" class="strong">POSTGRES SERVER PROCESSES</text>
+  <text x="481" y="136" text-anchor="middle">one backend process per connection</text>
+  <text x="481" y="154" text-anchor="middle">parser + planner + executor</text>
+  <text x="481" y="172" text-anchor="middle">MVCC, row locks: many writers</text>
+  <text x="481" y="190" text-anchor="middle">shared buffers (its own page cache)</text>
+  <text x="481" y="208" text-anchor="middle">B-tree indexes, 8 KB pages, WAL</text>
+  <text x="481" y="236" text-anchor="middle" class="blue-t">AUTH, ROLES, REPLICATION</text>
+  <line x1="481" y1="248" x2="481" y2="272" class="ink" stroke-width="1" />
+  <rect x="380" y="272" width="202" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="481" y="292" text-anchor="middle" class="strong">data dir: tables + pg_wal/</text>
+  <text x="481" y="322" text-anchor="middle">MANY FILES, OWNED BY THE SERVER</text>
+</svg>
+</Figure>
+
+(*Copy it while nothing is writing, or use SQLite's `.backup` command or `VACUUM INTO`, which make a consistent copy while the database is in use.)
+
+Reach for **SQLite** when one machine owns the data: a CLI tool, a crawler's cache, an eval harness's results, a desktop or phone app, a single-server web app with modest write traffic, a test fixture. It's zero setup, a query is a function call instead of a network round trip, and the "file" is a real database with real transactions. The limit is writes: one writer at a time for the whole database. Thousands of small write transactions per second on one machine is fine (you'll measure it); many machines writing to the same file is not, and SQLite over a network filesystem like NFS is explicitly warned against in its docs, because the file locking it relies on is unreliable there.
+
+Reach for **Postgres** when many processes on many machines need to write at once, when you want users and permissions, replication to a standby, point-in-time recovery, or the big ecosystem (pgvector for embeddings, PostGIS for maps, JSONB columns when you really do want documents). The cost is a server to run, connections to manage, and a network hop on every query.
+
+For your crawler cache: SQLite, today. If the crawler later becomes a fleet on twenty machines, Postgres, or something built for that scale.
+
+<Predict id="sqlite-vs-log">
+Your append-only log does a put in about 4 µs without fsync. SQLite, default settings, autocommit (every `INSERT` is its own transaction): how long per insert? And how about SQLite with all inserts in one transaction?
+<Fragment slot="answer">
+
+On my Mac, SQLite defaults (rollback journal, `synchronous=FULL`), one insert per transaction: about 295 µs each, around 80x slower than the log. Each commit creates the journal file, fsyncs it, writes the database page, fsyncs that, and deletes the journal. In WAL mode with `synchronous=NORMAL`, about 16 µs. With WAL and `synchronous=FULL` (an fsync per commit, the same promise as your log with fsync at 28 µs): about 51 µs.
+
+All 100,000 inserts in one transaction: about 1.3 µs per insert, *faster* than the Python log, because the per-row work happens in C and there's one commit at the end. The lesson: in SQLite, the transaction is the unit of cost. Batch your writes.
+
+Reads, for completeness: about 0.6 µs per get for the log (dict lookup plus `os.pread`) and about 1.8 µs for SQLite in WAL mode through Python. A real query planner and B-tree, within 3x of a bare dict.
+
+</Fragment>
+</Predict>
+
+## Build It
+
+Everything goes in `~/workbench/kv/`. Standard library only: `json`, `os`, `struct`, `zlib`, `sqlite3`, `time`. Same three methods for every version, so the benchmark doesn't care which store it's timing.
+
+<Task id="t0" title="Set up the folder and a timing harness" agent="ok">
+
+```python
+# bench.py
+import os, sys, time, importlib
+
+VAL = b"x" * 100
+
+def fresh(path: str) -> None:
+    for p in (path, path + ".tmp", path + "-wal", path + "-shm", path + "-journal"):
+        if os.path.exists(p):
+            os.remove(p)
+
+def time_puts(store, n: int, prefix: str = "key") -> float:
+    """Seconds per put, averaged over n puts of new keys."""
+    t = time.perf_counter()
+    for i in range(n):
+        store.put(f"{prefix}{i:08d}", VAL)
+    return (time.perf_counter() - t) / n
+
+def time_gets(store, n: int) -> float:
+    t = time.perf_counter()
+    for i in range(n):
+        store.get(f"key{i:08d}")
+    return (time.perf_counter() - t) / n
+
+if __name__ == "__main__":
+    print("python", sys.version.split()[0])
+    import sqlite3; print("sqlite", sqlite3.sqlite_version)
+```
+
+Values are bytes throughout. The JSON store will have to decode them to a string to store them, which is one more small way JSON doesn't fit this job.
+
+</Task>
+
+<Task id="t1" title="v1: the JSON store, and watch it slow down" agent="hands">
+
+```python
+# jsonkv.py
+class JsonKV:
+    def __init__(self, path: str, fsync: bool = True):
+        """Load the whole file into self.d (empty dict if missing)."""
+        ...
+    def get(self, key: str) -> bytes | None: ...
+    def put(self, key: str, value: bytes) -> None:
+        """Update self.d, then save the WHOLE dict crash-safely:
+        write path + '.tmp', flush, optionally os.fsync, os.replace."""
+        ...
+    def delete(self, key: str) -> None: ...
+```
+
+Then time it. For N in 100, 1,000, 10,000, 100,000: fill the dict with N keys directly (`store.d[...] = ...`, no saving, so setup is fast), then time 100 real puts and print milliseconds per put and the file size. Do it with `fsync=True` and `fsync=False`.
+
+Write your predictions in the Measure table before you run. What happens to per-put time each time N goes up 10x?
+
+</Task>
+
+<Task id="t2" title="v2: an append-only log with a hash index and CRCs" agent="hands">
+
+The heart of the lesson. Record format, little-endian:
+
+```text
+crc32 (4 bytes) | key_len (4) | val_len (4) | key bytes | value bytes
+val_len = 0xFFFFFFFF means tombstone (no value bytes follow)
+crc32 covers everything after itself: key_len, val_len, key, value
+```
+
+```python
+# logkv.py
+import os, struct, zlib
+
+HDR = struct.Struct("<III")   # crc, key_len, val_len  -> 12 bytes
+TOMB = 0xFFFFFFFF
+
+class LogKV:
+    def __init__(self, path: str, sync: bool = False):
+        """Open path for appending and reading ('a+b'), then self.recover()."""
+        self.index: dict[str, tuple[int, int]] = {}   # key -> (value_offset, value_len)
+        ...
+
+    def _append(self, key: bytes, value: bytes | None) -> int:
+        """Build one record, write it with ONE write() call, flush,
+        fsync if self.sync. Return the offset where the record starts."""
+        ...
+
+    def put(self, key: str, value: bytes) -> None: ...
+    def delete(self, key: str) -> None: ...
+    def get(self, key: str) -> bytes | None:
+        """One dict lookup, then os.pread(fd, length, offset). No seeking the shared file object."""
+        ...
+
+    def recover(self) -> None:
+        """Read the log from the start. For each record: need 12 header bytes,
+        need key_len + val_len more bytes, CRC must match. Apply it to the index.
+        Stop at the first record that fails any check, truncate the file there,
+        and print how many bytes you cut."""
+        ...
+```
+
+Hints:
+
+- `zlib.crc32(body)` returns an unsigned int on Python 3, which is what `struct`'s `I` wants.
+- Build the record as one `bytes` object (`header + key + value`) and pass it to a single `write()`. That's what makes `kill -9` unable to tear it, and you'll test that claim next.
+- Before appending, make sure you're at the end of the file. In `'a+b'` mode writes always go to the end anyway, but you need the offset: `f.seek(0, 2)` then `f.tell()`.
+- The index stores where the **value** starts (record offset + 12 + key length), so `get` can `pread` the value directly.
+- In `recover`, reading the whole file with one `read()` is fine for this lesson. Notice that it means recovery memory grows with the log; a real engine would read in chunks.
+
+Test: put three keys, overwrite one, delete one, close, reopen, check every `get`.
+
+</Task>
+
+<Task id="t3" title="Kill it mid-write, then tear it on purpose" agent="hands">
+
+First, the honest crash. A writer that puts 4 KB values forever:
+
+```python
+# writer.py
+from logkv import LogKV
+db = LogKV("crash.log"); i = 0
+while True:
+    db.put(f"key{i}", b"v" * 4000); i += 1
+```
+
+```bash
+rm -f crash.log; python3 writer.py & sleep 1; kill -9 $!
+python3 -c "from logkv import LogKV; db = LogKV('crash.log'); print(len(db.index), 'keys')"
+```
+
+Do it a few times with different sleeps. Note the file size, the key count, how many bytes recovery truncated, and how long recovery took.
+
+Then make the crash that `kill -9` can't: write the first half of a record, then kill yourself before writing the rest. Add a debug method:
+
+```python
+def _put_torn(self, key: str, value: bytes) -> None:
+    """Build the record exactly like _append, write only rec[: len(rec) // 2],
+    flush, then os.kill(os.getpid(), signal.SIGKILL)."""
+```
+
+Reopen and check that recovery truncates exactly the half-record and every earlier key is intact. Finally, the third kind of damage: open the log, flip one byte inside the *last* record's value (`f.seek(-10, 2)`, read a byte, XOR it with 1, write it back), and reopen. The lengths are fine; only the CRC can catch this.
+
+</Task>
+
+<Task id="t4" title="Add compaction" agent="review">
+
+```python
+def compact(self) -> None:
+    """Write every live key's current value to path + '.compact' as fresh records,
+    flush + fsync it, os.replace it over self.path, fsync the directory,
+    then reopen and rebuild the index."""
+```
+
+Test it: 1,000 keys, each overwritten 100 times. Print the log size before and after, time the compaction, and check every key still reads back its newest value. Then kill a process in the middle of `compact()` (put a `time.sleep(5)` in the loop and `kill -9` it) and confirm the original log is untouched.
+
+Then have an agent review it, specifically for: what happens to a put that arrives *during* compaction in a design where compaction runs in a background thread? (Yours doesn't; Bitcask's does. The answer is why Bitcask only compacts closed segments.)
+
+</Task>
+
+<Task id="t5" title="The same benchmark against SQLite" agent="hands">
+
+Wrap SQLite in the same three-method interface:
+
+```python
+# sqlkv.py
+import sqlite3
+
+class SqliteKV:
+    def __init__(self, path: str, journal: str = "DELETE", synchronous: str = "FULL"):
+        """connect with isolation_level=None (autocommit: each statement is its own transaction),
+        set PRAGMA journal_mode and PRAGMA synchronous,
+        CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v BLOB)."""
+        ...
+    def put(self, key, value): ...   # INSERT OR REPLACE
+    def get(self, key): ...          # SELECT v FROM kv WHERE k = ?
+    def delete(self, key): ...
+```
+
+Time puts and gets for: your log with and without fsync (use 2,000 puts for the fsync runs, 100,000 otherwise); SQLite with `(DELETE, FULL)` (the defaults), `(WAL, FULL)` and `(WAL, NORMAL)`; and SQLite with 100,000 puts inside one `BEGIN` ... `COMMIT`. Also time how long `LogKV()` takes to open (that's recovery) on your 100,000-key log.
+
+Pair the rows up by promise, not by name. Your log with fsync and SQLite `(WAL, FULL)` promise the same thing. Your log without fsync and `(WAL, NORMAL)` roughly do.
+
+</Task>
+
+<Task id="t6" title="Two writers: JSON vs SQLite" agent="hands">
+
+```python
+# two.py   usage: python3 two.py json|sql NAME N
+# json: N times: load two.json (empty dict if missing or unparseable),
+#       add key f"{NAME}-{i}", save via a per-process temp file + os.replace
+# sql:  N times: INSERT INTO kv VALUES (f"{NAME}-{i}", i) on two.db,
+#       WAL mode, autocommit, connect(timeout=10)
+```
+
+Create the SQLite table once beforehand. Then run two at once:
+
+```bash
+python3 two.py json A 2000 & python3 two.py json B 2000; wait
+python3 two.py sql  A 2000 & python3 two.py sql  B 2000; wait
+```
+
+Count the keys in each. Then try the JSON version with a **shared** temp file name (`two.json.tmp` for both) and see what other errors appear.
+
+</Task>
+
+<Task id="t7" title="Run it all on the Spark" agent="review">
+
+Copy the folder over Tailscale and rerun t1, t3, t5 and t6. The interesting number is the fsync row: Linux `fsync` actually flushes the drive, so expect the log-with-fsync and SQLite `FULL` rows to move a lot relative to the Mac. Have an agent review your benchmark for unfairness: are you timing file creation in some runs and not others? Is the page cache warm for one store and cold for another?
+
+</Task>
+
+<DoneWhen>
+
+- `JsonKV`, `LogKV` and `SqliteKV` pass the same small test (put, overwrite, delete, reopen, get).
+- `LogKV` recovered from `kill -9`, from a deliberately torn half-record, and from a flipped byte, each time keeping every earlier record and dropping only the damaged tail.
+- Compaction shrinks the log to its live size, and a kill during compaction leaves the old log intact.
+- You have a filled-in Measure table for the Mac and the Spark, with predictions written first.
+- You can explain, without notes, why two JSON writers lose data and two SQLite writers don't.
+
+</DoneWhen>
+
+## Measure
+
+| Experiment | Prediction | Mac | Spark |
+| --- | --- | --- | --- |
+| JSON put, N = 1,000 / 100,000 (ms) | | | |
+| Log put, no fsync (µs) | | | |
+| Log put, fsync every put (µs) | | | |
+| Log get (µs) | | | |
+| Recovery: 100k small records (ms) | | | |
+| Recovery after `kill -9`: torn bytes found | | | |
+| Compaction: 1,000 keys × 100 overwrites, before → after | | | |
+| SQLite defaults (DELETE, FULL), autocommit put (µs) | | | |
+| SQLite (WAL, FULL) put (µs) | | | |
+| SQLite (WAL, NORMAL) put (µs) | | | |
+| SQLite, 100k puts in one transaction (µs/put) | | | |
+| SQLite get (µs) | | | |
+| Two writers × 2,000: JSON keys kept / SQLite rows | | | |
+
+Mine, M4 Pro MacBook Pro, macOS, APFS, Python 3.14, SQLite 3.53. Shape over exact numbers.
+
+| Experiment | Mine (Mac) |
+| --- | --- |
+| JSON put, N = 100 / 1k / 10k / 100k | 0.19 / 0.53 / 4.2 / 43 ms (file 0.02 / 0.13 / 1.2 / 12 MB) |
+| Log put, no fsync / fsync | 3.7 µs / 28 µs |
+| Log get | 0.6 µs |
+| Recovery: 100k records of 100 B / 156k records of 4 KB (628 MB) | 48 ms / 156 ms (warm page cache) |
+| `kill -9` at 0.5, 0.7, 1.1 s | 0 torn bytes, all three times |
+| Chopped-off tail / flipped byte in last record | truncated 2,787 / 4,021 bytes: exactly the damaged last record |
+| Compaction | 11.6 MB → 116 KB in 5.5 ms; reopening took 0.4 ms |
+| SQLite (DELETE, FULL) / (WAL, FULL) / (WAL, NORMAL) put | 295 / 51 / 16 µs |
+| SQLite, one transaction | 1.3 µs/put |
+| SQLite get (WAL) | 1.8 µs |
+| Two writers: JSON / SQLite | 2,015 of 4,000 / 4,000 of 4,000 |
+| SQLite writer `kill -9`'d mid-loop | `PRAGMA integrity_check` → ok |
+
+What the numbers should tell you:
+
+**JSON: 10x the keys, 10x the time.** It's O(N) per put, so O(N²) to build up N keys one put at a time. The 43 ms at 100k is nearly all serialization and copying 12 MB; the fsync is noise by comparison.
+
+**The log: about 4 µs regardless of size.** That's a Python function call, building a small bytes object, one `write()` syscall into the page cache, and a dict store. It's within a factor of two of the "4 KB write only" number from the files lesson, because that's basically all it is.
+
+**fsync dominates whenever you ask for it.** 3.7 → 28 µs on the Mac. On the Spark you'll likely see more. And SQLite's default mode is about 10x slower again than your log with fsync, because a rollback-journal commit does several fsyncs and creates and deletes a file. WAL mode brings it within 2x of your log at the same promise, with a B-tree, SQL and transactions on top.
+
+**One transaction makes SQLite faster than your Python log.** 1.3 µs per row. The work per row moved into C and the commit cost was paid once. This is the single most useful SQLite performance fact.
+
+**Recovery reads the whole log.** ~50 ms per 100k records here; it scales with log size, not key count, which is why compaction and hint files exist. Cold from disk it will be slower; drop the page cache on the Spark (`sync; echo 3 | sudo tee /proc/sys/vm/drop_caches`) and try it.
+
+**`kill -9` didn't tear anything; deliberate tearing did, and the CRC caught it.** The checksum is for the crashes `kill -9` can't produce: power loss, split writes, and silent corruption.
+
+**Two writers: JSON lost half, SQLite lost nothing.** SQLite didn't make the writers faster; it made them take turns (a file lock and a busy timeout), and each insert changed one row instead of replacing the whole world.
+
+## Break It
+
+**1. Write the JSON file in place, with a reader running.** Change `JsonKV.put` to `json.dump` straight into `open(path, "w")`. Run one process writing in a loop and another process doing `json.load` in a loop. The reader will hit `JSONDecodeError` regularly: it opened the file between the truncate and the end of the dump. No crash needed, just two processes. A database never shows a reader a half-written state; that's the I in ACID, and the reason temp-plus-rename exists for files.
+
+**2. Remove the CRC check.** Keep the lengths but skip the CRC comparison in `recover`, then flip a byte in a value. Recovery happily loads it and `get` returns a wrong value with no error. Now flip a byte in a *length* field instead: recovery reads garbage as a header, and either stops early, losing every record after it, or tries to allocate a 4 GB key. Silent wrong answers are worse than crashes, and this is why every serious storage format (SQLite's WAL, Postgres's WAL, RocksDB's blocks, ZFS) checksums its records.
+
+**3. Two `LogKV` writers on the same file.** Start two processes that each open `shared.log` and put different keys. Appends from both land in the file (append mode makes each `write()` go to the current end), so the log on disk is fine; reopen it and recovery finds everything. But while running, each process's index only knows about its own puts, and process A's `get` can't see what B wrote. Your engine has no concurrency control, it just has a log. Locks, a single writer process, or a server in front are the three ways out, and SQLite and Postgres each picked one.
+
+**4. Fill RAM with the index.** Put 10 million distinct small keys and watch the process memory (`ps -o rss= -p <pid>`). My 1M-key Python index was about 180 MB, so expect a couple of GB. Then multiply by the number of URLs TinyFish's crawlers know about. This is Bitcask's hard limit, and the reason the next lesson is about trees.
+
+## Explain It Back
+
+Answer out loud, in plain words, then check.
+
+<details>
+<summary>1. What does a database give you that writing JSON to a file doesn't?</summary>
+
+Four things. Updating one record costs about the same no matter how much data there is, instead of rewriting everything. A crash at any moment leaves the data in a known good state (the last committed version), because changes go through a log with checksums and fsyncs first. Many clients can read and write at the same time without erasing each other's changes, because the database controls concurrency with locks or versions and transactions. And you can ask questions without reading everything, because data is organized by indexes and a query planner picks how to use them. A JSON file can be made crash-safe with temp-plus-rename, but it stays O(N) per write, has no concurrency control, and every question is a full scan.
+
+</details>
+
+<details>
+<summary>2. Describe a Bitcask-style store. How does a get work, how does a crash get recovered, and what are its limits?</summary>
+
+Data is an append-only log of records, each with a CRC, key and value lengths, key and value. RAM holds a hash table from every key to the file and offset of its newest record. A put appends a record and updates the hash table; a delete appends a tombstone; a get is one hash lookup and one disk read. The log is the truth and the index is rebuildable, so after a crash you replay the log from the start, rebuilding the index, and truncate at the first record that is short or fails its CRC (a torn write). Overwritten records are garbage; compaction copies live records into a new file and swaps it in, and hint files make startup fast. Limits: every key must fit in RAM, and there's no order, so no range queries.
+
+</details>
+
+<details>
+<summary>3. What is write-ahead logging and why is it faster than just updating the data carefully?</summary>
+
+Before changing the main data structure, append a description of the change to a log and fsync the log. Then change the structure lazily, in memory, and write it to disk whenever convenient. After a crash, replay the log to redo anything that didn't make it. It's faster because the log write is small and sequential and it's the only thing that has to be durable at commit time, while the real changes are scattered random writes that can be batched, merged and written later. A checkpoint periodically writes out the changed pages so old log can be thrown away and recovery stays short. Filesystem journals, SQLite's WAL mode, Postgres and LSM engines all use it.
+
+</details>
+
+<details>
+<summary>4. How does each design scale? Your store goes from 1 million to 1 billion keys, with writes going up 10x.</summary>
+
+The JSON file is dead long before that: O(N) per write means seconds per put at a few million keys. Bitcask's writes still cost the same (an append), and gets still cost one read, but the index needs every key in RAM: at a hundred-plus bytes per key in a real implementation, a billion keys is around a hundred GB of RAM, and recovery or reading hint files at startup gets long. So you'd move to a sorted engine. A B-tree grows by one level per ~hundreds-fold more data, so a billion keys is still 4-5 page reads per lookup with the top levels cached; writes become random page writes plus WAL, and 10x more writes means more fsyncs, which group commit amortizes. An LSM-tree absorbs the 10x writes best, since they're sequential, at the cost of background compaction I/O and checking several files per read (mitigated by Bloom filters). Past one machine, you shard keys across machines, and each machine runs one of these engines.
+
+</details>
+
+<details>
+<summary>5. When would you pick SQLite over Postgres, and what's the one thing that makes SQLite slow if you get it wrong?</summary>
+
+SQLite when one machine owns the data and write concurrency is modest: CLI tools, caches, eval results, local apps, a single-server web app, tests. It's a library, so there's no server to run and a query is a function call, and the whole database is one file, with real transactions, indexes and crash safety. Postgres when many processes or machines must write at once, or you need users and permissions, replication, or extensions; it's a server with MVCC and row-level locking. The SQLite trap is autocommit: every statement outside a transaction is its own commit with its own fsyncs, so 100,000 separate inserts take hundreds of microseconds each, while the same inserts inside one transaction take about a microsecond each. Turn on WAL mode and batch writes into transactions.
+
+</details>
+
+## Go Deeper
+
+- **Martin Kleppmann, _Designing Data-Intensive Applications_, Chapter 3 "Storage and Retrieval"** (O'Reilly, 2017; a second edition is in progress). Starts from a two-line bash database, builds up to hash indexes, SSTables, LSM-trees and B-trees. This lesson follows its path; read it next.
+- **Justin Sheehy and David Smith, "Bitcask: A Log-Structured Hash Table for Fast Key/Value Data"** (Basho, 2010). Six pages. Exactly what you just built, plus hint files and the keydir, with the reasoning for each choice.
+- **E. F. Codd, "A Relational Model of Data for Large Shared Data Banks"**, _Communications of the ACM_, June 1970. Read the first section for the problem he was solving (programs breaking when storage changed); the rest is the math of relations.
+- **SQLite documentation: ["Appropriate Uses For SQLite"](https://www.sqlite.org/whentouse.html), ["Atomic Commit In SQLite"](https://www.sqlite.org/atomiccommit.html), and ["Write-Ahead Logging"](https://www.sqlite.org/wal.html).** The first is the honest SQLite-vs-server guide. The second walks through a rollback-journal commit step by step, including every fsync, and is the best short explanation of crash-safe commits anywhere.
+- **Patrick O'Neil, Edward Cheng, Dieter Gawlick, Elizabeth O'Neil, "The Log-Structured Merge-Tree (LSM-Tree)"**, _Acta Informatica_, 1996. The origin of the LSM idea. Dense; read Kleppmann's version first and come here for the cost model.
+- **Alex Petrov, _Database Internals_** (O'Reilly, 2019). Part I goes deep on B-trees, LSM-trees, page layouts and recovery. The book to keep open while doing the [indexes](/lessons/indexes/) lesson.
+- **CMU 15-445/645 Database Systems, Andy Pavlo's lectures** (free on YouTube and the course site). The storage, buffer pool, logging and recovery lectures cover the same ground at university depth, with good humour.
+- **PostgreSQL documentation, "Reliability and the Write-Ahead Log"** chapter. How a production database explains its WAL, checkpoints, `synchronous_commit` and what fsync it relies on.
+
+## Connections
+
+This lesson stands on [Why did my checkpoint come back broken?](/lessons/files-and-disks/): the page cache is why `kill -9` doesn't tear records, `fsync` is the durability dial, temp-plus-rename is how compaction swaps files, and the ext4 journal was your first write-ahead log. The two-writers race is [the threads lesson's](/lessons/processes-threads-gil/) lost update, moved from memory to disk.
+
+Next, [Indexes and B-trees](/lessons/indexes/) fixes the two things your hash index can't do: keys that don't fit in RAM and range queries. Then [Transactions](/lessons/transactions/) takes apart the concurrency-control box in Figure 006: what exactly SQLite and Postgres promise when two writers meet, and what goes wrong at each isolation level. And [Caching and Redis](/lessons/caching/) is, underneath, an in-memory hash table with an append-only log for durability. You'll recognise it.
