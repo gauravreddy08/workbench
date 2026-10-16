@@ -23,7 +23,7 @@ Success means:
 |---|---|
 | Format | Two hosts |
 | Script writer | Claude Code itself, inside a `/podcast` skill (no API spend) |
-| Voice | Fish Audio (S2.1-pro, two speakers per request). Not Gemini, not ElevenLabs |
+| Voice | ElevenLabs Text to Dialogue, `eleven_v4_turbo`, Christopher (explainer) + Mike (listener). Chosen by ear after the pilot; Fish S2.1, Fish Drama 3 and ElevenLabs v4 were tried and rejected (robotic, or not worth 2x) |
 | Hands-on parts | Talked through (see "Turning a lesson into talk") |
 | Quiz / Explain It Back | No quiz |
 | Where it lives | Inside this repo, `podcast/` + `.claude/skills/podcast/` |
@@ -38,7 +38,7 @@ Success means:
   2. script       writes dialogue section by section    → podcast/scripts/<slug>.md
   3. coverage     checks script against lesson, fills gaps
   4. naturalness  rewrites any line a person wouldn't say out loud
-  5. render       node podcast/render.mjs <slug>  (Fish Audio → chunks → ffmpeg → mp3)
+  5. render       node podcast/render.mjs <slug>  (ElevenLabs → chunks → ffmpeg → mp3)
   6. publish      node podcast/publish.mjs <slug> (upload mp3 to R2, regenerate feed.xml)
   7. site         set audio URL on the lesson in curriculum.ts; player appears on the page
 ```
@@ -57,7 +57,8 @@ whole chain; `--script-only` stops after step 4 so the script can be read before
   earlier, or they want the actual number. Sometimes states their own (wrong) mental model and gets
   corrected, which is where many lessons' "you thought X, it's actually Y" moments go.
 
-Two fixed Fish voices, the same across every episode, picked by ear in the pilot.
+Two fixed voices, the same across every episode, picked by ear in the pilot: Christopher (friendly,
+slightly raspy) explains, Mike (natural podcast host) listens.
 
 ## Script rules
 
@@ -120,8 +121,8 @@ B: Wait, it's actually sitting idle while ...
 ```
 
 `A` = explainer, `B` = listener. Section comments are for the coverage check and chunking only; they
-are never spoken. Fish inline emotion/pacing tags are allowed but used sparingly, and only by the
-naturalness pass.
+are never spoken. Square-bracket delivery tags (`[amused]`, `[jumping in]`) steer the voice; see
+STYLE.md for how often.
 
 ## Coverage check
 
@@ -130,26 +131,24 @@ every idea, number, definition, trade-off, correction, Predict answer, Break It 
 Back model answer. Each item is either found in the script or added to it. The check's list is saved
 next to the script (`podcast/scripts/<slug>.coverage.md`) so a gap can be traced.
 
-## Rendering (Fish Audio)
+## Rendering (ElevenLabs)
 
 `node podcast/render.mjs <slug>`
 
-- Splits the script into chunks of roughly 2 minutes (~2,000 characters), always at a turn
-  boundary, never mid-sentence.
-- Sends each chunk to Fish Audio's TTS API as a two-speaker request (speaker tags map `A`/`B` to
-  the two chosen voices), model `s2.1-pro` (or the free fair-use `s2.1-pro-free` tier while it holds).
+- Splits the script into chunks of at most ~1,900 characters (ElevenLabs asks for ≤ 2,000 per
+  dialogue request), always at a turn boundary, or at a sentence end inside a very long turn.
+- Sends each chunk to ElevenLabs Text to Dialogue (`eleven_v4_turbo`): a list of turns, each with
+  the explainer's or listener's voice id. Square-bracket delivery tags in the script steer delivery.
 - Caches each chunk's audio under `podcast/.cache/<slug>/<hash>.mp3`, keyed by chunk text + voices +
   model, so a failure resumes and an edited script only re-renders changed chunks.
 - Joins chunks with ffmpeg, normalizes loudness for in-car listening, writes a mono MP3 (~64 kbps,
   ~30 MB per hour) to `podcast/out/<slug>.mp3`.
-- Retries on rate limits/5xx with backoff; aborts the episode (not the whole batch) on a hard error.
-- Reads `FISH_API_KEY` and voice IDs from env (`.env`, gitignored).
+- Retries on rate limits/5xx with backoff; at most 3 requests in flight.
+- Fish Audio stays available behind `TTS_PROVIDER=fish` but is not the default.
 
-Exact request shape (endpoint, speaker tag syntax, per-request size limit) is confirmed against Fish
-Audio's current docs during implementation; the chunk size is adjusted to fit.
-
-Cost: Fish S2.1-pro is about $15 per million UTF-8 bytes. A one-hour episode is ~55k characters, so
-about **$0.85 per hour of audio**, or $0 on the free tier.
+Cost: `eleven_v4_turbo` is $0.04 per 1,000 characters, so a one-hour episode (~55k characters) is
+about **$2.20**. Every ElevenLabs plan charges the same per-character rate; bigger plans only include
+more characters. Creator ($22/mo) covers about ten hour-long episodes a month.
 
 ## Publishing
 
@@ -177,8 +176,9 @@ about **$0.85 per hour of audio**, or $0 on the free tier.
 
 1. Pick one lesson (suggest `waiting-vs-working`, the one with his own diagnostic answer in it).
 2. Write its full script; Gaurav reads it.
-3. Render one ~10-minute section with 2-3 candidate voice pairs from Fish's library; Gaurav picks the
-   pair and says what sounds unnatural.
+3. Render short samples with candidate voice pairs; Gaurav picks the pair and says what sounds
+   unnatural. (Done: the first samples sounded robotic; the fix was writing the script the way people
+   talk, plus ElevenLabs podcast voices.)
 4. Fix the rules in the skill, render the full episode, publish, confirm it plays from the feed on
    his phone.
 5. Only then run the rest of the 62 lessons, a few at a time.
@@ -192,8 +192,8 @@ about **$0.85 per hour of audio**, or $0 on the free tier.
 
 ## Risks
 
-- **Fish free tier changes or S2.1 is replaced.** The model name is one config value; paid S2.1-pro
-  is still under $1/hour.
+- **ElevenLabs price or model changes.** Model and voices are config values; Fish is wired in as a
+  fallback.
 - **Voice drift between chunks** (the same voice sounding slightly different chunk to chunk). Mitigate
   with fixed reference voices and turn-boundary cuts; check in the pilot.
 - **Script length.** A 60-minute script is ~9,000 words; written section by section it stays within

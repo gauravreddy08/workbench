@@ -1,6 +1,6 @@
 ---
 name: podcast
-description: Turn a Workbench lesson into a two-host podcast episode (script, Fish Audio voice, private feed, player on the lesson page). Use when Gaurav runs /podcast <slug>, or asks to make, redo, or publish a podcast / audio version of a lesson, or to podcast all new lessons. Flags - --script-only stops before paying for audio; --render-only and --publish-only skip ahead.
+description: Turn a Workbench lesson into a two-host podcast episode (script, ElevenLabs voices, private feed, player on the lesson page). Use when Gaurav runs /podcast <slug>, or asks to make, redo, or publish a podcast / audio version of a lesson, or to podcast all new lessons. Flags - --script-only stops before paying for audio; --render-only and --publish-only skip ahead.
 ---
 
 # Podcast
@@ -41,14 +41,16 @@ For several slugs, run one subagent per lesson in parallel, each given this whol
 
 Stop here on `--script-only`, and tell him the word count, minutes and where the script is.
 
-## 2. Render (Fish Audio)
+## 2. Render (ElevenLabs)
 
 ```
 node podcast/render.mjs <slug>
 ```
 
-Needs `FISH_API_KEY`, `FISH_VOICE_A`, `FISH_VOICE_B` in `.env` (template: `.env.example`, setup:
-`podcast/README.md`). If they're missing, stop and ask him for them; don't guess voice ids.
+Needs `ELEVENLABS_API_KEY`, `ELEVEN_VOICE_A`, `ELEVEN_VOICE_B` in `.env` (template: `.env.example`, setup:
+`podcast/README.md`). If they're missing, stop and ask him for them; don't guess voice ids. The dry run prints the cost
+(about $2.20 per hour on `eleven_v4_turbo`); a 402/quota error means the ElevenLabs plan is out of
+characters for the month, so tell him rather than retrying.
 Chunks cache in `podcast/.cache/<slug>/`, so re-running after a failure or a script edit only pays
 for changed chunks. Output: `podcast/out/<slug>.mp3`. Listen check: report the duration; if it is far
 off the dry-run estimate (more than ~25%), something was dropped or repeated — say so.

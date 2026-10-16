@@ -8,7 +8,7 @@ podcast/
   STYLE.md              how scripts are written
   scripts/<slug>.md     the episode script (A explains, B listens)
   outlines/<slug>.md    what the lesson teaches, item by item
-  render.mjs            script → Fish Audio → out/<slug>.mp3
+  render.mjs            script → ElevenLabs → out/<slug>.mp3
   publish.mjs           mp3 → R2 → feed.xml, and the player on the lesson page
   episodes.json         what's in the feed
   lib/, test/           node --test 'podcast/test/*.test.mjs'
@@ -18,11 +18,12 @@ podcast/
 
 Copy `.env.example` to `.env` and fill it in.
 
-**Fish Audio.** Get an API key from your Fish Audio account (API keys page). API use is billed
-separately from the website plans: the `s2.1-pro-free` model is free under fair use; `s2.1-pro`
-costs $15 per million bytes of text, about $0.85 per hour of audio, paid from prepaid API credit.
-Pick two contrasting voices from the Fish voice library (one lower, one higher works best) and put
-their model ids in `FISH_VOICE_A` (explainer) and `FISH_VOICE_B` (listener).
+**ElevenLabs.** Put your API key in `ELEVENLABS_API_KEY`. The voices are Christopher - Friendly,
+Kind and Raspy (`ELEVEN_VOICE_A`, explainer) and Mike - Natural and Engaging Podcast Host
+(`ELEVEN_VOICE_B`, listener), from the shared voice library; add them to your account once (Voice
+Library → Add) if a render says the voice isn't found. `eleven_v4_turbo` is $0.04 per 1,000
+characters, about $2.20 per hour-long episode. Starter's 40k credits a month isn't enough for one
+episode; Creator ($22/mo) covers about ten.
 
 **Cloudflare R2.**
 1. Cloudflare dashboard → R2 → create a bucket (e.g. `workbench-podcast`).
@@ -38,6 +39,6 @@ Pocket Casts also take a feed URL.
 
 ## Costs
 
-Scripts: written by Claude Code, no API spend. Voice: $0 on the free model, about $0.85 per hour of
-audio on `s2.1-pro`. Hosting: R2's free tier covers this (62 hour-long episodes are about 2 GB, and
+Scripts: written by Claude Code, no API spend. Voice: about $2.20 per hour of audio on ElevenLabs
+v4 Turbo (the whole 62-lesson backlog is roughly $135). Hosting: R2's free tier covers this (62 hour-long episodes are about 2 GB, and
 R2 doesn't charge for downloads).
