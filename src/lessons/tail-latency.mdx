@@ -219,7 +219,7 @@ Three things to take from the simulator.
 
 **Variability is the enemy, not just load.** The three service-time settings have the same average, so the same utilization, yet very different tails. A rule called <Term w="Kingman's formula">An approximation for the average wait in a single-server queue with any arrival and service distributions: wait ≈ (ρ / (1 − ρ)) × ((Ca² + Cs²) / 2) × S, where Ca and Cs measure how variable arrivals and service times are.</Term> says the average wait is roughly (utilization term) × (variability term) × (service time). You can attack either factor: lower utilization (more servers) or lower variability (cap request sizes, split big jobs, move the slow 1% to a separate queue).
 
-**Why people run servers at 50-70%.** Because the knee is there and traffic is bursty. At a normal 60%, a spike of 30% takes you to 90% and p99 goes up 5x. At a normal 85%, the same spike takes you past 100% and the queue grows until something times out. In the [baseline lesson](/lessons/baseline-vs-fireworks/) the naive Spark server had to stay near 1% utilization for 99% of requests to see no wait. That was this curve at its most brutal.
+**Why people run servers at 50-70%.** Because the knee is there and traffic is bursty. At a normal 60%, a spike of 30% takes you to 90% and p99 goes up 4x. At a normal 85%, the same spike takes you past 100% and the queue grows until something times out. In the [baseline lesson](/lessons/baseline-vs-fireworks/) the naive Spark server had to stay near 1% utilization for 99% of requests to see no wait. That was this curve at its most brutal.
 
 ### Closed loop and open loop
 

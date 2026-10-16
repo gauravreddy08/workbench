@@ -166,7 +166,7 @@ DistillSpec (Zhou et al. 2023) found that drafts trained on student-generated da
 
 Here is the pipeline you'll build.
 
-<Figure n="003" title="FROM YOUR 8B TO A DRAFT" caption="Generate once, score once, train many times. Storing the 8B's top-64 logits (plus one normalizer) per position costs 388 bytes instead of 250 KB, which turns a 640 GB dataset into a 1 GB one.">
+<Figure n="003" title="FROM YOUR 8B TO A DRAFT" caption="Generate once, score once, train many times. Storing the 8B's top-64 logits (plus one normalizer) per position costs 388 bytes instead of 250 KB, which turns a ~510 GB dataset into a 1 GB one.">
 
 <svg viewBox="0 0 560 320" role="img" aria-label="Pipeline: prompts go to the 8B which generates text, the 8B re-reads the text to produce top-64 logits, both feed draft training, which is evaluated offline and then in the speculative decoder">
   <rect x="10" y="20" width="150" height="50" class="fill-paper" stroke-width="1.2" />
@@ -233,7 +233,7 @@ You generate 10,000 answers of about 200 tokens: 2 million positions. Llama 3's 
 
 <Fragment slot="answer">
 
-Full: 128,256 × 2 bytes = **250 KB per position**. Times 2 million positions = **about 640 GB**. More than the Spark's 128 GB of memory, and a slow thing to stream from disk every epoch.
+Full: 128,256 × 2 bytes = **250 KB per position**. Times 2 million positions = **about 510 GB**. More than the Spark's 128 GB of memory, and a slow thing to stream from disk every epoch.
 
 Top 64: each entry is a token id and a value. The id needs 4 bytes (`int32`), because 128,256 doesn't fit in the 65,535 that a 2-byte `uint16` can hold. The value takes 2 bytes in fp16. So 64 × 6 = 384 bytes, plus 4 bytes for one more number explained below: **388 bytes per position**, **0.78 GB in total**. About 660 times smaller, and it fits in RAM.
 
@@ -734,7 +734,7 @@ Because of where the draft is used. The first guess in a round follows real targ
 
 ## Connections
 
-Built on: [Speculative decoding](/lessons/speculative-decoding/) (the acceptance rule, α, the K sweep, your decoder) and [Memory math for models](/lessons/memory-math/) (the 640 GB vs 0.78 GB decision). The bandwidth argument for sharing Medusa's output layer is [Why ~17 tokens per second?](/lessons/bandwidth-bound/) again.
+Built on: [Speculative decoding](/lessons/speculative-decoding/) (the acceptance rule, α, the K sweep, your decoder) and [Memory math for models](/lessons/memory-math/) (the 510 GB vs 0.78 GB decision). The bandwidth argument for sharing Medusa's output layer is [Why ~17 tokens per second?](/lessons/bandwidth-bound/) again.
 
 This was a small, complete training run: data generation, a scoring pass, a training loop, held-out evaluation, and a downstream metric that isn't the loss. [Train a small LM, end to end](/lessons/tiny-lm/) does the same loop from raw text at larger scale, [Training memory](/lessons/training-memory/) explains the 16 bytes per parameter you budgeted for, and [Fine-tuning and LoRA](/lessons/lora/) shows how to do this kind of fine-tune with a tiny fraction of the trainable parameters. The habit of judging a model by a held-out metric that matches the real goal, not by its training loss, is the whole subject of [why evals are separate](/lessons/why-evals-are-separate/).
 

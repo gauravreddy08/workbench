@@ -140,7 +140,7 @@ gain×disc: 3.000  0      1.000  0      0.387      DCG@5 = 4.387
 
 ### NDCG: dividing by the best you could have done
 
-DCG has one problem: its scale depends on the query. A query with ten perfect documents can reach a DCG of 15; a query with one relevant document can't get past 3. Averaging raw DCG over queries lets the "easy, many-answers" queries drown everyone else out.
+DCG has one problem: its scale depends on the query. A query with ten perfect documents can reach a DCG of about 13.6; a query with one relevant document can't get past 3. Averaging raw DCG over queries lets the "easy, many-answers" queries drown everyone else out.
 
 So we normalise. Take the same grades, sort them from best to worst, and compute the DCG of that perfect ordering: the <Term w="ideal DCG">The DCG of the best possible ranking for this query: all judged documents sorted by grade, highest first, cut at k. Written IDCG@k.</Term>. Then divide.
 

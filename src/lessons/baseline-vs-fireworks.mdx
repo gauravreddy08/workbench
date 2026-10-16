@@ -457,7 +457,7 @@ python bench.py --target fireworks --base-url https://api.fireworks.ai/inference
   --n 1000 --max-tokens 256 --ignore-eos
 ```
 
-The Spark run takes a few hours (200 requests × ~20 s, three times). For c = 64 on the Spark, use `--n 128`: every request will wait about 20 minutes, which makes the point without costing a day. Then run both once more with `prompts/long.jsonl`, `--max-tokens 64`, at c = 1, to measure prefill. Check Fireworks' pricing page before the big run; it is a few hundred thousand tokens of an 8B model, but you should know what you are spending.
+The Spark run takes a few hours (200 requests × ~20 s, three times). For c = 64 on the Spark, use `--n 128`: every request will wait about 20 minutes, which makes the point without costing a day. Then run both once more with `prompts/long.jsonl`, `--max-tokens 64`, at c = 1, to measure prefill. Check Fireworks' pricing page before the big run; it is about a million output tokens of an 8B model (4 levels × 1,000 requests × 256), but you should know what you are spending.
 
 </Task>
 
@@ -536,7 +536,7 @@ You will also benchmark vLLM and SGLang on the Spark in [Inside vLLM and SGLang]
 Answer each out loud, as if in an interview, before opening the answer.
 
 <details>
-<summary>Fireworks has 3× better tok/s than your Spark, but your TTFT is lower at c = 1. Explain both.</summary>
+<summary>Fireworks has roughly 10× better tok/s than your Spark, but your TTFT is lower at c = 1. Explain both.</summary>
 
 TTFT is network plus queue plus prefill. For a short prompt on localhost, my network is basically zero and nobody is ahead of me, and prefill of a few hundred tokens is short even on slow hardware. Fireworks pays an internet round trip and its gateway and scheduler before its fast prefill even starts, so the fixed costs dominate. Tok/s is a different number: each decode step reads every weight once, so it is set by memory bandwidth and by how few bytes you read per token. They have HBM with roughly ten times the Spark's bandwidth, may store weights in fewer bits, may use speculative decoding to get more than one token per read, and run compiled kernels instead of a Python loop. Fixed costs favor the nearby box; per-token costs favor the fast one. Make the prompt long or the answer long and Fireworks wins both.
 

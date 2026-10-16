@@ -99,7 +99,7 @@ Your program never touches any of this directly. It asks the <Term w="kernel">Th
 </svg>
 </Figure>
 
-Crossing that boundary is not free. The CPU has to switch into kernel mode, the kernel checks your arguments, does the work and switches back. On my M4 Pro, an unbuffered one-byte `write` from Python costs about **1.8 µs**, most of which is the syscall and Python's own overhead. That is thousands of times more than appending a byte to a buffer in your own memory (about 40 ns). Which is why the first layer exists.
+Crossing that boundary is not free. The CPU has to switch into kernel mode, the kernel checks your arguments, does the work and switches back. On my M4 Pro, an unbuffered one-byte `write` from Python costs about **1.8 µs**, most of which is the syscall and Python's own overhead. That is about 45 times more than appending a byte to a buffer in your own memory (about 40 ns). Which is why the first layer exists.
 
 ### Layer 1: the buffer inside your process
 
