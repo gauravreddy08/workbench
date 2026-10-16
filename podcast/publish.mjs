@@ -79,6 +79,10 @@ const feed = buildFeed({
   link: 'https://gtadkapally.com/learn-cs',
   image: publicUrl(coverKey),
   feedUrl: publicUrl(feedKey),
+  // PODCAST_PUBLIC=1 lists the show in Apple/Spotify/YouTube; they verify via PODCAST_OWNER_EMAIL.
+  public: process.env.PODCAST_PUBLIC === '1',
+  ownerName: process.env.PODCAST_OWNER_NAME || 'Workbench',
+  ownerEmail: process.env.PODCAST_OWNER_EMAIL,
 }, episodes);
 // Short cache so new episodes show up on the phone within minutes.
 await put(feedKey, feed, 'application/rss+xml; charset=utf-8', 'public, max-age=300');

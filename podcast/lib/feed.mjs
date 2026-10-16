@@ -8,7 +8,12 @@ export function upsertEpisode(list, ep) {
   return [...list.filter((e) => e.slug !== ep.slug), ep];
 }
 
-export function buildFeed({ title, description, link, image, feedUrl }, episodes) {
+// public: listed in directories (Apple, Spotify, YouTube), which verify ownership by emailing ownerEmail.
+// Otherwise the feed asks directories not to list it and carries no email.
+export function buildFeed({ title, description, link, image, feedUrl, public: isPublic = false, ownerName = 'Workbench', ownerEmail }, episodes) {
+  const owner = isPublic && ownerEmail
+    ? `\n    <itunes:owner>\n      <itunes:name>${esc(ownerName)}</itunes:name>\n      <itunes:email>${esc(ownerEmail)}</itunes:email>\n    </itunes:owner>`
+    : '';
   const items = [...episodes]
     .sort((a, b) => new Date(b.pubDate) - new Date(a.pubDate))
     .map((e) => `    <item>
@@ -30,11 +35,10 @@ export function buildFeed({ title, description, link, image, feedUrl }, episodes
     <language>en</language>
     <atom:link href="${esc(feedUrl)}" rel="self" type="application/rss+xml"/>
     <itunes:image href="${esc(image)}"/>
-    <itunes:author>Workbench</itunes:author>
+    <itunes:author>${esc(ownerName)}</itunes:author>${owner}
     <itunes:explicit>false</itunes:explicit>
     <itunes:category text="Technology"/>
-    <itunes:block>Yes</itunes:block>
-${items}
+${isPublic ? '' : '    <itunes:block>Yes</itunes:block>\n'}${items}
   </channel>
 </rss>
 `;

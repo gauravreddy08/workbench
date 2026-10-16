@@ -41,3 +41,16 @@ test('upsert replaces an episode with the same slug', () => {
   assert.equal(next.length, 2);
   assert.equal(next.find((e) => e.slug === 'a').url, 'new.mp3');
 });
+
+test('public feeds drop the block flag and carry the owner for directory verification', () => {
+  const xml = buildFeed({ ...channel, public: true, ownerName: 'Gaurav & co', ownerEmail: 'me+podcast@example.com' }, []);
+  assert.doesNotMatch(xml, /itunes:block/);
+  assert.match(xml, /<itunes:owner>\s*<itunes:name>Gaurav &amp; co<\/itunes:name>\s*<itunes:email>me\+podcast@example.com<\/itunes:email>\s*<\/itunes:owner>/);
+  assert.match(xml, /<itunes:author>Gaurav &amp; co<\/itunes:author>/);
+});
+
+test('private feeds stay blocked and carry no email', () => {
+  const xml = buildFeed(channel, []);
+  assert.match(xml, /<itunes:block>Yes<\/itunes:block>/);
+  assert.doesNotMatch(xml, /itunes:owner/);
+});
