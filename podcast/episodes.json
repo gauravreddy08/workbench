@@ -7,5 +7,14 @@
     "bytes": 26152794,
     "seconds": 3269,
     "pubDate": "2026-10-16T21:02:29.548Z"
+  },
+  {
+    "slug": "speculative-decoding",
+    "title": "Speculative decoding.",
+    "description": "How can a small model make a big model faster without changing its output at all? The trick you are fascinated by. Implementing it teaches sampling, verification and probability.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-0b2b2efd.mp3",
+    "bytes": 31745923,
+    "seconds": 3968,
+    "pubDate": "2026-10-16T21:07:13.249Z"
   }
 ]

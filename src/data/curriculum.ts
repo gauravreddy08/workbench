@@ -338,6 +338,7 @@ export const tracks: Track[] = [
         question: 'How can a small model make a big model faster without changing its output at all?',
         why: 'The trick you are fascinated by. Implementing it teaches sampling, verification and probability.',
         build: 'Implement speculative sampling from the paper, prove the output distribution matches, and tune draft length.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-0b2b2efd.mp3',
       },
       {
         slug: 'serving-engines',
