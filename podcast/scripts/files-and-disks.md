@@ -324,7 +324,7 @@ A: And what you'd see, on the Mac, killed at a hundred fifty milliseconds. The n
 
 B: [working it out] And those two hundred sixty-four megabytes are, like... exactly what it had written so far. Because the page cache kept them when the process died.
 
-A: Every byte the process had handed to write before it died was there. And nothing after. That's the page-cache-survives-kill fact, made visible. The zip index was missing, so the load failed. The atomic version left a partial temp file, about four hundred eighty-seven megabytes, and a perfectly good ckpt dot P T. One point oh seven gigabytes, two hundred fifty-six tensors. So on startup, delete stray temp files and move on. You can't easily pull the power on purpose, so the power-cut side stays a thought experiment. The kill test shows the truncation bug, and the figure shows why the F syncs matter beyond it.
+A: Every byte the process had handed to write before it died was there. And nothing after. That's the page-cache-survives-kill fact, made visible. The zip index was missing, so the load failed. The atomic version left a partial temp file, about four hundred eighty-seven megabytes, and a perfectly good ckpt dot P T. One point oh seven gigabytes, two hundred fifty-six tensors. So on startup, delete stray temp files and move on. You can't easily pull the power on purpose, so the power-cut side stays a thought experiment. The kill test shows the truncation bug, and the picture of the write path shows why the F syncs matter beyond it.
 
 <!-- section: Build It: load weights four ways -->
 

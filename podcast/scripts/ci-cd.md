@@ -314,7 +314,7 @@ A: So you're done when you can point at the blob, tree and commit files in your 
 
 <!-- section: Measure -->
 
-A: So what should the numbers look like? Locally, a full astro build of the site is about one second on an M-series Mac. The lesson measured under a second for sixty-five pages. On C I, these are rough expectations from GitHub's runners, not measurements, and they vary by day. Checkout and setting up Node, five to twenty seconds. N P M C I, ten to forty seconds, less once the cache is warm. Build plus your checker, a few seconds. The deploy job, ten seconds to a minute. Push to new version visible, one to three minutes.
+A: So what should the numbers look like? Locally, a full astro build of the site is about one second on an M-series Mac. When I ran it, it was under a second for sixty-five pages. On C I, these are rough expectations from GitHub's runners, not measurements, and they vary by day. Checkout and setting up Node, five to twenty seconds. N P M C I, ten to forty seconds, less once the cache is warm. Build plus your checker, a few seconds. The deploy job, ten seconds to a minute. Push to new version visible, one to three minutes.
 
 B: [surprised] Wait, so the build is one second, and the whole thing is two or three minutes?
 

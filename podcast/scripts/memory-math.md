@@ -310,7 +310,7 @@ A: Sixth piece, check V L L M's arithmetic. Start it with the eight B in B F six
 
 A: Then point last lesson's benchmark at it with concurrency just above your predicted max, and long prompts that fill the context. And watch what V L L M does with the request that doesn't fit. Does it queue it? Or start it and later kick someone else out to make room? The logs and metrics will tell you. That behavior is the batching lesson. For now just notice that the limit you computed is a real wall.
 
-A: And you're done when your counter matches all five counts exactly and you can say off the top of your head that the MLP is about seventy percent. When your plan prints a table for six models on three machines and it agrees with the figure. When you've got a probe log on the Spark from cold start through a thirty-two K prefill, with the context, the weights and the cache growth each pointed out. When you've found the real max batch at three context lengths, and know which thing failed. And when V L L M's pool is within a few percent of your prediction, or you can explain why it isn't.
+A: And you're done when your counter matches all five counts exactly and you can say off the top of your head that the MLP is about seventy percent. When your plan prints a table for six models on three machines and it agrees with the numbers we just walked through. When you've got a probe log on the Spark from cold start through a thirty-two K prefill, with the context, the weights and the cache growth each pointed out. When you've found the real max batch at three context lengths, and know which thing failed. And when V L L M's pool is within a few percent of your prediction, or you can explain why it isn't.
 
 <!-- section: Measure -->
 

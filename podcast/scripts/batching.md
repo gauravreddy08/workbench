@@ -100,7 +100,7 @@ A: [flatly] Nothing. Ever. The harness is a closed loop: each worker only sends 
 
 B: Oh. Because the workers are waiting for the server and the server's waiting for the workers.
 
-A: Exactly that. And it bites at sixteen too, just later. When the run winds down and there are fewer than sixteen requests left, the last batch never fills, and the run never finishes. That actually happened while the code for this lesson was being tested. The last few requests of a run just hung.
+A: Exactly that. And it bites at sixteen too, just later. When the run winds down and there are fewer than sixteen requests left, the last batch never fills, and the run never finishes. That actually happened to me while I was testing this code. The last few requests of a run just hung.
 
 A: The fix is a deadline. Start the batch when it's full, or when the oldest waiting request has waited some maximum time. Whichever comes first. That's dynamic batching. Triton's version is literally called the dynamic batcher, and the knob is called max queue delay, in microseconds. The window's a dial. Zero means never wait, just batch whatever's there right now. Large means wait for fuller batches. Every request pays up to one window of extra latency, and in exchange the GPU runs fuller steps. Typical values are a few milliseconds up to a few tens of milliseconds.
 
@@ -136,7 +136,7 @@ A: And that equal-lengths case matters for you directly. Your harness is a close
 
 <!-- section: The Idea: Prefill and decode in the same step -->
 
-A: There's a wrinkle the figure hides. A new request needs a prefill. Its whole prompt, maybe hundreds or thousands of tokens, through the model in one pass. Meanwhile the running sequences each need one decode token. So what happens to them while the newcomer's prefilling?
+A: There's a wrinkle that picture hides. A new request needs a prefill. Its whole prompt, maybe hundreds or thousands of tokens, through the model in one pass. Meanwhile the running sequences each need one decode token. So what happens to them while the newcomer's prefilling?
 
 B: They... wait?
 
@@ -256,7 +256,7 @@ A: And then you run the matrix. Commit first, so every results file points at th
 
 <!-- section: Measure -->
 
-A: So you fill in a table. Naive, static and continuous, at each number of workers, plus the two mixed runs. And for each one, the median and p ninety-nine time to first token, the median per-stream speed, the p ninety-nine of the biggest gap, and total throughput. So what should those look like? These are expectations from the model in this lesson, not results. On a machine like the Spark, overheads you haven't met yet can move them a lot.
+A: So you fill in a table. Naive, static and continuous, at each number of workers, plus the two mixed runs. And for each one, the median and p ninety-nine time to first token, the median per-stream speed, the p ninety-nine of the biggest gap, and total throughput. So what should those look like? These are expectations from the model we just built, not results. On a machine like the Spark, overheads you haven't met yet can move them a lot.
 
 A: At one user, all three servers should be within a few tokens a second of each other. A batch of one is a batch of one. The static server's time to first token should be about one window worse than naive, so fifty milliseconds. That's the price of the window, paid even when nobody else is coming. And the continuous server's tokens a second might be a little lower than naive's, because your Python loop does more bookkeeping per step than generate does.
 
@@ -286,7 +286,7 @@ A: And then you break it. What if you start the static server with an infinite w
 
 B: That's the deadlock. It never comes back.
 
-A: [dry] Never comes back. And then try sixteen workers. It gets most of the way through and hangs on the last few requests, because the final batch never fills. That happened, exactly like that, while this lesson's code was being tested. Every batcher needs a deadline, and a closed-loop benchmark is really good at finding the missing one.
+A: [dry] Never comes back. And then try sixteen workers. It gets most of the way through and hangs on the last few requests, because the final batch never fills. That happened, exactly like that, while I was testing this code. Every batcher needs a deadline, and a closed-loop benchmark is really good at finding the missing one.
 
 A: What if you pad on the right instead? Set the padding side to right in the static server, and send two requests with very different prompt lengths at the same time.
 

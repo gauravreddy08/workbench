@@ -160,7 +160,7 @@ A: That's the shape. Close to flat at first, near the cached speed, then it bend
 
 B: And after the bend?
 
-A: Each extra token of length adds about two times eight billion FLOPs to every step, divided by whatever FLOPs per second you actually measured. And to be clear, that's a prediction for you to check, not something the lesson measured. Python and attention overhead will probably blur the corner.
+A: Each extra token of length adds about two times eight billion FLOPs to every step, divided by whatever FLOPs per second you actually measured. And to be clear, that's a prediction for you to check, not something I measured. Python and attention overhead will probably blur the corner.
 
 <!-- section: The Idea: The price: memory -->
 

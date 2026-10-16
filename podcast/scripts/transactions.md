@@ -120,7 +120,7 @@ A: Next is the dirty read. Reading a change another transaction has made but has
 
 B: Which Postgres never lets happen, I'm hoping.
 
-A: Never, at any level. Hold on to that, it matters for the figure later. Then the non-repeatable read. You read the same row twice in one transaction and get two different values, because somebody else changed it and committed in between. Like a billing report that reads the balance at the top, a hundred, does some work, then reads it again for the invoice total and gets ninety. And prints an invoice that disagrees with itself.
+A: Never, at any level. Hold on to that, it matters later. Then the non-repeatable read. You read the same row twice in one transaction and get two different values, because somebody else changed it and committed in between. Like a billing report that reads the balance at the top, a hundred, does some work, then reads it again for the invoice total and gets ninety. And prints an invoice that disagrees with itself.
 
 A: Third, the phantom. You run a query twice in the same transaction, and a row appears, or disappears, in the result. Because someone else inserted or deleted a row that matches your condition. So you count the runs for wallet one, get two, and a moment later the same query, same transaction, says three.
 
@@ -192,7 +192,7 @@ A: So, the doctors. Both running at the same moment. What's the weakest Postgres
 
 B: [working it out] Read committed, no, they'd both see two. Repeatable read... each one has a frozen snapshot, so... I want to say repeatable read? Because now they can't change under each other?
 
-A: That's the natural guess, and it's wrong. It's serializable. At repeatable read, each one reads from its own snapshot, both see two on call, and then each writes a different row. Alice versus Bob. There's no row that both of them write, so the "concurrent update" check never fires, and both commit. The lesson ran this against Postgres sixteen. Under repeatable read, both committed, and zero doctors were left on call. Under serializable, the first commit succeeded and the second failed with that read-write dependencies error. One doctor left on call. S S I noticed that each one read a row the other one wrote, and no one-at-a-time order explains that.
+A: That's the natural guess, and it's wrong. It's serializable. At repeatable read, each one reads from its own snapshot, both see two on call, and then each writes a different row. Alice versus Bob. There's no row that both of them write, so the "concurrent update" check never fires, and both commit. I ran this against Postgres sixteen. Under repeatable read, both committed, and zero doctors were left on call. Under serializable, the first commit succeeded and the second failed with that read-write dependencies error. One doctor left on call. S S I noticed that each one read a row the other one wrote, and no one-at-a-time order explains that.
 
 B: The frozen snapshot is the problem, actually. They're both looking at the same stale picture.
 
@@ -386,7 +386,7 @@ A: Fourth, run serializable on only half the code. Doctors again, but Alice's tr
 
 B: [a bit unsure] I'd guess you get... half the protection? Maybe it still catches it, since one side's watching?
 
-A: [gently] It doesn't. The lesson ran it both ways round. Both commits succeeded, zero doctors on call. S S I only tracks reads made by serializable transactions, and it can only abort a transaction that's itself serializable. So if you're relying on serializable, set it as the database default, with the default transaction isolation setting. Not per call site, where someone will forget.
+A: [gently] It doesn't. I ran it both ways round. Both commits succeeded, zero doctors on call. S S I only tracks reads made by serializable transactions, and it can only abort a transaction that's itself serializable. So if you're relying on serializable, set it as the database default, with the default transaction isolation setting. Not per call site, where someone will forget.
 
 <!-- section: Connections and close -->
 
