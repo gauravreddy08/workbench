@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { synthesizeDialogue } from '../lib/eleven.mjs';
+import { speak, synthesizeDialogue } from '../lib/eleven.mjs';
 
 const ok = () => new Response(new Uint8Array([7, 8]), { status: 200 });
 const args = (fetchImpl) => ({
@@ -36,4 +36,15 @@ test('retries 429 then succeeds; does not retry 422', async () => {
     /422.*too long/,
   );
   assert.equal(calls, 1);
+});
+
+test('speak sends one line in one voice', async () => {
+  let seen;
+  const audio = await speak({
+    text: 'Workbench.', voice: 'va', model: 'eleven_v4_turbo', apiKey: 'k', baseDelayMs: 1,
+    fetchImpl: async (url, init) => { seen = { url, init }; return ok(); },
+  });
+  assert.deepEqual([...audio], [7, 8]);
+  assert.match(seen.url, /^https:\/\/api\.elevenlabs\.io\/v1\/text-to-speech\/va\?output_format=mp3_44100_128$/);
+  assert.deepEqual(JSON.parse(seen.init.body), { text: 'Workbench.', model_id: 'eleven_v4_turbo' });
 });

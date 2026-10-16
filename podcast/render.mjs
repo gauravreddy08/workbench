@@ -16,7 +16,8 @@ import { parseArgs } from 'node:util';
 import { chunkKey } from './lib/cache.mjs';
 import { chunkTurns } from './lib/chunk.mjs';
 import { loadEnv, requireEnv } from './lib/env.mjs';
-import { synthesizeDialogue } from './lib/eleven.mjs';
+import { lessonMeta } from './lib/curriculum.mjs';
+import { speak, synthesizeDialogue } from './lib/eleven.mjs';
 import { synthesize } from './lib/fish.mjs';
 import { parseScript, toFishText } from './lib/script.mjs';
 
@@ -28,7 +29,7 @@ const PROVIDERS = {
   elevenlabs: {
     defaultModel: 'eleven_v4_turbo',
     price: (model) => (model.includes('turbo') ? 0.04 : 0.08) / 1000,
-    concurrency: 3, // Starter plan limit
+    concurrency: 2, // Starter plan allows 2 requests in flight
     env: ['ELEVENLABS_API_KEY', 'ELEVEN_VOICE_A', 'ELEVEN_VOICE_B'],
     render: ({ pieces, voices, model, key }) => synthesizeDialogue({ pieces, voices, model, apiKey: key }),
   },
@@ -49,6 +50,7 @@ const { values: opts, positionals } = parseArgs({
     voices: { type: 'string' },
     out: { type: 'string' },
     'chunk-chars': { type: 'string', default: '1900' },
+    'no-intro': { type: 'boolean', default: false },
   },
 });
 const slug = positionals[0];
@@ -118,14 +120,40 @@ async function worker() {
 }
 await Promise.all(Array.from({ length: provider.concurrency }, worker));
 
+const duration = (file) =>
+  Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', file]));
+
+// Intro: the music sting, with the explainer saying the show and episode title over it.
+// The spoken title comes from a <!-- title: ... --> comment in the script, else curriculum.ts.
+const MUSIC = join(ROOT, 'podcast/intro-music.mp3');
+let intro = null;
+if (existsSync(MUSIC) && providerName === 'elevenlabs' && !opts.minutes && !opts['no-intro']) {
+  const scriptTitle = readFileSync(scriptPath, 'utf8').match(/<!--\s*title:\s*(.+?)\s*-->/)?.[1];
+  const title = scriptTitle || lessonMeta(readFileSync(join(ROOT, 'src/data/curriculum.ts'), 'utf8'), slug).title.replace(/\.$/, '');
+  const text = `[warm, relaxed] Workbench. ... ${title}.`;
+  const file = join(cacheDir, `title-${chunkKey({ text, voices: [voices[0]], model })}.mp3`);
+  if (!existsSync(file)) writeFileSync(file, await speak({ text, voice: voices[0], model, apiKey: key }));
+  intro = { file, seconds: duration(file) };
+}
+
 const out = resolve(opts.out || join(ROOT, 'podcast/out', `${slug}.mp3`));
 mkdirSync(dirname(out), { recursive: true });
 const list = join(cacheDir, 'concat.txt');
 writeFileSync(list, files.map((f) => `file '${f}'`).join('\n'));
 // Join, even out loudness for car/shower listening, and shrink to mono 64 kbps (~30 MB per hour).
-execFileSync('ffmpeg', [
-  '-y', '-loglevel', 'error', '-f', 'concat', '-safe', '0', '-i', list,
-  '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-ac', '1', '-ar', '44100', '-b:a', '64k', out,
-]);
-const seconds = Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', out]));
+const loud = 'loudnorm=I=-16:TP=-1.5:LRA=11';
+const mono = 'aresample=44100,aformat=channel_layouts=mono';
+const body = ['-f', 'concat', '-safe', '0', '-i', list];
+const filter = intro
+  ? (() => {
+    // Title starts 1.8 s in; the music fades over the last 3 s, ending 2 s after the title.
+    const len = Math.max(8.5, 1.8 + intro.seconds + 2).toFixed(2);
+    return ['-i', MUSIC, '-i', intro.file, '-filter_complex',
+      `[1:a]apad,volume=0.55,afade=t=out:st=${(len - 3).toFixed(2)}:d=3[m];[2:a]adelay=1800|1800,volume=1.1[v];` +
+      `[m][v]amix=inputs=2:duration=longest:normalize=0,atrim=0:${len},${mono}[intro];[0:a]${mono}[b];` +
+      `[intro][b]concat=n=2:v=0:a=1,${loud}`];
+  })()
+  : ['-af', loud];
+execFileSync('ffmpeg', ['-y', '-loglevel', 'error', ...body, ...filter, '-ac', '1', '-ar', '44100', '-b:a', '64k', out]);
+const seconds = duration(out);
 console.log(`wrote ${out} (${Math.floor(seconds / 60)}m${Math.round(seconds % 60)}s)`);
