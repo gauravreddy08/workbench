@@ -4,7 +4,7 @@ A: [relaxed, thinking out loud] So you've built G P T two from scratch. More tha
 
 B: [a bit unsure] I mean, I'd have assumed the idea. If the training were actually broken, something would blow up, right? You'd get a crash, or the loss would go to NaN, or... something loud.
 
-A: That's the trap. Almost nothing in a training run is loud. A run has maybe twenty settings, and each one, if it's wrong, quietly costs you something like a factor of two. Set the learning rate ten times too low. It doesn't crash. You just get a model that looks dumb. Forget warmup, it doesn't crash, it costs you a few percent. Feed the model the wrong targets... it doesn't crash either. It gives you a beautiful loss curve. Like, gorgeous. None of these throw an exception. And every single one of them makes your creative idea look like it failed.
+A: [warmly] That's the trap. Almost nothing in a training run is loud. A run has maybe twenty settings, and each one, if it's wrong, quietly costs you something like a factor of two. Set the learning rate ten times too low. It doesn't crash. You just get a model that looks dumb. Forget warmup, it doesn't crash, it costs you a few percent. Feed the model the wrong targets... it doesn't crash either. It gives you a beautiful loss curve. Like, gorgeous. None of these throw an exception. And every single one of them makes your creative idea look like it failed.
 
 B: Huh. So the "it didn't work" was maybe never about the idea.
 
@@ -26,7 +26,7 @@ A: [laughs] Always. So this whole episode follows that lineage. When in doubt, t
 
 <!-- section: The Idea: The whole loop -->
 
-A: Okay, so let me draw the whole loop, start to finish, like over the phone. Top row, left to right, three boxes. Raw text, which is the web pages. Then the tokenizer, G P T two's, which also sticks a special end-of-document marker in front of each document. Then token files on disk. Each token stored in two bytes, split into training files and a validation file. That whole top row runs once, up front. It just writes files.
+A: Okay, so let me just draw the whole loop, start to finish. Top row, left to right, three boxes. Raw text, which is the web pages. Then the tokenizer, G P T two's, which also sticks a special end-of-document marker in front of each document. Then token files on disk. Each token stored in two bytes, split into training files and a validation file. That whole top row runs once, up front. It just writes files.
 
 A: Then underneath, a dashed box. The training loop. It runs about five thousand times. Inside it, left to right: a loader, which reads a batch out of those files. Then the model, the hundred twenty-four million parameter GPT, running in B F sixteen and compiled. Then the loss. Then the optimizer, Adam W, which clips the gradient, looks up the current learning rate, and updates the weights. And a line loops back from the optimizer to the model. New weights. Round and round.
 
@@ -34,15 +34,15 @@ A: Off to the side, every so many steps, the loop writes a checkpoint. And a che
 
 B: [working it out] And the middle box, the model. That's the part I've actually built.
 
-A: That's the part you've built many times. This is about every other box. And the arrows between them. Because that's where runs die quietly. Off in the corner I'd write four of them. A token ID that doesn't fit in two bytes and wraps around. Targets that aren't shifted from the inputs. Validation documents that are also in the training data. And a loader that keeps replaying the same file. We're going to meet every one of those.
+A: [a little wry] That's the part you've built many times. This is about every other box. And the arrows between them. Because that's where runs die quietly. Off in the corner I'd write four of them. A token ID that doesn't fit in two bytes and wraps around. Targets that aren't shifted from the inputs. Validation documents that are also in the training data. And a loader that keeps replaying the same file. We're going to meet every one of those.
 
 <!-- section: The Idea: Choosing the text -->
 
 A: First real decision: what does the model read? Because it can only get as good as its text. Two good choices, for two different jobs. The first is Tiny Stories, from Eldan and Li, twenty twenty-three. About two million short children's stories, written by G P T three point five and G P T four, using a deliberately tiny vocabulary of words. A few hundred million tokens in total. Check the exact count on the dataset page. And its superpower is fast feedback. A model with only a few million parameters learns to write coherent little stories in minutes. So you can tell a working pipeline from a broken one before your coffee's cold.
 
-B: What's the catch?
+B: [skeptical] Children's stories, though. That's not what I'd ever want a model to write.
 
-A: It only teaches you about Tiny Stories. Nothing you learn about settings transfers cleanly to real text. The second choice is Fine Web Edu, Penedo and others at Hugging Face, twenty twenty-four. Web pages from Common Crawl, filtered by a classifier that was trained to spot "educational" pages. And it has ready-made samples, including one called sample ten B T. A random ten-billion-token slice. That's exactly what L L M dot C and build nano G P T trained on. Which is its superpower. There are published curves to compare against. When your run is at step two thousand, you can check whether a known-good run was at about the same loss at step two thousand.
+A: No, and that's the catch. It only teaches you about Tiny Stories. Nothing you learn about settings transfers cleanly to real text. The second choice is Fine Web Edu, Penedo and others at Hugging Face, twenty twenty-four. Web pages from Common Crawl, filtered by a classifier that was trained to spot "educational" pages. And it has ready-made samples, including one called sample ten B T. A random ten-billion-token slice. That's exactly what L L M dot C and build nano G P T trained on. Which is its superpower. There are published curves to compare against. When your run is at step two thousand, you can check whether a known-good run was at about the same loss at step two thousand.
 
 A: So: Fine Web Edu's ten-billion sample for the real run, Tiny Stories for the five-minute smoke tests. You're not trying to make the best small model in the world. You're trying to make a run you can trust. And the fastest way to trust a run is to have somebody else's run to hold it up against.
 
@@ -60,7 +60,7 @@ A: You'll actually check that. When you tokenize, you time it, and you'll see it
 
 A: First, use the smallest integer type that fits. G P T two's tokenizer has fifty thousand two hundred fifty-seven tokens. So every ID is between zero and fifty thousand two hundred fifty-six. An unsigned sixteen-bit integer, which is written U int sixteen, holds zero up to sixty-five thousand five hundred thirty-five. So it fits, and every token is two bytes. Two and a half billion tokens is five gigabytes on disk. If you'd used the sixty-four-bit integers PyTorch gives you by default, it'd be twenty gigabytes. Four times as big, for nothing.
 
-A: And there's a trap waiting in that choice. If you ever switch to a tokenizer with more than sixty-five thousand five hundred thirty-six tokens, like Llama three's, which has about a hundred twenty-eight thousand, the IDs don't fit anymore. You need thirty-two-bit. And if you silently cast to sixteen-bit anyway, the big IDs wrap around. They don't error. They just turn into other, smaller IDs. Garbage that looks like valid tokens. So you assert the biggest ID fits before you cast. One line.
+A: [more serious] And there's a trap waiting in that choice. If you ever switch to a tokenizer with more than sixty-five thousand five hundred thirty-six tokens, like Llama three's, which has about a hundred twenty-eight thousand, the IDs don't fit anymore. You need thirty-two-bit. And if you silently cast to sixteen-bit anyway, the big IDs wrap around. They don't error. They just turn into other, smaller IDs. Garbage that looks like valid tokens. So you assert the biggest ID fits before you cast. One line.
 
 B: That's one of the four bugs in the corner.
 
@@ -88,7 +88,7 @@ A: Second detail. Cover the data, don't just sample it. The tempting loader pick
 
 B: [a bit unsure] Most of them? I'd guess... ninety-something percent. Some repeats, but you drew a million out of a million.
 
-A: About sixty-three percent. Here's why. Take one particular window. On any one draw, the chance you miss it is almost one, it's one minus one over a million. Do that a million times in a row, and the chance you missed it every single time works out to about one over e. That's a classic limit. About thirty-seven percent. So thirty-seven percent of your data is never seen, and lots of windows get seen twice, or three times. For a run that goes through the data once, that's a real waste.
+A: [gently] About sixty-three percent. Here's why. Take one particular window. On any one draw, the chance you miss it is almost one, it's one minus one over a million. Do that a million times in a row, and the chance you missed it every single time works out to about one over e. That's a classic limit. About thirty-seven percent. So thirty-seven percent of your data is never seen, and lots of windows get seen twice, or three times. For a run that goes through the data once, that's a real waste.
 
 B: Oh. So a third of the dataset just... doesn't happen.
 
@@ -120,11 +120,11 @@ A: So here's one to try. You build the hundred twenty-four million model with th
 
 B: [working it out] It's random, so... it's going to be badly wrong about everything. So big? I don't know, thirty? And sixty-eight, I guess, is just a more random model.
 
-A: About ten point eight. And it's a number you can work out on paper. With small random weights, the scores the model outputs for every token, the logits, are all close to zero. And if all the scores are about equal, the softmax turns them into about equal probabilities. So every one of the fifty thousand two hundred fifty-seven tokens gets a probability of about one in fifty thousand. And minus the log of one over fifty thousand is just the log of fifty thousand. The natural log of fifty thousand two hundred fifty-seven is ten point eight two. With the padded vocabulary it's ten point eight three, same thing.
+A: [matter-of-fact] About ten point eight. And it's a number you can work out on paper. With small random weights, the scores the model outputs for every token, the logits, are all close to zero. And if all the scores are about equal, the softmax turns them into about equal probabilities. So every one of the fifty thousand two hundred fifty-seven tokens gets a probability of about one in fifty thousand. And minus the log of one over fifty thousand is just the log of fifty thousand. The natural log of fifty thousand two hundred fifty-seven is ten point eight two. With the padded vocabulary it's ten point eight three, same thing.
 
 B: So "random" doesn't mean "wrong about everything". It means "unsure about everything".
 
-A: That's exactly it. Unsure is cheap. Confidently wrong is expensive. Measured on this exact model at init, ten point nine eight. A little above, because the logits are small but not quite zero. Anything from about ten point eight to eleven point two is healthy. Now, sixty-eight. A sixty-eight means the model is extremely confident and wrong at step zero, and that only happens when the logits are huge. An init that's way too large. You can make it happen: initialize the same model with a standard deviation of one instead of zero point zero two, and the initial loss is sixty-eight point two. And a network that starts there spends its first thousand steps just undoing the init. Often it never fully recovers.
+A: [warmly] That's exactly it. Unsure is cheap. Confidently wrong is expensive. Measured on this exact model at init, ten point nine eight. A little above, because the logits are small but not quite zero. Anything from about ten point eight to eleven point two is healthy. Now, sixty-eight. A sixty-eight means the model is extremely confident and wrong at step zero, and that only happens when the logits are huge. An init that's way too large. You can make it happen: initialize the same model with a standard deviation of one instead of zero point zero two, and the initial loss is sixty-eight point two. And a network that starts there spends its first thousand steps just undoing the init. Often it never fully recovers.
 
 A: This is the single cheapest sanity check in deep learning. One forward pass. It catches broken inits, wrong vocab sizes, a loss that's summed where it should be averaged, and labels made with the wrong tokenizer.
 
@@ -148,7 +148,7 @@ A: Then weight decay, which is where people get it subtly wrong. Weight decay me
 
 B: So you just apply it to everything. It's regularization, more is... I mean, it's applied evenly, so that's fair.
 
-A: That's the subtle mistake. You apply it to the two-dimensional weight matrices. Every linear layer, and the embedding table. And not to the biases, and not to the Layer Norm parameters, the gain and the offset. Think about what decaying a Layer Norm gain actually does. That gain multiplies the layer's output. Pull it toward zero and you're literally turning that layer's volume down. There's no reason to want that. And the rule that gets it right is one line. Decay a parameter if it has two or more dimensions. For this model, that puts a hundred twenty-four million, three hundred fifty-four thousand, five hundred sixty parameters in the decay group, and a hundred twenty-one thousand, three hundred forty-four, the biases and the norms, in the no-decay group. So print both group sizes. If your no-decay group is empty, or it has tens of millions in it, something's off.
+A: [patiently] That's the subtle mistake. You apply it to the two-dimensional weight matrices. Every linear layer, and the embedding table. And not to the biases, and not to the Layer Norm parameters, the gain and the offset. Think about what decaying a Layer Norm gain actually does. That gain multiplies the layer's output. Pull it toward zero and you're literally turning that layer's volume down. There's no reason to want that. And the rule that gets it right is one line. Decay a parameter if it has two or more dimensions. For this model, that puts a hundred twenty-four million, three hundred fifty-four thousand, five hundred sixty parameters in the decay group, and a hundred twenty-one thousand, three hundred forty-four, the biases and the norms, in the no-decay group. So print both group sizes. If your no-decay group is empty, or it has tens of millions in it, something's off.
 
 <!-- section: The Idea: The learning rate -->
 
@@ -158,7 +158,7 @@ A: Picture it as a curve. Learning rate going up, steps going across, out to fiv
 
 B: Why the ramp? Why not just start at the peak?
 
-A: Because step zero is the most fragile moment of the whole run. Adam's running averages are empty. It has no history, so its first few steps are oddly sized. And the gradients of a random network point in wild directions. Put a full-size step on top of that and you can throw the model somewhere it never fully recovers from. So a few hundred steps of ramping is cheap insurance. G P T three Small warmed up over three hundred seventy-five million tokens. For a run of two and a half billion, a few hundred steps of half a million tokens each is the same spirit.
+A: [more serious] Because step zero is the most fragile moment of the whole run. Adam's running averages are empty. It has no history, so its first few steps are oddly sized. And the gradients of a random network point in wild directions. Put a full-size step on top of that and you can throw the model somewhere it never fully recovers from. So a few hundred steps of ramping is cheap insurance. G P T three Small warmed up over three hundred seventy-five million tokens. For a run of two and a half billion, a few hundred steps of half a million tokens each is the same spirit.
 
 A: The peak, six e minus four, is G P T three Small's, and it's a safe place to start. Karpathy found models this size actually tolerate about three times that. You'll find your own with a sweep.
 
@@ -172,7 +172,7 @@ A: Batch size. Quick check. When you trained your G P T two before, what batch s
 
 B: Like, sixteen? Thirty-two sequences, maybe, whatever fit on the GPU.
 
-A: Right, and that's the picture to change. For language models, think of batch size as tokens per optimizer step. Not sequences. G P T three Small used about half a million tokens per step. Nano G P T uses two to the nineteen, which is five hundred twenty-four thousand two hundred eighty-eight. A power of two near half a million. With a context of a thousand twenty-four tokens, that's five hundred twelve sequences per step.
+A: [gently] Right, and that's the picture to change. For language models, think of batch size as tokens per optimizer step. Not sequences. G P T three Small used about half a million tokens per step. Nano G P T uses two to the nineteen, which is five hundred twenty-four thousand two hundred eighty-eight. A power of two near half a million. With a context of a thousand twenty-four tokens, that's five hundred twelve sequences per step.
 
 B: [laughs] That's not fitting in one forward pass on the Spark.
 
@@ -196,7 +196,7 @@ A: Now speed. Four switches. None of them change what the model learns, to withi
 
 B: [a bit unsure] Wait, the scaler's for... okay, let me get this straight. B F sixteen is the more precise sixteen-bit one, and F P sixteen is the one with the bigger range? So you'd think you'd need the scaler with B F sixteen, if anything.
 
-A: That's backwards, and it's the exact thing worth fixing. A floating-point number spends its bits on two things. The exponent, which sets how big or tiny a number can be, the range. And the mantissa, the digits, which set the precision. B F sixteen keeps the same exponent as full thirty-two-bit floats. Same range. Huge numbers, tiny numbers, all fine. It pays for that with fewer digits. F P sixteen is the opposite. More digits, but a much smaller range. So in F P sixteen, small gradients underflow, they round to zero, and you need loss scaling to multiply everything up into the range and back down. B F sixteen never has that problem. That's why the scaler is F P sixteen's problem, and it's why basically everyone training switched to B F sixteen.
+A: [gently, but firmly] That's backwards, and it's the exact thing worth fixing. A floating-point number spends its bits on two things. The exponent, which sets how big or tiny a number can be, the range. And the mantissa, the digits, which set the precision. B F sixteen keeps the same exponent as full thirty-two-bit floats. Same range. Huge numbers, tiny numbers, all fine. It pays for that with fewer digits. F P sixteen is the opposite. More digits, but a much smaller range. So in F P sixteen, small gradients underflow, they round to zero, and you need loss scaling to multiply everything up into the range and back down. B F sixteen never has that problem. That's why the scaler is F P sixteen's problem, and it's why basically everyone training switched to B F sixteen.
 
 B: So B F sixteen is the wide one. Less precise, but never falls off the edge.
 
@@ -234,7 +234,7 @@ A: Button three, learning rate ten times too low. Smooth. Stable. No drama. And 
 
 A: Button four, no warmup. It drops, and then within the first hundred steps it jumps back up, sometimes above where it started. You only really see it on the log axis. Then it recovers, but it ends a little worse than the good run. That's the random weights and the empty Adam history, and the first updates are huge in every direction at once. Full learning rate on top of that shoves the model somewhere bad. Fix: linear warmup over a few hundred steps. Nobody trains a transformer without it.
 
-A: Button five, the data bug. The loss plunges toward zero in a few hundred steps. Training and validation agree perfectly. It looks amazing.
+A: [dry] Button five, the data bug. The loss plunges toward zero in a few hundred steps. Training and validation agree perfectly. It looks amazing.
 
 B: [laughs] That's the one I'd be screenshotting.
 
@@ -242,7 +242,7 @@ A: [laughs] Everyone would. And it's a bug. A model this size on web text lands 
 
 A: Button six, tiny data. Training keeps falling, with a small cliff every time the data repeats. Validation follows it at first, bottoms out, and then turns upward while training keeps getting better. That's memorizing. The model's seen every example several times. Past the bottom of the validation curve, every step makes it better at the training set and worse at text it's never seen, and that widening gap is overfitting. The fix is more fresh data, or stopping at the validation minimum. But runs like this one see each token about once, so in pretraining you rarely see this, unless the dataset's too small or the loader keeps replaying one shard.
 
-A: So, the patterns to burn in. The first number is the log of the vocab size. If step zero isn't near ten point eight, stop. Too good to be true is a bug. This model on web text does not reach a loss of one. And there's a two-minute test for this kind of leak. Train on random tokens. With random tokens there's nothing to learn, so a correct pipeline can't do better than ten point eight. It just can't. A tiny GPT on a Mac, with the target set equal to the input instead of shifted: loss fell from ten point five to five point eight in a hundred steps. On pure noise. Then: spikes that recover are a warning, spikes that don't are a verdict. Lower the learning rate, check clipping, look at the norm. A curve that's still falling steeply at the end means you stopped too early or the learning rate's too low. Compute left on the table. And validation pulling away from training is overfitting, which in a single pass over the data shouldn't happen. So if it does, suspect the data.
+A: [slowing down] So, the patterns to burn in. The first number is the log of the vocab size. If step zero isn't near ten point eight, stop. Too good to be true is a bug. This model on web text does not reach a loss of one. And there's a two-minute test for this kind of leak. Train on random tokens. With random tokens there's nothing to learn, so a correct pipeline can't do better than ten point eight. It just can't. A tiny GPT on a Mac, with the target set equal to the input instead of shifted: loss fell from ten point five to five point eight in a hundred steps. On pure noise. Then: spikes that recover are a warning, spikes that don't are a verdict. Lower the learning rate, check clipping, look at the norm. A curve that's still falling steeply at the end means you stopped too early or the learning rate's too low. Compute left on the table. And validation pulling away from training is overfitting, which in a single pass over the data shouldn't happen. So if it does, suspect the data.
 
 B: [working it out] So say I come back in the morning, and the loss dropped nicely, spiked twice, and now it's just flat around seven. That's button two.
 
@@ -256,7 +256,7 @@ A: How many tokens should a model this size see? In twenty twenty-two, DeepMind 
 
 B: I'd have guessed: as big a model as you can afford. Bigger's better.
 
-A: That's what the field thought, actually. Earlier work, Kaplan and others in twenty twenty, had said to favor bigger models. Chinchilla's correction was that most big models of the time were badly undertrained. The answer, roughly, is to grow them together. About twenty tokens per parameter. So for a hundred twenty-four million parameters, about two and a half billion tokens. And that's the "compute-optimal" budget. Meaning, the cheapest way to train to a given loss.
+A: [amused] That's what the field thought, actually. Earlier work, Kaplan and others in twenty twenty, had said to favor bigger models. Chinchilla's correction was that most big models of the time were badly undertrained. The answer, roughly, is to grow them together. About twenty tokens per parameter. So for a hundred twenty-four million parameters, about two and a half billion tokens. And that's the "compute-optimal" budget. Meaning, the cheapest way to train to a given loss.
 
 A: Now, plenty of real models go way past twenty on purpose. Llama three's eight billion model saw over fifteen trillion tokens. Because a small model trained for a long time is cheaper to serve. Every user's request runs through all of the parameters, so a smaller model is cheaper forever after. That trade is about inference cost, not training.
 
@@ -276,7 +276,7 @@ A: So, say forty percent. Forty percent of a hundred twenty-five trillion is fif
 
 B: So it's an overnight run.
 
-A: It's an overnight run. And that tells you something really important before you write a line of code. You get about one full-size run per day. One shot. So everything you want to learn about settings has to be learned on smaller, faster runs first.
+A: [emphatic] It's an overnight run. And that tells you something really important before you write a line of code. You get about one full-size run per day. One shot. So everything you want to learn about settings has to be learned on smaller, faster runs first.
 
 B: [working it out] And if I went the other way. I've got a budget of compute and I want to pick the model size?
 
@@ -294,7 +294,7 @@ A: Three. Overfit one batch. Take a single small batch and train on it, the same
 
 B: [skeptical] Overfitting on purpose? I've spent years being told overfitting's the thing to avoid.
 
-A: In a real run, sure. Here it's a test of the plumbing. Memorizing a couple hundred tokens is trivial for any working model. So a working model and optimizer must drive the loss to near zero. A four-layer GPT on a Mac, one batch of four sequences of sixty-four tokens, so two hundred fifty-six tokens, learning rate ten to the minus three: loss went from ten point eight seven to zero point zero eight in fifty steps. And zero point zero zero five by step three hundred. If yours plateaus at five, something between the loss and the weights is broken. Wrong targets. Tensors that got detached from the graph, so no gradient flows. An optimizer that was handed the wrong parameters. A learning rate of zero.
+A: [amused] In a real run, sure. Here it's a test of the plumbing. Memorizing a couple hundred tokens is trivial for any working model. So a working model and optimizer must drive the loss to near zero. A four-layer GPT on a Mac, one batch of four sequences of sixty-four tokens, so two hundred fifty-six tokens, learning rate ten to the minus three: loss went from ten point eight seven to zero point zero eight in fifty steps. And zero point zero zero five by step three hundred. If yours plateaus at five, something between the loss and the weights is broken. Wrong targets. Tensors that got detached from the graph, so no gradient flows. An optimizer that was handed the wrong parameters. A learning rate of zero.
 
 A: Four. Train on random tokens for a minute. The loss has to stay at or above ten point eight. If it drops, the model can see its targets. Five. Print the learning rate every step for the first few. Is warmup actually happening? Is it the number you think? Being off by a factor of ten is the most common silent bug there is. Six. A short real run, on Tiny Stories or a small slice of Fine Web. Does the curve look like the good run? Do the samples get better? And seven, only then, the long run. And keep notes.
 
@@ -304,7 +304,7 @@ A: Checkpoints. A ten-hour run will get interrupted at some point. A reboot. Run
 
 B: So you save the weights every so often.
 
-A: The weights alone won't let you continue as if nothing happened. You need five things. The model weights, and take them from the uncompiled model, because torch dot compile wraps it and sticks a little prefix, orig mod, on the front of every key. The optimizer state, Adam's two running averages, which is twice the size of the model. Without them, the resumed run is basically starting Adam cold again. The step number, so the learning-rate schedule picks up in the right place. The data position: which epoch, the shuffle seed, the index into the window list. So you don't retrain on data you already saw. And the config, and ideally the git commit of your code.
+A: [gently] The weights alone won't let you continue as if nothing happened. You need five things. The model weights, and take them from the uncompiled model, because torch dot compile wraps it and sticks a little prefix, orig mod, on the front of every key. The optimizer state, Adam's two running averages, which is twice the size of the model. Without them, the resumed run is basically starting Adam cold again. The step number, so the learning-rate schedule picks up in the right place. The data position: which epoch, the shuffle seed, the index into the window list. So you don't retrain on data you already saw. And the config, and ideally the git commit of your code.
 
 A: And you write it crash-safe. Write to a temporary file in the same directory. F sync it, which forces it all the way to disk instead of sitting in the OS's memory. Then os dot replace to swap it over the old one in one atomic step. Then F sync the directory too, so the swap itself is on disk. Because a checkpoint that's half-written when the machine dies is worse than none at all. It overwrote the good one. And keep the last two or three, plus a few milestones, so a bad stretch of training doesn't leave you with only bad checkpoints.
 
@@ -328,7 +328,7 @@ A: Then evaluation. Validation loss is your main number. It's cheap, it's smooth
 
 B: [skeptical] Twenty-nine and a half, against twenty-five for guessing. That's... a terrible score.
 
-A: It's barely above chance. And that's exactly why it's a good small eval. It moves as you train. A benchmark a small model can't budge tells you nothing. And the noise on it: with ten thousand forty-two examples, the standard error is about plus or minus half a point. So differences under about one point between two runs are noise.
+A: [laughs] It's barely above chance. And that's exactly why it's a good small eval. It moves as you train. A benchmark a small model can't budge tells you nothing. And the noise on it: with ten thousand forty-two examples, the standard error is about plus or minus half a point. So differences under about one point between two runs are noise.
 
 <!-- section: Build It -->
 
@@ -380,7 +380,7 @@ A: Tokens per second: thirty-two-bit will be the lowest of the four, because mos
 
 B: [a bit unsure] And M F U... higher's just better, right? If I got seventy percent I'd be pretty happy.
 
-A: You'd be suspicious. M F U is the honest number, in both directions. If it's under twenty percent, the GPU's waiting on something. Maybe data loading, and you'd see one CPU core pegged at a hundred percent in H top. Maybe Python overhead, because the micro-batch is too small and the GPU finishes each one before Python's ready with the next. Maybe unfused elementwise operations, because compile's off. Each of those has a different fix. And if it's over sixty, check your FLOP count and check your timer. You probably forgot to synchronize, so you're timing Python handing out work.
+A: [laughs] You'd be suspicious. M F U is the honest number, in both directions. If it's under twenty percent, the GPU's waiting on something. Maybe data loading, and you'd see one CPU core pegged at a hundred percent in H top. Maybe Python overhead, because the micro-batch is too small and the GPU finishes each one before Python's ready with the next. Maybe unfused elementwise operations, because compile's off. Each of those has a different fix. And if it's over sixty, check your FLOP count and check your timer. You probably forgot to synchronize, so you're timing Python handing out work.
 
 B: And if I scaled up? Bigger model, or more GPUs?
 
@@ -400,7 +400,7 @@ A: Third one's my favorite. Forget to divide each micro-batch's loss by the numb
 
 B: [working it out] Gradients are thirty-two times too big, so... yeah. That's thirty-two times the step. That should blow up worse than the high learning rate button.
 
-A: Probably much less bad than you'd guess, and that's the interesting part. With plain gradient descent, you'd be right. Thirty-two times the gradient, thirty-two times the step. But remember what Adam does. It divides each gradient by the square root of its own running average of squared gradients. Multiply every gradient by thirty-two, and the squared average goes up by thirty-two squared, and its square root goes up by thirty-two. So the thirty-two on top and the thirty-two on the bottom cancel. Only epsilon, that tiny number added to avoid dividing by zero, even notices.
+A: [pleased] Probably much less bad than you'd guess, and that's the interesting part. With plain gradient descent, you'd be right. Thirty-two times the gradient, thirty-two times the step. But remember what Adam does. It divides each gradient by the square root of its own running average of squared gradients. Multiply every gradient by thirty-two, and the squared average goes up by thirty-two squared, and its square root goes up by thirty-two. So the thirty-two on top and the thirty-two on the bottom cancel. Only epsilon, that tiny number added to avoid dividing by zero, even notices.
 
 B: [surprised] So Adam just... shrugs it off.
 
@@ -414,4 +414,4 @@ A: And this run is the baseline for everything after it. Changing only the data,
 
 B: [working it out] Okay, let me try the whole thing. My old experiments didn't fail because the ideas were bad, or not necessarily. They failed because training breaks silently, and I had nothing to compare against. So the fix is: get one run working that matches a published curve, check it with cheap tests before the long run, like the loss at step zero being about ten point eight, and then change one thing at a time and plot it on top.
 
-A: That's it, and I'd sharpen one piece. It's not that you get one run working and then you're done with it. The baseline is a measuring instrument. You trust it because you checked it, the init loss, the overfit test, the random tokens, the published curve, and that's the only thing that lets you say "my idea moved the loss by zero point zero two" and believe it. Without the baseline, every result is just a number. With it, every result is a difference.
+A: [warmly] That's it, and I'd sharpen one piece. It's not that you get one run working and then you're done with it. The baseline is a measuring instrument. You trust it because you checked it, the init loss, the overfit test, the random tokens, the published curve, and that's the only thing that lets you say "my idea moved the loss by zero point zero two" and believe it. Without the baseline, every result is just a number. With it, every result is a difference.
