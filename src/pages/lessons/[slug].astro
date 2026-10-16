@@ -1,6 +1,8 @@
 ---
 import Base from '../../layouts/Base.astro';
+import LessonAudio from '../../components/LessonAudio.astro';
 import { allLessons, findLesson } from '../../data/curriculum';
+import episodes from '../../../podcast/episodes.json';
 
 const modules = import.meta.glob<any>('../../lessons/*.mdx', { eager: true });
 const bySlug: Record<string, any> = {};
@@ -21,6 +23,7 @@ const i = allLessons.findIndex((l) => l.slug === slug);
 const prev = allLessons[i - 1];
 const next = allLessons[i + 1];
 const idx = lesson.track.lessons.findIndex((l) => l.slug === slug) + 1;
+const episode = episodes.find((e) => e.slug === slug);
 
 const prompt = `Write the Workbench lesson "${lesson.slug}" (${lesson.title}) following CLAUDE.md in this repo. Track: ${lesson.track.title}. Question: ${lesson.question} Build: ${lesson.build}`;
 ---
@@ -42,12 +45,7 @@ const prompt = `Write the Workbench lesson "${lesson.slug}" (${lesson.title}) fo
       </div>
       <h1>{lesson.title}</h1>
       <p class="question">{lesson.question}</p>
-      {lesson.audio && (
-        <div class="listen">
-          <span class="label">Listen</span>
-          <audio controls preload="none" src={lesson.audio}></audio>
-        </div>
-      )}
+      {lesson.audio && <LessonAudio src={lesson.audio} seconds={episode?.seconds} />}
     </header>
     <div class="lesson-head-rule ticks"></div>
     <article class="prose">
@@ -93,8 +91,3 @@ const prompt = `Write the Workbench lesson "${lesson.slug}" (${lesson.title}) fo
     if (secs.length) { addEventListener('scroll', onScroll, { passive: true }); onScroll(); }
   </script>
 </Base>
-
-<style>
-  .listen { display: flex; align-items: center; gap: 14px; margin-top: 22px; max-width: 32em; }
-  .listen audio { flex: 1; min-width: 0; height: 36px; accent-color: var(--blue); }
-</style>

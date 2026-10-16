@@ -1,0 +1,139 @@
+---
+// The lesson's podcast episode, in the site's style: play, a scrubbable progress rule, time, speed.
+// Remembers where you stopped per episode (localStorage), since episodes run about an hour.
+interface Props { src: string; seconds?: number }
+const { src, seconds } = Astro.props;
+const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+---
+<div class="listen" data-listen data-src={src}>
+  <button class="play" type="button" aria-label="Play episode" aria-pressed="false">
+    <svg class="i-play" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 1.5v9l7.5-4.5z" /></svg>
+    <svg class="i-pause" viewBox="0 0 12 12" aria-hidden="true"><path d="M2.5 1.5h2.5v9H2.5zM7 1.5h2.5v9H7z" /></svg>
+  </button>
+  <div class="body">
+    <div class="top">
+      <span class="label">Listen{seconds ? ` · ${Math.round(seconds / 60)} min` : ''}</span>
+      <span class="time"><span class="now">0:00</span> / <span class="dur">{seconds ? fmt(seconds) : '--:--'}</span></span>
+      <button class="speed" type="button" aria-label="Playback speed">1×</button>
+    </div>
+    <div class="bar" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div class="fill"></div>
+    </div>
+  </div>
+  <audio preload="none" src={src}></audio>
+</div>
+
+<style>
+  .listen { display: flex; gap: 14px; align-items: center; margin-top: 22px; max-width: 32em; }
+  .play {
+    flex: none; width: 40px; height: 40px; display: grid; place-items: center; cursor: pointer;
+    background: var(--blue); border: 1px solid var(--blue); color: var(--paper); padding: 0;
+  }
+  .play:hover { background: var(--blue-2); border-color: var(--blue-2); }
+  .play svg { width: 13px; height: 13px; fill: currentColor; }
+  .play .i-pause, .play[aria-pressed='true'] .i-play { display: none; }
+  .play[aria-pressed='true'] .i-pause { display: block; }
+  .body { flex: 1; min-width: 0; }
+  .top {
+    display: flex; align-items: baseline; gap: 12px; margin-bottom: 8px;
+    font-family: var(--mono); font-size: 11.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  }
+  .time { margin-left: auto; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+  .speed {
+    font: inherit; color: var(--blue); background: none; border: 1px solid var(--rule);
+    padding: 1px 6px; cursor: pointer; min-width: 3.4em;
+  }
+  .speed:hover { border-color: var(--blue); }
+  .bar { position: relative; height: 14px; cursor: pointer; touch-action: none; }
+  .bar::before { content: ''; position: absolute; left: 0; right: 0; top: 6px; height: 2px; background: var(--rule); }
+  .fill { position: absolute; left: 0; top: 6px; height: 2px; width: 0; background: var(--blue); }
+  .fill::after {
+    content: ''; position: absolute; right: -4px; top: -3px; width: 8px; height: 8px; background: var(--blue);
+  }
+  .bar:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
+</style>
+
+<script>
+  const SPEEDS = [1, 1.25, 1.5, 2];
+  const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+  const store = {
+    get: (k: string) => { try { return localStorage.getItem(k); } catch { return null; } },
+    set: (k: string, v: string) => { try { localStorage.setItem(k, v); } catch {} },
+  };
+
+  document.querySelectorAll<HTMLElement>('[data-listen]').forEach((root) => {
+    const audio = root.querySelector('audio')!;
+    const play = root.querySelector<HTMLButtonElement>('.play')!;
+    const speed = root.querySelector<HTMLButtonElement>('.speed')!;
+    const bar = root.querySelector<HTMLElement>('.bar')!;
+    const fill = root.querySelector<HTMLElement>('.fill')!;
+    const now = root.querySelector<HTMLElement>('.now')!;
+    const dur = root.querySelector<HTMLElement>('.dur')!;
+    const key = `wb:listen:${location.pathname.split('/').pop()}`;
+    const rateKey = 'wb:listen:rate';
+
+    // Resume where you left off (applied once metadata is available).
+    const saved = Number(store.get(key)) || 0;
+    let rate = Number(store.get(rateKey)) || 1;
+    speed.textContent = `${rate}×`;
+    if (saved) now.textContent = fmt(saved);
+
+    const render = () => {
+      const d = audio.duration || 0;
+      const t = audio.currentTime || 0;
+      fill.style.width = d ? `${(t / d) * 100}%` : '0';
+      now.textContent = fmt(t);
+      if (d) dur.textContent = fmt(d);
+      bar.setAttribute('aria-valuenow', d ? String(Math.round((t / d) * 100)) : '0');
+    };
+
+    audio.addEventListener('loadedmetadata', () => {
+      if (saved && saved < audio.duration - 5) audio.currentTime = saved;
+      audio.playbackRate = rate;
+      render();
+    });
+    audio.addEventListener('timeupdate', () => {
+      render();
+      if (Math.floor(audio.currentTime) % 5 === 0) store.set(key, String(Math.floor(audio.currentTime)));
+    });
+    audio.addEventListener('play', () => play.setAttribute('aria-pressed', 'true'));
+    audio.addEventListener('pause', () => play.setAttribute('aria-pressed', 'false'));
+    audio.addEventListener('ended', () => store.set(key, '0'));
+
+    play.addEventListener('click', () => {
+      if (audio.paused) {
+        audio.playbackRate = rate;
+        audio.play();
+      } else audio.pause();
+    });
+    speed.addEventListener('click', () => {
+      rate = SPEEDS[(SPEEDS.indexOf(rate) + 1) % SPEEDS.length];
+      audio.playbackRate = rate;
+      speed.textContent = `${rate}×`;
+      store.set(rateKey, String(rate));
+    });
+
+    const seekTo = (clientX: number) => {
+      const r = bar.getBoundingClientRect();
+      const f = Math.min(1, Math.max(0, (clientX - r.left) / r.width));
+      const go = () => { audio.currentTime = f * audio.duration; render(); };
+      if (audio.readyState >= 1) go();
+      else { audio.addEventListener('loadedmetadata', go, { once: true }); audio.load(); }
+    };
+    bar.addEventListener('pointerdown', (e) => {
+      seekTo(e.clientX);
+      const move = (ev: PointerEvent) => seekTo(ev.clientX);
+      const up = () => { removeEventListener('pointermove', move); removeEventListener('pointerup', up); };
+      addEventListener('pointermove', move);
+      addEventListener('pointerup', up);
+    });
+    bar.addEventListener('keydown', (e) => {
+      if (!audio.duration) return;
+      if (e.key === 'ArrowRight') audio.currentTime = Math.min(audio.duration, audio.currentTime + 15);
+      else if (e.key === 'ArrowLeft') audio.currentTime = Math.max(0, audio.currentTime - 15);
+      else return;
+      e.preventDefault();
+      render();
+    });
+  });
+</script>
