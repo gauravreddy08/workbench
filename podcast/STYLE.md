@@ -36,6 +36,13 @@ Nothing either host says may sound unlike something a person would actually say 
   "let's unpack", "at the end of the day". No recap of what "we just covered".
 - **Real rhythm.** Turn lengths vary a lot: a 300-word stretch, then a six-word reaction. B
   sometimes cuts in mid-thought (end A's line with an em dash). Mild, real disagreement is fine.
+- **Spoken, not written.** Polished prose read aloud sounds robotic, whatever the voice. Write how
+  people actually talk when they're explaining something: contractions everywhere, short sentences,
+  sentences that restart ("It's, well, it's not really a queue"), self-corrections, thinking out
+  loud ("so that's, what, two seconds?"), trailing off with "...", "I mean", "like", "you know?" where
+  a person would really say them. This is texture, not filler: a few per exchange, never on every
+  line, and never the performative kind banned above. Tested: the same content went from
+  "robotic" to natural with this rewrite alone.
 - **Opening:** straight into the problem. One sentence naming the topic is fine. No preamble.
 - **Ending:** when the idea is complete. B puts the core idea in their own words, A corrects the
   part B got slightly wrong or sharpens it, and it ends. **No quiz**, no questions read out, no
@@ -99,8 +106,10 @@ A: Just sitting there. And here's the strange part —
 - Every turn starts on a new paragraph with `A:` or `B:`. A turn may run over several lines; a blank
   line or the next `A:`/`B:` ends it.
 - `<!-- section: Name -->` marks which lesson section the following turns cover. Not spoken.
-- Fish Audio emotion tags in square brackets (`[laughs]`, `[thoughtful]`) are allowed but rare: at
-  most a handful per episode, only where the delivery would otherwise come out wrong.
+- Delivery tags in square brackets at the start of a turn or mid-line steer the voice (ElevenLabs
+  v4 audio tags): `[relaxed, thinking out loud]`, `[amused]`, `[skeptical]`, `[working it out]`,
+  `[jumping in]`, `[laughs]`, `[sighs]`. Use them on maybe one turn in four, where the delivery
+  would otherwise come out flat or wrong. Never as decoration.
 - Write numbers and symbols the way they should be said ("about two hundred milliseconds", not
   "~200ms"). The voice model reads exactly what is written.
 - Plain text only: no markdown emphasis, no bullet points, no backticks, no URLs.
