@@ -4,7 +4,7 @@ A: [relaxed, thinking out loud] So, remember where your K sweep ended up. The sp
 
 B: And a better draft means... a better model. A smarter one B.
 
-A: That's what everyone assumes. So try this first. Print the rejections. Pick twenty rounds where the very first guess got thrown out, and just look at what the one B proposed next to what the eight B wanted. You'll see stuff like this. The eight B starts its answers with "Here's a", and the one B guesses "Sure". The eight B likes to put a little markdown header before a list, and the one B just goes straight to "one, dot". And in code, the eight B writes area as math dot pi times r squared, and the one B writes three point one four times r times r.
+A: [mildly amused] That's what everyone assumes. So try this first. Print the rejections. Pick twenty rounds where the very first guess got thrown out, and just look at what the one B proposed next to what the eight B wanted. You'll see stuff like this. The eight B starts its answers with "Here's a", and the one B guesses "Sure". The eight B likes to put a little markdown header before a list, and the one B just goes straight to "one, dot". And in code, the eight B writes area as math dot pi times r squared, and the one B writes three point one four times r times r.
 
 B: [amused] Okay, the three point one four one is a bit worse.
 
@@ -20,7 +20,7 @@ A: But before the name, a question. Two candidate drafts for your eight B. Draft
 
 B: [a bit unsure] I mean, my gut says A. If it's smarter, it'll guess the right word more often. And the right word is what the big model wants... right?
 
-A: That's the natural answer, and it's almost certainly backwards. It's draft B. Acceptance doesn't reward being right. It rewards agreeing with the target. A draft that answers better than the target is going to propose tokens the target wouldn't, and every single one of those gets rejected.
+A: [gently] That's the natural answer, and it's almost certainly backwards. It's draft B. Acceptance doesn't reward being right. It rewards agreeing with the target. A draft that answers better than the target is going to propose tokens the target wouldn't, and every single one of those gets rejected.
 
 B: Okay, but if it's better, isn't that a good thing? Like, you'd want the better word in your output.
 
@@ -88,7 +88,7 @@ A: So how do you actually move q toward p? The obvious way first. Have the eight
 
 B: That seems fine, though. What's wrong with it?
 
-A: Nothing's wrong. It's just wasteful, and here's why. Look at what one training example actually tells the student. The ordinary loss is cross-entropy. Minus the log of the probability the model gave to the token that actually came next. It's low when the model put a lot of probability on that token. And the label it's scored against is what's called one-hot: a list that's one for the token that came next and zero for every other token. It only says what came next. Nothing about the alternatives. So in that area example, the eight B happened to sample "math". The label says: math, one. Everything else, zero. But the eight B knew way more than that. It had the whole list. Math forty-six percent, r fourteen, three ten, and so on. And sampling one token from that list threw nearly all of it away.
+A: [thinking out loud] Nothing's wrong. It's just wasteful, and here's why. Look at what one training example actually tells the student. The ordinary loss is cross-entropy. Minus the log of the probability the model gave to the token that actually came next. It's low when the model put a lot of probability on that token. And the label it's scored against is what's called one-hot: a list that's one for the token that came next and zero for every other token. It only says what came next. Nothing about the alternatives. So in that area example, the eight B happened to sample "math". The label says: math, one. Everything else, zero. But the eight B knew way more than that. It had the whole list. Math forty-six percent, r fourteen, three ten, and so on. And sampling one token from that list threw nearly all of it away.
 
 B: So same as Hinton's dog. The label says "dog" and loses the wolf.
 
@@ -96,7 +96,7 @@ A: Same thing. And knowledge distillation is just: keep it. Instead of the one-h
 
 B: [a bit unsure] Okay, so this is a different training setup, then. New loss, new... whatever goes with it.
 
-A: That's the thing, it barely is. If you split the K L from the teacher to the student into two pieces, the first piece is cross-entropy. The same cross-entropy you already know. Except the label is the teacher's whole list instead of a one-hot. And the second piece is the teacher's own entropy, how spread out the teacher is, which the student can't change at all. It's a constant. So "distillation loss" is literally just the loss you already know, with a soft label. And the gradient on the student's raw scores comes out to the student's probabilities minus the teacher's. Ordinary training gives you the student's probabilities minus the one-hot. Same shape. One line of code changes.
+A: [jumping in] That's the thing, it barely is. If you split the K L from the teacher to the student into two pieces, the first piece is cross-entropy. The same cross-entropy you already know. Except the label is the teacher's whole list instead of a one-hot. And the second piece is the teacher's own entropy, how spread out the teacher is, which the student can't change at all. It's a constant. So "distillation loss" is literally just the loss you already know, with a soft label. And the gradient on the student's raw scores comes out to the student's probabilities minus the teacher's. Ordinary training gives you the student's probabilities minus the one-hot. Same shape. One line of code changes.
 
 B: Huh. Okay. So the only real change is how much each example says.
 
@@ -136,7 +136,7 @@ A: Reverse K L, from the student to the teacher. Now each token's weighted by th
 
 B: [skeptical] Okay, so which one actually matches acceptance?
 
-A: Neither, exactly. Acceptance is one minus T V, and T V is symmetric. It charges the same for a bit of probability in the wrong place, whichever direction it's wrong in. Both K Ls do put a bound on it, though. There's a classic result called Pinsker's inequality. In words: T V is never bigger than the square root of half the K L, either direction. So drive either K L to zero and T V goes to zero, and alpha goes to one. You can even check it on that area example. After distilling halfway the K L was point oh eight. Half of that's point oh four, square root's point two. So T V is at most point two, alpha at least point eight. And it was point eight two.
+A: [working it out] Neither, exactly. Acceptance is one minus T V, and T V is symmetric. It charges the same for a bit of probability in the wrong place, whichever direction it's wrong in. Both K Ls do put a bound on it, though. There's a classic result called Pinsker's inequality. In words: T V is never bigger than the square root of half the K L, either direction. So drive either K L to zero and T V goes to zero, and alpha goes to one. You can even check it on that area example. After distilling halfway the K L was point oh eight. Half of that's point oh four, square root's point two. So T V is at most point two, alpha at least point eight. And it was point eight two.
 
 B: So they both get you there. Where's the catch?
 
@@ -188,7 +188,7 @@ A: About five hundred gigabytes. Which is about four times the Spark's whole mem
 
 B: Sixty-four entries. A token id and a value. Value's two bytes. And the id, the vocab's a hundred twenty-eight thousand, so... two bytes is enough for an id?
 
-A: That's the one everybody tries. Two bytes only counts up to sixty-five thousand five hundred thirty-five. The vocabulary's almost twice that. So the id needs four bytes. Plus two for the value, that's six bytes an entry. Sixty-four of them is three hundred eighty-four bytes. Plus four more bytes for one extra number I'll explain in a second. Three hundred eighty-eight bytes per position. And times two million, that's about point seven eight gigabytes. Under one gig. About six hundred sixty times smaller, and it sits in RAM.
+A: [amused] That's the one everybody tries. Two bytes only counts up to sixty-five thousand five hundred thirty-five. The vocabulary's almost twice that. So the id needs four bytes. Plus two for the value, that's six bytes an entry. Sixty-four of them is three hundred eighty-four bytes. Plus four more bytes for one extra number I'll explain in a second. Three hundred eighty-eight bytes per position. And times two million, that's about point seven eight gigabytes. Under one gig. About six hundred sixty times smaller, and it sits in RAM.
 
 B: [amused] Five hundred gigabytes down to less than one. Okay. And the extra number?
 
@@ -228,7 +228,7 @@ A: So, before any training at all, you just chop the eight B at layer four and r
 
 B: [a bit unsure] I mean... it's the real model's own layers. And its own output layer. So, decent? Maybe not as good as the one B, but it's the eight B, sort of.
 
-A: Much worse. Likely terrible. The output layer was trained to read the hidden state after layer thirty-two. That's the only shape of vector it's ever seen. After layer four, the hidden state is in a very different form. The early layers are still mostly working out what the tokens are, not what comes next. Researchers who poke at this, it's called the logit lens, where you apply the output layer to the middle layers and see what they'd predict, they find early-layer predictions are mostly nonsense. Or they just echo back the input token.
+A: [laughs] Much worse. Likely terrible. The output layer was trained to read the hidden state after layer thirty-two. That's the only shape of vector it's ever seen. After layer four, the hidden state is in a very different form. The early layers are still mostly working out what the tokens are, not what comes next. Researchers who poke at this, it's called the logit lens, where you apply the output layer to the middle layers and see what they'd predict, they find early-layer predictions are mostly nonsense. Or they just echo back the input token.
 
 B: [amused] So it's like reading someone's notes halfway through and expecting the conclusion.
 
@@ -264,7 +264,7 @@ A: So, say your distilled draft gets offline top-one agreement of point eight on
 
 B: Position one, same thing basically, so point eight. And four... lower. It's building on its own guesses. Errors compound.
 
-A: Position one, yes. It's the same question. The text before it is real eight B text, and the draft guesses one token. Small differences come from the prompt mix and B F sixteen noise. But position four could go either way, and the reason's kind of lovely. Guess four is only judged when guesses one through three were all kept. And when does that happen? Mostly in easy stretches. Boilerplate. The end of a word. Code syntax. So just being judged at position four means you're probably somewhere easy. That pushes acceptance up. But you're right that by then the draft is reading its own guesses, and that pushes it slightly down. On chat text the easy-stretch effect often wins. So don't be surprised if acceptance by position is flat, or even rises.
+A: [thinking out loud] Position one, yes. It's the same question. The text before it is real eight B text, and the draft guesses one token. Small differences come from the prompt mix and B F sixteen noise. But position four could go either way, and the reason's kind of lovely. Guess four is only judged when guesses one through three were all kept. And when does that happen? Mostly in easy stretches. Boilerplate. The end of a word. Code syntax. So just being judged at position four means you're probably somewhere easy. That pushes acceptance up. But you're right that by then the draft is reading its own guesses, and that pushes it slightly down. On chat text the easy-stretch effect often wins. So don't be surprised if acceptance by position is flat, or even rises.
 
 B: [slowly] Oh. So the later positions are graded on an easier test.
 
@@ -284,7 +284,7 @@ A: For measuring alpha. Only that. They must never be trained on. And neither mu
 
 B: Why does that matter? It's the same text.
 
-A: Because if you decode to text and then re-tokenize it later, it can split differently. And then your stored scores line up with the wrong tokens, and nothing errors. It's just quietly wrong. And you might ask why temperature one for training when you serve greedily. Sampled text wanders into more of the places the eight B can go. And the K L target at every position is the whole list anyway, so the student learns what the eight B would do at every branch, not just the branch it took. If your scoreboard is greedy-only, an extra run on greedy text is a fair experiment. Oh, and note how long generation takes. That's your eight B's batched throughput, and it's a number worth having.
+A: [serious] Because if you decode to text and then re-tokenize it later, it can split differently. And then your stored scores line up with the wrong tokens, and nothing errors. It's just quietly wrong. And you might ask why temperature one for training when you serve greedily. Sampled text wanders into more of the places the eight B can go. And the K L target at every position is the whole list anyway, so the student learns what the eight B would do at every branch, not just the branch it took. If your scoreboard is greedy-only, an extra run on greedy text is a fair experiment. Oh, and note how long generation takes. That's your eight B's batched throughput, and it's a number worth having.
 
 <!-- section: Build It: Scoring and offline alpha -->
 
@@ -294,9 +294,9 @@ B: [working it out] So if the prompt is ten tokens, the answer starts at positio
 
 A: Row nine. So the rows you want start one before the answer and stop one before the end. One row per answer token. Write the results into three memory-mapped files on disk, one for ids, one for scores, one for the log-sum-exp, plus a list of where each answer starts. That way training can read any answer without loading everything. Do the top sixty-four and the log-sum-exp in thirty-two-bit floats. And each answer is roughly a four-hundred-token prefill, which is nowhere near memory-bound, so one at a time is fine, or batch them if you want it faster. While you're there, record the top-sixty-four mass at every position. Report the average and the tenth percentile. That's your ceiling. And before the full run, a self-check. Take one greedy answer. On most rows, the eight B's top stored token should be the token that actually comes next. Because greedy means it picked its top token. If it only matches on a few rows, you're off by one.
 
-B: Nice. That's a cheap test.
+B: And it has to be a greedy one, because a sampled answer didn't always take the top token anyway.
 
-A: Very cheap, and you'll want it later. Fourth step, measure where you start. Before training anything. On the held-out sets, teacher-forced, both models over the same ids. At every position, the overlap of the two full lists, whether the top tokens match, and the K L. Average them, and also save the overlap at every position. Use the temperature-one held-out text for alpha and the greedy one for top-one agreement. And use the full lists here, not your stored top sixty-four. Five hundred answers is small enough to score live. That way the measurement doesn't share the approximation your training uses. And make a histogram of those per-position overlaps. You'll see a big spike near one. The easy tokens. And then a long spread below it. That's the taste.
+A: Right, on sampled text that check would fail even with perfect alignment. Fourth step, measure where you start. Before training anything. On the held-out sets, teacher-forced, both models over the same ids. At every position, the overlap of the two full lists, whether the top tokens match, and the K L. Average them, and also save the overlap at every position. Use the temperature-one held-out text for alpha and the greedy one for top-one agreement. And use the full lists here, not your stored top sixty-four. Five hundred answers is small enough to score live. That way the measurement doesn't share the approximation your training uses. And make a histogram of those per-position overlaps. You'll see a big spike near one. The easy tokens. And then a long spread below it. That's the taste.
 
 <!-- section: Build It: Training two ways -->
 
@@ -328,7 +328,7 @@ A: Ninth step. Three heads, guessing two, three and four tokens ahead from the e
 
 B: And then each head gets its own output layer, like the paper.
 
-A: That's the decision to make. The paper gives each head its own trainable copy. But on the Spark, that's an extra one point oh five gigabytes of reads per head, per step. Three heads is about three gigabytes on top of a sixteen-gigabyte verify pass. About twenty percent slower, every single pass.
+A: [thinking out loud] That's the decision to make. The paper gives each head its own trainable copy. But on the Spark, that's an extra one point oh five gigabytes of reads per head, per step. Three heads is about three gigabytes on top of a sixteen-gigabyte verify pass. About twenty percent slower, every single pass.
 
 B: [skeptical] Which basically cancels the point of having no draft cost.
 
@@ -348,7 +348,7 @@ A: Offline top-one agreement should match position-one acceptance in the greedy 
 
 B: [working it out] So the same training run is worth more if the draft step is cheaper. The two levers multiply.
 
-A: They multiply. A distilled draft helps more the cheaper your draft step is. So training a better draft and lowering the draft cost aren't competing for your weekend, they stack. Medusa: head one alone might rival the distilled one B's position-one acceptance, or fall short. Heads two and three will be clearly worse, because they're guessing blind. But the draft cost is near zero, so even modest acceptance can win. And without tree verification you're leaving some of Medusa's gain on the table, which is fine for a first build. On the scoreboard, tokens per second at concurrency one should rise by roughly the ratio of the new speedup to the old one. Throughput at sixteen is still bounded by the lock. Same story as last time. Faster per request, not wider.
+A: [emphatic] They multiply. A distilled draft helps more the cheaper your draft step is. So training a better draft and lowering the draft cost aren't competing for your weekend, they stack. Medusa: head one alone might rival the distilled one B's position-one acceptance, or fall short. Heads two and three will be clearly worse, because they're guessing blind. But the draft cost is near zero, so even modest acceptance can win. And without tree verification you're leaving some of Medusa's gain on the table, which is fine for a first build. On the scoreboard, tokens per second at concurrency one should rise by roughly the ratio of the new speedup to the old one. Throughput at sixteen is still bounded by the lock. Same story as last time. Faster per request, not wider.
 
 <!-- section: Break It -->
 
@@ -378,7 +378,7 @@ A: [laughs] Suspiciously. Then run the sweep on a fresh set of twenty chat promp
 
 B: Okay, so how does this scale? Say instead of two million tokens I want to distill on a billion.
 
-A: Storage first. Full score lists would be a billion times a quarter of a megabyte. Two hundred fifty terabytes. That's just impossible. Top sixty-four at three hundred eighty-eight bytes a token is about three hundred ninety gigabytes. Possible on disk. Too big for the Spark's memory, so you'd stream it. Then compute. Scoring with the teacher is about sixteen billion operations a token, so for a billion tokens that's sixteen billion billion. Many hours to days on one box. And generating that text with the eight B in the first place is slower still, because decoding is the expensive part. Training the student is about seven billion a token.
+A: [relaxed] Storage first. Full score lists would be a billion times a quarter of a megabyte. Two hundred fifty terabytes. That's just impossible. Top sixty-four at three hundred eighty-eight bytes a token is about three hundred ninety gigabytes. Possible on disk. Too big for the Spark's memory, so you'd stream it. Then compute. Scoring with the teacher is about sixteen billion operations a token, so for a billion tokens that's sixteen billion billion. Many hours to days on one box. And generating that text with the eight B in the first place is slower still, because decoding is the expensive part. Training the student is about seven billion a token.
 
 B: So at that size the expensive part isn't the training at all. It's getting the eight B to write.
 
