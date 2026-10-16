@@ -11,6 +11,7 @@ export type Lesson = {
   why: string; // why you should care, ideally tied to real work
   build: string; // the thing you build or measure
   source?: string; // where this gap came from (job post, interview, inbox)
+  audio?: string; // podcast episode URL, set by podcast/publish.mjs
 };
 
 export type Track = {
