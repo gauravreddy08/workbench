@@ -56,7 +56,7 @@ export const tracks: Track[] = [
         question: 'What do sync and async actually mean, and why does my server stall under load?',
         why: 'Every LLM app spends most of its life waiting on a network. Async is how one process waits on thousands of things.',
         build: 'A server that calls a slow fake LLM. Hammer it, watch it stall, rebuild it async, hammer it again.',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-487cea93.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-b11ca406.mp3',
       },
       {
         slug: 'cpu-caches',
@@ -338,7 +338,7 @@ export const tracks: Track[] = [
         question: 'How can a small model make a big model faster without changing its output at all?',
         why: 'The trick you are fascinated by. Implementing it teaches sampling, verification and probability.',
         build: 'Implement speculative sampling from the paper, prove the output distribution matches, and tune draft length.',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-0b2b2efd.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-b9e0bfe4.mp3',
       },
       {
         slug: 'serving-engines',

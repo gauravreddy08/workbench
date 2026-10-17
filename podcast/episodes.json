@@ -3,18 +3,18 @@
     "slug": "waiting-vs-working",
     "title": "Waiting vs working.",
     "description": "What do sync and async actually mean, and why does my server stall under load? Every LLM app spends most of its life waiting on a network. Async is how one process waits on thousands of things.",
-    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-487cea93.mp3",
-    "bytes": 26152794,
-    "seconds": 3269,
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-b11ca406.mp3",
+    "bytes": 26220712,
+    "seconds": 3278,
     "pubDate": "2026-10-16T21:02:29.548Z"
   },
   {
     "slug": "speculative-decoding",
     "title": "Speculative decoding.",
     "description": "How can a small model make a big model faster without changing its output at all? The trick you are fascinated by. Implementing it teaches sampling, verification and probability.",
-    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-0b2b2efd.mp3",
-    "bytes": 31745923,
-    "seconds": 3968,
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-b9e0bfe4.mp3",
+    "bytes": 31811961,
+    "seconds": 3976,
     "pubDate": "2026-10-16T21:07:13.249Z"
   }
 ]
