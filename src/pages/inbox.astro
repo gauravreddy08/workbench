@@ -1,82 +1,133 @@
 ---
 import Base from '../layouts/Base.astro';
 import { tracks } from '../data/curriculum';
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
 <Base title="Gap inbox · Workbench">
   <main class="page">
     <span class="label">Workbench</span>
     <h1 style="margin-top:14px">Gap inbox.</h1>
-    <p style="color:var(--ink-2);margin:0">Every word you didn't know, every interview question you fumbled, every term in a job post. Drop it here the moment you hit it, from any device. Claude Code reads this inbox and turns items into lessons.</p>
+    <p style="color:var(--ink-2);margin:0">Every word you didn't know, every interview question you fumbled, every term in a job post. Drop it here the moment you hit it. Then sort it, and turn the ones that matter into lessons.</p>
+    <p class="label" id="mode" style="margin-top:16px">Saved in this browser only</p>
 
-    <section id="locked" hidden>
+    <form class="io" id="add" autocomplete="off">
+      <div class="io-row"><span class="label">In:</span><div><input type="text" name="term" placeholder="e.g. coordinated omission" required aria-label="Term or question" /></div></div>
+      <div class="io-row"><span class="label">From:</span><div><input type="text" name="src" placeholder="where you saw it: a job post, an interview, Slack..." aria-label="Where you saw it" /></div></div>
+      <div class="io-row"><span class="label">Track:</span><div>
+        <select name="track" aria-label="Track guess">
+          <option value="">Not sure</option>
+          {tracks.map((t) => <option value={t.title}>{t.n}. {t.title}</option>)}
+        </select>
+      </div></div>
+      <div class="io-row"><span class="label">Out:</span><div><button class="btn" type="submit">Add to inbox</button></div></div>
+    </form>
+
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:40px">
+      <span class="label" id="count">Loading…</span>
+      <span style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn" type="button" data-view="open" aria-pressed="true">Open</button>
+        <button class="btn" type="button" data-view="done" aria-pressed="false">Done</button>
+      </span>
+    </div>
+    <ul class="inbox-list" id="list"></ul>
+    <p id="empty" class="label" style="padding:24px 0;display:none">Nothing here.</p>
+
+    <div class="copybox" id="promptbox" hidden>
+      <span class="label">Turn open items into lessons</span>
+      <pre id="prompt"></pre>
+      <button class="btn" type="button" id="copy">Copy prompt</button>
+    </div>
+
+    <div class="ticks" style="margin:48px 0 20px"></div>
+    <span class="label">Sorting</span>
+    <dl class="stub-card" style="margin-top:12px">
+      <dt>Now</dt><dd>It blocks something you're building right now. It becomes the next lesson.</dd>
+      <dt>Map</dt><dd>It shows up in job posts, interviews or your work. It becomes a stub lesson in the right track.</dd>
+      <dt>Later</dt><dd>Neither. It stays here. If it keeps coming back, it gets promoted.</dd>
+      <dt>Into lessons</dt><dd>Lessons are MDX files in the <a href="https://github.com/gauravreddy08/workbench">source repo</a>. Fork it, then paste the prompt above into Claude Code (or any coding agent) inside your fork. <code>CLAUDE.md</code> tells it how a lesson is written. See <a href={`${base}/about`}>About</a>.</dd>
+    </dl>
+
+    <details class="owner" id="owner">
+      <summary class="label">Owner sync</summary>
+      <p>The site's owner can sync this inbox and lesson progress across devices with a key. Your own fork can do the same with its own database (see the README).</p>
       <form class="io" id="unlock" autocomplete="off">
-        <div class="io-row"><span class="label">Key:</span><div><input type="password" name="token" placeholder="owner key (WORKBENCH_TOKEN in .env.local)" required aria-label="Owner key" /></div></div>
+        <div class="io-row"><span class="label">Key:</span><div><input type="password" name="token" placeholder="owner key" required aria-label="Owner key" /></div></div>
         <div class="io-row"><span class="label">Out:</span><div><button class="btn" type="submit">Unlock this device</button></div></div>
       </form>
-      <p class="label" id="unlock-msg">Unlocking also syncs your lesson progress across devices.</p>
-    </section>
-
-    <section id="open" hidden>
-      <form class="io" id="add" autocomplete="off">
-        <div class="io-row"><span class="label">In:</span><div><input type="text" name="term" placeholder="e.g. coordinated omission" required aria-label="Term or question" /></div></div>
-        <div class="io-row"><span class="label">From:</span><div><input type="text" name="src" placeholder="where you saw it: Anthropic Code RL post, interview, Slack..." aria-label="Where you saw it" /></div></div>
-        <div class="io-row"><span class="label">Track:</span><div>
-          <select name="track" aria-label="Track guess">
-            <option value="">Not sure</option>
-            {tracks.map((t) => <option value={t.title}>{t.n}. {t.title}</option>)}
-          </select>
-        </div></div>
-        <div class="io-row"><span class="label">Out:</span><div><button class="btn" type="submit">Add to inbox</button></div></div>
-      </form>
-
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;margin-top:40px">
-        <span class="label" id="count">Loading…</span>
-        <span style="display:flex;gap:8px;flex-wrap:wrap">
-          <button class="btn" type="button" data-view="open" aria-pressed="true">Open</button>
-          <button class="btn" type="button" data-view="done" aria-pressed="false">Done</button>
-        </span>
-      </div>
-      <ul class="inbox-list" id="list"></ul>
-      <p id="empty" class="label" style="padding:24px 0;display:none">Nothing here.</p>
-
-      <div class="ticks" style="margin:48px 0 20px"></div>
-      <span class="label">Turning items into lessons</span>
-      <dl class="stub-card" style="margin-top:12px">
-        <dt>In Claude Code</dt><dd>Open this repo and say <code>triage my workbench inbox</code>. Claude reads the open items, writes lessons for <b>now</b>, adds stubs for <b>map</b>, and marks each one done with a note.</dd>
-        <dt>Now</dt><dd>It blocks something you're building right now. It becomes the next lesson.</dd>
-        <dt>Map</dt><dd>It shows up in job posts, interviews or your work. It becomes a stub lesson in the right track.</dd>
-        <dt>Later</dt><dd>Neither. It stays here. If it keeps coming back, it gets promoted.</dd>
-      </dl>
-      <p style="margin-top:20px"><button class="btn" type="button" id="lock">Lock this device</button></p>
-    </section>
+      <p class="label" id="unlock-msg"></p>
+      <p><button class="btn" type="button" id="lock" hidden>Lock this device</button></p>
+    </details>
   </main>
+
+  <style>
+    .owner { margin-top: 40px; border-top: 1px solid var(--rule); padding-top: 16px; }
+    .owner summary { cursor: pointer; color: var(--ink-3); }
+    .owner p { color: var(--ink-2); }
+  </style>
 
   <script>
     import { client, api, getToken, setToken, pullProgress } from '../lib/db';
 
-    type Item = { _id: string; _creationTime: number; term: string; source: string; track: string; tag: '' | 'now' | 'map' | 'later'; status: 'open' | 'done'; note?: string };
+    type Tag = '' | 'now' | 'map' | 'later';
+    type Item = { _id: string; _creationTime: number; term: string; source: string; track: string; tag: Tag; status: 'open' | 'done'; note?: string };
     const $ = (id: string) => document.getElementById(id)!;
     const esc = (s: string) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]!));
     let view: 'open' | 'done' = 'open';
     let items: Item[] = [];
+    let remote = !!getToken();
 
-    function show(unlocked: boolean) {
-      $('locked').hidden = unlocked;
-      $('open').hidden = !unlocked;
+    // Visitors: the inbox lives in this browser's localStorage. Owner (with key): Convex.
+    const KEY = 'wb:inbox';
+    const readLocal = (): Item[] => { try { return JSON.parse(localStorage.getItem(KEY) || '[]'); } catch { return []; } };
+    const writeLocal = (all: Item[]) => { try { localStorage.setItem(KEY, JSON.stringify(all)); } catch {} };
+    const editLocal = (id: string, f: (it: Item) => Item | null) =>
+      writeLocal(readLocal().flatMap((it) => (it._id === id ? [f(it)].filter(Boolean) as Item[] : [it])));
+
+    const store = {
+      async list(): Promise<Item[]> {
+        if (remote) return (await client.query(api.inbox.list, { token: getToken()!, status: view })) as Item[];
+        return readLocal().filter((i) => i.status === view).sort((a, b) => b._creationTime - a._creationTime);
+      },
+      async add(term: string, source: string, track: string) {
+        if (remote) return void (await client.mutation(api.inbox.add, { token: getToken()!, term, source, track }));
+        writeLocal([...readLocal(), { _id: crypto.randomUUID(), _creationTime: Date.now(), term, source, track, tag: '', status: 'open' }]);
+      },
+      async tag(id: string, tag: Tag) {
+        if (remote) return void (await client.mutation(api.inbox.setTag, { token: getToken()!, id: id as any, tag }));
+        editLocal(id, (it) => ({ ...it, tag }));
+      },
+      async done(id: string) {
+        editLocal(id, (it) => ({ ...it, status: 'done' }));
+      },
+      async remove(id: string) {
+        if (remote) return void (await client.mutation(api.inbox.remove, { token: getToken()!, id: id as any }));
+        editLocal(id, () => null);
+      },
+    };
+
+    function showMode() {
+      $('mode').textContent = remote ? 'Synced to the owner database' : 'Saved in this browser only';
+      $('lock').hidden = !remote;
+      $('unlock').hidden = remote;
     }
 
     async function load() {
-      const token = getToken();
-      if (!token) return show(false);
       try {
-        items = (await client.query(api.inbox.list, { token, status: view })) as Item[];
-        show(true);
-        render();
-      } catch (e) {
+        items = await store.list();
+      } catch {
         setToken(null);
-        show(false);
-        $('unlock-msg').textContent = 'That key was rejected. Check WORKBENCH_TOKEN in .env.local.';
+        remote = false;
+        $('unlock-msg').textContent = 'That key was rejected.';
+        ($('owner') as HTMLDetailsElement).open = true;
+        items = await store.list();
       }
+      showMode();
+      render();
+    }
+
+    function promptText(open: Item[]) {
+      const lines = open.map((i) => `- ${i.term}${i.tag ? ` [${i.tag}]` : ''}${i.source ? ` (from: ${i.source})` : ''}${i.track ? ` (track: ${i.track})` : ''}`);
+      return `Triage these Workbench gap-inbox items following CLAUDE.md in this repo. For each: if an existing lesson covers it, tell me which one and where. If tagged now, write it as a new lesson. If tagged map, add a stub to src/data/curriculum.ts in the right track. Otherwise leave it.\n\n${lines.join('\n')}`;
     }
 
     function render() {
@@ -91,9 +142,13 @@ import { tracks } from '../data/curriculum';
           </div>
           <div class="acts">
             ${view === 'open' ? (['now', 'map', 'later'] as const).map((t) => `<button type="button" data-tag="${t}" aria-pressed="${it.tag === t}">${t}</button>`).join('') : ''}
+            ${view === 'open' && !remote ? '<button type="button" data-done title="Mark done">done</button>' : ''}
             <button type="button" data-del title="Remove">×</button>
           </div>
         </li>`).join('');
+      const show = view === 'open' && items.length > 0;
+      $('promptbox').hidden = !show;
+      if (show) $('prompt').textContent = promptText(items);
     }
 
     $('unlock').addEventListener('submit', async (e) => {
@@ -101,11 +156,13 @@ import { tracks } from '../data/curriculum';
       const f = e.target as HTMLFormElement;
       setToken(String(new FormData(f).get('token') ?? '').trim());
       f.reset();
+      remote = true;
+      $('unlock-msg').textContent = '';
       await load();
-      pullProgress();
+      if (remote) pullProgress();
     });
 
-    $('lock').addEventListener('click', () => { setToken(null); show(false); });
+    $('lock').addEventListener('click', () => { setToken(null); remote = false; load(); });
 
     $('add').addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -113,7 +170,7 @@ import { tracks } from '../data/curriculum';
       const d = new FormData(f);
       const term = String(d.get('term') ?? '').trim();
       if (!term) return;
-      await client.mutation(api.inbox.add, { token: getToken()!, term, source: String(d.get('src') ?? ''), track: String(d.get('track') ?? '') });
+      await store.add(term, String(d.get('src') ?? ''), String(d.get('track') ?? ''));
       f.reset();
       (f.elements.namedItem('term') as HTMLInputElement).focus();
       if (view === 'open') load();
@@ -129,15 +186,18 @@ import { tracks } from '../data/curriculum';
       const b = (e.target as HTMLElement).closest('button');
       const li = b?.closest('li');
       if (!b || !li) return;
-      const id = li.dataset.id as any;
-      const token = getToken()!;
-      if (b.hasAttribute('data-del')) await client.mutation(api.inbox.remove, { token, id });
+      const id = li.dataset.id!;
+      if (b.hasAttribute('data-del')) await store.remove(id);
+      else if (b.hasAttribute('data-done')) await store.done(id);
       else {
         const it = items.find((i) => i._id === id)!;
-        const tag = it.tag === b.dataset.tag ? '' : (b.dataset.tag as Item['tag']);
-        await client.mutation(api.inbox.setTag, { token, id, tag });
+        await store.tag(id, it.tag === b.dataset.tag ? '' : (b.dataset.tag as Tag));
       }
       load();
+    });
+
+    $('copy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText($('prompt').textContent!); $('copy').textContent = 'Copied'; setTimeout(() => ($('copy').textContent = 'Copy prompt'), 1500); } catch {}
     });
 
     load();

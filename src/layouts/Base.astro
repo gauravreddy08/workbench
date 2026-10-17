@@ -8,6 +8,7 @@ const nav = [
   { href: base || '/', label: 'Contents' },
   { href: `${base}/method`, label: 'Method' },
   { href: `${base}/inbox`, label: 'Gap inbox' },
+  { href: `${base}/about`, label: 'About' },
 ];
 ---
 <!doctype html>
@@ -34,7 +35,7 @@ const nav = [
     <slot />
     <footer class="site">
       <span class="label">Workbench · predict, build, measure, explain</span>
-      <span class="label">Progress saves in this browser, and syncs once unlocked</span>
+      <span class="label">Progress saves in this browser</span>
     </footer>
     <script is:inline>
       document.getElementById('theme-btn').addEventListener('click', () => {

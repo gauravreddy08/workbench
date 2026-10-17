@@ -1,0 +1,61 @@
+---
+layout: ../layouts/Page.astro
+title: About.
+---
+
+Workbench is a free, build-it-yourself course in the parts of computer science and machine learning that most people skip. It covers how memory and threads really work, what happens on the wire, databases, scaling and estimation, and then the ML systems side: serving models fast, training them, evaluating them, and training agents with RL.
+
+Every lesson makes a problem happen on your own machine first, then explains it in plain words, then has you build the fix. You guess a number before you measure it. Every piece of jargon is defined in the margin, right where it shows up.
+
+## Where It Came From
+
+It started as one engineer's study plan. A year into a first job building ML systems, [Gaurav Tadkapally](https://gtadkapally.com) kept running into questions without good answers: "how does this scale?", "why is decoding memory-bound?", "what's the difference between a thread and a process?". A self-diagnostic found the gaps, and each gap became a lesson.
+
+So the lessons talk to one reader. They mention that reader's hardware (an NVIDIA DGX Spark and a home server reached over Tailscale) and work (a ranking model, an inference server benchmarked against a hosted API). If you're a different reader, that works fine: swap in your own machine and your own project. The lessons are drafted with Claude Code against a strict style guide, then checked by running the code and measuring the numbers.
+
+## How To Use It
+
+1. **Start with Chapter 0** on the [contents page](/). It goes from the latency numbers behind every estimate, through memory, threads and async, to a baseline model server you benchmark. Everything later builds on it.
+2. **Then go in any order.** There's no timeline. Lessons link to each other where one needs another.
+3. **Do the loop.** Write your prediction in the box before reading the answer. Type the code yourself. Fill in the results table. Answer the "Explain It Back" questions out loud. The [method page](/method/) explains why each step is there, and what the agent badges on each task mean.
+4. **Use the [gap inbox](/inbox/).** When you hit a word you don't know, drop it there. It turns your list into a prompt you can hand to a coding agent to write the lesson.
+
+Your progress (checked tasks, predictions, visited lessons, inbox items) saves in your own browser. Nothing is sent anywhere. Clearing site data clears it.
+
+## What You Need
+
+| Tracks | Hardware |
+|---|---|
+| Machine, Wire, Data, Scale | Any laptop. Python 3, a C compiler, a terminal. |
+| Evaluation, Agents and RL | A laptop for most of it. Some tasks call a hosted model API. |
+| Inference, Training | A GPU you can reach: a workstation, a cloud box, or Apple Silicon for the small builds. Numbers are worked out for the DGX Spark's spec sheet, so redo the arithmetic for yours. |
+
+When the numbers on the page don't match what you measure, trust your machine. That gap is usually the most interesting part of the lesson.
+
+## Build Your Own
+
+The whole site is open source: [github.com/gauravreddy08/workbench](https://github.com/gauravreddy08/workbench). Fork it and make it yours: your own gaps, your own lessons, your own hardware.
+
+```sh
+git clone https://github.com/<you>/workbench
+cd workbench
+npm install
+npm run dev        # http://localhost:4321/learn-cs
+```
+
+What's where:
+
+| Path | What it is |
+|---|---|
+| `src/data/curriculum.ts` | The map: tracks and lessons. A lesson without a file shows as a stub. |
+| `src/lessons/<slug>.mdx` | One lesson. |
+| `src/components/` | The lesson building blocks: margin notes, predictions, tasks, figures. |
+| `CLAUDE.md` | The style guide: who the reader is, how a lesson is structured, and the rules for figures and facts. |
+| `.claude/skills/workbench/` | A Claude Code skill for searching lessons, triaging the inbox and writing new ones. |
+| `convex/`, `scripts/wb.mjs` | Optional: a small database to sync the inbox and progress across devices. |
+
+To add a lesson, put an entry in `curriculum.ts`, then ask a coding agent in the repo to "write the lesson on X following CLAUDE.md". Edit the reader profile at the top of `CLAUDE.md` first, so the lessons aim at your gaps instead of the original reader's.
+
+It's a static site (Astro and MDX), so `npm run build` gives you a folder you can host anywhere: Vercel, Netlify, GitHub Pages. The `/learn-cs` base path is set in `astro.config.mjs`; change it or remove it.
+
+Found a wrong number or a broken figure? [Open an issue](https://github.com/gauravreddy08/workbench/issues).
