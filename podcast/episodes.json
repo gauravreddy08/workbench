@@ -16,5 +16,14 @@
     "bytes": 31811961,
     "seconds": 3976,
     "pubDate": "2026-10-16T21:07:13.249Z"
+  },
+  {
+    "slug": "bandwidth-bound",
+    "title": "Why ~17 tokens per second?",
+    "description": "Why is LLM decoding limited by memory speed, and how fast should my Spark be before I run anything? One division predicts your server's speed. Every optimization in this track is a way around it.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/bandwidth-bound-1f5649df.mp3",
+    "bytes": 6557613,
+    "seconds": 820,
+    "pubDate": "2026-10-19T22:33:38.601Z"
   }
 ]

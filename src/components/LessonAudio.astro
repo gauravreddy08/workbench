@@ -4,6 +4,7 @@
 interface Props { src: string; seconds?: number }
 const { src, seconds } = Astro.props;
 const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const YT_MUSIC = 'https://music.youtube.com/playlist?list=PLN_1hGjwpaFk';
 ---
 <div class="listen" data-listen data-src={src}>
   <button class="play" type="button" aria-label="Play episode" aria-pressed="false">
@@ -19,6 +20,7 @@ const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).p
     <div class="bar" role="slider" tabindex="0" aria-label="Seek" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
       <div class="fill"></div>
     </div>
+    <div class="also">Follow the show on <a href={YT_MUSIC} target="_blank" rel="noopener">YouTube Music</a></div>
   </div>
   <audio preload="none" src={src}></audio>
 </div>
@@ -51,6 +53,8 @@ const fmt = (s: number) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).p
     content: ''; position: absolute; right: -4px; top: -3px; width: 8px; height: 8px; background: var(--blue);
   }
   .bar:focus-visible { outline: 1px solid var(--blue); outline-offset: 2px; }
+  .also { margin-top: 6px; font-family: var(--mono); font-size: 11px; letter-spacing: 0.04em; color: var(--ink-2); }
+  .also a { color: var(--blue); }
 </style>
 
 <script>

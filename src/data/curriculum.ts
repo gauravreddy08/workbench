@@ -296,6 +296,7 @@ export const tracks: Track[] = [
         question: 'Why is LLM decoding limited by memory speed, and how fast should my Spark be before I run anything?',
         why: 'One division predicts your server\'s speed. Every optimization in this track is a way around it.',
         build: 'Predict tokens/sec from bandwidth and model size, measure it, and explain the gap.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/bandwidth-bound-1f5649df.mp3',
       },
       {
         slug: 'baseline-vs-fireworks',
