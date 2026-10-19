@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import ObsTraceWaterfall from '../components/figures/ObsTraceWaterfall.astro';
 import ObsHistogram from '../components/figures/ObsHistogram.astro';
 
+This is the craft of making a running program keep a diary, so that when something goes wrong you can work out what happened afterwards, without having been there and without reading the code.
+
+You need it because the code is the same for every request and the behavior isn't. Your server on the Spark will one day be slow for some requests and fine for others, and the source file will look exactly like it did yesterday. The only evidence is what the program wrote down while it was happening. It's the difference between a teammate saying "the agent feels slow sometimes" and you answering with which step, which requests, and since when. It's also how you'd back up any claim about your server against Fireworks.
+
+It builds on [p99 and load testing](/lessons/tail-latency/), where the slowest few requests turned out to matter more than the average, and on the streaming server from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). After this, every change you make to that server, starting with [Batching and continuous batching](/lessons/batching/), is something you can watch working or failing.
+
 ## Today
 
-- Say what logs, metrics and traces each answer, what each one costs, and why you need all three (plus a profiler) to debug a live system.
-- Instrument an inference server yourself: JSON logs with request ids, Prometheus counters, gauges and histograms, and OpenTelemetry traces that follow one request across two processes.
-- Read a dashboard built on the RED method, and know why `user_id` must never be a metric label.
-- Find a slowdown someone else planted, on 5% of requests, using only telemetry. No reading the code.
-- Write an SLO for TTFT, compute its error budget and burn rate, and explain why you page on that instead of on CPU.
+- Say what each of the three kinds of record answers (a line per event, running counts and timings, and the timed path of one request), what each one costs, and why you need all three, plus a tool that shows which line of code is busy, to debug a live system.
+- Make your inference server write all three yourself: one searchable line per request stamped with a request ID, running counts and timing tallies in the format Prometheus (the standard collector) reads, and a record that follows one request across two separate programs, using OpenTelemetry (the standard way to produce them).
+- Read a dashboard built on a three-number recipe (how many requests, how many failed, how long they took), and know why you must never break a metric down per user.
+- Find a slowdown someone else planted, on 5% of requests, using only what the server wrote down. No reading the code.
+- Write a reliability target for time to first token (like "99% of requests start answering within 250 ms"), work out how much failure it allows and how fast you're using that allowance up, and explain why that, not a busy CPU, is what should wake someone at 3am.
 
-Prerequisites: [p99 and load testing](/lessons/tail-latency/) (histograms, percentiles, open-loop load) and the streaming server from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (TTFT, ITL). The build runs on a stand-in server on your Mac first, so the Spark is optional until the last task. Rough time: two evenings.
+You'll want [p99 and load testing](/lessons/tail-latency/) first (histograms, percentiles, and load that keeps arriving whether or not the server keeps up), plus the streaming server from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), where you met time to first token and the gap between tokens. Everything runs on a stand-in server on your Mac first, so the Spark only matters for the last task. Budget two evenings.
 
 ## The Problem
 

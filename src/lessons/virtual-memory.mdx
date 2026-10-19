@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import VirtMemMapper from '../components/figures/VirtMemMapper.astro';
 
+Every address your program uses is a pretend one. The operating system gives each program its own made-up numbering of memory, and the processor quietly translates each pretend address into a real spot on the RAM chips, one chunk at a time. And memory is only really handed over when the program first touches it, not when it asks.
+
+That fine print decides whether a big model loads on the Spark or dies without an error message. It's why a program can ask for more memory than the machine has and be told yes. It's why the workers that feed batches to a training run slowly swell while only *reading* their data. And on the Spark, where the processor and the GPU draw from one shared 128 GB pool (a spec-sheet number), it's why moving weights onto the GPU can starve the rest of the machine.
+
+This finishes the picture from [Where do my variables live?](/lessons/stack-and-heap/), whose long strip of a program's memory turns out to be the pretend numbering, and explains the wall between programs you met in [Processes, threads and the GIL](/lessons/processes-threads-gil/). Next, [What happens when you save a file?](/lessons/files-and-disks/) follows the same memory down to the disk, and [How much memory does a model need?](/lessons/memory-math/) turns "will it fit?" into arithmetic.
+
 ## Today
 
-- Explain what a virtual address is, how the CPU turns it into a real RAM location (pages, page tables, the TLB), and why every process gets to believe it owns the whole machine.
-- Make `malloc` hand you 100 GB on a 48 GB laptop, then watch real memory (RSS) climb only as you touch it, one page fault at a time.
-- Read a process's memory like a doctor: VSZ vs RSS, anonymous vs file-backed, minor vs major faults, swap, `free`'s "available" column.
-- Trigger the Linux OOM killer on purpose, safely, inside a memory-limited container, and read its confession in the kernel log.
-- Explain copy-on-write after `fork`, why simply *reading* a Python list in a DataLoader worker makes memory grow, and what unified memory on the Spark means for loading a 70B model.
+- Explain how the processor turns the address your program uses into a real spot in RAM (memory cut into fixed-size pages, a lookup table per program, and a tiny cache of recent lookups), and why every program gets to believe it owns the whole machine.
+- Ask for 100 GB on a 48 GB laptop and get it, then watch the memory your program actually holds climb only as you touch it, one page at a time.
+- Read a process's memory like a doctor: memory promised vs memory actually held, memory that is a copy of a file vs memory with no copy anywhere else, cheap vs expensive trips to the kernel for a missing page, the overflow space on disk, and the "available" number Linux reports.
+- Make Linux's last-resort out-of-memory killer fire on purpose, safely, inside a box with a 512 MB limit, and read its confession in the kernel's log.
+- Explain why a cloned process shares its parent's memory until one of them writes, why simply *reading* a Python list in a data-loading worker makes memory grow, and what the Spark's shared CPU-and-GPU memory means for loading a 70B model.
 
-Prerequisites: [Where do my variables live?](/lessons/stack-and-heap/) (the address space strip) and [Processes, threads, and the GIL](/lessons/processes-threads-gil/) (each process has its own address space; `fork` and DataLoader workers). Rough time: one evening on the Mac, one session on the Spark.
+Read [Where do my variables live?](/lessons/stack-and-heap/) first (the strip picture of a program's memory) and [Processes, threads and the GIL](/lessons/processes-threads-gil/) (each process has its own private memory, and data-loading workers are cloned processes). Budget one evening on the Mac and one session on the Spark.
 
 ## The Problem
 

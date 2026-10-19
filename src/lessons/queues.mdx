@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import QueueSim from '../components/figures/QueueSim.astro';
 
+A queue is a to-do list that sits between two programs: one side writes down jobs, the other side picks them off and does them whenever it's free, and the list remembers what's still waiting even if either side crashes.
+
+You'll want one the first time a slow job is tied to someone waiting for it. Re-scoring a whole corpus with a new ranker checkpoint, summarizing every document a user imports, running a big batch of evals through the Spark overnight: done as one long loop, a single bad document or a restart halfway through leaves you not knowing what finished, and starting over. Done through a queue, a crash costs you one job's worth of redo. "Put a queue in between" is also one of the most common moves in any system design interview, and the follow-up questions are exactly the ones this page answers.
+
+It builds on [Waiting vs working](/lessons/waiting-vs-working/), where you met the rule linking how fast work arrives, how long each piece takes and how much is in progress at once, and on [Rate limits and backpressure](/lessons/rate-limits/), where you saw a big enough waiting room hide the fact that you're overloaded. [Transactions](/lessons/transactions/) helps for the part about making a repeated job harmless. Next, [Data a model can eat](/lessons/data-pipelines/) uses the same ideas at training-data scale, and [Batching](/lessons/batching/) is what a worker should do with a pile of jobs on a GPU.
+
 ## Today
 
-- Explain what a message queue is, and the four reasons systems put one between services: different speeds, traffic spikes, independent retries, and fan-out.
-- Say exactly what happens when a worker dies halfway through a job: acks, leases (visibility timeouts), redelivery, and where a job goes when it fails forever (the dead-letter queue).
-- Explain at-most-once, at-least-once and "exactly-once", why the last one is mostly a marketing word, and why idempotent consumers are the real answer.
-- Tell a job queue (Celery, RQ, SQS) apart from a log (Kafka): offsets, partitions, consumer groups, retention, replay, and why ordering only holds inside one partition.
-- Size a worker pool with Little's Law, watch consumer lag, and run your ranker over millions of documents through a queue that survives `kill -9`.
+- Explain what a queue between two programs is, and the four reasons systems use one: the two sides run at different speeds, traffic arrives in bursts, failed work can be retried without the user knowing, and one event can feed many readers.
+- Say exactly what happens when a worker dies halfway through a job: how the worker signals "done", how the job is loaned out with a deadline so a dead worker's job comes back, and where a job goes when it fails every single time.
+- Explain the three promises a queue can make (a job runs at most once, at least once, or exactly once), why the last one is mostly a marketing word, and why the real answer is a worker that can safely do the same job twice.
+- Tell a to-do-list queue (Celery, RQ, SQS) apart from a keep-everything event history (Kafka), where readers track their own position, the history is split into lanes, and order only holds inside one lane.
+- Work out how many workers you need, watch how far behind they're falling, and run a stand-in for your ranker over thousands of documents through a queue that survives workers being killed without warning.
 
-Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (Little's Law, the fake LLM), [Rate limits and backpressure](/lessons/rate-limits/) (why unbounded buffers hide overload, retries with backoff). [Transactions](/lessons/transactions/) helps for the idempotency part. Rough time: one evening to read, one or two to build.
+You'll want [Waiting vs working](/lessons/waiting-vs-working/) (the arrivals-times-time rule and the fake LLM) and [Rate limits and backpressure](/lessons/rate-limits/) (why a bottomless waiting room hides overload, and retrying with growing pauses); [Transactions](/lessons/transactions/) helps for the "safe to do twice" part. Plan on one evening to read and one or two to build.
 
 ## The Problem
 

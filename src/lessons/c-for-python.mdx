@@ -1,0 +1,816 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import CForPythonPointerStrip from '../components/figures/CForPythonPointerStrip.astro';
+import CForPythonStrides from '../components/figures/CForPythonStrides.astro';
+
+C is the old, plain programming language that most of the fast software you use is written in. Python itself is a C program. The parts of PyTorch that do the math, llama.cpp, and the code that runs on a GPU are C, or C's bigger sibling C++.
+
+That matters because the answer to "why is this slow?" or "what does this function actually do?" usually lives in that code, not in the docs. If you can read it, you can check a speed claim yourself instead of taking it on trust, and you can follow a bug past the point where the Python stops.
+
+You don't need to write C for this. You need to read it, the way you can read a recipe in a language you half-speak. You already know most of the ideas from Python and from [Where do my variables live?](/lessons/stack-and-heap/); this lesson gives them their C spelling. It is the key that opens [Why is NumPy 100x faster?](/lessons/cpu-caches/), [Why is Python slow?](/lessons/python-speed/) and [FlashAttention and kernels](/lessons/flash-attention/).
+
+## Today
+
+- Say how many bytes a whole number, a decimal number and a memory address take, and why C makes you say which one you mean.
+- Explain what happens between typing a C file and running it, and why that is a big part of why it's fast.
+- Read the two symbols that scare everyone, `&` and `*`, and explain why a Python variable is secretly one of them.
+- Explain what a tensor is underneath: one block of numbers, plus a small rule for finding row `i`, column `j`.
+- Open the real C behind a Python list, a llama.cpp loop and a GPU kernel, and say what each line does.
+
+**Prerequisites:** [Where do my variables live?](/lessons/stack-and-heap/) helps (stack, heap, refcounts). A Mac or the Spark with `cc` (on a Mac, `xcode-select --install` once). **Time:** about two hours.
+
+## The Problem
+
+Picture this. A small model under llama.cpp on the Spark is slower than you expected. A GitHub issue says "it's because `ggml_vec_add_f32` isn't vectorized on ARM." You click through to the file and see this:
+
+```c
+inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) {
+    int i = 0;
+#if defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+```
+
+Five lines in, there are stars in strange places, a loop with nothing before the first semicolon, a line starting with `#`, and `x + i` where `x` is supposed to be a list of numbers. You close the tab and believe the issue.
+
+C isn't hard. It's *unfamiliar* in about ten specific ways, and each maps onto something you already know from Python. By the end you'll read that function and judge the issue yourself. (It's right, sort of.)
+
+<Origin year="1972" title="A language for a machine with bytes">
+
+In 1969 Ken Thompson wrote the first Unix in assembly, then made a small language called B to write tools in. B had no types. Every value was one "word" of the machine, and the program just did arithmetic on words.
+
+Then Bell Labs got a PDP-11. It addressed memory in single bytes, and it would soon have hardware for decimal (floating-point) numbers. A typeless language couldn't say "this is one byte of text" versus "this is a two-byte integer" versus "this is a floating-point number." Dennis Ritchie added exactly that: types, so the compiler knew how many bytes each value took and which machine instructions to use on it. He called the result C. By 1973 the Unix kernel itself was rewritten in C, which proved a high-level language could be fast enough for an operating system.
+
+That is the "why" behind most of C's strangeness. C is a thin, honest layer over memory. Every rule you are about to meet exists because the compiler needs to know, ahead of time, exactly how many bytes things are and where they sit.
+
+</Origin>
+
+## The Idea
+
+### Types: how many bytes is this?
+
+In Python you write `x = 3` and never think about size. Python ints grow as large as you need: `2 ** 100` just works. That's a luxury, paid for with a full object on the heap for every number (you weighed them in [Where do my variables live?](/lessons/stack-and-heap/): 28 bytes for a small int).
+
+C makes you say what kind of number you want, because that decides how many bytes it gets:
+
+```c
+char   c = 'A';     // 1 byte. A tiny integer; also how C stores text.
+int    n = 42;      // 4 bytes. Whole numbers from about -2.1 billion to +2.1 billion.
+long   big = 42;    // 8 bytes on Mac and Linux (only 4 on Windows!).
+float  f = 0.5f;    // 4 bytes. Same as torch.float32.
+double d = 0.5;     // 8 bytes. Same as a Python float, torch.float64.
+```
+
+Read `int n = 42;` as "make a 4-byte box called `n`, holding 42." The type comes first, then the name. The `;` ends the statement, like a newline does in Python.
+
+The fixed size is a real limit. An `int` that goes past 2,147,483,647 doesn't grow; it breaks (Break It). When the exact width matters, as it does in a weight file, C has names that spell it out: `int32_t`, `int64_t`, `uint8_t` (u for unsigned: no negatives).
+
+C will tell you the size of anything with <Term w="sizeof">A built-in that gives the size in bytes of a type or variable, worked out when the program is compiled. sizeof(double) is 8.</Term>. You'll fill in a table of these in Build It. Notice the link to your memory math: a 7B-parameter model in `float` is 7 billion × `sizeof(float)` = 28 GB. Same arithmetic.
+
+### Compiling: translate once, run many times
+
+Python reads your `.py` file every time you run it, turns it into <Term w="bytecode">A list of simple instructions for Python's own virtual machine, like LOAD_FAST and BINARY_OP. The real CPU can't run these; a program has to read and act on them one by one.</Term>, and then a big loop inside `python3` reads each bytecode instruction and does what it says. That loop is the <Term w="interpreter">A program that runs another program by reading its instructions one at a time and carrying each one out. CPython's interpreter is a C function with a giant switch statement in a loop.</Term>, and it's written in C.
+
+C skips the middleman. A <Term w="compiler">A program that translates source code into the CPU's own instructions (machine code) once, ahead of time. cc, clang and gcc are C compilers; nvcc compiles CUDA.</Term> translates your file into the CPU's own instructions, once, and saves them as an <Term w="executable">A file of machine code the operating system can load and run directly, with no interpreter in between. On a Mac it's a Mach-O file; on Linux, ELF.</Term>:
+
+```bash
+cc -O2 sum.c -o sum    # translate sum.c into machine code, save it as ./sum
+./sum                  # run it; no cc, no interpreter, just the CPU
+```
+
+`-O2` means "optimize": rearrange the code to be faster as long as the output is the same. `-O0` means "translate literally." The compiler takes "the output is the same" very seriously, which bites benchmarks (Break It).
+
+<Figure n="001" title="TWO WAYS TO RUN A PROGRAM" caption="C pays the translation cost once, before the program runs. Python pays a little of it on every single instruction, every time, because the interpreter loop sits between your code and the CPU.">
+<svg viewBox="0 0 640 210" role="img" aria-label="Top row: sum.c goes through the compiler once and becomes machine code the CPU runs directly. Bottom row: sum.py becomes bytecode, which the Python interpreter, itself compiled C, reads one instruction at a time while the CPU runs the interpreter.">
+  <defs>
+    <marker id="cfp-a1" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="22" class="strong">C</text>
+  <rect x="20" y="34" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="58" text-anchor="middle">sum.c</text>
+  <line x1="122" y1="54" x2="196" y2="54" class="blue" stroke-width="1.3" marker-end="url(#cfp-a1)" />
+  <text x="159" y="46" text-anchor="middle" class="blue-t">cc -O2</text>
+  <text x="159" y="70" text-anchor="middle">once</text>
+  <rect x="200" y="34" width="150" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="275" y="52" text-anchor="middle" class="strong">./sum</text>
+  <text x="275" y="67" text-anchor="middle">machine code</text>
+  <line x1="352" y1="54" x2="516" y2="54" class="blue" stroke-width="1.3" marker-end="url(#cfp-a1)" />
+  <text x="434" y="46" text-anchor="middle" class="blue-t">runs directly</text>
+  <rect x="520" y="34" width="100" height="40" class="ink" fill="none" stroke-width="1.5" />
+  <text x="570" y="58" text-anchor="middle" class="strong">CPU</text>
+
+  <line x1="20" y1="100" x2="620" y2="100" class="ink dash" stroke-width="1" />
+
+  <text x="20" y="124" class="strong">PYTHON</text>
+  <rect x="20" y="136" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="70" y="160" text-anchor="middle">sum.py</text>
+  <line x1="122" y1="156" x2="196" y2="156" class="blue" stroke-width="1.3" marker-end="url(#cfp-a1)" />
+  <text x="159" y="148" text-anchor="middle" class="blue-t">compile</text>
+  <rect x="200" y="136" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="250" y="154" text-anchor="middle">bytecode</text>
+  <text x="250" y="169" text-anchor="middle">LOAD, ADD...</text>
+  <line x1="302" y1="156" x2="356" y2="156" class="blue" stroke-width="1.3" marker-end="url(#cfp-a1)" />
+  <rect x="360" y="128" width="140" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="430" y="148" text-anchor="middle" class="strong">python3</text>
+  <text x="430" y="163" text-anchor="middle">interpreter loop</text>
+  <text x="430" y="177" text-anchor="middle">(compiled C)</text>
+  <line x1="502" y1="156" x2="516" y2="156" class="blue" stroke-width="1.3" marker-end="url(#cfp-a1)" />
+  <rect x="520" y="136" width="100" height="40" class="ink" fill="none" stroke-width="1.5" />
+  <text x="570" y="160" text-anchor="middle" class="strong">CPU</text>
+  <text x="430" y="202" text-anchor="middle">read, decide, act: per instruction, every run</text>
+</svg>
+</Figure>
+
+The deeper reason compiled C is fast is the types again. When the compiler sees `total += x[i]` and knows both are `double`, it emits one floating-point add instruction. When Python sees `total += v`, it has to look up what `total` and `v` are *right now*, find the right add function, make a new float object for the result and update reference counts. [Why is Python slow?](/lessons/python-speed/) takes that apart in detail; you'll put a number on it in Measure.
+
+### Boxes with addresses: `&` and `*`
+
+Every variable in C is a box in memory, and every box has an <Term w="address">The number of the first byte of a box in memory. Memory is one long row of numbered bytes, so an address is just a big integer, usually printed in hex like 0x16fd0040.</Term>. You already saw this: `int n = 42;` is four bytes somewhere, holding 42.
+
+Two operators let you talk about the box instead of what's in it:
+
+- `&n` means **"the address of `n`."** Not the 42, but where the 42 lives.
+- A <Term w="pointer">A variable whose value is an address. Its type says what kind of thing lives at that address, so C knows how many bytes to read there.</Term> is a variable that holds an address. You declare one with a star: `int *p = &n;` reads as "`p` is a pointer to an int, and it holds the address of `n`."
+- `*p` (a star in front of an existing pointer) means **"go to that address and use what's there."** So `*p` is 42, and `*p = 7;` changes `n` to 7. This is called <Term w="dereferencing">Following a pointer to the box it points at, to read or write the value there. Written with a star in front: *p.</Term>.
+
+The star doing two jobs is the single most confusing thing in C, so say it slowly. **In a declaration** (`int *p`), the star means "is a pointer." **In an expression** (`*p + 1`), the star means "follow it." The spacing doesn't matter: `int *p`, `int* p` and `int * p` are the same. llama.cpp writes `float * x`, CPython writes `PyObject *op`.
+
+Why bother? Because C functions get **copies** of their arguments. If you want a function to change your variable, you hand it the address:
+
+```c
+void double_it(int *v) {   // v holds an address
+    *v = *v * 2;           // go there, read, double, write back
+}
+
+int n = 21;
+double_it(&n);             // pass where n lives; now n == 42
+```
+
+This "pass a pointer so the function can write into it" pattern is everywhere. When you see a function that returns `void` (nothing) but takes a pointer, the pointer is usually the output. Hold onto that; it's in the llama.cpp reading task.
+
+<Predict id="py-double">
+
+In Python, `def double_it(v): v = v * 2`, then `n = 21; double_it(n)`. What's `n` afterwards, and what does that tell you about what a Python function receives?
+
+<Fragment slot="answer">
+
+Still 21. `v` got the address of the same int object, then `v = v * 2` pointed `v` at a *new* object (42); the caller's `n` never moved. Python hands functions a pointer to the object, but no way to rebind the caller's name. Pass a list and do `v.append(1)`, though, and the caller sees it: you went through the pointer to the shared object, exactly like `*v = ...` in C.
+
+</Fragment>
+</Predict>
+
+### The bridge: a Python name is a pointer
+
+Here is the sentence that makes CPython readable: **every Python variable is a C pointer to an object on the heap.**
+
+When you write `x = [0.5, 1.5, 2.5]`, CPython builds a list object somewhere in memory and makes `x` hold its address. In CPython's C, the type of that address is `PyObject *`, "pointer to a Python object." Every function in CPython takes and returns `PyObject *`. `b = x` copies the address, not the list. `id(x)` in CPython is literally that address as an integer; `hex(id(x))` looks just like the `%p` output you'll print from C.
+
+And the list itself? It holds more pointers, one per element, each pointing at a separate float object. A C array of doubles holds the numbers themselves, side by side:
+
+<Figure n="002" title="PYTHON LIST VS C ARRAY" caption="Same three numbers. Python: a name pointing at a list object, pointing at an array of pointers, pointing at three separate float objects, about 160 bytes in five separate blocks. C: 24 bytes in one block." wide>
+<svg viewBox="0 0 640 300" role="img" aria-label="Top: the name x points to a list object with refcount, type, size, item pointer and allocated fields; its item pointer points to an array of four pointer slots, three of which point to separate float objects. Bottom: a C array of three doubles in one contiguous block.">
+  <defs>
+    <marker id="cfp-a2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="20" y="22" class="strong">PYTHON · x = [0.5, 1.5, 2.5]</text>
+  <rect x="20" y="96" width="40" height="28" class="fill-wash" stroke-width="1.2" />
+  <text x="40" y="114" text-anchor="middle" class="strong">x</text>
+  <line x1="62" y1="110" x2="106" y2="66" class="blue" stroke-width="1.3" marker-end="url(#cfp-a2)" />
+
+  <text x="185" y="46" text-anchor="middle">PyListObject</text>
+  <rect x="110" y="54" width="150" height="110" class="fill-paper" stroke-width="1.2" />
+  <line x1="110" y1="76" x2="260" y2="76" class="ink" stroke-width="0.8" />
+  <line x1="110" y1="98" x2="260" y2="98" class="ink" stroke-width="0.8" />
+  <line x1="110" y1="120" x2="260" y2="120" class="ink" stroke-width="0.8" />
+  <line x1="110" y1="142" x2="260" y2="142" class="ink" stroke-width="0.8" />
+  <text x="118" y="69">ob_refcnt  1</text>
+  <text x="118" y="91">ob_type    list</text>
+  <text x="118" y="113">ob_size    3</text>
+  <text x="118" y="135" class="blue-t">ob_item    ●</text>
+  <text x="118" y="157">allocated  4</text>
+  <line x1="232" y1="131" x2="296" y2="131" class="blue" stroke-width="1.3" marker-end="url(#cfp-a2)" />
+
+  <text x="296" y="164">PyObject *[4]</text>
+  <rect x="300" y="120" width="32" height="24" class="fill-wash" stroke-width="1.2" />
+  <rect x="332" y="120" width="32" height="24" class="fill-wash" stroke-width="1.2" />
+  <rect x="364" y="120" width="32" height="24" class="fill-wash" stroke-width="1.2" />
+  <rect x="396" y="120" width="32" height="24" class="ink dash" fill="none" stroke-width="1" />
+  <text x="316" y="136" text-anchor="middle" class="blue-t">●</text>
+  <text x="348" y="136" text-anchor="middle" class="blue-t">●</text>
+  <text x="380" y="136" text-anchor="middle" class="blue-t">●</text>
+  <text x="412" y="136" text-anchor="middle">spare</text>
+
+  <line x1="316" y1="118" x2="476" y2="56" class="blue" stroke-width="1.1" marker-end="url(#cfp-a2)" />
+  <line x1="348" y1="146" x2="466" y2="184" class="blue" stroke-width="1.1" marker-end="url(#cfp-a2)" />
+  <line x1="380" y1="118" x2="532" y2="108" class="blue" stroke-width="1.1" marker-end="url(#cfp-a2)" />
+
+  <rect x="480" y="30" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="488" y="46">refcnt · type</text>
+  <text x="530" y="63" text-anchor="middle" class="strong">0.5</text>
+  <rect x="536" y="88" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="544" y="104">refcnt · type</text>
+  <text x="586" y="121" text-anchor="middle" class="strong">2.5</text>
+  <rect x="470" y="170" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="478" y="186">refcnt · type</text>
+  <text x="520" y="203" text-anchor="middle" class="strong">1.5</text>
+  <text x="400" y="196" text-anchor="end">float objects,</text>
+  <text x="400" y="210" text-anchor="end">wherever they landed</text>
+
+  <line x1="20" y1="226" x2="620" y2="226" class="ink dash" stroke-width="1" />
+
+  <text x="20" y="250" class="strong">C · double a[3] = ...</text>
+  <rect x="250" y="236" width="100" height="30" class="fill-wash" stroke-width="1.2" />
+  <rect x="350" y="236" width="100" height="30" class="fill-wash" stroke-width="1.2" />
+  <rect x="450" y="236" width="100" height="30" class="fill-wash" stroke-width="1.2" />
+  <text x="300" y="256" text-anchor="middle" class="strong">0.5</text>
+  <text x="400" y="256" text-anchor="middle" class="strong">1.5</text>
+  <text x="500" y="256" text-anchor="middle" class="strong">2.5</text>
+  <text x="250" y="284">+0</text>
+  <text x="350" y="284">+8</text>
+  <text x="450" y="284">+16</text>
+  <text x="560" y="256">24 B</text>
+</svg>
+</Figure>
+
+The C array is what NumPy and PyTorch store. The Python list is what you get by default. Everything in [Why is NumPy 100x faster?](/lessons/cpu-caches/) follows from the difference in this picture.
+
+### Arrays: one block, and `p + 1` means "the next one"
+
+A C array is a run of boxes of the same type, back to back with no gaps:
+
+```c
+int a[8] = {10, 20, 30, 40, 50, 60, 70, 80};   // 8 × 4 = 32 bytes, contiguous
+```
+
+`a[i]` reads element `i`, like Python. What's new is what the name `a` turns into when you use it: a pointer to the first element. And you can do arithmetic on pointers.
+
+This is <Term w="pointer arithmetic">Adding a whole number to a pointer to move it along an array. p + 1 moves one element forward, which is sizeof(element) bytes, not one byte.</Term>, and it has one rule: **`p + 1` means "the next element," not "the next byte."** If `p` points at an `int`, `p + 1` is 4 bytes further on. If it points at a `double`, 8 bytes. C multiplies by the element size for you, which is why the pointer needs a type.
+
+So `a[i]` is just shorthand. It's defined as `*(a + i)`: start at the beginning, step `i` elements forward, read what's there. Move the slider:
+
+<Figure n="003" title="POINTER ARITHMETIC" caption="The same 32 bytes seen as 32 chars, 8 ints or 4 doubles. p + i always lands at the start address plus i times the element size. The address is made up.">
+<CForPythonPointerStrip />
+</Figure>
+
+<Predict id="no-bounds">
+
+`a` has 8 ints. What do you think C does when you read `a[10]`?
+
+<Fragment slot="answer">
+
+Nothing special. It computes start + 10 × 4 and reads whatever 4 bytes are there: maybe another variable, maybe garbage, maybe a crash if that address isn't mapped. C does no bounds check, because that would cost an instruction or two on every access and C promises not to do work you didn't ask for. Python's `IndexError` is a check CPython does for you, in C, on every `x[i]`. You'll see the real check in the CPython reading task.
+
+</Fragment>
+</Predict>
+
+Notice what's *not* in the array: its length. A C array doesn't know how long it is. That's why C functions that take arrays almost always take the length too, like `ggml_vec_add_f32(const int n, ...)`. When you see `(int n, float *x)` read it as "a list of `n` floats, starting here."
+
+### Tensors: a data pointer plus a rule
+
+Now the payoff for ML. A NumPy array or a PyTorch tensor is, underneath, a C array plus a small description of how to read it:
+
+- a **data pointer**: the address of the first number,
+- a **dtype**: how many bytes each number is (`float32` = 4),
+- a **shape**: `(3, 4)`,
+- <Term w="strides">For each dimension, how many elements to skip in memory to move one step along it. PyTorch's t.stride() counts in elements; NumPy's .strides counts in bytes.</Term>: for each dimension, how far to jump to take one step.
+
+Element `[i, j]` lives at `data + offset + i * stride[0] + j * stride[1]`. That's pointer arithmetic, done once per dimension. The memory is always one flat row; the shape and strides are a lens on top.
+
+Here's the trick that makes PyTorch fast and occasionally confusing: transposing, slicing with steps, and many reshapes don't move any numbers. They make a new lens (new shape, strides and offset) over the same block. Try each view:
+
+<Figure n="004" title="ONE BLOCK, FOUR VIEWS" caption="All four views read the same 12 floats in memory; none of them copied anything. Only the shape, strides and starting offset change. Strides are in elements, like PyTorch reports them.">
+<CForPythonStrides />
+</Figure>
+
+This explains an error you've probably hit: `t.T.view(-1)` fails, because flattening without a copy needs a <Term w="contiguous">A tensor whose elements sit in memory in exactly the order you'd read them, row by row, with no gaps. Many fast kernels require it; .contiguous() makes a copy that is.</Term> layout, and `.T` isn't one. `.contiguous()` fixes it by copying. And a CUDA kernel that receives "a tensor" receives, in C terms, a `float *` plus these numbers. That's all a kernel ever gets.
+
+### Structs: named fields at fixed places
+
+A Python class bundles named attributes. A C <Term w="struct">A bundle of named fields stored together in one block of memory, each at a fixed distance from the start. Like a Python class with only attributes, no methods, and a fixed layout.</Term> does the same with less magic:
+
+```c
+struct point { float x; float y; };    // 8 bytes: x at +0, y at +4
+
+struct point pt = {1.0f, 2.0f};
+pt.x = 3.0f;                           // field of a struct: dot, like Python
+
+struct point *pp = &pt;
+pp->x = 4.0f;                          // field through a pointer: arrow
+```
+
+The arrow `->` is the one new symbol. `pp->x` is shorthand for `(*pp).x`: follow the pointer, then take the field. Because almost everything in CPython and PyTorch is passed around by pointer, you'll see `->` far more than `.`.
+
+Each field sits at a fixed <Term w="offset">How many bytes from the start of a struct a field begins. The compiler decides it from the field types, sometimes adding padding so fields line up on multiples of their size.</Term> from the start, decided by the compiler. Reading `pp->y` compiles to "load 4 bytes from the address in `pp`, plus 4." No dictionary lookup, no search: one instruction.
+
+Now the real thing. Every Python object begins with the same two fields. In CPython's `Include/object.h`, simplified:
+
+```c
+// simplified from CPython, Include/object.h (the real one wraps the
+// refcount in a union and has a different layout for free-threaded builds)
+typedef struct {
+    Py_ssize_t    ob_refcnt;   // how many pointers point at me
+    PyTypeObject *ob_type;     // pointer to my type: float, list, ...
+} PyObject;
+```
+
+And here is the actual definition of a Python list, from CPython's `Include/cpython/listobject.h` (comments trimmed):
+
+```c
+typedef struct {
+    PyObject_VAR_HEAD
+    /* Vector of pointers to list elements.  list[0] is ob_item[0], etc. */
+    PyObject **ob_item;
+    Py_ssize_t allocated;
+} PyListObject;
+```
+
+`PyObject_VAR_HEAD` is a <Term w="macro">A find-and-replace rule the C preprocessor applies before compiling. #define NAME text makes every later NAME become text.</Term> that expands to `PyVarObject ob_base;`: a struct holding the refcount, the type pointer and `ob_size` (the length). `Py_ssize_t` is just "a signed 8-byte integer" on your machines. `PyObject **ob_item` has two stars: a pointer to the first of several `PyObject *`. That's the array of pointers in Fig 002. `allocated` is how many slots exist, which can be more than `ob_size`, so that `append` doesn't have to grow the array every time.
+
+<Figure n="005" title="A PYTHON LIST, BYTE BY BYTE" caption="PyListObject on 64-bit CPython (default, non-free-threaded build). Five 8-byte fields; you'll read each one from Python in Build It. id(x) is the address of byte +0.">
+<svg viewBox="0 0 640 210" role="img" aria-label="A strip of five 8-byte fields at offsets 0, 8, 16, 24 and 32: refcount, type pointer, size, item pointer, allocated. Braces mark the first two as PyObject and the first three as PyObject_VAR_HEAD. The item pointer points to an array of element pointers.">
+  <defs>
+    <marker id="cfp-a3" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
+  </defs>
+  <path d="M40,44 L40,36 L276,36 L276,44" class="ink" fill="none" stroke-width="1" />
+  <text x="158" y="30" text-anchor="middle">PyObject · 16 B</text>
+  <path d="M40,22 L40,14 L396,14 L396,22" class="blue" fill="none" stroke-width="1" />
+  <text x="218" y="10" text-anchor="middle" class="blue-t">PyObject_VAR_HEAD · 24 B</text>
+  <rect x="40" y="50" width="118" height="44" class="fill-paper" stroke-width="1.2" />
+  <rect x="158" y="50" width="118" height="44" class="fill-paper" stroke-width="1.2" />
+  <rect x="276" y="50" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <rect x="396" y="50" width="120" height="44" class="fill-wash" stroke-width="1.2" />
+  <rect x="516" y="50" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="99" y="70" text-anchor="middle" class="strong">ob_refcnt</text>
+  <text x="99" y="86" text-anchor="middle">how many refs</text>
+  <text x="217" y="70" text-anchor="middle" class="strong">ob_type</text>
+  <text x="217" y="86" text-anchor="middle">→ list type</text>
+  <text x="336" y="70" text-anchor="middle" class="strong">ob_size</text>
+  <text x="336" y="86" text-anchor="middle">len(x)</text>
+  <text x="456" y="70" text-anchor="middle" class="strong">ob_item</text>
+  <text x="456" y="86" text-anchor="middle">→ items</text>
+  <text x="566" y="70" text-anchor="middle" class="strong">allocated</text>
+  <text x="566" y="86" text-anchor="middle">slots</text>
+  <text x="40" y="110">+0</text>
+  <text x="158" y="110">+8</text>
+  <text x="276" y="110">+16</text>
+  <text x="396" y="110">+24</text>
+  <text x="516" y="110">+32</text>
+  <line x1="456" y1="96" x2="456" y2="146" class="blue" stroke-width="1.3" marker-end="url(#cfp-a3)" />
+  <rect x="396" y="150" width="40" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="436" y="150" width="40" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="476" y="150" width="40" height="26" class="fill-wash" stroke-width="1.2" />
+  <rect x="516" y="150" width="40" height="26" class="ink dash" fill="none" stroke-width="1" />
+  <text x="416" y="167" text-anchor="middle">[0]</text>
+  <text x="456" y="167" text-anchor="middle">[1]</text>
+  <text x="496" y="167" text-anchor="middle">[2]</text>
+  <text x="536" y="167" text-anchor="middle">spare</text>
+  <text x="380" y="167" text-anchor="end">PyObject * each, 8 B</text>
+  <text x="396" y="196">x[i] in C: list-&gt;ob_item[i]</text>
+</svg>
+</Figure>
+
+So `x[i]` in Python, once all the checking is done, is `list->ob_item[i]`: follow the list pointer, read the field at +24, step `i` pointers along, and you have the address of the element's object. The "magic" of a Python list is 40 bytes and two pointer hops.
+
+### Who frees the memory?
+
+In [Where do my variables live?](/lessons/stack-and-heap/) you met the heap. In C you manage it by hand, with two functions:
+
+```c
+double *x = malloc(n * sizeof(double));   // ask for n*8 bytes; get the address
+if (x == NULL) { /* out of memory */ }     // malloc returns NULL on failure
+// ... use x[0] .. x[n-1] ...
+free(x);                                   // give it back. Exactly once.
+```
+
+`malloc` returns a pointer to fresh, uninitialized bytes, and nobody tracks who's still using them. Forget `free` and you have a <Term w="memory leak">Memory a program asked for and never gave back. The process grows until it's killed or exits.</Term>. `free` and keep using the pointer, or `free` twice, and the crash shows up later, somewhere unrelated. So the real question in any C codebase is **ownership**: whose job is it to call `free`?
+
+Python answers it with the `ob_refcnt` field you just saw. Store a new pointer to an object, the count goes up; drop one, it goes down; at zero, the object is freed on the spot. In CPython's C that's `Py_INCREF(op)` and `Py_DECREF(op)`, on nearly every page. The docs describe ownership with two phrases worth knowing: a <Term w="new reference">A pointer the function hands you along with the duty to Py_DECREF it when you're done. You own it.</Term> and a <Term w="borrowed reference">A pointer you may use but don't own: someone else keeps the object alive, so you must not Py_DECREF it, and it may vanish if that owner lets go.</Term>. PyTorch does the same one level up: a tensor's storage is refcounted, and the last tensor to let go returns the memory.
+
+### Headers and macros: enough not to be scared
+
+Lines starting with `#` aren't C. They're instructions to the <Term w="preprocessor">A text-editing pass that runs before the compiler proper. It pastes in files, expands macros, and deletes code that's switched off.</Term>, which edits your file before the compiler sees it:
+
+- `#include <stdio.h>` pastes in the file `stdio.h`, a <Term w="header">A .h file that lists what functions, types and macros exist, without (usually) their full code, so other files can use them. Roughly Python's import, done by copy-paste.</Term> that declares `printf` and friends.
+- `#define N 1024` makes every later `N` become `1024`. Macros can take arguments too, like `#define PyList_GET_ITEM(op, index) (_PyList_CAST(op)->ob_item[(index)])`, which is real CPython. Read a macro as "this name is shorthand for this code."
+- `#if defined(__AVX2__)` ... `#endif` keeps the code between them only if the condition holds at compile time. This is how one file supports many CPUs: Intel chips with <Term w="AVX2">A set of Intel/AMD instructions that work on 8 floats at once (256 bits). Apple Silicon and the Spark's ARM cores don't have it; they have NEON, which does 4 floats at once.</Term> get one loop, everything else gets another. On your Mac and your Spark, `__AVX2__` is not defined, so that block is simply deleted before compiling.
+
+There's also a short list of words you can skip on a first read. They change *how* the code is compiled or exported, not *what* it computes: `static`, `inline`, `extern`, `const` (a promise not to modify), `restrict` / `__restrict__` (a promise that pointers don't overlap), `PyAPI_FUNC(...)`, `GGML_API`, `Py_ALWAYS_INLINE`, `__device__`, `__forceinline__`.
+
+### Reading a real function
+
+Here's the recipe. It works on CPython, ggml and CUDA alike:
+
+1. **Read the signature like a sentence.** Return type, name, then each argument's type and name. Ask: which pointers are inputs (often `const`), which are outputs, and which `int` is the length?
+2. **Skip the noise words** from the list above, and skip `assert` and error handling on the first pass.
+3. **Find the loop.** Most performance-relevant functions are one loop over an array. What's the index, what are the bounds, what happens per element?
+4. **Translate stars and arrows.** `p[i]` is element `i`. `p->f` is field `f` of the thing `p` points at. `*out = v` is "write `v` to where `out` points."
+5. **For `#if` blocks, ask which one your machine gets.**
+
+PyTorch's core is C++, which adds classes, `::` for namespaces (`at::Tensor`), templates in angle brackets (`std::vector<float>`) and references (`Tensor&`, pointers you don't have to dereference). The recipe still works; the inner loops look like C.
+
+### One more: a GPU kernel
+
+A CUDA <Term w="kernel">A function that runs on the GPU, launched once but executed by thousands of threads in parallel, each usually handling one element. Not the operating-system kernel; same word, different thing.</Term> looks like a C function with one twist: there's usually no loop. The loop is replaced by thousands of threads, each running the same function with a different index. NVIDIA's CUDA C++ Programming Guide introduces kernels with a vector add; this version is mine, the same idea plus the bounds check real kernels need:
+
+```cuda
+__global__ void add(int n, const float *x, const float *y, float *out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;   // which element am I?
+    if (i < n) out[i] = x[i] + y[i];
+}
+
+// launched from the CPU with 256 threads per block, enough blocks to cover n:
+// add<<<(n + 255) / 256, 256>>>(n, x, y, out);
+```
+
+`__global__` marks it as a kernel. `threadIdx.x` is this thread's number inside its block, `blockIdx.x` is the block's number, `blockDim.x` is threads per block. Multiply and add, and every thread gets a unique `i`. The rest is the C you now read: a length, three pointers to floats, and `out[i] = x[i] + y[i]`. [FlashAttention and kernels](/lessons/flash-attention/) builds on exactly this.
+
+## Build It
+
+Make a folder, e.g. `~/workbench/c-for-python/`. Each C program is one file. Compile with `cc`, run with `./name`. When something doesn't compile, read the *first* error only; later ones are often knock-on effects.
+
+<Task id="t1" title="Ask C how big things are" agent="hands">
+
+Create `sizes.c`. Type it, don't paste; the point is to get your fingers used to the punctuation.
+
+```c
+#include <stdio.h>     // for printf
+#include <stdint.h>    // for int64_t etc.
+
+int main(void) {
+    printf("char    %zu\n", sizeof(char));
+    printf("int     %zu\n", sizeof(int));
+    // add lines for: short, long, long long, float, double,
+    //                int *, double *, size_t, int64_t
+    return 0;
+}
+```
+
+`printf` is Python's `print` with a format string: `%zu` means "a size", `%d` an int, `%f` a double, `%p` a pointer, `\n` a newline. Then add, above `main`:
+
+```c
+struct sample { char tag; double score; int id; };
+```
+
+and print `sizeof(struct sample)`. Add the field sizes in your head first.
+
+```bash
+cc -Wall sizes.c -o sizes && ./sizes
+```
+
+`-Wall` turns on warnings. Keep it on forever.
+
+</Task>
+
+<Task id="t2" title="Follow a pointer" agent="hands">
+
+Create `pointers.c`. It should:
+
+1. Make `int n = 21;` and `int *p = &n;`. Print `n`, `&n`, `p` and `*p`. Print addresses with `%p` and cast them: `(void *)p`.
+2. Write `void double_it(int *v)` (from The Idea) above `main`, call `double_it(&n)`, print `n`.
+3. Make `int a[4] = {10, 20, 30, 40};` and `int *q = a;`. In a loop, print `q + i` and `*(q + i)` for `i` from 0 to 3. The C `for` loop is `for (int i = 0; i < 4; i++) { ... }`: start, keep-going condition, step.
+4. Define `struct point { float x; float y; };`, write `void move_right(struct point *pt)` that adds 1 to `x` using `->`, call it on a point, print both fields.
+
+Compile with `cc -Wall -O0 pointers.c -o pointers`.
+
+Before running: how far apart will the four `q + i` addresses be? After running: do they match the strip in Fig 003?
+
+</Task>
+
+<Task id="t3" title="Sum ten million numbers, three ways" agent="hands">
+
+This is the core one. Write `sum.c` that:
+
+- reads `n` from the command line (default 10,000,000),
+- `malloc`s `n` doubles and checks the result isn't `NULL`,
+- fills them with `x[i] = i * 0.5`,
+- times **one** pass of `total += x[i]` over all of them,
+- prints the total, the seconds, and nanoseconds per element,
+- `free`s the memory.
+
+Shape and hints:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>    // malloc, free, atol
+#include <time.h>      // clock_gettime
+
+static double now(void) {             // seconds, as a double. Boilerplate: copy it.
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec * 1e-9;
+}
+
+int main(int argc, char **argv) {      // argv: array of strings, like sys.argv
+    long n = argc > 1 ? atol(argv[1]) : 10000000;
+    // 1. allocate: what goes inside malloc( ... )?  (hint: bytes, not elements)
+    // 2. fill
+    // 3. double t0 = now(); ... loop ... double dt = now() - t0;
+    // 4. printf with %.1f for the total, %.4f for seconds
+    // 5. free
+}
+```
+
+Notice `clock_gettime(CLOCK_MONOTONIC, &t)`: a function that writes its answer through a pointer you hand it. That's the `double_it` pattern from the real C library. And `cond ? a : b` is Python's `a if cond else b`.
+
+Use `long` for `n` and `i`: an `int` index would be fine at 10 million but overflows past 2.1 billion, and real tensors get there.
+
+Then the Python side, `sum.py`, for comparison:
+
+```python
+import time
+n = 10_000_000
+x = [i * 0.5 for i in range(n)]
+
+def loop(x):
+    total = 0.0
+    for v in x:
+        total += v
+    return total
+
+for name, f in [("for loop", loop), ("sum()", sum)]:
+    best = float("inf")
+    for _ in range(5):
+        t0 = time.perf_counter(); s = f(x); best = min(best, time.perf_counter() - t0)
+    print(f"{name:9s} {best:.4f} s  {best / n * 1e9:.2f} ns/element")
+```
+
+Build and run the C version three ways, three runs each:
+
+```bash
+cc -O0 sum.c -o sum && ./sum
+cc -O2 sum.c -o sum && ./sum
+cc -O2 -ffast-math sum.c -o sum && ./sum
+python3 sum.py
+```
+
+Check the totals agree with Python's before you trust any timing.
+
+</Task>
+
+<Task id="t4" title="Read a Python list's struct from Python" agent="hands">
+
+You can prove Fig 005 without leaving Python. `ctypes` can read raw memory at an address, and `id(x)` is the address. This is safe to *read* for an object you're holding; never write this way.
+
+```python
+import ctypes, sys
+
+x = [1.5, 2.5, 3.5]
+a = id(x)
+word = lambda off: ctypes.c_ssize_t.from_address(a + off).value   # read 8 bytes at a+off
+
+print("refcount", ctypes.c_uint32.from_address(a).value)  # low 32 bits hold the count on 3.12+
+print("ob_type is list?", word(8) == id(list))
+# your turn: print ob_size and allocated, using the offsets from Fig 005.
+# then: read ob_item, and check that the first pointer in that array equals id(x[0]).
+```
+
+Then do `y = x` and read the refcount again. Then `x.append(4.5)` a few times and watch `ob_size` and `allocated` move. Compare with `sys.getsizeof(x)`.
+
+Hint for the last step: `ob_item` is an address. The first element pointer is the 8 bytes *at* that address, so read `ctypes.c_void_p.from_address(items).value`.
+
+</Task>
+
+<Task id="t5" title="Read four real functions" agent="explain">
+
+These are real excerpts (except the last, which is mine). For each, read it with the five-step recipe and answer the questions out loud before opening the answers. An agent may explain C syntax you're stuck on, but don't ask it what the function does.
+
+**A. CPython, `Objects/listobject.c`: `PyList_GetItem`**, the C API's `x[i]`:
+
+```c
+PyObject *
+PyList_GetItem(PyObject *op, Py_ssize_t i)
+{
+    if (!PyList_Check(op)) {
+        PyErr_BadInternalCall();
+        return NULL;
+    }
+    if (!valid_index(i, Py_SIZE(op))) {
+        _Py_DECLARE_STR(list_err, "list index out of range");
+        PyErr_SetObject(PyExc_IndexError, &_Py_STR(list_err));
+        return NULL;
+    }
+    return ((PyListObject *)op) -> ob_item[i];
+}
+```
+
+1. What does it return, in plain words? What does it return on failure, and how does the caller find out *which* error?
+2. Why the cast `(PyListObject *)op`?
+3. Does it touch the refcount of the item it returns? What does that make the result?
+
+<details>
+<summary>Answers</summary>
+
+1. A pointer to element `i`'s object. On failure, `NULL` (address 0), with the exception recorded on the side by `PyErr_...`; the interpreter later raises it as the `IndexError` you know. "Return NULL, set an error" is CPython's `raise`.
+2. `op` arrives as a generic `PyObject *`, which only has the refcount and type. The cast says "this is really a list," so the compiler lets you reach `ob_item` at +24. `PyList_Check` is what makes that safe.
+3. No `Py_INCREF`, so it's a **borrowed reference**: if the list drops the item, your pointer dangles. That's why CPython 3.13 added `PyList_GetItemRef`, which returns a new reference. And `valid_index` is the bounds check C arrays don't have.
+
+</details>
+
+**B. CPython, same file, inside `list_resize`**: how much room a list grabs when it grows (`newsize` is the length it needs to hold):
+
+```c
+new_allocated = ((size_t)newsize + (newsize >> 3) + 6) & ~(size_t)3;
+```
+
+`>> 3` shifts the bits right by 3, which divides by 8. `& ~3` clears the bottom two bits, rounding down to a multiple of 4.
+
+1. Compute `new_allocated` for `newsize` 1, 5 and 9.
+2. Roughly what fraction of extra room does a big list get?
+
+<details>
+<summary>Answers</summary>
+
+1. 1 + 0 + 6 = 7, rounded down to a multiple of 4: **4**. 5 + 0 + 6 = 11, so **8**. 9 + 1 + 6 = 16, so **16**. The comment above it in the source lists the pattern: 0, 4, 8, 16, 24, 32, 40, 52, 64, 76...
+2. About 1/8, 12.5% extra. That's enough to make `append` cheap on average (most appends hit spare slots, and only occasionally does the list reallocate), while wasting little memory. You can watch it happen with the `allocated` field in t4.
+
+</details>
+
+**C. llama.cpp, `ggml/src/ggml-cpu/vec.h`**: the function from The Problem, in full:
+
+```c
+inline static void ggml_vec_add_f32 (const int n, float * z, const float * x, const float * y) {
+    int i = 0;
+#if defined(__AVX2__)
+    for (; i + 7 < n; i += 8) {
+        __m256 vx = _mm256_loadu_ps(x + i);
+        __m256 vy = _mm256_loadu_ps(y + i);
+        __m256 vz = _mm256_add_ps(vx, vy);
+        _mm256_storeu_ps(z + i, vz);
+    }
+#endif
+    for (; i < n; ++i) {
+        z[i] = x[i] + y[i];
+    }
+}
+```
+
+1. Which arguments are inputs and which is the output? What's the Python one-liner?
+2. On an Intel machine with AVX2, what does the first loop do per step, and why does the second loop still exist?
+3. On your Mac or Spark, which code gets compiled? Was the GitHub issue right?
+
+<details>
+<summary>Answers</summary>
+
+1. `n` is the length, `x` and `y` are inputs (`const`: won't be changed), `z` is the output, written through the pointer. NumPy: `z[:n] = x[:n] + y[:n]`.
+2. Each step loads 8 floats from `x + i` (the address of `x[i]`), 8 from `y + i`, adds the 8 pairs in one instruction, and stores 8 results at `z + i`. The second loop mops up the last 0-7 elements. Each `for` starts with an empty first part because `i` carries over from the loop before.
+3. `__AVX2__` isn't defined on ARM, so the first loop is deleted and only the plain loop compiles. The issue is right that there's no hand-written vector code *here*. But "isn't vectorized" is likely wrong: at `-O2` the compiler may vectorize a plain loop like this by itself. I compiled that loop with `cc -O2 -S` on a Mac and the output had NEON `fadd.4s` instructions (4 floats at once). Look or measure; don't trust the issue.
+
+</details>
+
+**D. A CUDA kernel (mine, from The Idea):**
+
+```cuda
+__global__ void add(int n, const float *x, const float *y, float *out) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = x[i] + y[i];
+}
+// add<<<(n + 255) / 256, 256>>>(n, x, y, out);
+```
+
+1. For `n = 1000`, how many blocks and how many threads run? What do the extra threads do?
+2. Where's the loop?
+3. Compare with C above: what's the same, what moved?
+
+<details>
+<summary>Answers</summary>
+
+1. `(1000 + 255) / 256` is 4 in integer division (C drops the remainder): 4 × 256 = 1,024 threads. The 24 with `i` of 1000 or more fail the `if` and do nothing; without it they'd write past the end of `out`.
+2. There isn't one. Each thread runs the body once, with its own `i`. That's the central idea of GPU programming.
+3. The body is ggml's tail loop, word for word. The loop moved: on the CPU one core walks `i` from 0 to `n`; on the GPU the hardware hands each thread its own `i`.
+
+</details>
+
+</Task>
+
+<DoneWhen>
+
+- `sizes`, `pointers` and `sum` compile with `-Wall` and no warnings, and you can say what each line does.
+- You've filled both tables in Measure and can explain each gap in one sentence.
+- t4 printed `ob_size`, `allocated` and a matching first-element pointer, and you watched `allocated` grow in jumps.
+- You answered all four reading tasks before opening the answers, and got at least the gist of each.
+
+</DoneWhen>
+
+## Measure
+
+**1. The size table.** From t1. Fill both columns; the Spark is ARM64 Linux, your Mac is ARM64 macOS.
+
+| Type | Your Mac | Your Spark | Python / PyTorch equivalent |
+| --- | --- | --- | --- |
+| `char` | | | `torch.int8` / `uint8` |
+| `short` | | | `torch.int16` |
+| `int` | | | `torch.int32` |
+| `long` | | | |
+| `float` | | | `torch.float32` |
+| `double` | | | Python `float`, `torch.float64` |
+| `int *`, `double *` | | | `id(x)` |
+| `size_t` | | | |
+| `struct sample` | | | |
+
+On my Mac (Apple Silicon, Apple clang 21): 1, 2, 4, 8, 4, 8, 8, 8, and **24** for `struct sample`. The Spark should match, because macOS and Linux both use the same convention for 64-bit machines (`long` and pointers are 8 bytes). Windows is the odd one out: `long` is 4 bytes there.
+
+The 24 surprises people: 1 + 8 + 4 is 13. The compiler starts each field at a multiple of its own size, because CPUs read aligned values fastest. So `tag` at +0, 7 bytes of <Term w="padding">Unused bytes the compiler inserts between or after struct fields so each field starts at a multiple of its size.</Term>, `score` at +8, `id` at +16, then 4 more so an array of them keeps every `score` aligned. Reorder to `double score; int id; char tag;` and it's 16.
+
+**2. The sum ladder.** From t3: 10 million doubles, nanoseconds per element.
+
+| Version | Your ns/element | My ns/element |
+| --- | --- | --- |
+| Python `for` loop | | 10.1 |
+| Python `sum()` | | 1.8 |
+| C `-O0` | | 0.85 |
+| C `-O2` | | 0.57 |
+| C `-O2 -ffast-math` | | 0.23 |
+| NumPy `x.sum()` (bonus) | | 0.12 |
+
+Mine are from an M4 Pro MacBook, Python 3.14, Apple clang 21, NumPy 2.4; C numbers are the middle of three runs, Python best of five. Expect your Mac to land close and the Spark's ARM cores to be in the same ballpark; measure, don't assume.
+
+How to read the ladder:
+
+- **Python loop to C `-O2`, about 18x.** The interpreter tax from Fig 001: per element, Python dispatches bytecode, checks types, makes a float object, adjusts refcounts. C does one add. `sum()` sits between: its loop is C, but it still follows a pointer to each float object.
+- **`-O0` to `-O2`, about 1.5x.** At `-O0`, `total` is stored to memory and reloaded every pass. At `-O2` it lives in a register.
+- **`-O2` stalls at ~0.57 ns, roughly 2-3 clock cycles.** Each add needs the previous `total`, so the adds form a chain and wait on each other. The compiler may not reorder them, because float addition isn't exactly associative: `(a + b) + c` can differ from `a + (b + c)` in the last bits, and C promises the result you wrote.
+- **`-ffast-math` drops that promise**, so the compiler keeps several running totals in vector registers: 2.5x faster, last digits may change. GPUs make this trade constantly, which is why two runs of a model can disagree in the 6th decimal place.
+- **NumPy** sums in a tree-shaped order with vector instructions (pairwise summation): faster, and more accurate than one long chain.
+
+At 0.12 ns per 8-byte element NumPy is reading about 65 GB/s, so the next limit is memory, not instructions. That's where [How slow is slow?](/lessons/latency-numbers/) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) pick up.
+
+## Break It
+
+**1. Read past the end.** In `pointers.c`, print `a[i]` for `i` from 0 to 6 over `int a[4]`. Mine printed 10, 20, 30, 40, three garbage numbers, and exited normally. Rebuild with `cc -O0 -g -fsanitize=address` and run again: AddressSanitizer stops at the first bad read with `stack-buffer-overflow` and the line number. C doesn't check, so tools do. When a C extension corrupts memory, this flag is how you find it.
+
+**2. Overflow an int.** Sum 0 to 99,999 into an `int`, then into a `long`. My `int` said 704,982,704; the `long` said 4,999,950,000, matching Python's `sum(range(100000))`. Signed overflow is <Term w="undefined behavior">Something the C standard puts no rules on at all. The compiler may assume it never happens and optimize as if it can't, so the program can do anything.</Term>, so at `-O2` you aren't even promised the wrapped number. Python ints never overflow; every `int32` index in a tensor library can.
+
+**3. Let the optimizer delete your benchmark.** Make `sum.c` repeat the timed loop 5 times and keep the best. At `-O2` I got **0.00 ns per element**: the array never changes between repeats, so the compiler did the work once and the timed repeats did nothing. It promises the same *output*, not the same *work*. If a C benchmark looks impossibly fast, it is. Print results, vary the input, or time one pass.
+
+**4. Return the address of a local.** Write `int *bad(void) { int x = 5; return &x; }` and print `*bad()`. Clang warns "address of stack memory associated with local variable 'x' returned." Run it anyway: mine printed 5, which looks fine, and that's the danger. `x`'s stack frame is gone, and the next call will overwrite it. This is why the heap exists, and why `-Wall` stays on.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview.
+
+1. Why does C make you declare types, when Python doesn't?
+
+<details>
+<summary>Model answer</summary>
+
+The compiler turns code into machine instructions before it runs, so it must know each value's size and which instruction to use: an integer add and a float add are different instructions, and 4-byte and 8-byte values load differently. Python decides that at runtime, on every operation, by checking the object's type field: flexible, and much slower. Types also make pointer arithmetic work: `p + 1` moves by the size of what `p` points at.
+
+</details>
+
+2. What does "a Python variable is a pointer" mean, concretely, in CPython?
+
+<details>
+<summary>Model answer</summary>
+
+Every object lives on the heap as a C struct that starts with a refcount and a pointer to its type. A variable, a list slot, a dict value: each just stores the address of such a struct, typed `PyObject *` in C. Assignment copies the address and bumps the refcount; nothing is copied. `id(x)` is that address. A list is a struct holding a pointer to an array of these pointers, which is why a list of floats is a pointer per number plus a separate object per number.
+
+</details>
+
+3. What is a tensor in memory, and why is `t.T` free?
+
+<details>
+<summary>Model answer</summary>
+
+One contiguous block of numbers plus metadata: a pointer to the start, the element type, the shape, the strides (how far to jump per step in each dimension) and a starting offset. Element `[i, j]` is at start + offset + i × stride0 + j × stride1. Transposing swaps shape and strides; no number moves. The bill comes later: the view isn't contiguous, so some operations need `.contiguous()` (a real copy), and reading it row by row jumps around memory, which the cache dislikes.
+
+</details>
+
+4. You have a C function `void f(int n, const float *x, float *out)`. What can you guess before reading the body?
+
+<details>
+<summary>Model answer</summary>
+
+It returns nothing, so the result goes through `out`. `x` is an input array it promises not to change, `n` is almost certainly the number of elements in both, and the body is probably a loop over `i` from 0 to `n`. Nothing tells me who allocated `out` or how big it is, so the caller must have allocated at least `n` floats; if not, it writes past the end and C won't stop it.
+
+</details>
+
+5. How does this scale? Your summing loop handles 10 million doubles in 5.7 ms. What happens at 10 billion, and what changes first: the code or the hardware?
+
+<details>
+<summary>Model answer</summary>
+
+10 billion doubles is 80 GB, so first it has to fit: fine in the Spark's 128 GB (spec sheet), not on most laptops, where it spills to disk and gets thousands of times slower. If it fits, time is linear: 1,000x the elements, ~5.7 seconds. The index must be a `long`, or it overflows at 2.1 billion. The serial loop is limited by the chain of dependent adds, not memory. Break the chain (several accumulators, vectors, threads) and you hit memory bandwidth: 80 GB at the Spark's ~273 GB/s (spec sheet) is about 0.3 seconds, a floor no code can beat. Past that, only more machines help.
+
+</details>
+
+## Go Deeper
+
+- **Brian Kernighan and Dennis Ritchie, *The C Programming Language*, 2nd ed. (1988).** "K&R." Short, precise, written by C's creator. Chapter 5 (Pointers and Arrays) and 6 (Structures) are the two you need for reading.
+- **Brian "Beej" Hall, *Beej's Guide to C Programming*.** Free at [beej.us/guide/bgc](https://beej.us/guide/bgc/). Friendly, modern and funny; the pointer chapters are the gentlest good explanation around.
+- **Python docs, "Extending and Embedding the Python Interpreter" and the "Python/C API Reference Manual".** [docs.python.org/3/extending](https://docs.python.org/3/extending/index.html) and [docs.python.org/3/c-api](https://docs.python.org/3/c-api/index.html). How C code talks to CPython; the "Reference Counting" and "Objects, Types and Reference Counts" sections explain new vs borrowed references properly.
+- **NVIDIA, *CUDA C++ Programming Guide*.** [docs.nvidia.com/cuda/cuda-c-programming-guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/). The "Programming Model" chapter: kernels, threads, blocks, and the vector add this lesson's kernel imitates.
+- **Dennis Ritchie, "The Development of the C Language" (HOPL-II, 1993).** C's history from B, in Ritchie's words, including why types and pointers look the way they do. The source for the Origin box.
+- **The source itself.** CPython's [`Include/cpython/listobject.h`](https://github.com/python/cpython/blob/main/Include/cpython/listobject.h) and `Objects/listobject.c`, and llama.cpp's `ggml/src/ggml-cpu/vec.h` on [github.com/ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). Files move between versions; search the repo for the function name if a path breaks.
+- **Edward Z. Yang, "PyTorch internals" (2019).** [blog.ezyang.com/2019/05/pytorch-internals](http://blog.ezyang.com/2019/05/pytorch-internals/). How a tensor is storage plus sizes, strides and offset, and how to find your way around PyTorch's C++. The natural next read after Fig 004.
+
+## Connections
+
+- Builds on [Where do my variables live?](/lessons/stack-and-heap/): stack frames, the heap, and refcounts are what `malloc`, `free` and `Py_DECREF` act on.
+- [How slow is slow?](/lessons/latency-numbers/) explains why the ladder in Measure flattens out once the code is fast: memory becomes the limit.
+- [Why is NumPy 100x faster?](/lessons/cpu-caches/) is Fig 002 measured: pointers to scattered objects vs one contiguous block.
+- [Why is Python slow?](/lessons/python-speed/) opens up the interpreter loop from Fig 001 and the 18x you measured.
+- [FlashAttention and kernels](/lessons/flash-attention/) starts from the CUDA kernel you just read and asks how to make it fast.

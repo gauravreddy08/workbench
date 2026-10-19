@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import StatsPairedCI from '../components/figures/StatsPairedCI.astro';
 import StatsPower from '../components/figures/StatsPower.astro';
 
+Every eval score you have ever printed is a guess. You asked the model 500 questions out of all the questions it could have been asked, and the score says how it did on those 500. Ask a different 500 and the number moves. The statistics here are a small kit for knowing how far it can move, so you can tell a model that got better from a set of questions that happened to be kinder.
+
+This decides real things. Whether the new way of picking training examples for your cross-encoder ships. Whether a shrunk, cheaper copy of a model on the Spark is "just as good". Whether a prompt tweak deserves a PR. Get it wrong one way and you ship luck and call it progress; get it wrong the other way and you throw out real wins because two numbers looked too close to call. Research interviews probe it for the same reason: it's the difference between a result and a rumour.
+
+It sits right after [Ranking metrics and eval sets](/lessons/ranking-metrics/), which decides *what* to measure; this one decides whether a change in that measurement is real. Next, [LLMs as judges](/lessons/llm-judges/) turns the same tools on a grader that is itself a wobbly instrument.
+
 ## Today
 
-- Put an error bar on any eval score, by formula and by bootstrap, and say in plain words what the bar means.
-- Explain why comparing two models on the *same* questions is several times more sensitive than comparing their two error bars, and compute the paired interval for the difference.
-- Run McNemar's test and a permutation test on per-question results, and know when each one fits.
-- Spot the three ways evals fool you even with error bars: clustered questions, sampling noise from temperature, and picking the best of many tries.
+- Put an error bar on any eval score two ways: with a one-line formula, and by re-drawing your own questions thousands of times and rescoring, and say in plain words what the bar means.
+- Explain why comparing two models question by question, on the *same* questions, is several times more sensitive than comparing their two separate error bars, and compute the error bar for the gap that way.
+- Run two checks that ask "could luck alone make a gap this big?" on per-question results (one looks only at the questions where the models disagree, one randomly swaps which model gave which answer), and know when each fits.
+- Spot the three ways evals fool you even with error bars: questions that come in related clumps, the extra randomness when the model is allowed to vary its answers, and picking the best of many tries.
 - Work out, before you run anything, how many questions you need to see a 1 or 2 point improvement, and write a result statement the way a careful paper would.
 
-Prerequisites: none beyond high-school probability. It helps to have done [Smaller numbers, same model?](/lessons/quantization/), because its `eval_small.py` gives you a real pair of models to test at the end. Rough time: one evening for the idea and the first four tasks, one more to apply it to real results.
+You need nothing beyond high-school probability: coins and averages. It helps to have done [Smaller numbers, same model?](/lessons/quantization/), because its `eval_small.py` gives you a real pair of models to test at the end. Budget one evening for the idea and the first four tasks, and one more to apply it to real results.
 
 ## The Problem
 

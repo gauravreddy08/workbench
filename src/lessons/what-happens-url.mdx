@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import URLWaterfall from '../components/figures/URLWaterfall.astro';
 
+When you press enter on a web address, your computer looks up where the site lives, makes contact with a machine there, sets up a private line to it, asks for the page, and then draws what comes back. Almost all of that time is spent waiting for messages to cross the distance and back, not on any computer thinking hard.
+
+It's the classic interview question because the answer is a map of nearly everything about networks, and a good answer shows you know where the time goes. It's also your actual job: TinyFish fetches web pages for agents all day, so every step here is a cost paid over and over, and knowing which step is slow decides which fix works. Guess wrong and you'll make the server faster while the page stays exactly as slow.
+
+You already have the pieces: [How does data travel?](/lessons/packets-and-ip/) got envelopes across the internet, [TCP and UDP](/lessons/tcp-vs-udp/) made them reliable, and [How slow is slow?](/lessons/latency-numbers/) priced each trip. Here they line up into one timeline you can measure. From here, [How does HTTPS keep secrets?](/lessons/tls/) opens up the private-line step, [HTTP from scratch](/lessons/http-from-scratch/) builds the server that answers, and [Load balancing](/lessons/load-balancing/), [Caching](/lessons/caching/) and [Tail latency](/lessons/tail-latency/) cover the machines behind it.
+
 ## Today
 
 - Walk through every step between pressing enter and seeing pixels, in order, and say roughly how long each one takes.
-- Explain DNS properly: who asks whom, what gets cached where and for how long, and why it doesn't melt under billions of queries a day.
-- Count the round trips a fresh HTTPS page load needs before the first byte arrives, and say which tricks (warm caches, reused connections, CDNs) remove which ones.
-- Build a DNS query by hand out of raw bytes, send it to `8.8.8.8` over UDP, and parse the answer.
-- Fetch a page with raw sockets while timing each phase, and line your numbers up against `curl`, `dig +trace` and the Chrome DevTools waterfall.
+- Explain properly how a name like `en.wikipedia.org` becomes a numeric address (the internet's phone book, DNS): who asks whom, who remembers the answer and for how long, and why it doesn't melt under billions of questions a day.
+- Count the round trips (a message there and a reply back) a fresh secure page load needs before the first byte of the page arrives, and say which tricks remove which ones: remembered answers, connections kept open and reused, and copies of the site on servers near you.
+- Build a phone-book question by hand out of raw bytes, send it to Google's public lookup server at `8.8.8.8` using UDP (the send-and-hope way from the last lesson), and read the answer.
+- Fetch a page using only the most basic network calls your operating system offers, timing each phase, and line your numbers up against `curl`, `dig +trace` and the timing chart in Chrome's developer tools.
 
-Prerequisites: [How does data travel?](/lessons/packets-and-ip/) (IP addresses and routes) and [TCP and UDP](/lessons/tcp-vs-udp/) help, but this lesson stands on its own. Rough time: one evening to read, one to build.
+[How does data travel?](/lessons/packets-and-ip/) (addresses and routes) and [TCP and UDP](/lessons/tcp-vs-udp/) (the opening handshake and the two ways to send) help, but this lesson stands on its own. Budget one evening to read and one to build.
 
 ## The Problem
 

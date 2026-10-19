@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import RateGoodput from '../components/figures/RateGoodput.astro';
 import RateBucket from '../components/figures/RateBucket.astro';
 
+A rate limit is a service's way of saying "not so fast": it turns away, or holds back, the requests that arrive faster than it can honestly handle, so the ones it does take still get answered in time. The other half of the deal is the caller listening, and easing off instead of hammering harder.
+
+You meet both halves constantly. Every time a script of yours fires thousands of calls at Claude to label data for your cross-encoder, the provider is limiting you, and how you write the retry loop decides whether the job finishes in minutes or crawls for hours. Flip it around and the reranker you serve at work is the one being flooded, by a backfill job or a burst of agent traffic. Without a way to refuse work, it doesn't just slow down; it stays fully busy producing answers nobody is waiting for anymore.
+
+It builds on [Waiting vs working](/lessons/waiting-vs-working/), where you capped how many requests run at once and met Little's Law, the rule linking how many requests are waiting, how fast they arrive, and how long each one waits. It pairs with [p99 and load testing](/lessons/tail-latency/), which shows why latency explodes as a server nears full, and [Load balancers and state](/lessons/load-balancing/), which is why a limit kept inside one copy of a server leaks once you run several. Next, [Queues and logs](/lessons/queues/) covers work that should wait rather than be refused, and [Batching](/lessons/batching/) shows what an inference server does with the line of requests in front of its GPU.
+
 ## Today
 
 - Explain exactly what happens to a server that accepts everything when more work arrives than it can do, and why "it stays busy but nobody gets an answer" is the normal way it fails.
-- Protect a server three ways: a bounded queue that sheds load, a token-bucket rate limiter, and deadlines so it stops doing work nobody is waiting for.
-- Compare fixed window, sliding window, token bucket and leaky bucket limiters, and pick one on purpose.
-- Write a client that backs off with jitter, honours `429` and `Retry-After`, and doesn't join a retry storm. Know what a circuit breaker is for.
-- Explain why your own scripts get `429`s from Claude or OpenAI even when you're "under the limit", and how to write a client that never does.
+- Protect a server three ways: a waiting line with a maximum length that turns away the overflow, a per-client allowance that refills at a steady rate, and an expiry time on each request so the server stops doing work nobody is waiting for.
+- Compare the four classic ways of counting "requests per second" for each client, and pick one on purpose.
+- Write a client that waits longer after each failure, with a random wobble so it doesn't retry in step with everyone else, obeys the server's "come back in N seconds", and doesn't pile on when a service is down. Know what a circuit breaker (a switch that stops calling a broken service for a while) is for.
+- Explain why your own scripts get "too many requests" errors from Claude or OpenAI even when you're under the per-minute limit, and how to write a client that never does.
 
-Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (async servers, the fake LLM, Little's Law, the semaphore). Rough time: one evening to read, one to build. Everything runs on your Mac; nothing in the main build costs money.
+You'll want [Waiting vs working](/lessons/waiting-vs-working/) first: its async server, the fake LLM, Little's Law, and the semaphore (a counter that lets only N tasks run at once). Budget one evening to read and one to build. Everything runs on your Mac; nothing in the main build costs money.
 
 ## The Problem
 

@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import LoRARank from '../components/figures/LoRARank.astro';
 
+Fine-tuning is taking a model that already knows a lot and training it a little more so it gets good at one particular job, and the trick here is to leave the whole original model untouched and train a small, slim add-on next to it instead.
+
+That trick decides whether you can do the job on your Spark at all. Retraining every number in an 8-billion-number model the ordinary way needs about as much memory as the whole machine has, before it even starts. The add-on version fits with room to spare, saves as a file small enough to email, and once you fold it back in, the model runs exactly as fast as before. That is how you would teach an 8B model to judge query-page relevance for your ranking work in a strict, machine-readable format, without it opening with "Sure! Here's my assessment:" one time in twenty.
+
+It builds on [How much memory does a model need?](/lessons/memory-math/) and [Why training needs so much memory](/lessons/training-memory/), which give you the memory bill this trick dodges, and on [Quantization](/lessons/quantization/) for squeezing the frozen model into fewer bits. If you did [Train your own draft model](/lessons/draft-model/), this is a much cheaper way to run that same kind of retraining. Next, [Why are evals separate from training?](/lessons/why-evals-are-separate/) is about trusting the score you get, and the add-on comes back in [DPO](/lessons/dpo/) and [GRPO](/lessons/grpo/), the cheap way to train models from preferences and rewards on one machine.
+
 ## Today
 
-- Work out, in bytes, why full fine-tuning an 8B model does not fit on the Spark, and why LoRA and QLoRA do.
-- Draw the LoRA picture from memory: a frozen `d × d` matrix plus a thin `B` times a flat `A`, the parameter count `2dr` vs `d²`, and why `B` starts at zero.
-- Write a LoRA layer from scratch in PyTorch, inject it into a real model, and prove only `A` and `B` learn.
-- LoRA (and QLoRA) fine-tune a 1-8B model on the Spark for a ranking-shaped task, evaluate it properly against the base model, merge it, and serve it with your own server.
-- Say clearly what LoRA is good at (format, style, a narrow task) and what it is bad at (lots of new knowledge), with the paper that measured it.
+- Work out, in bytes, why retraining every number of an 8B model does not fit on the Spark, and why the slim add-on version (LoRA), and the version that also squeezes the frozen model into 4 bits (QLoRA), do.
+- Draw the LoRA picture from memory: the big frozen `d × d` grid of numbers, plus a thin `B` times a flat `A` beside it, the count of numbers that buys you (`2dr` against `d²`), and why `B` starts at all zeros.
+- Write that add-on layer from scratch in PyTorch, plug it into a real model, and prove that only `A` and `B` learn.
+- Fine-tune a 1-8B model on the Spark with LoRA and QLoRA for a ranking-shaped task, test it properly against the untouched model, fold the add-on back in, and serve it from your own server.
+- Say clearly what this trick is good at (a format, a style, one narrow task) and what it is bad at (absorbing lots of new knowledge), with the paper that measured it.
 
-Prerequisites: [How much memory does a model need?](/lessons/memory-math/) (bytes per parameter), and ideally [Why training needs so much memory](/lessons/training-memory/) (the 16-bytes-per-parameter bill). Helpful: [Quantization](/lessons/quantization/) for the 4-bit part. Rough time: one evening for the from-scratch layer on your Mac, one or two sessions on the Spark.
+You will want [How much memory does a model need?](/lessons/memory-math/) for bytes per number, and ideally [Why training needs so much memory](/lessons/training-memory/) for the 16-bytes-per-number bill. [Quantization](/lessons/quantization/) helps for the 4-bit part. Plan on one evening for the from-scratch layer on your Mac, then one or two sessions on the Spark.
 
 ## The Problem
 

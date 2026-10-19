@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import TLSKeyExchange from '../components/figures/TLSKeyExchange.astro';
 import TLSHandshake from '../components/figures/TLSHandshake.astro';
 
+HTTPS is how your computer and a website it has never met agree on a secret code in full view of everyone in between, and check that they're really talking to that website and not an impostor, all before anything private is sent.
+
+You've already felt it twice without seeing it. Every new secure connection your benchmark client opens, to Fireworks or to your own server on the Spark, spends a round trip on this before the first request can leave, so it's sitting inside your latency numbers. And when it goes wrong, it goes wrong with an error that names a step you've never been shown, like Python refusing to trust the page you're serving from your home server. Once you know the steps, those errors become one-line diagnoses.
+
+This is the "secure the line" step from [What happens when you hit enter?](/lessons/what-happens-url/), opened up, and it counts round trips the way [TCP and UDP](/lessons/tcp-vs-udp/) taught you to. Everything in [HTTP from scratch](/lessons/http-from-scratch/) can run inside the private line you build here, and [Your home server, explained](/lessons/ssh-and-tailscale/) is where you'll use it on your own machines.
+
 ## Today
 
 - Explain how two machines that have never met can agree on a secret key while someone records every byte between them, using paint first and then real arithmetic.
-- Say why that alone is not enough (the man in the middle), and how signatures, certificates and certificate authorities close the gap.
-- Walk through a TLS 1.3 handshake message by message, and say what 1-RTT, 0-RTT and forward secrecy mean.
-- Do a Diffie-Hellman exchange by hand in Python, encrypt with the key you derived, read a real handshake with `openssl` and Wireshark, and verify a certificate chain yourself.
+- Say why that alone is not enough (an attacker can sit in the middle and play each side to the other), and how it's fixed: a seal only the real server can make (a signature), and a document from an organisation your computer already trusts saying whose seal it is (a certificate).
+- Walk through the real opening conversation of HTTPS (the TLS 1.3 handshake) message by message, and say why it costs one round trip, how a return visit can cost none, and why someone who records your traffic today and steals the server's key next year still can't read it.
+- Do the key agreement by hand in Python, encrypt with the key you got, watch a real handshake go by with `openssl` and Wireshark (a program that shows every packet), and check a website's chain of vouching documents yourself.
 - Know exactly what HTTPS hides from someone on your Wi-Fi and what it leaves in plain sight.
 
-Prerequisites: none strictly, but [What happens when you hit enter?](/lessons/what-happens-url/) places TLS in the sequence (DNS, TCP, TLS, HTTP), and [TCP and UDP](/lessons/tcp-vs-udp/) explains the round trips we'll be counting. Rough time: one evening, plus half an hour for the home-server cert.
+You don't strictly need anything first, but [What happens when you hit enter?](/lessons/what-happens-url/) shows where this step sits in a page load (look up the name, connect, secure the line, ask), and [TCP and UDP](/lessons/tcp-vs-udp/) explains the round trips we'll be counting. Budget one evening, plus half an hour to give your home server a real certificate.
 
 ## The Problem
 

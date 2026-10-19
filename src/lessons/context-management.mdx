@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import CtxWindowFill from '../components/figures/CtxWindowFill.astro';
 
+A model's context is everything it can see when it answers: the instructions, the conversation so far, every file and log it has looked at. It has no other memory. If something isn't in there this time, the model doesn't know it, and only so much fits.
+
+For an agent that runs for dozens of steps, what you put in there quietly decides three things at once. Whether it can still see the fact it read twenty steps ago. Whether that fact gets drowned out by everything piled around it. And how big the bill is, which can easily be eight times larger than it needs to be for reasons that have nothing to do with the task. Most people handle this by feel. The point here is to put numbers on it, so you can say which approach wins on which task, and by how much.
+
+It stands on [The KV cache, by hand](/lessons/kv-cache/), which showed what every word in the model's view costs in memory, and [Paged attention and prefix caching](/lessons/prefix-caching/), which showed why an unchanging start of a prompt is cheap to reuse. It sets up [What makes a task long-horizon?](/lessons/long-horizon/) and [Inside an agent harness](/lessons/agent-harness/), where tasks run far longer than anything fits.
+
 ## Today
 
-- Say what a context window is in machine terms: tokens in, a KV cache that grows with every one of them, a bill per token, and a prefill that gets slower the longer the prompt.
-- Explain why an agent loop's cost grows with the *square* of its length, and why prompt caching turns that back into something close to linear, as long as you never touch the start of the prompt.
-- Explain "lost in the middle" and attention dilution with one piece of arithmetic, and say what a needle-in-a-haystack score does and does not prove.
-- Pick between stuffing, retrieval, compaction, memory files, tool-result truncation and sub-agents for a given task, and say what each one throws away.
-- Build an agent harness with three context strategies, and measure success rate, tokens, dollars and seconds for each, plus your own lost-in-the-middle curve.
+- Say what the model's view is in machine terms: a list of word-pieces, a stored memory inside the model that grows with every one of them, a charge per piece, and a reading-in step before the first word of the reply that gets slower the longer the prompt.
+- Explain why an agent's bill grows with the *square* of its number of steps, and why the provider's discount for a repeated prompt start brings it back to nearly a straight line, as long as you never touch the start of the prompt.
+- Explain, with one piece of arithmetic, why a fact in the middle of a long prompt gets used less than one at the start or end, and why every extra word thins the model's focus; and say what the popular "find one planted sentence in a long document" test does and does not prove.
+- Pick between pasting everything in, fetching only what's relevant, summarising old history, keeping a notes file, cutting long tool outputs short, and handing sub-tasks to fresh helper agents, and say what each one throws away.
+- Build a small agent loop with three of those strategies, and measure success rate, tokens, dollars and seconds for each, plus your own curve of accuracy against where the fact sits in the prompt.
 
-Prerequisites: [What is the KV cache?](/lessons/kv-cache/) (what each token costs in memory) and [Prefix caching](/lessons/prefix-caching/) (why a shared prompt start is cheap). [Memory math](/lessons/memory-math/) helps for the scaling question at the end. Rough time: an evening to read and build the harness, a second evening to run the experiments. API spend: roughly $5-15 for everything if you use a small model and the budget guard in Task 1 (an estimate from the token counts below, not a receipt).
+Do [The KV cache, by hand](/lessons/kv-cache/) and [Paged attention and prefix caching](/lessons/prefix-caching/) first; [How much memory does a model need?](/lessons/memory-math/) helps with the scaling question at the end. Budget an evening to read and build the agent loop, and a second to run the experiments. API spend should be roughly $5-15 for everything if you use a small model and the budget guard in Task 1 (an estimate from the token counts below, not a receipt).
 
 ## The Problem
 

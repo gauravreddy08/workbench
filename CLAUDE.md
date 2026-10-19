@@ -48,11 +48,22 @@ Gaps found in a diagnostic (Oct 2026), so lessons can aim at them:
 ## Lesson anatomy
 
 Frontmatter is not needed (metadata comes from `curriculum.ts`). The page already renders the title
-and question; start the MDX body directly. Use these `##` sections in this order (the h2 text
-becomes the side navigation and is auto-numbered, so keep it short, Title Case):
+and question; start the MDX body with the opening, then the `##` sections.
 
-1. `## Today` — 3-5 bullets: what you'll be able to do/explain by the end. Plus prerequisites line
-   and rough time if useful.
+**The opening** (no heading, before `## Today`): 2-3 short paragraphs, zero jargon, that orient
+someone who just landed on this page. (1) What this thing is, in one plain sentence a smart
+non-engineer would follow. (2) Why it matters: a real consequence, ideally tied to his work.
+(3) Where it sits: what he already knows that this builds on (link the lessons) and what it
+unlocks next. No technical name appears here unless it is explained in the same sentence. No
+"In this lesson we will...".
+
+Then these `##` sections in this order (the h2 text becomes the side navigation and is
+auto-numbered, so keep it short, Title Case):
+
+1. `## Today` — 3-5 bullets: what you'll be able to do/explain by the end, in plain words. A
+   bullet must not lean on a term the lesson hasn't explained yet (say "the rule that a word can
+   only look backwards", not "the causal mask"); the real names come later in The Idea. Plus a
+   prerequisites line and rough time if useful.
 2. `## The Problem` — a concrete scene where the thing bites. Usually includes `<Origin>`.
 3. `## The Idea` — the plain-language explanation with figures. The heart of the lesson. Build up
    in layers. Use `<Term>` for every piece of jargon. Use `<Predict>` before any reveal.
@@ -139,6 +150,10 @@ animations).
 
 ## Lessons learned from earlier lessons
 
+- Code is Python. He doesn't write C. Where Python's per-step overhead (~30-50 ns) would hide the
+  effect (caches, pointer chasing), use Numba (`@njit`) so the code stays Python. Where C itself is
+  the point (raw addresses, the C stack, a C baseline), give complete annotated C as an `ok` task
+  he compiles and runs, and link [C for Python people](/lessons/c-for-python/).
 - Verify claims you can verify: run small snippets on this Mac (python3, cc are available; use a
   venv in your scratchpad for packages) and say what you measured. E.g. plain `counter += 1` did not
   race under the GIL on 3.11-3.14, so the threads lesson forces the race another way.

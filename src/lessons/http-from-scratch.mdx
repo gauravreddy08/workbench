@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import HTTPAnatomy from '../components/figures/HTTPAnatomy.astro';
 
+When one program asks another for something over the internet (a phone app checking the weather, your laptop asking a model for a completion), the two trade a few lines of plain text written in an agreed format. That format is HTTP: the rules for how a web request, and the reply to it, are written down.
+
+Every service you've shipped speaks it, and so will the server on your DGX Spark when you race it against Fireworks. When something goes wrong between two programs, like a request that hangs forever, a reply that stops halfway, or an error that came from a middleman rather than your code, the explanation is sitting in that text. Once you can read it, those bugs stop being mysteries.
+
+You already know how one program can serve many visitors at once, with threads in [Processes, threads and the GIL](/lessons/processes-threads-gil/) or with one loop that juggles waits in [Waiting vs working](/lessons/waiting-vs-working/). Here you put real web traffic on top of that, writing the server yourself, without the libraries that usually do it for you. Next, [Polling, SSE and WebSockets](/lessons/streaming/) uses the same pieces to send a model's words as they're generated, and [The life of an API](/lessons/api-lifecycle/) turns a working server into one other people can safely build on.
+
 ## Today
 
-- Type an HTTP request by hand into a raw TCP connection, to example.com and to your own server, and read the reply line by line.
-- Explain every part of a request and response: request line, headers, blank line, body, status codes, and the two ways a body says where it ends (Content-Length and chunked).
-- Write an HTTP/1.1 server with nothing but Python's `socket` module that serves JSON, returns correct status codes, reuses connections, and survives garbage input. Then make it concurrent with threads and with asyncio.
-- Say what ASGI is, write an ASGI app with no framework, run it under uvicorn, and list exactly what FastAPI adds on top.
-- Explain at a high level what HTTP/2 and HTTP/3 change and why.
+- Open a bare connection to example.com, and later to your own server, type a request by hand, and read the reply line by line.
+- Name every part of a request and its reply: the first line that says what you want, the labelled lines of extra information after it (headers), the blank line that ends them, the body, the three-digit number that says how it went, and the two ways a reply can mark where its body ends (state the length up front, or send it in size-labelled pieces).
+- Write a working server using only Python's basic networking module, `socket`. It answers with JSON, sends the right result numbers, reuses one connection for many requests, and shrugs off nonsense. Then make it serve many clients at once, first with threads, then with asyncio.
+- Explain the small contract that lets a server like uvicorn hand each request to your Python code (it's called ASGI), write an app against it with no library on top, and list exactly what FastAPI adds.
+- Say in a sentence or two what the two newer versions of HTTP change, and why they were needed.
 
-Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) and [Waiting vs working](/lessons/waiting-vs-working/) (you'll reuse your `loadgen.py` and your understanding of the event loop). Rough time: one long evening. The server is about 150 lines.
+Before this, do [Processes, threads and the GIL](/lessons/processes-threads-gil/) and [Waiting vs working](/lessons/waiting-vs-working/): you'll reuse the load-testing script you wrote there, `loadgen.py`, and your picture of one loop juggling many waiting connections. Budget one long evening; the server ends up about 150 lines.
 
 ## The Problem
 

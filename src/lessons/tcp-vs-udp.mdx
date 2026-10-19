@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import TCPSequenceSim from '../components/figures/TCPSequenceSim.astro';
 
+The internet only promises to *try* to deliver each small envelope of data, so programs talk over it in one of two standard ways: TCP, which turns that shaky promise into a perfect, in-order stream of bytes, and UDP, which hands you the shaky envelopes as they are and gets out of the way.
+
+TCP's carefulness has a price, paid in round trips, and you pay it all day without seeing the bill. It's hiding in the numbers when you benchmark your inference server on the Spark against Fireworks, in how fast an eval loop can call a service in another region, and in why a stream of tokens sometimes arrives in clumps. It's also a favourite interview topic, because it's where code that's quick on your laptop turns slow across an ocean.
+
+You saw in [How does data travel?](/lessons/packets-and-ip/) that the network loses, duplicates and reshuffles packets, and in [How slow is slow?](/lessons/latency-numbers/) what a round trip costs; this is the layer that repairs the first and pays the second. After it, [What happens when you hit enter?](/lessons/what-happens-url/), [How does HTTPS keep secrets?](/lessons/tls/), [HTTP from scratch](/lessons/http-from-scratch/), [Polling, SSE and WebSockets](/lessons/streaming/) and [Your home server, explained](/lessons/ssh-and-tailscale/) all build on it.
+
 ## Today
 
-- Say what a port and a socket are, and why "IP address plus port" is how a packet finds the right program.
-- Explain UDP in one sentence, and TCP's promise (every byte, in order, exactly once) plus the five tricks that keep it: sequence numbers, acks, retransmission timers, a sliding window, and congestion control.
-- Build a reliable channel on top of UDP in Python, first stop-and-wait and then a sliding window, and push it through a lossy, reordering, delaying proxy you also write.
-- Put numbers on the costs TCP charges you: the handshake round trip, slow start, Nagle's delay, head-of-line blocking, TIME_WAIT, and the window you need to fill a long pipe.
-- Explain why QUIC (and so HTTP/3) rebuilt reliability on top of UDP, and when you'd pick UDP yourself.
+- Say how a packet that reaches your machine finds the right program among the dozens running (a number on the envelope, like an apartment number on a building), and what your code is actually holding when it "opens a connection".
+- Explain UDP, the bare-bones way, in one sentence, and TCP's promise (every byte, in order, exactly once) plus the five tricks that keep it: number every piece, send back receipts, resend when a timer runs out, keep many pieces in flight at once, and slow down when the network is crowded.
+- Build that promise yourself in Python on top of UDP, first sending one piece at a time and then many at once, and push it through a deliberately bad relay you also write that loses, delays and shuffles packets.
+- Put numbers on what TCP charges you: the round trip spent saying hello, the deliberately slow start of every new connection, a rule that holds back small writes, one lost packet stalling everything queued behind it, the minute a closed connection lingers, and how much data must be in flight to keep a long, fast link busy.
+- Explain why the newest version of the web's protocol (HTTP/3) rebuilt all of this on top of UDP, and when you'd pick UDP yourself.
 
-Prerequisites: [How does data travel?](/lessons/packets-and-ip/) (IP is best-effort: packets get lost, duplicated, reordered) and [How slow is slow?](/lessons/latency-numbers/) (round-trip times and `latency × bandwidth`). Rough time: one evening to read and build the channel, one session for tcpdump and the Spark.
+Read [How does data travel?](/lessons/packets-and-ip/) first, since everything here repairs its main point: the network loses, duplicates and reorders packets. [How slow is slow?](/lessons/latency-numbers/) gives you round-trip times and the idea that a long, fast link holds a lot of data in transit at once. Budget one evening to read and build, and one more session to watch real traffic and try it on the Spark.
 
 ## The Problem
 

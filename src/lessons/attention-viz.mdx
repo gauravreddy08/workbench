@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import AttnSteps from '../components/figures/AttnSteps.astro';
 import AttnViewer from '../components/figures/AttnViewer.astro';
 
+Attention is the step inside a language model where each word decides which earlier words to read from, and how much. You can print those decisions and draw them as lines between words. The picture is one of the best windows into a model that exists, and one of the easiest to misread.
+
+You've written attention from scratch, so you know the formula. The formula doesn't tell you what the 144 separate attention units inside a trained GPT-2 actually ended up doing, or how to prove it. Finding one specific behaviour with a number, then switching it off to see what breaks, is the core move in research on what goes on inside trained models, and Anthropic's research engineer postings ask for exactly this.
+
+It builds on the GPT-2 you made in [Train a small LM, end to end](/lessons/tiny-lm/), and on [The KV cache, by hand](/lessons/kv-cache/), which showed the same reading step from the serving side. Afterwards, [FlashAttention and kernels](/lessons/flash-attention/) explains why fast inference never builds the picture you're about to draw.
+
 ## Today
 
-- Walk one query through attention by hand: dot products, the √d scaling, the causal mask, softmax, the blend of values. Say the shape of every tensor on the way, per head and per layer.
+- Walk one word through attention by hand: score it against every earlier word, shrink the scores so they don't blow up, block out the future, turn the scores into weights that add up to one, and blend. Say the shape of every array on the way, for each attention unit and each layer.
 - Pull the real attention weights out of GPT-2 small, check them against your own from-scratch math to six decimal places, and ship them to the browser as JSON.
-- Build an attention viewer in vanilla JS and SVG: pick a layer and head, hover a token, see what it reads.
-- Find a previous-token head and an induction head in GPT-2 small with a number, not by squinting, using a repeated random-token sequence.
-- Knock those heads out and measure what breaks, and explain why a bright attention line is a clue, not a proof.
+- Build an attention viewer in plain JavaScript and SVG: pick a layer and a unit, hover a word, see what it reads.
+- Find, with a number rather than by squinting, the unit that always reads one word back and the unit that spots a repeat and predicts whatever came after it last time, using a string of random words said twice.
+- Switch those units off and measure what breaks, and explain why a bright attention line is a clue, not a proof.
 
-Prerequisites: you've built GPT-2 ([Train a small LM, end to end](/lessons/tiny-lm/) is the closest lesson here), and [The KV cache, by hand](/lessons/kv-cache/) gives you the Q/K/V picture from the serving side. Rough time: one evening for the idea and the export, one for the viewer, one for induction scores and ablation. Everything runs on a laptop CPU.
+You should have built GPT-2 yourself ([Train a small LM, end to end](/lessons/tiny-lm/) is the closest lesson here), and [The KV cache, by hand](/lessons/kv-cache/) helps. Budget one evening for the idea and the export, one for the viewer, and one for scoring units and switching them off. Everything runs on a laptop CPU.
 
 ## The Problem
 

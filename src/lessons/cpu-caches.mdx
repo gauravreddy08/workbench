@@ -6,16 +6,22 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import CachesStrip from '../components/figures/CachesStrip.astro';
 
+Adding up ten million numbers in a plain Python loop takes about a tenth of a second. NumPy does it in about a millisecond. This lesson is about where that factor of a hundred comes from, and the answer is only partly "NumPy is written in C". The rest is about where the numbers sit in memory and the order you visit them in.
+
+That second part follows you everywhere Python's speed does not. It decides whether a feature pipeline over your ranker's scores takes one second or fifteen, why a matrix walked the wrong way round is six times slower in any language, and why PyTorch code is full of calls that rearrange a tensor before the real work starts. On a GPU, which is built to be fed huge amounts of memory per second, it matters even more.
+
+It builds on [How slow is slow?](/lessons/latency-numbers/), where you measured the layers of fast memory and how long each one takes, and [Where do my variables live?](/lessons/stack-and-heap/), where you saw that a Python list is a row of pointers to objects scattered around memory. It hands the interpreter's share to [Why is Python slow?](/lessons/python-speed/) and the memory share to [Why ~17 tokens per second?](/lessons/bandwidth-bound/).
+
 ## Today
 
-- Split "NumPy is faster" into its two real causes, the interpreter bill and the memory bill, and say how big each one is on your machine.
-- Explain what a cache line is, why reading one number drags in 64 or 128 bytes, and what the hardware prefetcher guesses.
-- Predict, before running, how a Python list, an `array.array`, a contiguous NumPy array, a strided view and a random gather will compare, and say why.
-- Explain row-major vs column-major order and NumPy strides, and show a 6x to 30x gap from loop order alone in C.
-- Explain SIMD at the level of a cartoon you could draw on a whiteboard, and why a plain C sum loop doesn't get it for free.
-- Carry it to the GPU: what coalesced memory access means, and why `.contiguous()` shows up all over PyTorch code.
+- Split "NumPy is faster" into its two real causes: the cost of Python running bookkeeping for every element, and the cost of fetching the numbers from memory. Say how big each one is on your machine.
+- Explain why reading one number from memory actually brings in the 64 or 128 bytes around it, and how the chip guesses what you will read next and fetches it early.
+- Predict, before running, how a Python list, an `array.array`, a NumPy array, a NumPy array read with gaps, and a NumPy array read in random order will compare, and say why.
+- Explain the two ways to lay a grid of numbers out in memory (row after row, or column after column), and show a 6x to 30x slowdown from walking it in the wrong order, in Python compiled with Numba.
+- Explain, with a picture you could draw on a whiteboard, how a CPU core does several additions at once, and why a plain loop that adds into one running total can't.
+- Carry it to the GPU: why it matters that neighbouring GPU threads read neighbouring addresses, and why `.contiguous()` shows up all over PyTorch code.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the cache ladder, locality, latency vs bandwidth) and [Where do my variables live?](/lessons/stack-and-heap/) (a list is an array of pointers to objects scattered on the heap; a NumPy array is one block of raw numbers). This lesson does not re-teach the ladder. It uses it. Rough time: one evening, plus half an hour on the Spark.
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the cache ladder, locality, latency vs bandwidth) and [Where do my variables live?](/lessons/stack-and-heap/) (a list is an array of pointers to objects scattered on the heap; a NumPy array is one block of raw numbers). This lesson does not re-teach the ladder. It uses it. All code is Python; the tight loops use Numba, which the Build section introduces. Rough time: one evening, plus half an hour on the Spark.
 
 ## The Problem
 
@@ -252,16 +258,16 @@ NumPy generalises this with <Term w="strides">For each dimension, how many bytes
 </svg>
 </Figure>
 
-For a small matrix this doesn't matter: the whole thing fits in cache, and every walk is a hit. For a big one it decides everything. On the M4 Pro, summing a 4096 × 4096 matrix of doubles (134 MB) in C:
+For a small matrix this doesn't matter: the whole thing fits in cache, and every walk is a hit. For a big one it decides everything. On the M4 Pro, summing a 4096 × 4096 matrix of doubles (134 MB) with a two-line loop compiled by Numba (you'll write it in the Build; a C version measured within a few percent of these):
 
 | Loop order | ns per element | |
 | --- | --- | --- |
-| row by row (`i` outer, `j` inner) | 0.53 | |
-| column by column (`j` outer, `i` inner) | 3.04 | 5.7x slower |
-| row by row, compiled with `-ffast-math` | 0.10 | |
-| column by column, `-ffast-math` | 3.19 | 32x slower |
+| row by row (`i` outer, `j` inner) | 0.48 | |
+| column by column (`j` outer, `i` inner) | 2.78 | 5.8x slower |
+| row by row, compiled with `fastmath=True` | 0.09 | |
+| column by column, `fastmath=True` | 2.77 | 31x slower |
 
-Same additions, same numbers, same compiler, only the loop order swapped. And look at the last two rows: the compiler flag made the good order 5x faster and did nothing for the bad one. That's the third trick, coming up.
+Same additions, same numbers, same compiler, only the loop order swapped. And look at the last two rows: the compiler setting made the good order 5x faster and did nothing for the bad one. That's the third trick, coming up.
 
 **NumPy is usually smart about this, but not always.** For a reduction like `M.T.sum(axis=1)`, NumPy's iterator notices the strides and walks memory in its natural order anyway (I measured 1.36 ms vs 1.19 ms for the un-transposed version: nearly the same). But some operations *must* read in one order and write in another. `M.T.copy()` has to produce a new row-major array from a transposed view, so either its reads or its writes go down columns: 5.4 ms vs 1.2 ms for `M.copy()`. Every time you call `np.ascontiguousarray`, `.copy()` on a transpose, or hand a transposed array to a library that needs C order, you pay that.
 
@@ -277,13 +283,13 @@ You can see strides directly:
 
 ### SIMD: doing several adds at once
 
-The memory bill explains why a column walk is slow. It doesn't explain why NumPy, in order, gets 0.12 ns per element while a plain C loop over the same in-order data gets 0.53. Both read memory perfectly. The difference is in how the arithmetic is done, and it has two parts.
+The memory bill explains why a column walk is slow. It doesn't explain why NumPy, in order, gets 0.12 ns per element while a plain compiled loop (Numba or C, they land within a few percent) over the same in-order data gets about 0.5. Both read memory perfectly. The difference is in how the arithmetic is done, and it has two parts.
 
 **Part 1: the dependency chain.** The plain loop is `s += a[i]`. Each add needs the result of the previous add. A floating-point add takes a few clock cycles to produce its answer, so the core sits waiting for `s` before it can start the next one, even though it has spare adders. One cook, one pot, and every ingredient has to wait for the last one to dissolve. That's where 0.5 ns per element comes from: it's the *latency* of one add, not memory.
 
-Fix: keep four running sums, `s0 += a[i]`, `s1 += a[i+1]`, `s2 += a[i+2]`, `s3 += a[i+3]`, and add them up at the end. Four independent chains, and the core runs them in parallel on its several adders. I measured 0.16 ns per element: 3.3x faster from rearranging the arithmetic, no special instructions at all. This is <Term w="instruction-level parallelism">A single core executing several independent instructions at the same time. Modern cores have several adders, multipliers and load units and will overlap any instructions that don't depend on each other.</Term>.
+Fix: keep four running sums, `s0 += a[i]`, `s1 += a[i+1]`, `s2 += a[i+2]`, `s3 += a[i+3]`, and add them up at the end. Four independent chains, and the core runs them in parallel on its several adders. I measured 0.13-0.15 ns per element against 0.46-0.48 for one accumulator: about 3.4x faster from rearranging the arithmetic, no special instructions needed. This is <Term w="instruction-level parallelism">A single core executing several independent instructions at the same time. Modern cores have several adders, multipliers and load units and will overlap any instructions that don't depend on each other.</Term>.
 
-**Part 2: wide registers.** Modern cores also have <Term w="SIMD">Single Instruction, Multiple Data. One instruction operates on a short vector of numbers packed into one wide register, e.g. adds 2 doubles or 4 floats at once on 128-bit NEON.</Term> instructions. A <Term w="vector register">A wide CPU register holding several numbers side by side. 128 bits on ARM NEON (Apple M and the Spark's cores), 256 bits with x86 AVX2, 512 bits with AVX-512.</Term> holds several numbers side by side, and one instruction adds all the lanes at once. ARM's NEON registers are 128 bits: 2 doubles or 4 floats per instruction. Combine wide registers with several accumulators and you get the 0.08 ns per element I measured for an in-cache sum.
+**Part 2: wide registers.** Modern cores also have <Term w="SIMD">Single Instruction, Multiple Data. One instruction operates on a short vector of numbers packed into one wide register, e.g. adds 2 doubles or 4 floats at once on 128-bit NEON.</Term> instructions. A <Term w="vector register">A wide CPU register holding several numbers side by side. 128 bits on ARM NEON (Apple M and the Spark's cores), 256 bits with x86 AVX2, 512 bits with AVX-512.</Term> holds several numbers side by side, and one instruction adds all the lanes at once. ARM's NEON registers are 128 bits: 2 doubles or 4 floats per instruction. Combine wide registers with several accumulators and you get the 0.07 ns per element I measured for an in-cache sum.
 
 <Figure n="004" title="THREE WAYS TO ADD" caption="Top: one accumulator, every add waits for the one before it. Middle: four accumulators, four independent chains run side by side. Bottom: each accumulator is a vector register holding two doubles (128-bit NEON), and one instruction adds both lanes. Measured on an M4 Pro, data in L1.">
 <svg viewBox="0 0 640 310" role="img" aria-label="Scalar sum with one dependency chain, four parallel chains, and vectorized chains with two lanes each">
@@ -291,7 +297,7 @@ Fix: keep four running sums, `s0 += a[i]`, `s1 += a[i+1]`, `s2 += a[i+2]`, `s3 +
     <marker id="cc-a4" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker>
   </defs>
   <text x="20" y="22" class="strong">ONE ACCUMULATOR</text>
-  <text x="620" y="22" text-anchor="end" class="blue-t">0.52 NS / ELEM</text>
+  <text x="620" y="22" text-anchor="end" class="blue-t">0.46 NS / ELEM</text>
   <rect x="20" y="32" width="64" height="26" class="fill-paper" stroke-width="1" />
   <text x="52" y="49" text-anchor="middle">s+=a0</text>
   <rect x="104" y="32" width="64" height="26" class="fill-paper" stroke-width="1" />
@@ -309,7 +315,7 @@ Fix: keep four running sums, `s0 += a[i]`, `s1 += a[i+1]`, `s2 += a[i+2]`, `s3 +
   <text x="430" y="49">... each waits for s</text>
   <line x1="20" y1="76" x2="620" y2="76" class="ink dash" stroke-width="0.6" />
   <text x="20" y="98" class="strong">FOUR ACCUMULATORS</text>
-  <text x="620" y="98" text-anchor="end" class="blue-t">0.16 NS / ELEM</text>
+  <text x="620" y="98" text-anchor="end" class="blue-t">0.13 NS / ELEM</text>
   <g>
     <rect x="20" y="108" width="64" height="20" class="fill-paper" stroke-width="1" />
     <text x="52" y="122" text-anchor="middle">s0+=a0</text>
@@ -336,7 +342,7 @@ Fix: keep four running sums, `s0 += a[i]`, `s1 += a[i+1]`, `s2 += a[i+2]`, `s3 +
   <text x="190" y="164">same plain instructions, reordered</text>
   <line x1="20" y1="214" x2="620" y2="214" class="ink dash" stroke-width="0.6" />
   <text x="20" y="236" class="strong">VECTOR ACCUMULATORS (SIMD)</text>
-  <text x="620" y="236" text-anchor="end" class="blue-t">0.08 NS / ELEM</text>
+  <text x="620" y="236" text-anchor="end" class="blue-t">0.07 NS / ELEM</text>
   <g>
     <rect x="20" y="246" width="128" height="22" class="fill-wash" stroke-width="1" />
     <line x1="84" y1="246" x2="84" y2="268" class="blue" stroke-width="1" />
@@ -360,11 +366,11 @@ Fix: keep four running sums, `s0 += a[i]`, `s1 += a[i+1]`, `s2 += a[i+2]`, `s3 +
 </svg>
 </Figure>
 
-**Why doesn't the compiler do this for you?** Because floating-point addition isn't associative. `(a + b) + c` and `a + (b + c)` can differ in the last bits, since each add rounds. Splitting one sum into four partial sums changes the order of additions, so it can change the answer, and C compilers aren't allowed to change your answer without permission. `-ffast-math` is that permission (along with several other, riskier ones; don't use it blindly in real code). For integers, where addition is exact, the compiler vectorizes the plain loop by itself.
+**Why doesn't the compiler do this for you?** Because floating-point addition isn't associative. `(a + b) + c` and `a + (b + c)` can differ in the last bits, since each add rounds. Splitting one sum into four partial sums changes the order of additions, so it can change the answer, and compilers aren't allowed to change your answer without permission. Numba uses the same optimiser as the clang C compiler (it is called LLVM), and it follows the same rule. `@njit(fastmath=True)` is that permission, the same thing C programmers ask for with `-ffast-math` (it grants several other, riskier liberties too; don't use it blindly in real code). For integers, where addition is exact, the compiler vectorizes the plain loop by itself: a one-accumulator `int64` sum in Numba ran at 0.06 ns per element with no flag at all.
 
 NumPy gets permission a cleaner way: its `sum` for floats is documented to use **pairwise summation**, adding numbers in blocks and then adding the block sums. That's both more accurate than one long running sum and naturally split into independent chains the CPU can vectorize. So `np.sum` gets the memory bill right (one dense run) *and* the arithmetic bill right (many independent lanes).
 
-**SIMD helps until memory is the wall.** Look at the C numbers when the array is 800 MB instead of fitting in L1: the vectorized sum drops from 0.08 to 0.11 ns per element, about 71 GB/s, because now it's waiting on RAM, not the adders. The one-accumulator sum doesn't change at all (0.52 → 0.54), because it was never waiting on memory. That's the roofline from [Why ~17 tokens per second?](/lessons/bandwidth-bound/) in miniature: a slow kernel is compute-bound, a fast kernel on big data hits the memory roof.
+**SIMD helps until memory is the wall.** Look at the numbers when the array is 800 MB instead of fitting in L1: the vectorized sum drops from 0.07 to 0.09 ns per element, about 89 GB/s, because now it's waiting on RAM, not the adders. The one-accumulator sum barely changes (0.46 → 0.48), because it was never waiting on memory. That's the roofline from [Why ~17 tokens per second?](/lessons/bandwidth-bound/) in miniature: a slow kernel is compute-bound, a fast kernel on big data hits the memory roof.
 
 And notice what SIMD needs: *the numbers packed side by side in memory*, so one load fills one vector register. A Python list can never feed it, because the doubles are inside separate objects. A strided array feeds it badly. Layout isn't just about cache lines; it's what allows the third trick at all.
 
@@ -539,14 +545,19 @@ So when you see `q = q.transpose(1, 2).contiguous()` in an attention implementat
 
 ## Build It
 
-Everything goes in `~/workbench/caches/`. You'll write three programs: the five-ways sum in Python, the row/column walk in C, and the SIMD sum in C. Then you'll repeat the C ones on the Spark with hardware counters.
+Everything goes in `~/workbench/caches/`. You'll write three programs, all Python: the five-ways sum in plain Python and NumPy, then the row/column walk and the dependency-chain sum with Numba. Then you'll repeat the Numba ones on the Spark with hardware counters.
+
+Why Numba for the last two? A plain Python loop spends 10-50 ns of bookkeeping per step, and the effects you're after are a fraction of a nanosecond to a few nanoseconds per element, so the interpreter would bury them. <Term w="Numba">A library that compiles one Python function into machine code the first time you call it. It understands a subset of Python (numbers, loops, NumPy arrays), and inside that subset loops run at roughly C speed.</Term> fixes that: put `@njit` above a function, and the first time you call it Numba works out the argument types and turns the function into the same kind of machine code a C compiler would produce. Every later call runs that machine code directly, with no interpreter in the way. If you met it in [How slow is slow?](/lessons/latency-numbers/), it's the same tool.
 
 <Task id="t0" title="Set up, and read your cache line size" agent="ok">
 
 ```bash
 mkdir -p ~/workbench/caches && cd ~/workbench/caches
-python3 -m venv .venv && . .venv/bin/activate && pip install numpy
+python3 -m venv .venv && . .venv/bin/activate && pip install numpy numba
+python -c "import numba; print(numba.__version__)"
 ```
+
+Numba supports a specific range of Python versions, and a brand-new Python can be ahead of it. If `pip` can't find a build, make the venv with an older Python (3.12 or 3.13 are safe bets at the time of writing; check the Numba install docs). On the Spark, Numba ships builds for ARM64 Linux, so the same `pip install numba` should work; check that it imports.
 
 Ask each machine what its line size is.
 
@@ -601,79 +612,102 @@ Hints:
 
 </Task>
 
-<Task id="t2" title="Walk a matrix by rows and by columns in C" agent="hands">
+<Task id="t2" title="Walk a matrix by rows and by columns with Numba" agent="hands">
 
-```c
-// rowcol.c   build: cc -O2 -o rowcol rowcol.c   and   cc -O2 -ffast-math -o rowcol_fm rowcol.c
-#include <stdio.h>
-#include <stdlib.h>
-#include <time.h>
+Write `rowcol.py`. The harness is yours to finish; the two loops are the point.
 
-static double now(void) {
-    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec + t.tv_nsec * 1e-9;
-}
+```python
+# rowcol.py   run: python rowcol.py 4096
+import sys, time
+import numpy as np
+from numba import njit
 
-// TODO: sum all n*n elements of m (row-major, m[i*n + j]) visiting row by row.
-static double sum_rows(const double *m, size_t n);
-// TODO: same sum, visiting column by column.
-static double sum_cols(const double *m, size_t n);
+@njit
+def sum_rows(m):
+    # TODO: sum all n*n elements of the 2-D array m, visiting row by row
+    # (i outer, j inner, reading m[i, j]). Return the sum.
+    ...
 
-int main(int argc, char **argv) {
-    size_t n = argc > 1 ? (size_t)atol(argv[1]) : 4096;
-    double *m = malloc(n * n * sizeof(double));
-    for (size_t i = 0; i < n * n; i++) m[i] = (double)(i % 7);
-    // TODO: run each twice (the first pass also faults the pages in), time the second,
-    // print n, MB, ns/elem for both orders, the ratio, and both sums.
-}
+@njit
+def sum_cols(m):
+    # TODO: same sum, visiting column by column (j outer, i inner).
+    ...
+
+# Then make fastmath=True copies of both, e.g.
+# sum_rows_fm = njit(fastmath=True)(sum_rows.py_func)
+# (.py_func is the original Python function behind an @njit one.)
+
+def best_ns_per_elem(f, m, reps=5):
+    # TODO: call f(m) once untimed. The first call compiles the function, and
+    # also makes the OS hand over the matrix's memory. Then time `reps` calls
+    # with time.perf_counter_ns() and return (best time / m.size, the sum).
+    ...
+
+n = int(sys.argv[1]) if len(sys.argv) > 1 else 4096
+m = (np.arange(n * n) % 7).astype(np.float64).reshape(n, n)   # row-major, like C
+# TODO: print n, MB, ns/elem for rows and cols (plain and fastmath),
+# the cols/rows ratio, and the sums (they must match).
 ```
 
-Run it for `n` = 256, 1024, 4096, 8192, with both builds. Before you run: at which `n` do you expect the gap to appear, and why there? (Use the cache sizes from `t0`.)
+Hints:
+
+- Write the loops with plain `for i in range(n)` and `m[i, j]`. Don't use `m.sum()` or slicing inside them; you want to control the order yourself.
+- Return the sum and print it. A loop whose result is never used can be deleted by the compiler, and you'd time nothing.
+- Numba checks types, not bounds: an index past the end won't raise an error, it will read garbage or crash. Get the ranges right. (`@njit(boundscheck=True)` turns checking on while you debug; turn it off for timing.)
+
+Run it for `n` = 256, 1024, 4096, 8192. Before you run: at which `n` do you expect the gap to appear, and why there? (Use the cache sizes from `t0`.)
 
 </Task>
 
 <Task id="t3" title="Break the dependency chain by hand" agent="hands">
 
-Write `simd.c` with two functions and a timing loop that calls one of them many times over the same array.
+Write `chain.py` with three Numba functions and a timing loop that calls each one many times over the same array.
 
-```c
-__attribute__((noinline)) double sum1(const double *a, size_t n);  // one accumulator
-__attribute__((noinline)) double sum4(const double *a, size_t n);  // four accumulators, then combine
+```python
+@njit
+def sum1(a): ...          # one accumulator: s += a[i]
+
+@njit
+def sum4(a): ...          # four accumulators s0..s3, step i by 4, combine at the end
+                          # (don't forget the leftover elements when len(a) % 4 != 0)
+
+sum1_fast = njit(fastmath=True)(sum1.py_func)   # sum1, compiler may reorder and vectorize
+
+@njit
+def repeat(f, a, reps):
+    # TODO: call f(a) `reps` times and return something that depends on every result.
+    ...
 ```
 
-Time each on `n = 4096` (32 KB, fits in L1) and `n = 100000000` (800 MB). Build three ways:
+(Numba lets you pass one `@njit` function into another, like `repeat(sum4, a, 20000)`. If your Numba version complains, write one small repeat function per sum instead.)
 
-```bash
-cc -O2 -o s_plain simd.c                                     # sum1, no reordering allowed
-cc -O2 -fno-vectorize -fno-slp-vectorize -o s_four simd.c    # sum4, scalar instructions only
-cc -O2 -ffast-math -o s_fast simd.c                          # sum1, compiler may vectorize
-```
+Time each on `n = 4096` (32 KB, fits in L1; 20,000 repetitions) and `n = 100_000_000` (800 MB; 3 repetitions). Report ns per element: total time ÷ (reps × n). Warm each one up with a single untimed call first, so compile time stays out of the numbers.
 
-(Use a `#define` or a command-line argument to pick which function the loop calls. On Linux with GCC the "no vectorize" flag is `-fno-tree-vectorize`; with clang on the Spark the flags above work.)
+Hints:
 
-The trap: the compiler is allowed to notice that you call a pure function on the same unchanged array a million times, and call it once. You'll see it in Break It. To stop it, put a compiler barrier inside the repeat loop, before each call:
-
-```c
-__asm__ volatile("" : : "r"(a) : "memory");   // "a's memory may have changed": compiler must re-run the sum
-```
-
-Optional, for the curious: `cc -O2 -ffast-math -S simd.c -o -` and look for vector instructions (on ARM64, `fadd v0.2d, ...`: the `.2d` means two doubles).
+- The repeat loop is inside Numba on purpose. Calling a compiled function from Python costs a few hundred nanoseconds each time, which is 5-10% of a 4096-element sum and would blur the L1 numbers.
+- The trap: the compiler may notice that you call a pure function on the same unchanged array again and again, and that nothing uses the answers, and skip the work. You'll see it in Break It. Adding every result into a total and returning the total is enough to stop it here; a ns-per-element number far below 0.05 means it cheated.
+- Print each sum. `sum1` and `sum4` will differ in the last few digits. That is not a bug: you changed the order of the additions, and every add rounds. It is exactly why the compiler won't make `sum4` from `sum1` without `fastmath`.
+- Optional, for the curious: `sum1_fast.inspect_asm()` returns the machine code as text, one entry per compiled signature. Look for vector adds: on the Mac they print as `fadd.2d v0, v4, v0`, on Linux as `fadd v0.2d, ...`; either way `2d` means two doubles in one register. `sum1.inspect_asm()` shows only plain `fadd d0, d0, d1`: one double at a time.
 
 </Task>
 
 <Task id="t4" title="Count the cache misses on the Spark" agent="explain">
 
-macOS has no `perf`. Linux does, and on the Spark you can ask the CPU's own counters how many lines it fetched. Copy `rowcol.c` over and run:
+macOS has no `perf`. Linux does, and on the Spark you can ask the CPU's own counters how many lines it fetched. Copy `rowcol.py` over (and `pip install numba` in a venv there), give it a mode argument so it can run only one order (`rows`, `cols`, or `none`, which builds the matrix and compiles but sums nothing), and run:
 
 ```bash
 sudo apt install linux-tools-common linux-tools-$(uname -r)   # if perf is missing
 perf list | grep -i -E "cache|l1d|ll_"                        # what this CPU offers
-perf stat -e cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses ./rowcol 4096
+perf stat -e cache-references,cache-misses,L1-dcache-loads,L1-dcache-load-misses \
+    python rowcol.py 4096 cols
 ```
+
+`perf stat` counts the whole process: starting Python, importing NumPy, Numba compiling your functions, and building the matrix all add misses of their own. That's what the `none` mode is for. Run it with the same `n`, subtract its counts from the `rows` and `cols` runs, and what's left is the walk. To make the walk dominate, sum the matrix several times in the timed mode.
 
 The generic event names (`cache-misses`, `L1-dcache-load-misses`) are mapped to different hardware counters on different chips, and on ARM some may show `<not supported>`. If so, use the ARM names from `perf list`, typically `l1d_cache` and `l1d_cache_refill` (L1 accesses and lines fetched into L1) and `ll_cache_miss_rd` (last-level cache misses on reads). I can't check exactly which the GB10's cores expose; `perf list` is the truth. If perf complains about permissions, `sudo sysctl kernel.perf_event_paranoid=1`.
 
-To isolate the two orders, give the program a mode argument that runs only one of them. Then compute **misses per element** for each. Row order should be about 1/8 (one 64 B line per 8 doubles), or far less if the prefetcher's lines count as hits. Column order should be close to 1. An agent can explain the event names and what `perf` prints; the program is yours.
+Then compute **misses per element** for each order. Row order should be about 1/8 (one 64 B line per 8 doubles), or far less if the prefetcher's lines count as hits. Column order should be close to 1. An agent can explain the event names and what `perf` prints; the program is yours.
 
 </Task>
 
@@ -692,8 +726,8 @@ GPU timing rules: warm up first, call `torch.cuda.synchronize()` before reading 
 <DoneWhen>
 
 - `five.py` prints every variant, all sums agree, and you wrote your ranking down before running it.
-- `rowcol` shows the row/column gap on both machines, and you can say at which matrix size it appeared and why.
-- `simd.c` shows three distinct speeds in L1, and you can say which one is the dependency chain, which is ILP, and which is SIMD.
+- `rowcol.py` shows the row/column gap on both machines, and you can say at which matrix size it appeared and why.
+- `chain.py` shows three distinct speeds in L1, and you can say which one is the dependency chain, which is ILP, and which is SIMD.
 - You have misses-per-element numbers from `perf stat` on the Spark for both loop orders (or a note on which events weren't supported).
 - You can explain why `x.T + y` is slower than `x + y` without saying "because it's transposed".
 
@@ -712,13 +746,13 @@ Fill in your numbers. Best of several runs. ns per element.
 | `np.sum` contiguous | | | |
 | `np.sum` stride 64 B / 128 B | | | |
 | `a[perm].sum()` | | | |
-| C rows / columns, n = 4096, `-O2` | | | |
-| C rows / columns, n = 4096, `-ffast-math` | | | |
+| Numba rows / columns, n = 4096 | | | |
+| Numba rows / columns, n = 4096, `fastmath=True` | | | |
 | `sum1` / `sum4` / vectorized, in L1 | | | |
 | `perf`: misses per element, rows / columns | | — | |
 | GPU `x + y` vs `x.T + y` (ms) | | — | |
 
-Reference run on an M4 Pro (CPython 3.14.6, NumPy 2.5.4, Apple clang):
+Reference run on an M4 Pro (Python rows: CPython 3.14.6, NumPy 2.5.4; Numba rows: CPython 3.13.9, Numba 0.68, NumPy 2.5.4):
 
 | Experiment | ns per element |
 | --- | --- |
@@ -726,28 +760,28 @@ Reference run on an M4 Pro (CPython 3.14.6, NumPy 2.5.4, Apple clang):
 | `sum(list)` / shuffled | 1.9 / 11.2 |
 | `np.sum` contiguous / stride 64 B / stride 128 B | 0.12 / 0.70 / 2.4 |
 | `a[perm].sum()` (sorted indices instead: 0.54) | 4.2 |
-| C rows / columns, n = 4096, `-O2` | 0.53 / 3.04 |
-| C rows / columns, n = 4096, `-ffast-math` | 0.10 / 3.19 |
-| `sum1` / `sum4` / vectorized, 32 KB array | 0.52 / 0.16 / 0.08 |
-| same, 800 MB array | 0.54 / 0.15 / 0.11 |
+| Numba rows / columns, n = 4096 | 0.48 / 2.78 |
+| Numba rows / columns, n = 4096, `fastmath=True` | 0.09 / 2.77 |
+| `sum1` / `sum4` / `sum1_fast`, 32 KB array | 0.46 / 0.13 / 0.07 |
+| same, 800 MB array | 0.48 / 0.14 / 0.09 |
 
 What to look for:
 
 **The two bills don't simply add.** Loop minus `sum(list)` is 8.8 ns per element for the in-order list (10.7 − 1.9), but 34.5 ns for the shuffled one (45.7 − 11.2). If the interpreter bill were a fixed tax, those would match. They don't because layout and code interact: in the tight C loop inside `sum`, many object loads can be in flight at once, so the misses overlap. In the interpreter loop, each load is surrounded by so much other work that fewer overlap, and each miss is exposed more. "5x interpreter, 16x layout" is a good first story; this is the truer second one.
 
-**The row/column gap appears when the matrix stops fitting in cache.** At n = 256 (512 KB) it was 1.2x for me, at 1024 (8 MB) 1.6x, at 4096 (134 MB) 5.7x. Compare those sizes with your L2 and with Apple's system-level cache (or the Spark's L3). On the Spark, with 64 B lines, the column walk wastes 7/8 of each line instead of 15/16, so if anything expect a slightly smaller ratio than the Mac's at the same size, but a slower row walk too. Measure it.
+**The row/column gap appears when the matrix stops fitting in cache.** At n = 256 (512 KB) it was 1.1x for me, at 1024 (8 MB) 1.6x, at 4096 (134 MB) 5.8x, and 8192 (537 MB) stayed at 5.7x. Compare those sizes with your L2 and with Apple's system-level cache (or the Spark's L3). On the Spark, with 64 B lines, the column walk wastes 7/8 of each line instead of 15/16, so if anything expect a slightly smaller ratio than the Mac's at the same size, but a slower row walk too. Measure it.
 
-**`-ffast-math` widens the gap.** It only speeds up the row walk, because only the row walk was waiting on arithmetic. The column walk was waiting on memory all along, and no amount of SIMD helps a loop that's waiting on RAM.
+**`fastmath=True` widens the gap.** It only speeds up the row walk, because only the row walk was waiting on arithmetic. The column walk was waiting on memory all along, and no amount of SIMD helps a loop that's waiting on RAM.
 
-**The SIMD sum hits the memory roof.** In L1 the vectorized sum is 6.5x faster than `sum1`. From RAM it slows to about 71 GB/s on my Mac: one core's practical bandwidth. `sum1` doesn't care where the data is: 0.52 vs 0.54. Slow code never sees the memory wall; fast code always does.
+**The SIMD sum hits the memory roof.** In L1 the vectorized sum is 6.5x faster than `sum1`. From RAM it slows to about 89 GB/s on my Mac: roughly one core's practical bandwidth. `sum1` barely cares where the data is: 0.46 vs 0.48. Slow code never sees the memory wall; fast code always does.
 
 **Sorted gather is 8x faster than random gather** (0.54 vs 4.2) with the same instructions, because sorted indices walk memory forward and the prefetcher can follow.
 
 ## Break It
 
-**1. Make the matrix a power of two.** Run `rowcol` with n = 4000, 4096 and 4100. On my Mac the column walk took 2.05, 3.27 and 1.96 ns per element. 4096 is about 60% worse than its neighbours. Each column step at n = 4096 is exactly 32 KB, and a cache decides which of its slots a line may go in from a few bits of the address. Addresses exactly 32 KB apart share those bits, so they all compete for the same few slots and keep evicting each other, while the rest of the cache sits empty. These are called <Term w="conflict misses">Cache misses caused not by the cache being full but by too many lines mapping to the same small group of slots (a "set"). Classic with power-of-two strides.</Term>. The classic fix is padding: allocate rows of 4096 + 8 and ignore the extra. This is why some libraries pad their leading dimension, and why FFT and matrix code benchmarks at 4096 sometimes look weirdly bad.
+**1. Make the matrix a power of two.** Run `rowcol.py` with n = 4000, 4096 and 4100. On my Mac the column walk took 1.88, 2.78 and 1.81 ns per element. 4096 is about 50% worse than its neighbours, and the row walk didn't move (0.48 for all three). Each column step at n = 4096 is exactly 32 KB, and a cache decides which of its slots a line may go in from a few bits of the address. Addresses exactly 32 KB apart share those bits, so they all compete for the same few slots and keep evicting each other, while the rest of the cache sits empty. These are called <Term w="conflict misses">Cache misses caused not by the cache being full but by too many lines mapping to the same small group of slots (a "set"). Classic with power-of-two strides.</Term>. The classic fix is padding: allocate rows of 4096 + 8 and ignore the extra. This is why some libraries pad their leading dimension, and why FFT and matrix code benchmarks at 4096 sometimes look weirdly bad.
 
-**2. Let the compiler cheat.** Remove the `__asm__ volatile` barrier from `simd.c`. I got "59,925 GB/s" for the in-cache sum: the compiler saw a function with no side effects called on unchanged data and ran it once. Then delete the final `printf` of the sum and the whole thing may vanish. Every microbenchmark has to make the compiler believe the work matters.
+**2. Let the compiler cheat.** Change `repeat` in `chain.py` so it calls `f(a)` but throws the answer away (`return 0.0` at the end). I got 0.0000045 ns per element for the in-cache `sum1`, which works out to nearly two million GB/s: the compiler saw a function with no side effects whose results nobody used, and removed the calls. Make `sum1` itself return nothing and the loop inside it vanishes too. Every microbenchmark has to make the compiler believe the work matters, and Numba's compiler is as ruthless about this as a C one.
 
 **3. Shrink the problem until NumPy loses.** Time `sum(l)` and `a.sum()` for 10, 100 and 1,000 elements. On my Mac: 59 ns vs 237 ns at 10 elements, about even at 100, and NumPy 5x ahead at 1,000. Every NumPy call pays a fixed few hundred nanoseconds (argument parsing, dtype dispatch, allocating the result) before it touches a single number. Then time `np.array(l).sum()`: it loses at every size, because converting a list to an array is itself a Python-speed loop over objects. NumPy pays off when data *lives* in arrays and many operations happen per conversion.
 

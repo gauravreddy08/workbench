@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import HorizonRuns from '../components/figures/HorizonRuns.astro';
 import HorizonCurves from '../components/figures/HorizonCurves.astro';
 
+A long task, for an AI agent (a model that works by taking actions, like reading a file or running a command, and looking at what happened), is one where it has to make many choices in a row before anything tells it whether it's on track. Fixing one typo is short. Moving forty files to a new config format, where each change depends on the one before, is long.
+
+Long tasks are where agents fall apart, and Anthropic's job postings for the team that trains Claude to code name this gap directly. You've seen the small version already: a web agent that has to get through ten pages to finish a checkout, where each page goes right 95% of the time, finishes only about 60% of the time. The good news is that the damage follows simple arithmetic. You can predict it, measure it, and tell which fix will actually help before you pay for it.
+
+This builds on [Is that improvement real?](/lessons/statistics-for-evals/), for how much to trust a handful of runs, and sits next to [Managing context](/lessons/context-management/), which is about what piles up in the model's memory as a task drags on. It sets up the rest of the track: turning tasks into something a model can practise on in [What is an RL environment?](/lessons/rl-environments/), writing checks that can't be fooled in [Rewards and verifiers](/lessons/verifiers-rewards/), and building the machinery around the model in [Inside an agent harness](/lessons/agent-harness/).
+
 ## Today
 
-- Say what "long-horizon" means in one sentence, and why it is about the number of decisions before feedback, not the number of tokens.
-- Do the compounding-error math in your head: if each step works 99% of the time, what happens at 100 steps, and what the 50% horizon is.
-- Explain why real agents beat that math (recovery), and write down a model with both a per-step error rate and a recovery rate.
-- Explain what METR's "time horizon" measures, what it doesn't, and what "doubling every ~7 months" does and doesn't mean.
-- Build a task suite with a length knob, run a real model through it, fit the curves, then add a verifier and watch the curve move.
+- Say what makes a task "long" in one sentence: how many choices come before anyone tells you how you did, not how much text gets written.
+- Do the math of small errors piling up in your head: if each step works 99% of the time, how often does a 100-step task succeed, and at what length is it a coin flip?
+- Explain why real agents beat that math (they notice and fix some of their mistakes), and write down a simple model with two dials: how often a step goes wrong, and how often a wrong step gets caught and fixed.
+- Explain what the "time horizon" number from METR, a nonprofit that tests AI systems, measures, what it doesn't, and what "it doubles every seven months" does and doesn't mean.
+- Build a set of tasks with a length dial, run a real model through them, fit curves to the results, then add an automatic checker and watch the curve move.
 
-Prerequisites: none strictly, but [Is that improvement real?](/lessons/statistics-for-evals/) helps with the error bars, and [Managing context](/lessons/context-management/) is the sibling lesson about what fills up as tasks get long. Rough time: one evening to read and build the harness, one session of model runs (budget a few dollars to a few tens of dollars, depending on the model; the cost math is in Build It).
+Nothing is strictly required first, though [Is that improvement real?](/lessons/statistics-for-evals/) helps with the error bars and [Managing context](/lessons/context-management/) is the sibling lesson about what fills up as tasks get long. Plan on one evening to read and build the code that runs the model, and one session of model runs, costing a few dollars to a few tens of dollars depending on the model (the cost math is in Build It).
 
 ## The Problem
 

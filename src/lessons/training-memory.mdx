@@ -7,19 +7,25 @@ import DoneWhen from '../components/DoneWhen.astro';
 import TrainMemTimeline from '../components/figures/TrainMemTimeline.astro';
 import TrainMemCalculator from '../components/figures/TrainMemCalculator.astro';
 
+Running a model only needs its weights, the millions or billions of numbers it learned. Teaching it needs those weights plus a pile of notes about every one of them: which way each number should move, how it has been moving lately, a more precise backup copy, and everything the model worked out on the way to its answer so it can trace its mistakes backwards. Add up the notes and they come to many times the weights.
+
+This is the arithmetic that decides what you can train on your own machine. Get it wrong and a job you were sure would fit dies before it finishes a single step, or you rent cloud GPUs for something the Spark could have done. Get it right and you can say, before you run anything, which model sizes are yours to train, which need tricks, and which need a cluster. Interviewers expect you to do this sum on a whiteboard.
+
+It builds on [How much memory does a model need?](/lessons/memory-math/), which sized the serving side, and borrows the story of 16-bit and 32-bit numbers from [the number formats lesson](/lessons/number-formats/). It feeds straight into [Train a small LM, end to end](/lessons/tiny-lm/), [Fine-tuning and LoRA](/lessons/lora/) and [Training on many GPUs](/lessons/distributed-training/).
+
 ## Today
 
-- Say, without looking anything up, why training a model takes about **16 bytes per parameter** before a single activation, and name every one of those bytes.
-- Explain in plain words why the backward pass needs the activations from the forward pass, and estimate how big they get from batch, sequence length, hidden size and layer count.
-- Predict the peak memory of a real training step, then measure it on the Spark with `max_memory_allocated` and a memory snapshot, and read the forward / backward / optimizer phases off the picture.
-- Cut that peak with checkpointing, 8-bit Adam and gradient accumulation, one at a time, and say what each one costs you in speed.
-- Answer "what's the biggest model I can fully fine-tune on the Spark, and how much bigger with LoRA?" with arithmetic, not vibes.
+- Say, without looking anything up, why training a model takes about **16 bytes per parameter** before counting anything that depends on the input, and name every one of those bytes.
+- Explain in plain words why working backwards to find each weight's correction needs the in-between results from the forward run, and estimate how big that pile gets from batch size, text length, model width and number of layers.
+- Predict the peak memory of a real training step, then measure it on the Spark with PyTorch's own memory counters and a recorded timeline of every allocation, and read the forward, backward and update phases off the picture.
+- Cut that peak with three levers, one at a time: recomputing in-between results instead of storing them, storing the optimizer's notes in 8 bits, and splitting a batch into smaller pieces whose corrections you add up; then say what each one costs you in speed.
+- Answer "what's the biggest model I can fully fine-tune on the Spark, and how much bigger if I only train small add-on pieces (LoRA)?" with arithmetic, not vibes.
 
-Prerequisites: [Where does the memory go?](/lessons/memory-math/) (the four inference buckets, GB vs GiB, `memory_allocated` vs `memory_reserved`, unified memory on the Spark). [Number formats](/lessons/number-formats/) helps for the bf16 vs fp32 part, but this lesson repeats what it needs. About one evening of reading and arithmetic plus one session on the Spark.
+Do [How much memory does a model need?](/lessons/memory-math/) first: it covers the four places memory goes when serving, GB vs GiB, the difference between memory in use and memory PyTorch has set aside, and the Spark's shared CPU-and-GPU memory. [The number formats lesson](/lessons/number-formats/) helps for the precision part, but this lesson repeats what it needs. Plan on one evening of reading and arithmetic plus one session on the Spark.
 
 ## The Problem
 
-In [Where does the memory go?](/lessons/memory-math/) you learned to size inference: a 1B model in bf16 is about 2.5 GB of weights, plus a KV cache and some overhead. Serving Llama 3.2 1B fits on a laptop.
+In [How much memory does a model need?](/lessons/memory-math/) you learned to size inference: a 1B model in bf16 is about 2.5 GB of weights, plus a KV cache and some overhead. Serving Llama 3.2 1B fits on a laptop.
 
 Now you want to fine-tune it. Same model, same 1.24 billion numbers. You write the obvious loop, batch of 8, sequence length 2,048, AdamW, on a 24 GB card, and it dies on the first step with something like:
 
@@ -842,6 +848,6 @@ With Ψ parameters and mixed-precision Adam: plain data parallel keeps all 16Ψ 
 
 ## Connections
 
-This lesson extends [Where does the memory go?](/lessons/memory-math/): same bytes-per-parameter thinking, same allocator, same unified-memory caveats, with three new buckets that inference gets to skip. The s² activation term is the training half of [FlashAttention](/lessons/flash-attention/), and the fp32 master copy is [number formats](/lessons/number-formats/) applied to a real failure.
+This lesson extends [How much memory does a model need?](/lessons/memory-math/): same bytes-per-parameter thinking, same allocator, same unified-memory caveats, with three new buckets that inference gets to skip. The s² activation term is the training half of [FlashAttention](/lessons/flash-attention/), and the fp32 master copy is [number formats](/lessons/number-formats/) applied to a real failure.
 
 It unlocks the next three lessons in this track. In [Train a small LM, end to end](/lessons/tiny-lm/) you'll pick batch size, sequence length and checkpointing for a ~100M model on the Spark using exactly this calculator. [LoRA](/lessons/lora/) builds the adapter trick that turns "7B, at most" into "70B, comfortably". And [distributed training](/lessons/distributed-training/) builds the ZeRO picture from Figure 005: when one machine's 128 GB really isn't enough, you split the 16 bytes across many.

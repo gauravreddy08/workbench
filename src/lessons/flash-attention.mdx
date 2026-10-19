@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import FlashTiles from '../components/figures/FlashTiles.astro';
 import FlashTraffic from '../components/figures/FlashTraffic.astro';
 
+Attention is the step where every word in a text looks at every other word to decide which ones matter to it, and FlashAttention is a way of doing that exact same arithmetic while shuffling far fewer numbers around inside the graphics chip. Same answer, to the last rounding error. Much less memory, and much less waiting.
+
+It matters because long inputs are where your work is heading. A day of agent traces, a whole codebase, a long page your ranker has to read: written the obvious way, attention for 32,000 words needs a scratch table bigger than your Spark's entire 128 GB, and it runs out of memory before it finishes the first layer. With FlashAttention the same job needs a few megabytes. Every serious model server, including the one you are benchmarking against Fireworks, depends on it.
+
+It builds on two things you already have: from [Why ~17 tokens per second?](/lessons/bandwidth-bound/), the habit of asking whether a job is waiting on math or on memory, and from [Why is NumPy 100x faster?](/lessons/cpu-caches/), the trick of working on small pieces that fit in fast memory. It is also your first time writing code that runs directly on the graphics chip. After it, the attention code inside real servers ([Inside vLLM and SGLang](/lessons/serving-engines/)) and the decode-time tricks in [The KV cache, by hand](/lessons/kv-cache/) stop being black boxes.
+
 ## Today
 
-- Draw a GPU's memory hierarchy from memory (registers, shared memory, L2, HBM) with rough sizes and speeds, and say which one attention is stuck on.
-- Count the bytes naive attention moves and explain why it is memory-bound for long sequences even though the math is the same.
-- Derive the online softmax trick step by step, prove to yourself that it gives the exact answer, and use it to build attention one tile at a time.
-- Explain FlashAttention's forward pass, why its backward pass recomputes instead of remembering, and what FlashAttention-2 and -3 changed.
-- Write a small GPU kernel in Triton, benchmark it without fooling yourself, and compare it with PyTorch's built-in attention on the Spark.
+- Sketch the layers of memory on a graphics chip, from the tiny fast storage beside the math units down to the big slow main memory, with rough sizes and speeds, and say which layer attention is stuck waiting on.
+- Count the bytes the obvious version of attention moves, and explain why it spends its time waiting on memory for long inputs even though the arithmetic is the same.
+- Work out, step by step, a way to compute softmax while seeing the numbers one piece at a time, prove it gives the exact answer, and use it to build attention one small block at a time.
+- Explain how FlashAttention runs forward, why training it recomputes work instead of saving it, and what the second and third versions changed.
+- Write a small program that runs on the graphics chip, in a Python-like language called Triton, time it without fooling yourself, and race it against PyTorch's built-in attention on the Spark.
 
-Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (arithmetic intensity, the roofline, the ridge point) and [Why is NumPy 100x faster?](/lessons/cpu-caches/) (caches, tiling, reuse). You have written attention yourself in GPT-2, so the math is not new; the machine underneath it is. Rough time: an evening on the idea and the NumPy builds, then a long session on the Spark.
+You will need two earlier lessons: [Why ~17 tokens per second?](/lessons/bandwidth-bound/), for telling memory-limited work from math-limited work, and [Why is NumPy 100x faster?](/lessons/cpu-caches/), for caches and working in small blocks. You have written attention yourself in GPT-2, so the math is not new; the machine underneath it is. Plan on an evening for the idea and the NumPy builds, then a long session on the Spark.
 
 ## The Problem
 

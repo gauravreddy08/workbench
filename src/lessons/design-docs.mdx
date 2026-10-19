@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import DesignGoodputTimeline from '../components/figures/DesignGoodputTimeline.astro';
 
+A design doc is a few pages you write before building something big: what problem you're solving, how you plan to solve it, what else you considered, and how it could go wrong. Other people read it and argue with the plan while changing it is still cheap.
+
+It matters because your code gets reviewed but your approach usually doesn't, and by the time code exists the approach is too expensive to change. A two-page doc is how you find out there was a better way to serve the ranker before you've built yours. It's also a skill AI labs name in their job postings, and the example here is the one they name: keeping a training run on a thousand GPUs alive when machines die under it, worked out with real arithmetic.
+
+It builds on [How do you train across many GPUs?](/lessons/distributed-training/), which showed why one broken GPU stalls all the others, and [How does it scale?](/lessons/back-of-envelope/), which turned vague questions into numbers with units. After this, any project that will take more than a week starts with a doc, beginning with [Train a small LM, end to end](/lessons/tiny-lm/).
+
 ## Today
 
 - Say what a design doc is for (thinking, agreeing, remembering) and why writing one finds problems that writing code lets you skip.
-- Write one with the standard parts: context, goals and non-goals, requirements with numbers, the proposal, alternatives with honest tradeoffs, failure modes, rollout, open questions.
-- Do the fault-tolerance math for a large training job: how often it fails, how often to checkpoint (√(2 × checkpoint cost × MTBF), and why), and what goodput is.
-- Name the real techniques: async and sharded checkpoints, in-memory copies, fast detection, hot spares, elastic training, catching silent corruption.
-- Write a 2-3 page design doc for a 1,000-GPU run with numbers from a simulator you built, then a second one for your own job, and get it reviewed by a person.
+- Write one with the standard parts: why the problem matters now, what you will and deliberately won't solve, the numbers the design must hit, the plan itself, the other options with their honest costs, how the plan can break, how you'll roll it out, and what you still don't know.
+- Do the math for keeping a huge training run alive: how often a job on a thousand GPUs gets knocked over, how often to save its progress (the answer is a square root, and you'll see why), and how to measure the share of time that went into work you actually kept.
+- Name the real tricks that make it cheaper: saving in the background and in pieces, keeping a spare copy in another machine's memory, noticing failures fast, keeping a spare machine warmed up, carrying on with fewer machines, and catching chips that quietly compute wrong answers.
+- Write a 2-3 page design doc for a 1,000-GPU run using numbers from a simulator you built yourself, then a second one for a real decision at your job, and get a person to review it.
 
-Prerequisites: [How do you train across many GPUs?](/lessons/distributed-training/) (data, tensor and pipeline parallelism; the all-reduce that needs every GPU) and [How does it scale?](/lessons/back-of-envelope/) (turning a vague question into arithmetic). Rough time: one evening for the reading and the simulator, a second evening for the doc, and a week of calendar time for the review.
+You'll want [How do you train across many GPUs?](/lessons/distributed-training/) first (the ways of splitting a model across GPUs, and the step where every GPU has to check in before anyone moves on) and [How does it scale?](/lessons/back-of-envelope/) (turning a vague question into arithmetic). Budget one evening for the reading and the simulator, a second for the doc, and a week of calendar time for the review.
 
 ## The Problem
 

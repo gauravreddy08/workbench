@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import GRPOGroupStep from '../components/figures/GRPOGroupStep.astro';
 
+This is how today's reasoning models learn: the model tries the same problem several times, a small piece of code checks which attempts were right, and training nudges the model toward whatever it did on the right ones. Nobody writes example answers for it to copy. GRPO, short for Group Relative Policy Optimization, is the popular recipe for doing that, and at small scale it runs on your Spark.
+
+It's the method behind DeepSeek-R1 and much of the wave of models that "think" before answering, and it's the training half of the coding-RL work Anthropic hires for. It also ties straight back to your inference work. Most of a training run is spent waiting for the model to write its attempts, one token at a time, so every speedup you've chased on the Spark while benchmarking against Fireworks becomes, here, training speed.
+
+It builds on [What is an RL environment?](/lessons/rl-environments/) for the practice arena and [Rewards and verifiers](/lessons/verifiers-rewards/) for the checker, and [Preference tuning with DPO](/lessons/dpo/) is the closest thing you've already implemented. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) explains why writing the attempts is the slow part. Next comes [What makes a task long-horizon?](/lessons/long-horizon/), where one score at the end of a hundred-step task makes all of this much harder.
+
 ## Today
 
-- Explain policy gradient from nothing: why "make the answers that scored well more likely" is a real gradient, and why it needs a baseline to be usable.
-- Say what PPO adds (a clip and a value model) in one breath, and what GRPO takes away (the value model) and pays instead (many samples per prompt).
-- Write GRPO from scratch for a ~0.5B model on the Spark: sample a group, score it with a verifier, compute group advantages, and apply the clipped loss with a KL leash.
-- Read a GRPO run like a dashboard: mean reward, the fraction of groups with zero spread, response length, KL, entropy. Know which curve means which disease.
-- Measure where the time goes, and explain why fast inference is fast RL.
+- Explain from nothing the basic idea of learning from scored attempts: why "make the answers that scored well more likely" is an exact training signal, not a rule of thumb, and why it only becomes usable once you subtract the score you expected.
+- Say in one breath what the older standard method, PPO, adds (a cap on how far one update can move things, and a second network that predicts scores), and what GRPO takes away (that second network) and pays instead (many attempts per question).
+- Write GRPO from scratch for a small model (about 0.5 billion parameters) on the Spark: sample a group of answers, score them with a checker, grade each against the group's average, and update the model with that cap plus a leash back to where it started.
+- Read a GRPO run like a dashboard: average score, the share of questions where every attempt scored the same, answer length, how far the model has drifted from where it started, and how varied its answers still are. Know which curve means which disease.
+- Measure where the time goes, and explain why fast inference means fast training here.
 
-Prerequisites: [What is an RL environment?](/lessons/rl-environments/) and [Rewards and verifiers](/lessons/verifiers-rewards/) (this lesson trains against them), [Preference tuning with DPO](/lessons/dpo/) (the closest thing you've already implemented). Helpful: [How much memory does training take?](/lessons/training-memory/) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/). Rough time: one evening to read, a weekend on the Spark.
+Come in with [What is an RL environment?](/lessons/rl-environments/) and [Rewards and verifiers](/lessons/verifiers-rewards/), since this lesson trains against both, and [Preference tuning with DPO](/lessons/dpo/), the closest thing you've already implemented. [How much memory does training take?](/lessons/training-memory/) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) help too. Plan on one evening to read and a weekend on the Spark.
 
 ## The Problem
 

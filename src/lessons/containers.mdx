@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import ContainerStack from '../components/figures/ContainerStack.astro';
 import ContainerCache from '../components/figures/ContainerCache.astro';
 
+A container is an ordinary program running on your computer behind a fence: it gets its own private view of files, process numbers and network, and a cap on how much memory and processor time it may use, but underneath it shares the one operating system core that the rest of the machine runs on. A virtual machine is the other way to get a private world: software pretends to be a whole separate computer, and a whole second operating system boots inside it.
+
+You ship nearly everything you build in Docker, and on the Spark it's the main supported way to get a working GPU build of PyTorch, so it pays to know what's actually happening when you type `docker run`. Once you can see the fence, a lot of things stop being magic: why one image runs on the Spark but not on a friend's Intel box, why a rebuild sometimes takes two minutes for a one-line change, why code an agent or a model wrote shouldn't run in a plain container, and the "container or VM?" question that interviewers like because the usual answer is fuzzy.
+
+It builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/), because a container turns out to be nothing more than processes with extra labels. Next it unlocks [CI/CD](/lessons/ci-cd/), which is mostly "rebuild this image quickly on every change", and later the sandbox questions in [RL environments](/lessons/rl-environments/) and [agent harnesses](/lessons/agent-harness/), where model-written code has to run somewhere safe.
+
 ## Today
 
-- Say in one sentence what a container is and what a VM is, and why the difference is about the kernel, not about GUIs.
-- Name the three Linux features a container is made of (namespaces, cgroups, a layered filesystem) and what each one does.
-- Build a working "container" by hand on the Spark with `unshare`, `chroot` and a cgroup, and watch your shell become PID 1.
-- Open a Docker image up with `tar` and see that it is just a stack of tarballs plus a JSON file, then write a Dockerfile that rebuilds in a second instead of two minutes.
-- Explain why containers start in milliseconds and VMs in seconds, why Docker on your Mac secretly runs a Linux VM, and how a container gets at the Spark's GPU.
+- Say in one sentence what a container is and what a virtual machine is, and why the difference is about whether you bring your own operating system core (the kernel), not about having a graphical desktop.
+- Name the three Linux features a container is made of, which control what a group of programs can see, how much they can use, and which files they get, and what each one does.
+- Build a working "container" by hand on the Spark with a few standard commands, and watch your shell become process number 1 in its own little world.
+- Open a Docker image up with `tar` and see that it's just a stack of file archives plus a small settings file, then write a Dockerfile that rebuilds in a second instead of two minutes.
+- Explain why containers start in milliseconds and virtual machines in seconds, why Docker on your Mac secretly runs a Linux virtual machine, and how a container gets at the Spark's GPU.
 
-Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) (what a process is, PIDs, what the kernel keeps per process). Helpful: [Where do my variables live?](/lessons/stack-and-heap/). You need the Spark (or any Linux box where you have `sudo`) for the Build section; the Mac can't do the namespace parts. Rough time: one evening.
+You'll want [Processes, threads and the GIL](/lessons/processes-threads-gil/) first (what a process is, process IDs, what the kernel keeps for each process); [Where do my variables live?](/lessons/stack-and-heap/) helps too. The Build section needs the Spark, or any Linux box where you have `sudo`, because the Mac can't do the fencing parts. About one evening.
 
 ## The Problem
 

@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import TxnIsolationLab from '../components/figures/TxnIsolationLab.astro';
 
+A transaction is how you tell a database "these few changes belong together": either all of them happen or none of them do, and nobody else ever sees the job half-finished.
+
+Any code that reads a number, decides something, and writes a new number back needs this the moment two copies of it run at once. Usage meters, credit balances, quotas on how many browser sessions a customer may open, a count of jobs still running: the bug that breaks them throws no error, passes every test, and shows up weeks later as numbers that don't add up. Knowing which guarantee you actually have, and which one you only assumed, is the difference between a system that's correct under load and one that's correct on your laptop. It's also a favourite interview topic, because so few people can explain it precisely.
+
+You've already met the core bug in [Processes, threads and the GIL](/lessons/processes-threads-gil/), where two threads each added one to a counter and one addition vanished. Here it moves into the database. The crash-safety half builds on [What happens when you save a file?](/lessons/files-and-disks/) and [Why not a JSON file?](/lessons/why-databases/), and the tools you'll meet here come back in [The life of an API](/lessons/api-lifecycle/) and [Queues and logs](/lessons/queues/).
+
 ## Today
 
-- Say in plain words what a transaction promises, letter by letter (A, C, I, D), and name the failure each letter prevents.
-- Make a credits service lose money under concurrent load, prove it with totals, then fix it four different ways and know when to pick each.
-- Name the five classic concurrency anomalies (dirty read, lost update, non-repeatable read, phantom, write skew) and say which isolation level stops which, in Postgres specifically.
-- Explain how Postgres gives every transaction its own view of the data without making readers wait for writers (MVCC: row versions and snapshots).
-- Cause a deadlock on purpose, read the error, and explain why people avoid transactions that span two databases, and what they do instead.
+- Say in plain words what a transaction promises, one letter of the acronym ACID at a time (all-or-nothing, rules always hold, no peeking at half-done work, committed means it survives a crash), and name the failure each letter prevents.
+- Make a credits service lose money when many requests hit it at once, prove it by adding up the totals, then fix it four different ways and know when to pick each.
+- Name the five classic ways two overlapping transactions can see or produce wrong data, and say which of the database's protection settings stops which, in Postgres specifically.
+- Explain how Postgres lets every transaction see its own consistent picture of the data without making readers wait for writers: it keeps old copies of each row around instead of overwriting them.
+- Cause two transactions to wait on each other forever, on purpose, read the error, and explain why people avoid transactions that span two databases, and what they do instead.
 
-Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) (the lost-update race on a counter; this lesson is the same bug, one floor down) and [What happens when you save a file?](/lessons/files-and-disks/) (what `fsync` promises). You need Postgres on your Mac or the Spark; Task 0 has three ways to get it. Rough time: one evening.
+Before this, do [Processes, threads and the GIL](/lessons/processes-threads-gil/) (the lost counter increment; this lesson is the same bug, one floor down) and [What happens when you save a file?](/lessons/files-and-disks/) (what forcing data to disk actually promises). You need Postgres on your Mac or the Spark; Task 0 has three ways to get it. Plan on one evening.
 
 ## The Problem
 
@@ -599,7 +605,7 @@ Two wallets, ids 1 and 2. Connection `a` updates wallet 1, connection `b` update
 deadlock detected
 DETAIL:  Process 46616 waits for ShareLock on transaction 58528; blocked by process 46617.
 Process 46617 waits for ShareLock on transaction 58527; blocked by process 46616.
-CONTEXT:  while updating tuple (0,2) in relation "accounts"
+CONTEXT:  while updating tuple (0,2) in relation "wallets"
 ```
 
 Explain each part out loud (an agent may help you decode it, not write the code): why is the lock it waits on a lock on a *transaction*, not on a row? (Hint: a row's `xmax` points at the transaction that is changing it; to wait for the row, you wait for that transaction to finish.) What is tuple `(0,2)`? Time how long the hang lasted and compare it to `SHOW deadlock_timeout`. Then fix it by ordering the updates by id, and show the deadlock is gone.

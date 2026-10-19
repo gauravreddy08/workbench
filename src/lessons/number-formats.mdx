@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import FloatBitFlipper from '../components/figures/FloatBitFlipper.astro';
 
+A computer stores a number with a decimal point the way you would write it in scientific notation: a few significant digits, plus a separate count of how far to slide the point. Give it fewer bits and you have to choose what to cut: digits, which make it blurrier, or the sliding room, which limits how huge or how tiny a number it can hold.
+
+That choice decides whether a training run works. Pick the wrong 16-bit format and a fine-tuning job can train happily for a few hundred steps and then print "not a number" forever, or quietly stop learning because half its tiny corrections have rounded to zero. Every model you train, your cross-encoder included, and every model your Spark serves runs in one of these formats, and it is also a classic interview question. In the diagnostic you were half right about the two common 16-bit formats. Most people are.
+
+You already met "2 bytes per number" in [How much memory does a model need?](/lessons/memory-math/); this is where that 2 comes from. Next, [Why training needs so much memory](/lessons/training-memory/) adds up what each format costs, and [Quantization](/lessons/quantization/) pushes on down to 8 and 4 bits.
+
 ## Today
 
-- Read any float bit by bit: sign, exponent, mantissa, and say what value the bits mean.
-- Say exactly how fp32, fp16, bf16, tf32 and the two fp8 formats differ, in range and in precision, with the real numbers (65,504, 6×10⁻⁵, 3.4×10³⁸, 2⁻⁷...).
-- Explain why the gap between neighbouring floats grows with the size of the number, and what that does to weight updates, sums and subtractions.
-- Make fp16 overflow and underflow happen on purpose, then fix them: the max trick for softmax, loss scaling for gradients.
-- Train the same small GPT four ways (fp32, fp16, fp16 with a gradient scaler, bf16), watch one of them die, and explain why bf16 doesn't need the scaler.
+- Read any number stored this way (a floating-point number) bit by bit: which bit is its sign, which bits say how big it is, which bits hold its digits, and what value they spell.
+- Say exactly how the common formats (32-bit, the two 16-bit ones, NVIDIA's 19-bit tensor-core format and the two 8-bit ones) differ in how big a number they can hold and how many digits they keep, with the real numbers (65,504, 6×10⁻⁵, 3.4×10³⁸, 2⁻⁷...).
+- Explain why the gap between one storable number and the next grows as numbers get bigger, and what that does to small weight updates, long sums and subtractions.
+- Make 16-bit numbers run off the top (to infinity) and off the bottom (to zero) on purpose, then fix both: the subtract-the-biggest-first trick for softmax, and blowing up the loss before working backwards so tiny gradients survive.
+- Train the same small GPT four ways (32-bit, the two 16-bit formats fp16 and bf16, and fp16 with that blow-up-the-loss helper), watch one of them die, and explain why bf16 never needs the helper.
 
-Prerequisites: none, really. It helps to have done [How much memory does a model need?](/lessons/memory-math/), where "2 bytes per parameter" first showed up. Rough time: an evening on your Mac, plus an optional session on the Spark.
+No lesson is strictly required first, though [How much memory does a model need?](/lessons/memory-math/), where "2 bytes per parameter" first showed up, helps. Plan on an evening on your Mac, plus an optional session on the Spark.
 
 ## The Problem
 

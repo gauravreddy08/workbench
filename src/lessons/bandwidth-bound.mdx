@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import BandwidthStream from '../components/figures/BandwidthStream.astro';
 import BandwidthRoofline from '../components/figures/BandwidthRoofline.astro';
 
+When a language model writes, every new word means reading the entire model out of memory once. So how fast it writes is set by how quickly memory can hand bytes over, not by how quickly the chip can do math.
+
+That one fact lets you predict how fast your DGX Spark will run any model, with a single division, before you download it. It explains why a provider like Fireworks feels quicker per user than your Spark before any of their clever tricks. And it turns every speed trick in inference into the same move: get more useful work out of each byte you pull from memory. It's also the honest answer, with a number, to the interview question "why is generating text slow?"
+
+It builds on [How slow is slow?](/lessons/latency-numbers/), where you met the difference between how long one fetch takes and how much can flow per second, and on [Waiting vs working](/lessons/waiting-vs-working/). It's the spine of the inference lessons. Next you'll build a server and race it against Fireworks in [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), and each lesson after that is one way around this limit.
+
 ## Today
 
 - Predict, with one division and no code, how many tokens per second your DGX Spark can generate for any model, before you download it.
 - Explain in plain words why generating text is limited by how fast memory moves bytes, not by how fast the GPU does math.
-- Read a roofline plot: know what arithmetic intensity is, where the ridge point sits on your machine, and which side of it a workload lives on.
-- Tell prefill from decode, and say which one sets time to first token and which one sets tokens per second.
-- Name every way around the wall (quantization, batching, mixture of experts, speculative decoding, faster memory) and say which byte each one saves.
+- Read a roofline plot, a one-picture summary of what limits a chip: score any workload by how much math it does per byte fetched, find the tipping point on your machine between "waiting on memory" and "waiting on math", and say which side a workload lives on.
+- Tell apart the two phases of answering a prompt (reading the whole prompt in one go, then writing the reply one token at a time), and say which one sets the wait before the first word and which sets the speed after it.
+- Name every way around the limit (storing weights in fewer bits, serving many users per read, models that only use part of themselves per token, guessing several tokens ahead and checking them all at once, faster memory) and say which bytes each one saves.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (latency vs bandwidth, the Spark's memory numbers) and [Waiting vs working](/lessons/waiting-vs-working/) (a GPU call returns before the work is done). You have written a transformer forward pass before, so you know what is inside a layer. About 3 hours, half of it measuring.
+You'll want [How slow is slow?](/lessons/latency-numbers/) first (how long one fetch takes versus how fast data flows, and the Spark's memory numbers) and [Waiting vs working](/lessons/waiting-vs-working/) (a GPU call hands control back before the work is done). You've written a transformer forward pass, so you already know what's inside a layer. About 3 hours, half of it measuring.
 
 ## The Problem
 

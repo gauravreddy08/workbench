@@ -11,14 +11,20 @@ import BaselineQueue from '../components/figures/BaselineQueue.astro';
 import BaselineHarness from '../components/figures/BaselineHarness.astro';
 import BaselineGap from '../components/figures/BaselineGap.astro';
 
+Fireworks is a company that runs open AI models on its own big GPUs and rents them out over the internet: you send a prompt, text streams back, and you pay a fraction of a cent for every word-piece it writes. Your DGX Spark can run the very same model on your desk. This is the race between the two, measured properly.
+
+Why bother? Because everything you do for the rest of this track is a claim that a number moved: "batching made it faster", "smaller weights helped". Without a fair, repeatable way to measure, those claims are just a feeling. It is also a question you will get at work and in interviews: should we run this model ourselves or pay someone? The honest answer depends on how long the prompt is, how long the answer is, and how many people show up at once. By the end you will have your own numbers for all three.
+
+It leans on two earlier lessons: the script that fires many requests at a server, and the waiting-in-line math, both from [Waiting vs working](/lessons/waiting-vs-working/), and your prediction from [Why ~17 tokens per second?](/lessons/bandwidth-bound/) that the Spark tops out around 17 word-pieces a second, which you finally get to check. What you build here is a scoreboard, and the next lessons ([how much memory a model needs](/lessons/memory-math/), [remembering past work instead of redoing it](/lessons/kv-cache/), [serving many people at once](/lessons/batching/)) each exist to move a row on it.
+
 ## Today
 
-- Say precisely what "fast" means for an LLM API: six numbers, each with a p50 and a p99, and which one a user actually feels.
-- Account for every millisecond of one streaming request, from your code to the GPU and back, and say where your Spark beats Fireworks and where it can't.
-- Build a deliberately naive model server on the Spark that speaks the same API as Fireworks, with real token streaming.
-- Turn your load generator from [Waiting vs working](/lessons/waiting-vs-working/) into a benchmark harness, run it against both servers, and start the `SCOREBOARD.md` that every later lesson in this track adds a row to.
+- Say precisely what "fast" means for a model you call over the internet: six numbers (how long until the first word shows up, how steady the pace is after that, how much the whole server produces, and so on), each reported for the typical request and for the unlucky one-in-a-hundred, and which of them a user actually feels.
+- Account for every millisecond of one request, from your code across the network to the GPU and back, and say where your Spark beats Fireworks and where it can't.
+- Build a deliberately simple model server on the Spark that accepts exactly the same requests Fireworks does and sends the text back word by word as it is written.
+- Turn your load generator from [Waiting vs working](/lessons/waiting-vs-working/) into a fair benchmark, run it against both servers, and start the `SCOREBOARD.md` file that every later lesson in this track adds a row to.
 
-Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (your async load generator) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (your prediction). Time: an evening for the server, an evening for the harness, and one overnight run.
+Before this, you want [Waiting vs working](/lessons/waiting-vs-working/) (you reuse its load generator) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (you check its prediction here). Budget an evening for the server, an evening for the benchmark, and one overnight run.
 
 ## The Problem
 

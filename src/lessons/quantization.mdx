@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import QuantGrid from '../components/figures/QuantGrid.astro';
 
+A model is billions of numbers, and quantization means storing each of them with fewer digits: rounding every weight to one of a small set of allowed values, the way you might write 14 cm instead of 14.3. Done well, the model shrinks to a quarter of its size and you can barely tell. Done naively, it forgets how to speak.
+
+On your Spark this is the biggest single lever you have. Writing each word-piece of an answer means reading every weight out of memory once, so the speed of your server is mostly the size of the model divided by how fast memory can be read. Shrink the model four times and the ceiling on your scoreboard moves from about 17 word-pieces per second to something near 55, without touching the server. It is also why the open models people actually run come as a menu of 8-bit and 4-bit files, and why it is worth asking how many bits a hosted provider like Fireworks keeps per weight before you compare your speed against theirs.
+
+This builds directly on [Why ~17 tokens per second?](/lessons/bandwidth-bound/), where you found that reading bytes, not doing math, sets the speed, and it adds rows to the scoreboard from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). [fp32, bf16, fp16, fp8](/lessons/number-formats/) covers how computers store numbers in the first place. Next, [Speculative decoding](/lessons/speculative-decoding/) attacks the same speed limit from a different side, and [Inside vLLM and SGLang](/lessons/serving-engines/) shows how real engines combine the two.
+
 ## Today
 
-- Quantize and dequantize a weight matrix by hand: pick a scale and a zero-point, round, and say exactly how big the error can be.
-- Explain why one huge weight can ruin a whole tensor, and how per-channel and per-group scales (group size 128) contain the damage.
-- Say which formats speed up decode (fewer bytes: W4A16, W8A16) and which also speed up prefill (cheaper math: W8A8, FP8, FP4), and why.
-- Read the alphabet soup: FP8 E4M3 and E5M2, NVFP4, MXFP4, GPTQ, AWQ, SmoothQuant, LLM.int8(), Q4_K_M.
-- Serve the same model in bf16, fp8 and 4-bit on the Spark, check each speed against the bandwidth prediction, measure what quality you paid, and add the rows to `SCOREBOARD.md`.
+- Round a matrix of weights to a coarse grid and back by hand: choose the spacing between allowed values and where zero sits on the grid, and say exactly how big the rounding error can be.
+- Explain why one unusually large weight can ruin a whole matrix, and how giving each row, or each run of 128 weights, its own spacing contains the damage.
+- Say which tricks only make the model smaller to read (which speeds up writing the answer) and which also make the arithmetic cheaper (which speeds up reading the prompt too), and why the two halves of a request care about different things.
+- Decode the names you see on model downloads (FP8, NVFP4, MXFP4, GPTQ, AWQ, SmoothQuant, LLM.int8(), Q4_K_M) into what each one actually does to the numbers.
+- Serve the same model at full size, at 8 bits and at 4 bits on the Spark, check each speed against what memory speed predicts, measure how much quality you paid, and add the rows to `SCOREBOARD.md`.
 
-Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bytes per token sets decode speed) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your `bench.py` and scoreboard). It helps to have skimmed [fp32, bf16, fp16, fp8](/lessons/number-formats/), but this lesson explains what it needs. Time: an evening on your Mac for the hand-built part, an evening on the Spark for serving and evals.
+Before this, read [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bytes per token sets the speed) and set up `bench.py` and the scoreboard from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). Skimming [fp32, bf16, fp16, fp8](/lessons/number-formats/) helps, but everything needed is explained here. Plan on two evenings: one on your Mac for the hand-built part, one on the Spark for serving and evals.
 
 ## The Problem
 

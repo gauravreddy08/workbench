@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import VecScanCost from '../components/figures/VecScanCost.astro';
 import VecSearchStepper from '../components/figures/VecSearchStepper.astro';
 
+Vector search is how a computer finds, among millions of stored passages, the few whose meaning sits closest to your question, when each passage has been boiled down to a long list of numbers.
+
+It's the step that runs before your cross-encoder ever sees anything, and it quietly sets a ceiling on how good your ranker can look. When a search result is bad, the fault is often here, in a stage that's easy to treat as plumbing. It's also a favourite interview question, because the honest answer is a page of arithmetic about bytes and memory speed.
+
+It leans on two things you already have: the napkin math from [How does it scale?](/lessons/back-of-envelope/), and the idea from [Why ~17 tokens per second?](/lessons/bandwidth-bound/) that a chip is often stuck waiting for numbers to arrive from memory rather than working on them. After it, [Ranking metrics and eval sets](/lessons/ranking-metrics/) asks how sure you can be that one search setup really beats another, and the "match by meaning" cache from [Caching and Redis](/lessons/caching/) turns out to be this same machinery.
+
 ## Today
 
-- Treat an embedding as a point in space, and say exactly when cosine, dot product and Euclidean distance give the same ranking.
-- Work out, on a napkin, what brute-force search over 100 million vectors costs in bytes, multiply-adds and milliseconds, and why the answer is set by memory bandwidth.
-- Explain the three classic ways around it (IVF, product quantization, HNSW) in plain words, and which dial on each trades recall for speed or memory.
-- Build all of them on real MS MARCO embeddings on the Spark, measure recall@10 against brute force, and plot recall against queries per second and memory.
-- Put an approximate index in front of a cross-encoder, the two-stage pipeline you work on, and measure what each stage costs and buys in NDCG.
+- Picture each passage's list of numbers as a point in space, and say when the three common ways of measuring "how close" two points are all agree on the order.
+- Work out on a napkin what it costs to compare one question against 100 million passages, in bytes, arithmetic and milliseconds, and why the answer is set by how fast memory can be read.
+- Explain, in plain words, the three classic shortcuts: sort passages into rooms and only search a few rooms, shrink each passage's numbers to a few bytes, and walk a road map of links between neighbours. Name the dial on each that trades accuracy for speed or memory.
+- Build all three on real search data on the Spark, check how often each finds the same top 10 as the slow exact search, and plot that against speed and memory.
+- Put a shortcut search in front of your cross-encoder, the two-step fetch-then-reorder setup you work on, and measure what each step costs and how much it improves the final ranking.
 
-Prerequisites: [How does it scale?](/lessons/back-of-envelope/) (napkin math) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bandwidth-bound vs compute-bound). Helpful: [Why is NumPy 100x faster?](/lessons/cpu-caches/). Rough time: one evening to read, one long session on the Spark.
+You'll want the napkin math from [How does it scale?](/lessons/back-of-envelope/) and the "waiting on memory versus working" idea from [Why ~17 tokens per second?](/lessons/bandwidth-bound/); [Why is NumPy 100x faster?](/lessons/cpu-caches/) helps too. Plan on one evening to read and one long session on the Spark.
 
 ## The Problem
 

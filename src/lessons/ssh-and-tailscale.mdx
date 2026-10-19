@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import SSHHolePunch from '../components/figures/SSHHolePunch.astro';
 import SSHPaths from '../components/figures/SSHPaths.astro';
 
+SSH is how you sit at another computer's keyboard from far away: you type on your laptop, the commands run on the other machine, and nobody on the network in between can read or fake what you send. Tailscale is the app that lets your laptop find that machine at all, from anywhere, even though your home router normally turns away anyone knocking from outside.
+
+You lean on both every day. They're how you get to the home server and the DGX Spark, and soon how you'll reach the model server and its dashboards on the Spark without opening them to the whole internet. Right now it all works by magic, which is fine until it doesn't: a frightening warning the day you reinstall the server, a connection that's suddenly slow, a door left open that bots find within hours. Knowing what's really happening is what lets you fix those, and answer an interviewer who asks how a packet gets into a house that's built to keep it out.
+
+It reuses two ideas from earlier lessons, how machines are addressed in [Packets and IP](/lessons/packets-and-ip/) and how two strangers agree on a secret in public in [How does HTTPS keep secrets?](/lessons/tls/), and it unlocks the rest of your Spark work: [Serving engines](/lessons/serving-engines/) and [Observability](/lessons/observability/) both reach the Spark the way you set up here.
+
 ## Today
 
-- Say what is actually running on your home server when you "have SSH", and walk through an SSH connection from the first packet to the shell prompt: key exchange, host keys, user keys, channels.
+- Say what is actually running on your home server when you "have SSH" (a background program waiting by the door), and walk through one connection from the first packet to the prompt: how the two machines agree on a secret, how the server proves it's really your server, how you prove you're you, and how one connection carries many separate streams.
 - Read the scary `REMOTE HOST IDENTIFICATION HAS CHANGED` warning and know whether to worry.
-- Use `~/.ssh/config`, `-L`, `-R`, `-D` and `ProxyJump` so that reaching a Jupyter server on the Spark is one short command.
-- Explain why your laptop cannot reach your home server from a cafe without help (NAT, private addresses), and why opening a port on the router is the risky fix.
-- Explain what Tailscale really does: WireGuard tunnels between your devices, a control server that only swaps keys, hole punching, and DERP relays when that fails. Then prove it with `tailscale ping`, `netcheck` and `tcpdump`.
+- Use a short settings file and a few tunnelling flags (`~/.ssh/config`, `-L`, `-R`, `-D`, `ProxyJump`) so that opening a Jupyter notebook running on the Spark in your laptop's browser is one short command.
+- Explain why your laptop can't reach your home server from a cafe without help (the router shares one public address among every device in the house and turns away strangers), and why poking a hole in the router for it is the risky fix.
+- Explain what Tailscale really does: encrypted tunnels straight between your devices (WireGuard), a central server that only swaps public keys and never sees your traffic, a trick for slipping through two routers at once, and relay servers for when that trick fails. Then prove it with Tailscale's own diagnostics and by watching the packets go by.
 
-Prerequisites: none strictly. [Packets and IP](/lessons/packets-and-ip/) and [TLS](/lessons/tls/) make a few sections click faster, and [TCP vs UDP](/lessons/tcp-vs-udp/) explains why WireGuard picked UDP. Rough time: one evening on the home server, plus half an hour with the Spark.
+[Packets and IP](/lessons/packets-and-ip/) and [How does HTTPS keep secrets?](/lessons/tls/) aren't strictly required first; they just make a few sections click faster. [TCP vs UDP](/lessons/tcp-vs-udp/) also helps: it explains why WireGuard sends its packets the quick, no-guarantees way. Budget one evening on the home server, plus half an hour with the Spark.
 
 ## The Problem
 

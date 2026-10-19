@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import TailFanout from '../components/figures/TailFanout.astro';
 import TailQueue from '../components/figures/TailQueue.astro';
 
+Send the same request to the same server a thousand times and you get a thousand different answer times. Most land close together. A handful take ten or a hundred times longer, for reasons that have nothing to do with your code. Those few slow ones are what people mean by "the tail", and they decide how fast a system feels.
+
+That matters the moment you make a claim about speed. When you say your inference server on the Spark holds up against Fireworks, the claim lives or dies on the slowest 1 request in 100, and on whether your test sent traffic the way real users do. An agent step that calls five tools at once waits for the slowest of the five. And "what happens to response times if we run fewer machines?" is a question interviewers love, because most people guess wrong.
+
+You've already built the pieces this needs: a load generator (a program that fires requests at a server and times them) and the rule that ties "how many requests are in flight" to "how long each takes" in [Waiting vs working](/lessons/waiting-vs-working/), and a benchmark harness in [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). Here you learn to point them at a server without fooling yourself. After this come [Rate limits and backpressure](/lessons/rate-limits/) (what to do when more traffic arrives than you can serve), [Load balancers and state](/lessons/load-balancing/), and [Batching](/lessons/batching/), which trades a little waiting for a lot more work per GPU pass.
+
 ## Today
 
-- Say exactly what p50, p99 and p99.9 are, why the mean misleads, and why you can't average two p99s.
-- Explain where the long tail of a latency distribution comes from, and why fan-out turns one backend's rare bad day into most users' normal day.
-- Predict, with one formula, how latency grows as a server gets busier, and find the knee of the curve on a real server.
-- Tell a closed-loop load generator from an open-loop one, catch coordinated omission in the act, and record latencies in an HDR histogram.
-- Build hedged requests and measure what they do to p99, and what they cost.
+- Read latency numbers like p50 and p99 (the time that 50, or 99, out of every 100 requests beat), say why the average misleads, and why you can't average two p99s together.
+- Explain why a few requests are always far slower than the rest, and why a page that has to wait for many servers turns each server's rare bad moment into most users' normal experience.
+- Predict, with one short formula, how waiting time grows as a server gets busier, and find the point on a real server where it suddenly shoots up.
+- Tell a load test that waits for each answer before sending the next from one that sends on a fixed schedule the way real users do; catch the first kind hiding slow requests from you; and record latencies in a compact tally that keeps the slow ones.
+- Build "if the first copy is slow, send a second copy elsewhere" and measure how much it helps the slowest requests and how much extra traffic it costs.
 
-Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (your async `loadgen.py` and Little's Law) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your benchmark harness, and why 20 samples can't give a p99). Rough time: two evenings.
+You'll want [Waiting vs working](/lessons/waiting-vs-working/) first (your async `loadgen.py`, and Little's Law, the rule linking requests in flight, request rate and time per request) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your benchmark harness, and why 20 samples can't tell you about the slowest 1 in 100). Budget two evenings.
 
 ## The Problem
 

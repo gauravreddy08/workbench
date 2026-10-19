@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import RewardHackGallery from '../components/figures/RewardHackGallery.astro';
 import RewardAmplify from '../components/figures/RewardAmplify.astro';
 
+When a model practises coding, something has to give each attempt a score. That score is the reward, and the program that works it out, usually by running the code and checking what comes back, is the verifier. Between them, they are the only way the model ever finds out what "good" means.
+
+Get them wrong and training goes beautifully in the wrong direction. Pay a model for making the tests say "passed" and, sooner or later, it learns to make the tests say "passed" without writing code that works, while your score chart climbs the whole time. Labs that train coding models have reported exactly this in public. It's the same worry you already have about your ranker's metrics, turned up to full: push hard enough on any number and it stops meaning what it used to.
+
+This picks up the practice arena from [What is an RL environment?](/lessons/rl-environments/) and replaces its rough scoring with something you can trust. It leans on [Why is the eval separate?](/lessons/why-evals-are-separate/) and [LLMs as judges](/lessons/llm-judges/), and the grader you build here is what [RL with verifiable rewards](/lessons/grpo/) trains against next.
+
 ## Today
 
-- Name the main ways to score code automatically (visible and hidden tests, property tests, comparing against a reference, lint and type checks, LLM judges with rubrics) and say what each one can and cannot see.
-- Explain outcome vs process rewards and sparse vs dense rewards, and why most code RL uses sparse outcome rewards anyway.
-- Recognise the classic reward hacks on sight: hardcoding answers, editing tests, patching the test runner, exiting early, always-equal objects, swallowing errors, reading the answer key, copying the fix.
-- Treat a verifier as a classifier, and explain why its false positives are the most dangerous error in RL.
-- Measure how strong a test suite really is with mutation testing.
+- Name the main ways to score code automatically (tests the model can see and tests it can't, tests that check a rule on hundreds of random inputs, comparing against a known-correct version, style and type checkers, and another model grading from a written checklist) and say what each one can and cannot see.
+- Explain the two big choices in scoring, grading only the final result or every step along the way, and scoring once at the end or often, and why most coding training grades once, at the end, on the result.
+- Recognise on sight the classic ways a model cheats its score: hardcoding answers, editing the tests, rigging the test runner, quitting before the tests run, returning an object that claims to equal anything, swallowing errors, reading the answer key, copying the real fix.
+- Treat a checker as a yes/no classifier, and explain why its most dangerous mistake during training is passing bad code.
+- Measure how strong a test suite really is by planting small bugs in correct code and counting how many the tests catch.
 
-Prerequisites: [What is an RL environment?](/lessons/rl-environments/) (the coding environment with `reset`, `step`, a sandbox, and reward = fraction of hidden tests passed). This lesson replaces that last line with something that deserves the word "reward". Helpful: [Why is the eval separate?](/lessons/why-evals-are-separate/) for Goodhart's law. Rough time: one evening to read, one to build and red-team, an hour for the agent run.
+Start from [What is an RL environment?](/lessons/rl-environments/): the practice world where the model's code runs in a locked box and its score is the fraction of hidden tests it passes. This lesson replaces that last part with something that deserves the word "reward". [Why is the eval separate?](/lessons/why-evals-are-separate/) helps too, for why a number stops meaning much once you push on it. Plan on one evening to read, one to build and attack your own grader, and an hour for the agent run.
 
 ## The Problem
 

@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import RLEnvEpisode from '../components/figures/RLEnvEpisode.astro';
 import RLEnvSignal from '../components/figures/RLEnvSignal.astro';
 
+An environment is a practice arena for an AI model: a small world it can act in, plus a referee that scores how it did, built so the model can try the same kind of task thousands of times and slowly get better at it.
+
+A model can only learn what its arena can measure. Make the arena too easy and it learns nothing. Leave a crack in the scoring and it learns to squeeze through the crack instead of doing the work. Make it slow and a room full of expensive GPUs sits idle waiting for unit tests. Anthropic's job postings for the team that trains Claude to code list building these arenas as core work, and it's the same instinct you already use on your ranker's eval set: a score is only as good as the thing producing it.
+
+This leans on [What is a container, really?](/lessons/containers/) for the walls around the arena and [Processes, threads and the GIL](/lessons/processes-threads-gil/) for running code as a separate program. Next, [Rewards and verifiers](/lessons/verifiers-rewards/) hardens the scoring against cheating, and [RL with verifiable rewards](/lessons/grpo/) actually trains a model inside the arena you build here.
+
 ## Today
 
-- Explain the reinforcement learning loop in plain words: agent, environment, observation, action, reward, episode, policy.
-- Read and write the Gymnasium `reset` / `step` interface, and say why it returns both `terminated` and `truncated`.
-- Map that loop onto an LLM doing a coding task: what the policy, the actions, the episode and the reward actually are.
-- List what a coding environment contains (task, starting repo, sandbox, tools, stop rules, reward, metadata) and why each piece is there.
-- Build a 20-task coding environment with a real sandbox, run three baselines through it (no-op, random, an LLM), and measure how fast it resets, steps and runs in parallel.
+- Explain learning by trial and error in plain words: who acts, what it gets to see, what moves it can make, how it gets scored, what one full attempt is, and what the "habit" being trained actually is.
+- Read and write the two-function shape nearly every practice world uses, one to start fresh and one to make a single move, and say why it reports two different kinds of "finished".
+- Map that loop onto a language model fixing a bug: what its habit, its moves, one attempt and its score actually are.
+- List what a coding practice world contains (the task, the starting code, a locked box to run code in, tools, rules for when to stop, the scoring, and record-keeping) and why each piece is there.
+- Build a 20-task coding world that runs code safely, try three players in it (one that does nothing, one that acts at random, and a real model), and measure how fast it starts, takes a move, and runs many copies at once.
 
-Prerequisites: [What is a container, really?](/lessons/containers/) for the sandbox part, and [Processes, threads and the GIL](/lessons/processes-threads-gil/) for what a subprocess is. [Queues](/lessons/queues/) and [Back-of-envelope](/lessons/back-of-envelope/) help with the throughput section. Rough time: one evening to read, one to build.
+You'll want [What is a container, really?](/lessons/containers/) for the locked box and [Processes, threads and the GIL](/lessons/processes-threads-gil/) for what it means to start a separate program; [Queues](/lessons/queues/) and [Back-of-envelope](/lessons/back-of-envelope/) help with the part about running many copies at once. Plan on one evening to read and one to build.
 
 ## The Problem
 

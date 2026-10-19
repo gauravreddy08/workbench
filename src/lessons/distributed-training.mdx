@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import DistRingAllReduce from '../components/figures/DistRingAllReduce.astro';
 import DistPipelineBubble from '../components/figures/DistPipelineBubble.astro';
 
+Training on many GPUs means cutting one training job into pieces so that hundreds or thousands of chips can work on it together, passing numbers back and forth all the time so they stay in agreement.
+
+It matters because the big models you use every day can't be made any other way. A model the size of the large open ones needs more memory than ten of the biggest GPUs hold, and would take a single GPU centuries to train. Your cross-encoder meets a small version of the same problem the day you want to train it on two machines instead of one. And "how would you lay out a 70-billion-weight model on a thousand GPUs?" is a standard interview question at the labs that train these models.
+
+It builds on [How much memory does a model need?](/lessons/memory-math/) for counting bytes, [Back of the envelope](/lessons/back-of-envelope/) for estimating with powers of ten, and [Processes, threads and the GIL](/lessons/processes-threads-gil/), because every GPU here is driven by its own separate program. It sets up [Train a small LM, end to end](/lessons/tiny-lm/), where you split real training across processes, and [Writing a design doc](/lessons/design-docs/), where a plan for surviving broken machines becomes something a team can approve.
+
 ## Today
 
-- Work out, with two lines of arithmetic, why a 70B model can't be trained on one GPU: not enough memory, and not enough years.
-- Draw the five collective operations (broadcast, reduce, all-reduce, reduce-scatter, all-gather), and explain why ring all-reduce sends about 2x the data no matter how many GPUs there are.
-- Explain the three ways to split training (data, tensor, pipeline parallelism), what each one costs in communication, and why tensor parallelism stays inside one machine.
-- Explain ZeRO / FSDP: what gets sharded at each stage and what it costs.
+- Work out, with two lines of arithmetic, why a 70-billion-weight model can't be trained on one GPU: not enough memory, and not enough years.
+- Draw the five group moves GPUs use to share data (the key one: everyone adds up their numbers and everyone gets the total), and explain why doing that sum by passing pieces around a ring sends about 2x the data per GPU, no matter how many GPUs there are.
+- Explain the three ways to split training: give every GPU a copy of the model and different examples, cut each weight matrix across GPUs, or give each GPU a slice of the layers like an assembly line (data, tensor and pipeline parallelism). Say what each costs in talking between GPUs, and why cutting the matrices only works inside one machine.
+- Explain how to stop every GPU keeping its own full copy of the weights, gradients and optimizer bookkeeping (ZeRO and FSDP): what gets split up at each stage, and what it costs.
 - Pick a layout for a 70B model on 1,024 GPUs and defend it with numbers, including what happens when a GPU dies at 3 a.m.
 
-Prerequisites: [How much memory does a model need?](/lessons/memory-math/) (bytes per parameter), [Back of the envelope](/lessons/back-of-envelope/) (estimating with powers of ten), and [Processes, threads and the GIL](/lessons/processes-threads-gil/) (this whole lesson runs as separate processes). [How much memory does training take?](/lessons/training-memory/) is the training-side version of the memory math; if you haven't done it, the one number you need is "about 16 bytes per parameter". Rough time: two evenings. Everything runs on your Mac or the Spark; the cluster parts are done with numbers.
+Read [How much memory does a model need?](/lessons/memory-math/) for bytes per weight, [Back of the envelope](/lessons/back-of-envelope/) for estimating with powers of ten, and [Processes, threads and the GIL](/lessons/processes-threads-gil/), since this whole lesson runs as separate processes. [How much memory does training take?](/lessons/training-memory/) is the training version of the memory math; if you skip it, the one number you need is about 16 bytes per weight. Budget two evenings. Everything runs on your Mac or the Spark, and the cluster parts are done with numbers.
 
 ## The Problem
 

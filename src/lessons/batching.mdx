@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import BatchGantt from '../components/figures/BatchGantt.astro';
 
+Batching means letting the GPU work on many people's answers in the same pass instead of one person's at a time. Continuous batching goes one step further: people can join and leave that shared pass at any moment, like passengers on a bus that never waits at the terminal.
+
+This is how inference companies make money. A GPU costs the same per hour whether it writes 17 word-pieces a second or 700, and batching is most of the difference between the two. It is also the row on your scoreboard that hurt most: at 16 users, your naive server made the last person wait about five minutes for their first word. And when an interviewer asks how Fireworks serves thousands of strangers on a handful of GPUs, this is the answer.
+
+It builds on a lot of what you have done. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) showed that each step is mostly hauling the model out of memory, and that haul can be shared. [The baseline](/lessons/baseline-vs-fireworks/) gave you the server, the benchmark and the scoreboard you are about to upgrade. [Waiting vs working](/lessons/waiting-vs-working/) gave you the waiting-in-line math, and [How much memory does a model need?](/lessons/memory-math/) and [The KV cache, by hand](/lessons/kv-cache/) tell you what each seat on the bus costs. Next, [prefix caching](/lessons/prefix-caching/) packs those seats tighter, and [Inside vLLM and SGLang](/lessons/serving-engines/) shows the same ideas done fast.
+
 ## Today
 
 - Explain, with one division, why serving 64 users at once costs barely more per step than serving one, and where that stops being true.
-- Name the three taxes of static batching (padding, waiting for the longest, head-of-line blocking) and show how a wait window and then continuous batching remove them.
-- Write your own decode loop where sequences join and leave the batch at every step, and prove it produces exactly the same tokens as one-at-a-time `generate`.
-- Read a throughput-vs-latency plot, pick a batch size from an SLO, and say whether memory, bandwidth or compute is what stops you adding more users.
-- Add two rows to `SCOREBOARD.md`, and watch the c = 16 row stop being embarrassing.
+- Name the three costs of the simplest kind of batching, where a fixed group starts and finishes together (filler added to short prompts, everyone waiting for the longest answer, and newcomers stuck behind a batch already running), and show how a time limit, and then letting people join and leave at every step, remove them.
+- Write your own generation loop where requests join and leave the shared batch at every step, and prove it produces exactly the same words as running each request alone.
+- Read a chart of total output against waiting time, pick a batch size from a speed promise you have made to users, and say whether memory space, memory speed or raw math is what stops you adding more users.
+- Add two rows to `SCOREBOARD.md`, and watch the 16-user row stop being embarrassing.
 
-Prerequisites: [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your naive server, `bench.py`, `SCOREBOARD.md`) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the roofline). [Memory math](/lessons/memory-math/) and [the KV cache](/lessons/kv-cache/) help with the last section. Time: an evening for static batching, a weekend for continuous batching, an evening of benchmark runs.
+Before this, you want [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your naive server, `bench.py` and `SCOREBOARD.md`) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the chart of when memory or math is the bottleneck). [How much memory does a model need?](/lessons/memory-math/) and [The KV cache, by hand](/lessons/kv-cache/) help with the last section. Budget an evening for the simple batcher, a weekend for continuous batching, and an evening of benchmark runs.
 
 ## The Problem
 

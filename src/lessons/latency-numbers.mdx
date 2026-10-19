@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import LatencyLadder from '../components/figures/LatencyLadder.astro';
 import LatencyTransfer from '../components/figures/LatencyTransfer.astro';
 
+A computer keeps your data in several places at once: a few tiny, very fast spots right next to the processor, a big main memory a few centimetres away, a drive that remembers things with the power off, and other machines across a network. Getting a number from each of those places takes a very different amount of time, from about a billionth of a second to a sizeable fraction of a second.
+
+Those gaps decide whether a design works before you write any code. A lookup service for your ranker that reads from memory answers in microseconds; the same code reading from the drive can be a thousand times slower and fall over under real traffic. "How does it scale?" is mostly the question "how many times do we touch the slow places, and how slow are they?", and you cannot answer it without these numbers in your head.
+
+This is the first lesson of the chapter and the measuring stick for the rest. It pairs with [Where do my variables live?](/lessons/stack-and-heap/), which is about where things sit in memory; this one is about what each place costs. It sets up [Why is NumPy 100x faster?](/lessons/cpu-caches/), [Waiting vs working](/lessons/waiting-vs-working/) and [Why ~17 tokens per second?](/lessons/bandwidth-bound/).
+
 ## Today
 
-- Say from memory, to within a factor of a few, how long an L1 hit, a RAM read, an SSD read, a datacenter round trip and a round trip to Europe take, and how many times slower each one is than the last.
-- Explain why the ladder exists: why caches are fast and small, why RAM is slow even though it is a few centimetres away, why flash takes microseconds, and why no amount of money makes Europe closer.
-- Tell **latency** (how long until the first byte) apart from **bandwidth** (bytes per second once it is flowing), and know which one a given job is limited by.
-- Measure every rung yourself on your Mac and your DGX Spark, including the cache "staircase".
-- Use the numbers for a back-of-envelope answer to "can we serve this from disk, or does it need RAM?"
+- Say from memory, to within a factor of a few, how long it takes to get a number from the processor's closest little memory, from main memory, from the drive, from another machine in the same building, and from a server in Europe, and roughly how many times slower each step is than the one before.
+- Explain why those steps exist: why the fastest memory has to be tiny, why main memory is slow even though it sits a few centimetres away, why a drive takes millionths of a second rather than billionths, and why no amount of money makes Europe closer.
+- Tell apart two different kinds of "fast": how long you wait for the first byte to arrive, and how many bytes per second flow once they are moving. Know which one a given job is stuck on.
+- Measure every step yourself on your Mac and your DGX Spark, in Python, including the "staircase" you get as your data outgrows each layer of fast memory.
+- Use the numbers to answer "can we serve this from disk, or does it need to sit in memory?" on the back of an envelope.
 
-**Prerequisites:** you can compile a C file and run Python. **Time:** an evening for the reading and the C benchmark, another for disks and network.
+**Prerequisites:** you can run Python and `pip install` a package. No C needed. **Time:** an evening for the reading and the memory benchmarks, another for disks and network.
 
 ## The Problem
 
@@ -314,7 +320,18 @@ The way to get many things in flight from one program is to not wait for each on
 
 You are going to put a measured number next to every rung, on both machines. Make a folder, say `~/workbench/latency`, and keep every script and result there. Write your predictions into the Measure table before you run anything.
 
-<Task id="t1" title="Find your hardware's cache sizes" agent="ok">
+<Task id="t1" title="Set up, and find your hardware's cache sizes" agent="ok">
+
+Make a virtual environment with NumPy and Numba (you will meet Numba properly in the pointer-chase task):
+
+```bash
+mkdir -p ~/workbench/latency && cd ~/workbench/latency
+python3 -m venv .venv && . .venv/bin/activate
+pip install numpy numba
+python -c "import numba; print(numba.__version__)"
+```
+
+Numba supports a specific range of Python versions, and a brand-new Python can be ahead of it. If `pip` fails to find a build, make the venv with an older Python (3.12 or 3.13 are safe bets at the time of writing; check the Numba install docs). Do the same on the Spark: Numba ships builds for ARM64 Linux, so `pip install numba` there should just work, but check that it imports.
 
 Before measuring the caches, find out what the chip claims. On the Mac:
 
@@ -355,62 +372,67 @@ Then feel the interpreter's overhead on memory. Write `chase_py(n, steps)` that 
 - Shape: build the list, warm it up with one full pass, then `t0 = time.perf_counter_ns()`, loop, `t1 = ...`, print `(t1 - t0) / steps`.
 - Use at least a few million steps so the timer's own cost disappears.
 
-You should find that the small list costs tens of nanoseconds per step, not one. The interpreter's work per step is bigger than the L1 and L2 latencies you are trying to see, so they are invisible. The big list will be slower, because it does miss cache, but the steps between cache levels are smeared out. That is why the real measurement is in C.
+You should find that the small list costs tens of nanoseconds per step, not one. The interpreter's work per step is bigger than the L1 and L2 latencies you are trying to see, so they are invisible. The big list will be slower, because it does miss cache, but the steps between cache levels are smeared out. That is why the real measurement takes the interpreter out of the loop.
 
 </Task>
 
-<Task id="t3" title="Pointer-chase the cache staircase in C" agent="hands">
+<Task id="t3" title="Pointer-chase the cache staircase with Numba" agent="hands">
 
-The trick for measuring latency, not bandwidth, is to make every load depend on the one before it. Store an array where each slot holds the index of the next slot to visit, in a random order. Then `i = next[i]` in a loop: the CPU cannot know where to go next until the current load finishes, and the random order defeats the prefetcher. This is called <Term w="pointer chasing">Following a chain where each memory address comes from the previous load. The CPU cannot overlap or predict these loads, so the time per step is pure latency.</Term>.
+The trick for measuring latency, not bandwidth, is to make every load depend on the one before it. Store an array where each slot holds the index of the next slot to visit, in a random order. Then `i = nxt[i]` in a loop: the CPU cannot know where to go next until the current load finishes, and the random order defeats the prefetcher. This is called <Term w="pointer chasing">Following a chain where each memory address comes from the previous load. The CPU cannot overlap or predict these loads, so the time per step is pure latency.</Term>.
+
+The previous task showed that plain Python adds tens of nanoseconds per step, which buries the cache. So you will write the loop in Python and hand it to <Term w="Numba">A library that compiles one Python function into machine code the first time you call it. It only understands a subset of Python (numbers, loops, NumPy arrays), and inside that subset the loop runs at roughly C speed.</Term>. You put `@njit` above a function. The first time you call it, Numba reads the function, works out the types of its arguments, and turns it into the same kind of machine code a C compiler would produce. From then on, each call runs that machine code directly: no bytecode, no interpreter, no float objects. The loop is still Python you wrote; the interpreter is just not in the way any more.
 
 Here is the harness. The two functions marked TODO are yours.
 
-```c
-// chase.c: average latency of one dependent load, for growing array sizes.
-// build: cc -O2 -o chase chase.c       (same command on macOS and on the Spark)
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <time.h>
+```python
+# chase.py: average latency of one dependent load, for growing array sizes.
+# run: python chase.py        (same command on macOS and on the Spark)
+import time
+import numpy as np
+from numba import njit
 
-static double now_ns(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (double)t.tv_sec * 1e9 + (double)t.tv_nsec;
-}
+@njit
+def make_cycle(nxt):
+    # TODO 1: fill nxt[0..n) so that starting at 0 and following i = nxt[i]
+    # visits every slot exactly once, in random order, before returning to 0.
+    ...
 
-// TODO 1: fill next[0..n) so that starting at 0 and following i = next[i]
-// visits every slot exactly once, in random order, before returning to 0.
-static void make_cycle(size_t *next, size_t n);
+@njit
+def chase(nxt, steps):
+    # TODO 2: follow the chain `steps` times starting from 0; return the final index.
+    ...
 
-// TODO 2: follow the chain `steps` times starting from 0; return the final index.
-static size_t chase(const size_t *next, size_t steps);
+STEPS = 20_000_000
 
-int main(void) {
-    const size_t steps = 20 * 1000 * 1000;
-    for (size_t bytes = 4 << 10; bytes <= ((size_t)1 << 30); bytes *= 2) {
-        size_t n = bytes / sizeof(size_t);
-        size_t *next = malloc(bytes);
-        if (!next) return 1;
-        make_cycle(next, n);
-        chase(next, n);                       // warm-up: touch every slot once
-        double t0 = now_ns();
-        size_t end = chase(next, steps);
-        double t1 = now_ns();
-        printf("%8zu KB  %7.2f ns/load  (end %zu)\n", bytes >> 10, (t1 - t0) / steps, end);
-        free(next);
-    }
-    return 0;
-}
+# Warm-up: the first call to each @njit function includes compiling it
+# (a fraction of a second). Call both once on a tiny array so that cost
+# never lands inside a timed region.
+tiny = np.zeros(1024, dtype=np.int64)
+make_cycle(tiny)
+chase(tiny, 10)
+
+size = 4 << 10                                 # 4 KB
+while size <= 1 << 30:                         # ... up to 1 GB
+    nxt = np.empty(size // 8, dtype=np.int64)  # 8 bytes per slot
+    make_cycle(nxt)
+    chase(nxt, nxt.size)                       # touch every slot once
+    t0 = time.perf_counter_ns()
+    end = chase(nxt, STEPS)
+    t1 = time.perf_counter_ns()
+    print(f"{size >> 10:8d} KB  {(t1 - t0) / STEPS:7.2f} ns/load  (end {end})")
+    size *= 2
 ```
 
 Hints, not answers:
 
-- For TODO 1, look up **Sattolo's algorithm**. It is the Fisher-Yates shuffle with one character changed, and it produces a permutation that is a single cycle (plain Fisher-Yates can produce many small cycles, and you would chase around a tiny loop that fits in L1). Apply it to an identity array `next[i] = i`.
-- You need random numbers up to 128 million. `rand()` is fine on both platforms here; a 64-bit xorshift is a nicer exercise.
-- Print `end`. If the result is never used, the compiler is allowed to delete your whole loop (you will do this on purpose in Break It).
-- Run it a couple of times. On the Spark, pin to a big core with `taskset -c <cpu> ./chase` using a CPU number from `lscpu -e`. macOS does not let you pin threads; a single busy thread usually lands on a performance core, but expect a little noise.
+- For TODO 1, look up **Sattolo's algorithm**. It is the Fisher-Yates shuffle with one character changed, and it produces a permutation that is a single cycle (plain Fisher-Yates can produce many small cycles, and you would chase around a tiny loop that fits in L1). Apply it to an identity array `nxt[i] = i`. Inside an `@njit` function, `np.random.randint(lo, hi)` works and returns one integer; check the Numba docs for which NumPy functions it supports.
+- Keep it to plain loops, integers and array indexing. If Numba hits something it does not understand, it stops with a long "TypingError": read the last few lines, which name the line and the types it could not handle.
+- Keep the array `int64` and `i` an integer. If you mix in a float (say `i = 0.0`), indexing fails to compile.
+- Return `i` from `chase`, and print `end`. If the result is never used, the compiler is allowed to delete your whole loop (you will do this on purpose in Break It).
+- Run it a couple of times. On the Spark, pin to a big core with `taskset -c <cpu> python chase.py` using a CPU number from `lscpu -e`. macOS does not let you pin threads; a single busy thread usually lands on a performance core, but expect a little noise.
 - Want a smoother curve? Step by ×1.41 instead of ×2 (and round to a multiple of 8 bytes).
+
+How close is this to C? I ran the same chase as a C program on the same Mac as a check: 1.1-1.4 ns per load in L1 for C, about 1.5 ns for Numba (Numba adds one tiny check per step for negative indices), and both at 124 ns for a 1 GB array. Close enough that every step of the staircase shows. If you are curious what the C version looks like, [C for Python people](/lessons/c-for-python/) has it.
 
 Save the output of each machine to `chase_mac.txt` and `chase_spark.txt`.
 
@@ -418,12 +440,13 @@ Save the output of each machine to `chase_mac.txt` and `chase_spark.txt`.
 
 <Task id="t4" title="Measure RAM bandwidth with a big copy" agent="hands">
 
-Now the other number. Write `bw.c`: allocate two 1 GB buffers, write to every byte of both once (so the operating system actually gives you the memory; see [the virtual memory lesson](/lessons/virtual-memory/) for why that is needed), then time 10 calls of `memcpy(dst, src, 1 GB)`.
+Now the other number. Write `bw.py`: allocate two 1 GB NumPy arrays of `uint8`, write to every byte of both once (`np.ones` and `np.zeros` then one warm-up copy is enough, so the operating system actually gives you the memory; see [the virtual memory lesson](/lessons/virtual-memory/) for why that is needed), then time 10 calls of `np.copyto(dst, src)`.
 
+- Python is fine here without Numba: `np.copyto` is one call that copies a whole gigabyte in C, so the interpreter's cost is one microsecond out of tens of milliseconds.
 - Report two numbers: bytes copied per second, and memory traffic per second. A copy *reads* 1 GB and *writes* 1 GB, so traffic is twice the bytes copied.
-- Use `now_ns()` from the previous task. Print a byte from `dst` at the end so the copies cannot be optimised away.
+- Print a byte from `dst` at the end, as a habit: always use the result of the thing you time.
 
-This is one core. To see how far below the spec sheet one core sits, compare your traffic number to your Mac's spec bandwidth and to the Spark's 273 GB/s. Stretch: run the copy on 4 or 8 threads with `pthread_create`, each copying its own slice, and watch the total climb until it flattens.
+This is one core. To see how far below the spec sheet one core sits, compare your traffic number to your Mac's spec bandwidth and to the Spark's 273 GB/s. Stretch: split the arrays into 2, 4 and 8 slices and copy each slice on its own `threading.Thread`. NumPy lets go of the GIL during a big copy, so the threads really do run at the same time (the GIL is in [Processes, threads and the GIL](/lessons/processes-threads-gil/)). Watch the total climb until it flattens. On an M4 Pro I measured about 120 GB/s of traffic on one thread, 180 on two, and a ceiling near 220-225 GB/s from four threads up.
 
 </Task>
 
@@ -527,7 +550,7 @@ Have an agent write a small matplotlib script that reads `chase_mac.txt` and `ch
 
 <DoneWhen>
 
-- `chase` prints a clear staircase on both machines, and you can point at each step and name the cache level.
+- `chase.py` prints a clear staircase on both machines, and you can point at each step and name the cache level.
 - Every row of the Measure table has your number for the Mac and the Spark (or "n/a" with a reason).
 - You can say, without looking, your measured RAM latency, SSD random read latency, and how far below 273 GB/s the Spark's GPU copy landed.
 
@@ -561,7 +584,7 @@ Before you plot: on your Mac, at what array sizes will the ns/load curve jump, a
 <Fragment slot="answer">
 You should see flat stretches with ramps between them, one ramp per cache level running out:
 
-- Flat around **1 ns** while the array fits in L1 (up to ~128 KB on an Apple performance core, ~64 KB on the Spark's big cores).
+- Flat around **1-1.5 ns** while the array fits in L1 (up to ~128 KB on an Apple performance core, ~64 KB on the Spark's big cores).
 - A step up to **a few ns** until the array outgrows L2 (Apple shares a large L2, around 12-16 MB, per cluster of performance cores; the Spark's cores have a smaller private L2 and a shared L3).
 - On Apple, a short shelf in the **tens of ns** for the system-level cache, which is shared with the GPU.
 - Then a climb to **~100 ns or more** once the array is far bigger than any cache, and a slow rise beyond that, which is the TLB (below).
@@ -605,7 +628,22 @@ The ramps are gradual, not cliffs, because caches do not evict perfectly and som
 
 **What the numbers should look like, and why.**
 
-*The staircase.* The heights of the plateaus are the latencies of each level; the positions of the ramps are their sizes. If your L1 plateau ends at about the size `sysctl` or `lscpu` reported, you have just measured a cache with nothing but a stopwatch. The far right keeps rising slowly past the DRAM step. That is the <Term w="TLB">Translation lookaside buffer: a small cache of recent virtual-to-physical address translations. A miss means walking the page tables, which are themselves in memory.</Term> running out: every address your program uses has to be translated to a physical one, and with a huge random working set those translations miss too. Apple's 16 KB pages cover four times as much memory per entry as 4 KB pages, so the Mac may suffer this a little later.
+*The staircase.* Here is the Numba `chase.py` measured on an M4 Pro (Python 3.13, Numba 0.68, `sysctl` says 128 KB of L1 and 16 MB of L2 per performance cluster):
+
+| Array size | ns per load | What it is hitting |
+|---|---|---|
+| 4 KB - 128 KB | 1.5-1.6 | L1 |
+| 256 KB | 4.6 | just spilled out of L1 into L2 |
+| 1 MB - 2 MB | 7.2-7.7 | L2 |
+| 4 MB | 10.3 | L2, starting to strain |
+| 8 MB | 21 | L2 running out |
+| 16 MB | 56 | past L2, partly the system-level cache |
+| 32 MB | 84 | mostly DRAM |
+| 64 MB | 103 | DRAM |
+| 256 MB | 119 | DRAM plus TLB misses |
+| 1 GB | 126 | DRAM plus TLB misses |
+
+The heights of the plateaus are the latencies of each level; the positions of the ramps are their sizes. If your L1 plateau ends at about the size `sysctl` or `lscpu` reported, you have just measured a cache with nothing but a stopwatch. The far right keeps rising slowly past the DRAM step. That is the <Term w="TLB">Translation lookaside buffer: a small cache of recent virtual-to-physical address translations. A miss means walking the page tables, which are themselves in memory.</Term> running out: every address your program uses has to be translated to a physical one, and with a huge random working set those translations miss too. Apple's 16 KB pages cover four times as much memory per entry as 4 KB pages, so the Mac may suffer this a little later.
 
 *Python.* The function call and dict lookup should land in the tens of nanoseconds: roughly an L3 hit, or a third to a half of a RAM read. That surprises people. It means a tight Python loop is "slow" in the same units as a cache miss, so for Python code, the interpreter is usually the first bottleneck, not memory. [Why is Python slow?](/lessons/python-speed/) takes that apart.
 
@@ -617,11 +655,11 @@ The ramps are gradual, not cliffs, because caches do not evict perfectly and som
 
 ## Break It
 
-**1. Make the loads independent.** Change `chase` to walk the array in order (`i = i + 1`) instead of following `next`, or in Python run `a[idx].sum()` with NumPy, where `idx` is a big random index array. The DRAM-sized runs suddenly cost a few nanoseconds per element instead of a hundred. Nothing about RAM changed. In order, the prefetcher fetches lines before you ask; with NumPy's gather, every load's address is known up front, so the core issues many misses at once and overlaps them. You moved from measuring latency to measuring bandwidth. Any benchmark that claims "RAM is 2 ns" has made this mistake.
+**1. Make the loads independent.** Add a Numba function to `chase.py` that reads the same 1 GB array in order and adds up what it reads (`s += nxt[k]` for every `k`, and return `s`), or in plain Python run `a[idx].sum()` with NumPy, where `idx` is a big random index array. On my Mac the in-order walk cost 0.09 ns per element and the gather 4.6 ns, against 126 ns for the chase over the same gigabyte. Nothing about RAM changed. In order, the prefetcher fetches lines before you ask; with NumPy's gather, every load's address is known up front, so the core issues many misses at once and overlaps them. You moved from measuring latency to measuring bandwidth. Any benchmark that claims "RAM is 2 ns" has made this mistake.
 
 **2. Forget the page cache.** Run `disk.py` without `F_NOCACHE` or `O_DIRECT`, twice. The second run will report "SSD reads" of a microsecond or two: you are reading RAM. A sneakier version: make the test file with `truncate -s 4G` instead of writing random bytes. The file is all holes, the filesystem knows there is nothing stored there, and it hands back zeros without touching the drive. Both mistakes give you a dream SSD. The page cache is a big topic of its own in [What happens when you save a file?](/lessons/files-and-disks/).
 
-**3. Let the compiler win.** Delete `end` from the `printf` in `chase.c` and rebuild with `-O2`. You will likely see 0.00 ns per load. The compiler noticed the loop's result is never used and deleted it. Every microbenchmark has to make its result observable, or it measures nothing.
+**3. Let the compiler win.** Make `chase` return nothing (delete the `return i`) and run it on the 1 GB array. On my Mac it reported 0.00007 ns per load: twenty million RAM reads in about a millisecond, which is impossible. Numba hands your function to the same kind of optimiser a C compiler uses, and that optimiser noticed the loop's result is never used and deleted it. Every microbenchmark has to make its result observable, or it measures nothing.
 
 **4. Time one thing at a time.** Time a single dict lookup with two `perf_counter_ns()` calls around it. You will get a number several times larger than `timeit`'s, and very noisy, because the timer call itself costs more than the thing you are timing. Measure many operations and divide, and check your timer's own cost by timing an empty region.
 

@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import KVStepper from '../components/figures/KVStepper.astro';
 import KVHeads from '../components/figures/KVHeads.astro';
 
+A language model writes one word-piece at a time, and to choose each one it looks back over everything written so far. The KV cache is the model keeping notes on those earlier words, so it never has to reread them from scratch.
+
+It is the difference between a model that slows to a crawl as an answer gets longer and one that keeps an even pace. On a laptop it turns a three-minute GPT-2 run into twelve seconds, with the exact same words out. Almost every serving trick that follows (fitting many users on one GPU, reusing the block of instructions every conversation starts with, guessing several words at once) is really a way of managing these notes. And "what does the KV cache store?" is about the most likely inference question you will get in an interview.
+
+You built GPT-2 from scratch, and you will add the notes to that very code. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) gave you the two phases of generation, reading the prompt and then writing word by word. [How much memory does a model need?](/lessons/memory-math/) sized the notes; here you build them. Your server from [the baseline](/lessons/baseline-vs-fireworks/) has quietly used them all along. After this come [batching](/lessons/batching/), [prefix caching](/lessons/prefix-caching/) and [speculative decoding](/lessons/speculative-decoding/), each of which bends these notes to a new purpose.
+
 ## Today
 
-- Say exactly what the KV cache stores: which tensors, what shape, per layer, and why it holds keys and values but never queries.
-- Explain why the causal mask is the thing that makes caching legal, and why an encoder like BERT cannot do it.
-- Count the work a generation loop does with and without a cache, and say how per-token cost and total cost scale with length.
-- Add a KV cache to your own GPT-2 by hand, prove it gives bit-for-bit the same tokens, and plot latency and memory against position.
-- Explain the designs that shrink the cache (MQA, GQA, sliding windows, quantized caches) and compute what each one saves.
+- Say exactly what the model keeps between steps: which vectors, what shape, in every layer, and why it keeps the two vectors each past word is looked up by (its key and value) but throws away the one it used to do its own looking (its query).
+- Explain why the rule that a word can only look backwards is what makes keeping the notes safe, and why a model like BERT, where every word sees every other word, cannot do it.
+- Count the work a generation loop does with and without the notes, and say how the cost of each new word, and of the whole answer, grows with length.
+- Add the cache to your own GPT-2 by hand, prove it writes exactly the same words, and plot time and memory per word against position.
+- Explain the designs that make the notes smaller (letting attention heads share one set, remembering only the most recent few thousand words, storing them in fewer bits) and compute what each one saves.
 
-Prerequisites: you have built GPT-2 or Llama from scratch, so you know a forward pass. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) for prefill vs decode and the roofline, and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) for the server and harness you will poke at the end. About one evening on your laptop and an hour on the Spark.
+You have built GPT-2 or Llama from scratch, so you know what one pass through the model does. From [Why ~17 tokens per second?](/lessons/bandwidth-bound/) you want the two phases of generation and the chart of when memory or math is the bottleneck; from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), the server and benchmark you will poke at the end. About one evening on your laptop and an hour on the Spark.
 
 ## The Problem
 
@@ -746,4 +752,4 @@ MQA and GQA shrink the cache per token by sharing keys and values across query h
 
 Built on: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (prefill vs decode, the roofline, and the cache as bytes read per step) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (the server and scoreboard you just ran an ablation on).
 
-Next: [How much memory does a model need?](/lessons/memory-math/) turns the cache formula into a capacity plan. [Batching](/lessons/batching/) puts many users' caches into one step, which is where the per-user cache becomes the limit. [Paged attention and prefix caching](/lessons/prefix-caching/) stores caches in pages and shares them between requests with the same prompt. [Speculative decoding](/lessons/speculative-decoding/) feeds several tokens on top of a cache at once, which is where the T×S mask from this lesson earns its keep. And [FlashAttention](/lessons/flash-attention/) speeds up the attention that reads all of this.
+Looking back: [How much memory does a model need?](/lessons/memory-math/) turns the cache formula into a capacity plan. Next: [Batching](/lessons/batching/) puts many users' caches into one step, which is where the per-user cache becomes the limit. [Paged attention and prefix caching](/lessons/prefix-caching/) stores caches in pages and shares them between requests with the same prompt. [Speculative decoding](/lessons/speculative-decoding/) feeds several tokens on top of a cache at once, which is where the T×S mask from this lesson earns its keep. And [FlashAttention](/lessons/flash-attention/) speeds up the attention that reads all of this.

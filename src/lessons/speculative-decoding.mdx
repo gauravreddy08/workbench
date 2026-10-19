@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import SpecAcceptReject from '../components/figures/SpecAcceptReject.astro';
 import SpecSpeedup from '../components/figures/SpecSpeedup.astro';
 
+Speculative decoding makes a big model write faster by letting a small, cheap model guess the next few words, then having the big model check all the guesses in one go instead of writing each word itself. The clever part is the rule for which guesses to keep: it leaves the big model's answers exactly as they would have been. Same words, same odds, just sooner.
+
+On your Spark the big model spends nearly all its time waiting for its weights to arrive from memory, so checking five guesses costs about the same as writing one word. A decent guesser can make your server up to two or three times faster without changing a single answer, which is a rare kind of free lunch on the scoreboard against Fireworks. It is also a favourite interview question, because "how can it be faster *and* exact?" separates people who have heard of the trick from people who understand it.
+
+You already have the two facts it rests on: decoding is limited by reading memory, not by math ([Why ~17 tokens per second?](/lessons/bandwidth-bound/)), and the model keeps notes on everything it has read so far ([The KV cache, by hand](/lessons/kv-cache/)). [Quantization](/lessons/quantization/) attacks the same speed limit by shrinking the model; this attacks it by getting more words out of each trip to memory, and the two stack. Afterwards, [Train your own draft model](/lessons/draft-model/) builds a better guesser, and [Inside vLLM and SGLang](/lessons/serving-engines/) shows how production engines run this alongside everything else.
+
 ## Today
 
-- Say exactly what a model's "output distribution" is: a list of probabilities, one per vocabulary entry, at every step. Say what greedy decoding and sampling each do with it.
-- Explain why checking 5 guessed tokens costs your Spark about the same as generating 1, using the bandwidth math you already know.
-- State the acceptance rule (keep the draft token with probability `min(1, p/q)`, otherwise sample from the leftover `max(0, p − q)`) and prove, in four lines, that the output follows the big model's distribution exactly. Not approximately. Exactly.
-- Predict the speedup from three numbers (acceptance rate α, draft length K, draft cost c), and pick K.
-- Implement speculative sampling yourself with Llama 3.2 1B drafting for Llama 3.1 8B, test it statistically, tune it, try a draft-free variant, and add a row to `SCOREBOARD.md`.
+- Say exactly what a model's "output distribution" is: at every step, a list of odds, one for each possible next word-piece. Say what always taking the top choice (greedy decoding) and rolling the dice by those odds (sampling) each do with it.
+- Explain why checking 5 guessed word-pieces costs your Spark about the same as writing 1, using the memory-speed math you already know.
+- State the rule for keeping a guess (keep it with probability `min(1, p/q)`, where p and q are how likely the big and the small model each thought it was; otherwise draw a replacement from the leftover `max(0, p − q)`, the part the small model under-guessed) and prove, in four lines, that the output follows the big model's odds exactly. Not approximately. Exactly.
+- Predict the speedup from three numbers (how often guesses are kept, how many guesses per round, and how expensive the guesser is next to the big model), and pick the best number of guesses.
+- Build it yourself with Llama 3.2 1B guessing for Llama 3.1 8B, check with a statistics test that the output odds really match, tune it, try a version that needs no second model at all, and add a row to `SCOREBOARD.md`.
 
-Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (decode reads every weight once per token) and [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server, harness and scoreboard). Helpful but not required: [The KV cache, by hand](/lessons/kv-cache/). Time: an evening for the idea and the proof, two or three evenings to build and test, one benchmark run.
+You need [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (each written word-piece reads every weight once) and the server, harness and scoreboard from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). [The KV cache, by hand](/lessons/kv-cache/) helps but isn't required. Plan on an evening for the idea and the proof, two or three evenings to build and test, and one benchmark run.
 
 ## The Problem
 

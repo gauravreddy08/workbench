@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import StackFrames from '../components/figures/StackFrames.astro';
 import StackListVsArray from '../components/figures/StackListVsArray.astro';
 
+Every value your program makes has to sit somewhere in the computer's memory. A running program splits its memory into a few areas with different rules. The two you hear about most are the stack, a small, very fast scratch pad that each function call borrows and hands back when it finishes, and the heap, a big shared pool for anything that has to stick around or whose size nobody knew in advance.
+
+This is where three everyday surprises come from: a Python list of 50 million numbers taking five times the RAM you budgeted, a recursive function that crashes the whole program instead of raising an error, and a long-running service (say, the ranking server you'll eventually deploy) that slowly eats memory until something kills it. Each one is easy to explain once you can picture where the bytes are.
+
+It builds on [How slow is slow?](/lessons/latency-numbers/), which showed that memory close to the CPU is about a hundred times faster than main RAM. It sets up [Processes, threads and the GIL](/lessons/processes-threads-gil/) (each thread gets its own scratch pad, all of them share the pool) and [Why is Python slow?](/lessons/python-speed/). Along the way you'll compile and run a few short C programs, given to you whole, to see raw memory addresses. You read them, you don't write them; [C for Python people](/lessons/c-for-python/) has more if you want it.
+
 ## Today
 
-- Draw a running program's memory from memory: code, globals, heap, memory-mapped regions, stack, and say which way each grows.
-- Explain what a function call physically does to the stack, why that makes the stack fast, and why it is small.
-- Explain what the heap is for, who cleans it up in C, CPython, and Rust, and what fragmentation is.
-- Predict, within 20%, how much RAM a Python list, dict, or numpy array of N numbers will take, and say where a PyTorch tensor's numbers actually live.
-- Find a memory leak in a Python program with `tracemalloc` instead of guessing.
+- Sketch how a running program's memory is laid out: where its instructions, its long-lived variables, the shared pool and the per-call scratch space sit, and which way each one grows.
+- Explain what calling a function physically does to memory, why that makes it so cheap, and why there's a hard size limit that very deep recursion runs into.
+- Explain what the shared pool is for, who is responsible for handing memory back in C, Python and Rust, and how memory can be free yet unusable.
+- Predict, within 20%, how much RAM a Python list, dict, or NumPy array of N numbers will take, and say where a PyTorch tensor's numbers actually live.
+- Find a memory leak in a Python program by measuring which lines are holding on to memory, with Python's built-in memory tracer, instead of guessing.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (you need the L1-vs-RAM gap). A C compiler (`cc` works on macOS and the Spark), Python 3.12+, numpy. About 3 hours with the builds.
+Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (you need the gap between the CPU's own fast memory and RAM). A C compiler to build the given C programs (`cc` is already on macOS and the Spark), Python 3.12+, numpy. About 3 hours with the builds.
 
 ## The Problem
 
@@ -194,7 +200,7 @@ On Linux, the main thread's stack is 8 MB by default. Check yours:
 ulimit -s     # prints 8192 on most Linux boxes (KB), 8176 on macOS
 ```
 
-8 MB is plenty for normal code: a typical frame is tens to hundreds of bytes, so you could nest calls tens of thousands deep. It is nothing for data. If you write `double big[2000000];` as a local in C, that's 16 MB on the stack, and the program dies.
+8 MB is plenty for normal code: a typical frame is tens to hundreds of bytes, so you could nest calls tens of thousands deep. It is nothing for data. A C function with a local `double big[2000000];` asks for 16 MB of stack, and the program dies.
 
 When the stack pointer walks past the end of the reserved region, it hits a <Term w="guard page">An unmapped page placed just past the end of the stack. Touching it causes an immediate crash instead of letting the stack silently overwrite whatever memory sits next to it.</Term>, and the OS kills the program with a <Term w="segmentation fault">The crash you get when a program touches memory it has no right to. The OS sends signal SIGSEGV (number 11), and the shell shows exit code 139 = 128 + 11.</Term>. That is a <Term w="stack overflow">Running out of stack space, almost always from recursion that goes too deep or a huge local array. The name of the website comes from this.</Term>.
 
@@ -426,51 +432,76 @@ On your DGX Spark there's a twist: the CPU and GPU share one physical pool of me
 
 ## Build It
 
-Make a working folder, e.g. `~/workbench/stack-and-heap/`. Do the C tasks on both your Mac and the Spark if you can; the differences are part of the lesson.
+Make a working folder, e.g. `~/workbench/stack-and-heap/`. The first two tasks are C programs that are given to you whole: you compile them, run them, and read what they print. Python hides stack addresses and only reaches the real stack indirectly (task t3 does that), which is the only reason these two are in C. Run them on both your Mac and the Spark if you can; the differences are part of the lesson.
 
-<Task id="t1" title="Map your own address space in C" agent="hands">
+<Task id="t1" title="Map your own address space in C" agent="ok">
 
-Write `where.c` that prints the address of each of these, one per line, with a label:
-
-- `main` itself (code),
-- a global `int g = 42;`,
-- a local in `main`,
-- a small `malloc(64)` block and a big `malloc(1 << 20)` (1 MB) block,
-- a local inside a recursive function `deeper(int depth)` that calls itself 3 times and prints at each level.
-
-Shape and hints:
+Save this as `where.c`. It prints the address of one thing from each region in Figure 002: the code, a global, the heap (a small and a big request), and locals on the stack, including one per level of a function that calls itself three times.
 
 ```c
-#include <stdio.h>
-#include <stdlib.h>
+#include <stdio.h>    // printf
+#include <stdlib.h>   // malloc, free
 
-int g = 42;
+int g = 42;           // a global: lives for the whole run
 
 void deeper(int depth) {
-    int x = depth;
-    // print depth and &x, then recurse while depth < 3
+    int x = depth;                              // a local, in this call's frame
+    printf("depth %d local   %p\n", depth, (void *)&x);   // &x = "the address of x"
+    if (depth < 3) {
+        deeper(depth + 1);                      // call ourselves: a new frame, below this one
+    }
 }
 
 int main(void) {
-    // print (void *)main, &g, a local's address, the two malloc results
-    // then call deeper(1)
+    int local = 7;                              // a local, in main's frame
+    char *small = malloc(64);                   // 64 bytes from the heap
+    char *big = malloc(1 << 20);                // 1 MB from the heap (1 << 20 = 1,048,576)
+
+    printf("code (main)  %p\n", (void *)main);  // where main's machine code sits
+    printf("global       %p\n", (void *)&g);
+    printf("heap small   %p\n", (void *)small);
+    printf("heap 1MB     %p\n", (void *)big);
+    printf("local main   %p\n", (void *)&local);
+    deeper(1);
+
+    free(small);                                // hand the heap memory back
+    free(big);
+    return 0;
 }
 ```
 
-Print addresses with `%p` and cast to `(void *)`. Compile with `cc -O0 where.c -o where` (`-O0` stops the compiler from keeping locals only in registers). Run it three times.
+What the lines do, in Python terms:
 
-On a Mac (Apple Silicon), you should see something shaped like this:
+- `int g = 42;` outside any function is a global, like a module-level variable, except C has to be told its type (`int`, a 4-byte whole number) and it never changes type.
+- `int x = depth;` inside a function is a local. It gets a slot in that call's stack frame, which is exactly what you want to see.
+- `&x` means "the address of `x`": not its value, but the number of the byte where it starts in the address space. A variable that holds an address is a <Term w="pointer">A variable whose value is a memory address. In C, `char *small` declares one: "small holds the address of some bytes". Every Python name is secretly one of these, pointing at a heap object.</Term>, and `char *small` declares one.
+- `malloc(64)` is C's "give me 64 bytes from the heap". It returns a pointer to the first byte. `free(small)` hands them back. Python does the equivalent for you every time it makes an object.
+- `printf` is C's `print` with a template: `"%p"` in the <Term w="format string">The template passed to printf. Each `%` code is a slot filled by the next argument: `%d` prints a whole number, `%p` prints a pointer as a hex address. Like a Python f-string with the values listed after it.</Term> means "print this address in hex". The `(void *)` in front of each argument is a <Term w="cast">An instruction to treat a value as a different type. `(void *)` means "treat this as a plain address, never mind what it points at", which is what `%p` expects.</Term>.
+- `(void *)main` with no parentheses after `main` doesn't call it. It's the function's address: where its machine code was loaded.
+
+Compile and run it three times:
+
+```bash
+cc -O0 where.c -o where
+./where; ./where; ./where
+```
+
+`cc` is the C compiler, `-o where` names the output program, and `-O0` is a <Term w="compiler flag">An option that changes how the compiler translates your code. `-O0` means "no optimization": translate every line literally. `-O2` and `-O3` let it rearrange, merge, and delete work to run faster.</Term> asking for no optimization. With optimization on, the compiler is allowed to keep `x` only in a CPU register, and a variable in a register has no memory address to print.
+
+On a Mac (Apple Silicon), you should see something shaped like this (your exact numbers will differ, and change every run):
 
 ```text
-code (main)  0x100a20560
-global       0x100a28000
-heap small   0x101249180
-heap 1MB     0x7bac800000
-local main   0x16f3de3e8
-depth 1 local   0x16f3de388
-depth 2 local   0x16f3de358
-depth 3 local   0x16f3de328
+code (main)  0x100a50560
+global       0x100a58000
+heap small   0x101175180
+heap 1MB     0x7c8b000000
+local main   0x16f3ae3e8
+depth 1 local   0x16f3ae3a8
+depth 2 local   0x16f3ae378
+depth 3 local   0x16f3ae348
 ```
+
+If you want to read more C than this, [C for Python people](/lessons/c-for-python/) walks through it slowly.
 
 </Task>
 
@@ -485,11 +516,36 @@ Before you run it: which local will have the lower address, `depth 1` or `depth 
 </Fragment>
 </Predict>
 
-<Task id="t2" title="Blow the C stack on purpose" agent="hands">
+<Task id="t2" title="Blow the C stack on purpose" agent="ok">
 
-Write `boom.c`: a recursive function `f(int n)` that has a 1 KB local array (`char pad[1024];`), writes `n` into it so the compiler can't remove it, prints `n` every 1,000 calls (with `fflush(stdout)` so output survives the crash), and calls `f(n + 1)` forever. Use the array in the return value so the call isn't turned into a loop.
+Save this as `boom.c`. It's a function that calls itself forever, and each call carries a 1 KB local, so every frame is a bit over 1 KB. It prints how deep it is every 1,000 calls.
 
-Before running it, write down how deep you think it gets, using `ulimit -s`.
+```c
+#include <stdio.h>
+
+int f(int n) {
+    char pad[1024];                    // 1 KB array, a local: it lives in this call's frame
+    pad[n % 1024] = (char)n;           // write into it, so the compiler can't delete it
+    if (n % 1000 == 0) {
+        printf("depth %d\n", n);
+        fflush(stdout);                // push the text out now, before the crash eats it
+    }
+    return f(n + 1) + pad[0];          // recurse forever; using pad after the call keeps
+}                                      // every frame alive (no loop shortcut)
+
+int main(void) {
+    return f(1);
+}
+```
+
+What the lines do:
+
+- `char pad[1024];` is an <Term w="array" label="array (C)">A fixed number of values of one type, packed side by side in memory. `char pad[1024]` is 1,024 one-byte slots. Declared inside a function, the whole thing sits in that call's stack frame. Closest Python relative: a fixed-size `bytearray`, minus the object header.</Term> of 1,024 one-byte `char`s. Because it's declared inside `f`, all 1,024 bytes go in `f`'s frame, on the stack. That's the point: it makes each frame big, so the stack fills fast.
+- `pad[n % 1024] = (char)n;` writes one byte into it. Without a write, the compiler could notice the array is never used and quietly drop it.
+- `printf` buffers its output, holding text in memory until it has a chunk worth writing. `fflush(stdout)` forces it out immediately. Without it, the last lines would still be sitting in the buffer when the program dies, and you'd never see them.
+- `return f(n + 1) + pad[0];` is the recursion. Adding `pad[0]` *after* the inner call returns means this frame still has work to do, so it has to stay on the stack. If the call were the very last thing, a compiler could reuse the frame and turn the recursion into a plain loop, and nothing would ever overflow.
+
+Before running it, write down how deep you think it gets, using `ulimit -s` (the stack size in KB) and "a bit over 1 KB per frame".
 
 Then:
 
@@ -501,7 +557,7 @@ ulimit -s 16384      # double it, this shell only (macOS caps this at 65520)
 ./boom; echo "exit code $?"
 ```
 
-Read the error. Look up why the exit code is 139.
+On this Mac it printed `depth 7000` and died with exit code 139; with the doubled stack it reached `depth 15000`. Read the error. Look up why the exit code is 139 (the segmentation fault note in The Idea has the answer).
 
 </Task>
 
@@ -635,9 +691,51 @@ If any number is off by more than ~20%, figure out why before moving on. The lik
 
 ## Break It
 
-**Return a pointer to a local.** In C, write `int *make(void) { int x = 1234; return &x; }`, print `*make()`, then call some other function that has a few locals, then print it again. The compiler warns you. The first print may even work; the second shows garbage (on my Mac, `1234` then `1`). The frame was popped, the next call reused the same bytes. This is the clearest possible demonstration that stack memory has no life beyond its call, and why the heap exists.
+The first two are C again, given whole: compile with `cc -O0 file.c -o file` and run.
 
-**Double free.** `free(p); free(p);` The allocator notices its own map is corrupt and kills the process: on Linux glibc prints `free(): double free detected in tcache 2` and aborts; on my Mac it died silently with exit code 133 (a trap). Then compile with `-fsanitize=address` and run again: AddressSanitizer names the exact line of each `free`. Use ASan any time you write C or build a C extension.
+**Return a pointer to a local.** `make()` hands back the address of its own local `x`, then returns, so its frame is popped. `*p` means "the value at the address in `p`" (the reverse of `&`).
+
+```c
+#include <stdio.h>
+
+int *make(void) {
+    int x = 1234;          // x lives in make()'s frame
+    return &x;             // BUG: hand back the address of a local
+}
+
+int other(void) {
+    int a = 1, b = 2, c = 3;   // a few locals that land on the same stack bytes
+    return a + b + c;
+}
+
+int main(void) {
+    int *p = make();       // make() has returned: its frame is gone
+    printf("first:  %d\n", *p);
+    other();               // a new call reuses those bytes
+    printf("second: %d\n", *p);
+    return 0;
+}
+```
+
+The compiler warns you (`address of stack memory associated with local variable 'x' returned`). The first print may even work; the second shows garbage (on my Mac, `1234` then `1`). The frame was popped, and the next call reused the same bytes. This is the clearest possible demonstration that stack memory has no life beyond its call, and why the heap exists.
+
+**Double free.** Hand the same heap block back twice:
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    char *p = malloc(32);  // ask the heap for 32 bytes
+    p[0] = 'x';
+    free(p);               // give them back
+    free(p);               // BUG: give them back again
+    printf("still alive?\n");
+    return 0;
+}
+```
+
+The allocator notices its own map is corrupt and kills the process: on Linux glibc prints `free(): double free detected in tcache 2` and aborts; on my Mac it died with `Trace/BPT trap: 5` and exit code 133, and never printed "still alive?". Then compile with `cc -O0 -g -fsanitize=address` and run again: <Term w="AddressSanitizer">A checker built into clang and gcc (turned on with `-fsanitize=address`, "ASan" for short). It adds bookkeeping around every memory access and stops the program at the first bad one, with a report of where the memory was allocated and freed.</Term> names the exact line of each `free` (here, lines 7 and 8). Reach for it any time you build a C extension.
 
 **`del` that frees nothing.** Make a 500 MB numpy array, put it in a list too, then `del` the name and check RSS. Nothing changes: the list still holds a reference. Clear the list and it drops instantly. Do the same with a tensor captured in a lambda, or stored on `self` in a training loop, and you've reproduced the most common "my notebook ran out of memory" bug.
 

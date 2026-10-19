@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import MemMathBudget from '../components/figures/MemMathBudget.astro';
 
+A running language model is two things sitting in memory: a few billion fixed numbers that are the model itself, and a pile of notes it keeps about every conversation it is in the middle of, which grows with every word. This is how to size both on paper, before you download a single file.
+
+That arithmetic decides which models your Spark can run at all, how long each conversation can get, and how many people can use it at once. Get it wrong and the server refuses to start. On the Spark it can be worse: the GPU and the rest of the computer share one pool of memory, so overshooting doesn't just fail your script, it can make Linux start killing programs. And "how much memory does a 70B model need?" is a classic interview question with a crisp answer that most people fumble.
+
+You have already met pieces of this. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) showed how many bytes each past word of a conversation costs. [What does the OS do with my memory?](/lessons/virtual-memory/) showed how the Spark's shared memory behaves when it fills up. Here you put them into one budget and check it against your own server from [the baseline](/lessons/baseline-vs-fireworks/). Next, [The KV cache, by hand](/lessons/kv-cache/) has you build those conversation notes yourself, and [batching](/lessons/batching/) turns "how many people fit" into "how fast each of them gets served".
+
 ## Today
 
-- Say, within a gigabyte and without looking anything up, how much memory any model needs to serve N users at context L, and which of the four buckets (weights, KV cache, activations, overhead) dominates.
-- Count a model's parameters from its `config.json` by hand, matrix by matrix, and land on Llama 3.1 8B's 8,030,261,248 exactly.
-- Turn a weight format (BF16, FP8, Q8_0, AWQ, Q4_K_M) into bytes per parameter, including the hidden scales.
-- Read PyTorch's and the Spark's memory numbers and say why `memory_allocated`, `memory_reserved` and the operating system all disagree.
-- Predict the largest batch × context your Spark can hold before it runs out, then find the real edge and explain the gap.
+- Say, to within a gigabyte and without looking anything up, how much memory a model needs to serve a given number of people at a given conversation length, split into four parts (the model itself, each conversation's running notes, the scratch space used during one step, and overhead), and say which part is biggest.
+- Count a model's learned numbers (its parameters) by hand from the small settings file that ships with it, `config.json`, matrix by matrix, and land on Llama 3.1 8B's 8,030,261,248 exactly.
+- Turn a storage format, from plain 16-bit numbers down to the squeezed 4-bit ones (BF16, FP8, Q8_0, AWQ, Q4_K_M), into bytes per number, including the small scale factors each squeezed format quietly stores alongside.
+- Read the memory numbers PyTorch and the Spark report, and say why PyTorch's two counters (`memory_allocated`, `memory_reserved`) and the operating system all give different answers.
+- Predict how many conversations, at what length, your Spark can hold before it runs out, then find the real edge and explain the gap.
 
-Prerequisites: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the KV-per-token formula and GQA), [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server and harness), and [What does the OS do with my memory?](/lessons/virtual-memory/) (unified memory, the page cache, the OOM killer). About one evening of arithmetic and one session on the Spark.
+Before this, you want [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (the per-word memory formula, and the trick of letting attention heads share their stored keys and values), [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server and benchmark), and [What does the OS do with my memory?](/lessons/virtual-memory/) (the Spark's shared memory, Linux's file cache, and the out-of-memory killer). Budget one evening of arithmetic and one session on the Spark.
 
 ## The Problem
 

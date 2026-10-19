@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import EvalSepJudgeMatrix from '../components/figures/EvalSepJudgeMatrix.astro';
 import EvalSepGoodhart from '../components/figures/EvalSepGoodhart.astro';
 
+An eval is the measuring stick you hold up to a model to find out whether it's any good. The surprise is that the stick can be a model too, and what makes it trustworthy isn't how clever it is but how little it shares with the thing it measures.
+
+Get this wrong and the number lies to you, always in the flattering direction. A model asked to grade its own homework approves its own mistakes. A test set you check every afternoon for three weeks slowly stops measuring anything, so your cross-encoder's score climbs while real users notice nothing. Every serious team, and every interviewer at a lab that trains models, wants to know how you know your number is honest.
+
+All you need is to have trained a model and watched how it does on data held back from training. This opens the evaluation track: [Ranking metrics and eval sets](/lessons/ranking-metrics/) applies it to your ranker, [Is that improvement real?](/lessons/statistics-for-evals/) tells you how much of a win is just luck, and [Rewards and verifiers](/lessons/verifiers-rewards/) shows what happens when a training loop starts chasing the score.
+
 ## Today
 
 - Say in one sentence what an eval is for, and why "it's also just a model" misses the point: an eval's job is to be an **independent** measurement, not a smart one.
-- Explain why a model grading its own answers approves its own mistakes (correlated errors), and when a model-based judge is fine anyway.
-- Explain Goodhart's law with a picture: why a score you optimize against stops tracking what you care about, and why it breaks first at the top.
-- Explain the difference between a training objective and an evaluation metric, and why train, dev and test are separate piles that get touched different numbers of times.
-- Build it: catch a small LLM approving its own wrong arithmetic, make a flawed metric go up while true accuracy goes down, and build a frozen held-out eval with a harness that logs everything.
+- Explain why a model grading its own answers approves its own mistakes (its blind spots and its grader's blind spots are the same ones), and when using a model as the grader is fine anyway.
+- Explain, with a picture, why a score you keep pushing up eventually stops tracking what you care about (Goodhart's law), and why it breaks first at the very top.
+- Explain the difference between the number training pushes down and the number you judge the model by, and why data gets split into three piles (train, dev, test) that are touched very different numbers of times.
+- Catch a small LLM approving its own wrong arithmetic, make a flawed score go up while true accuracy goes down, and build a frozen, held-out eval with a harness that logs everything.
 
-Prerequisites: none hard. You've trained models and watched a validation loss, which is enough. [Training a tiny LM](/lessons/tiny-lm/) helps for the train/val picture. Rough time: one evening to read, one session on the Spark for the build.
+Nothing is required beyond having trained models and watched a validation loss. [Training a tiny LM](/lessons/tiny-lm/) helps for the picture of training data next to held-out data. Budget one evening to read and one session on the Spark for the build.
 
 ## The Problem
 

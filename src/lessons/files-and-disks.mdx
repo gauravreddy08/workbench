@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import DiskWritePath from '../components/figures/DiskWritePath.astro';
 import DiskAtomicSave from '../components/figures/DiskAtomicSave.astro';
 
+Saving a file feels like one step. It isn't. Between your program handing over the bytes and those bytes being safe on the drive, they sit in several holding areas, each run by someone different, and most of them forget everything when the power goes. Reading a file walks the same path in reverse.
+
+That path decides whether a nine-hour training run survives a crash and picks up where it left off, or starts over from nothing. It also decides how fast the inference server on your Spark gets its weights into memory when it starts, and why load times for the same model can swing tenfold depending on whether the machine has read that file recently. Most benchmark claims about loading speed quietly depend on which case they measured.
+
+This builds on [How slow is slow?](/lessons/latency-numbers/), which gave you the speed of an SSD, and on [Virtual memory and the OOM killer](/lessons/virtual-memory/), whose trick of borrowing a file as memory shows up here from the file's side. The write-down-your-plan-first idea you'll find underneath the filesystem is the same one that makes databases trustworthy in [Transactions](/lessons/transactions/).
+
 ## Today
 
-- Trace a single `f.write()` from your Python code to the flash chips, naming every place the bytes wait along the way, and say which of those places a crash wipes out.
-- Explain why `write()` returning means almost nothing about safety, what `fsync` actually promises, and why it costs 10x on Linux but 1,000x on a Mac.
-- Save a checkpoint so that no crash, at any moment, can leave you with a broken file: write to a temp file, fsync, rename, fsync the directory.
-- Describe, at cartoon level, how an SSD writes (pages, blocks, erase, the translation layer) and why random small writes cost more than they look.
-- Load model weights with `torch.load` and with memory-mapped safetensors, cold and warm, and explain every number, including the one where mmap loses.
+- Trace a single `f.write()` from your Python code to the flash chips inside the SSD, naming every place the bytes wait along the way, and say which of those places a crash wipes out.
+- Explain why `write()` returning means almost nothing about safety, what the one call that forces bytes onto the drive (`fsync`) actually promises, and why a Mac has two versions of it, one about 10x the cost of a plain write and one about 1,000x.
+- Save a checkpoint so that no crash, at any moment, can leave you with a broken file: write to a temporary file, force it onto the drive, swap the name over in one step, then force the folder's own record onto the drive too.
+- Describe, at cartoon level, how an SSD writes (it can never overwrite in place, so a tiny computer inside keeps shuffling data around) and why many small scattered writes cost more than they look.
+- Load model weights two ways, copying the file into your memory (`torch.load`) and borrowing the file as memory (safetensors), both when the machine already has the file in RAM and when it doesn't, and explain every number, including the one where borrowing loses.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the SSD numbers and the page cache mention) and ideally [Virtual memory and the OOM killer](/lessons/virtual-memory/) (pages, page faults, mmap). File descriptors came up in [Processes, threads and the GIL](/lessons/processes-threads-gil/). Rough time: one evening, plus half an hour on the Spark.
+Read [How slow is slow?](/lessons/latency-numbers/) first for the SSD numbers, and ideally [Virtual memory and the OOM killer](/lessons/virtual-memory/) for pages and borrowing a file as memory. The small numbered handles a program uses for open files first came up in [Processes, threads and the GIL](/lessons/processes-threads-gil/). Budget one evening, plus half an hour on the Spark.
 
 ## The Problem
 

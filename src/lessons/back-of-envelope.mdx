@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import EnvelopeCalculator from '../components/figures/EnvelopeCalculator.astro';
 
+A back-of-the-envelope estimate is a few lines of rough multiplication that tell you, before you build anything, whether a design needs one machine, ten, or a thousand, and which part of it gives out first.
+
+It's the answer to the question that stalls you in interviews: "so how does it scale?" A strong answer takes about ninety seconds and never needs a calculator. It's also how you'd decide, at work, whether your cross-encoder can rank every search on a couple of GPUs or needs a cheaper first step in front of it, before anyone spends a month or a budget finding out.
+
+It's arithmetic over things you already have: the speeds of memory, disks and networks from [How slow is slow?](/lessons/latency-numbers/), the rule linking arrival rate, time per request and requests in progress from [Waiting vs working](/lessons/waiting-vs-working/), and the "is the chip calculating or waiting for data?" question from [Why ~17 tokens per second?](/lessons/bandwidth-bound/). After it, [p99 and load testing](/lessons/tail-latency/) explains why things slow down sharply as a machine gets close to full, and [Nearest neighbors at scale](/lessons/vector-search/) takes one of the estimates here and builds it for real.
+
 ## Today
 
 - Answer "how does your solution scale?" with a five-step method you can run out loud, in any interview, on any system.
-- Turn "queries per day" into GPUs, gigabytes and dollars with nothing but powers of ten and a handful of numbers you now carry in your head.
-- Work three estimates end to end: your cross-encoder ranker serving search, embeddings for a billion web pages, and the KV cache of a chat product at N users.
-- Say which resource breaks first (compute, memory bandwidth, memory size, network, CPU, money) and what you'd change at 10× and 100×.
-- Estimate your ranker's capacity on paper, load-test it on the Spark, and keep an estimation journal so your guesses get measurably better.
+- Turn "queries per day" into GPUs, gigabytes and dollars by rounding every number to a power of ten, using a handful of numbers you'll carry in your head.
+- Work three estimates end to end: your cross-encoder ranker serving search, search vectors for a billion web pages, and the per-conversation memory a chat model keeps for every user talking to it at once.
+- Say which resource gives out first (raw calculation, how fast memory can be read, how much memory there is, network, CPU, money) and what you'd change at 10× and 100× the traffic.
+- Estimate your ranker's capacity on paper, then hit it with steadily rising fake traffic on the Spark to find where it really tops out, and keep a journal of guesses against results so your estimates get measurably better.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the numbers), [Waiting vs working](/lessons/waiting-vs-working/) (Little's law), [Why ~17 tokens per second?](/lessons/bandwidth-bound/) (bytes per token, compute vs memory bound). Rough time: one evening for the idea and the paper estimates, one session on the Spark for the load test.
+You'll want the numbers from [How slow is slow?](/lessons/latency-numbers/), the in-progress rule from [Waiting vs working](/lessons/waiting-vs-working/), and the bytes-per-token thinking from [Why ~17 tokens per second?](/lessons/bandwidth-bound/). Plan on one evening for the idea and the paper estimates, and one session on the Spark for the load test.
 
 ## The Problem
 

@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import StreamLanes from '../components/figures/StreamLanes.astro';
 
+Streaming is a server handing you an answer a piece at a time, each piece the moment it's ready, instead of making you wait for the whole thing. It's why a chatbot's reply appears word by word.
+
+For a model server, that first word arriving fast is most of what makes it feel quick, and it's one of the numbers you race your DGX Spark against Fireworks on. Streaming is also fragile in ways that never show up in your own code. Something sitting between your server and the screen can quietly hold the words back, hang up on a connection that went quiet, or let the model keep writing for someone who already left, burning GPU time on text nobody will read.
+
+It builds on [Waiting vs working](/lessons/waiting-vs-working/), where one program learned to hold many open waits at once, and on [HTTP from scratch](/lessons/http-from-scratch/), where you saw that a reply can be sent in pieces without knowing its total length up front. You've already read one of these streams in [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/); here you find out what it was. Afterwards, [Load balancing](/lessons/load-balancing/) and [Rate limits](/lessons/rate-limits/) deal with what long-lived connections do to a whole fleet of servers.
+
 ## Today
 
-- Explain why plain HTTP can't push, and the four ways people get around it: short polling, long polling, Server-Sent Events, WebSockets.
-- Read an SSE stream byte by byte (`data:`, `event:`, `id:`, `retry:`, blank lines, chunk sizes) and a WebSocket handshake and frame header.
-- Say which one to pick for a given job, and why every big LLM API streams tokens with SSE.
-- Stream tokens from a fake model three ways and measure time-to-first-token, bytes, requests and server CPU for each.
-- Break streaming with a proxy, an idle timeout and a closed browser tab, then fix each one, including stopping generation when nobody is listening.
+- Explain why the web's ordinary ask-then-answer rules give a server no way to speak first, and the four workarounds: ask on a timer, ask and have the server sit on the question until there's news, get one reply that just keeps going (Server-Sent Events, or SSE), or switch the connection to a two-way line (WebSockets).
+- Read one of those never-ending replies byte by byte, down to the short labelled lines each event is made of and the size markers between pieces. Read the greeting a WebSocket opens with, and the tiny header in front of each of its messages.
+- Say which one to pick for a given job, and why every big model provider streams its words with SSE.
+- Stream words from a fake model three ways and measure, for each: how long until the first word shows up, how many bytes and requests it took, and how much work the server did.
+- Break streaming three ways (a middleman server that holds everything back, a connection cut for being quiet too long, a closed browser tab), then fix each one, including making the model stop writing when nobody is reading.
 
-Prerequisites: [Waiting vs working](/lessons/waiting-vs-working/) (async, the event loop) and ideally [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), where you already parsed an SSE stream without being told much about it. [HTTP from scratch](/lessons/http-from-scratch/) is the natural lesson before this one; if you haven't done it, the bits of HTTP you need are explained here. Rough time: one evening, plus an hour with nginx.
+Before this, do [Waiting vs working](/lessons/waiting-vs-working/), and ideally [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), where you parsed one of these streams without being told much about it. [HTTP from scratch](/lessons/http-from-scratch/) is the natural lesson right before this one, but the bits of HTTP you need are explained here too. Budget an evening, plus an hour with nginx, the middleman server you'll put in front.
 
 ## The Problem
 

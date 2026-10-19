@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import PipelineIntegration from '../components/figures/PipelineIntegration.astro';
 
+Two jobs hide behind the letters in the title. One is remembering every version of a project, so several people can change it at once and anyone can go back in time. The other is handing every change to a fresh, borrowed computer that checks it within minutes and, if it passes, puts it in front of users without anyone lifting a finger.
+
+The reason to care is the gap between making a mistake and finding out. Push a change to your ranker's training code and learn two minutes later that it broke something, and the fix is obvious. Learn it three weeks later, on merge day, with 140 changes to suspect, and you lose an afternoon or a week. Serious teams ship models this way, behind checks no one can skip, and interviewers expect you to know why.
+
+It builds on [Containers vs VMs](/lessons/containers/), because the fresh computer is the same "clean and identical every time" idea. By the end, the site you're reading will be checked and published by an automatic assembly line you wrote. Next comes [Logs, metrics and traces](/lessons/observability/), which answers the question shipping leaves open: did the change actually work once it was live?
+
 ## Today
 
-- Say what git actually stores: not diffs, but a pile of snapshots named by their own hash, with branches as tiny files pointing into the pile. You'll prove it by reading `.git/objects` by hand.
+- Say what git actually keeps on disk: not a list of edits, but full snapshots of the project, each filed under a fingerprint of its own contents, with a branch being a tiny file that points at one snapshot. You'll prove it by opening git's storage folder by hand.
 - Explain, with arithmetic, why ten small merges hurt less than one big one, and why a bug found in two minutes is cheaper than the same bug found in two weeks.
-- Define continuous integration, continuous delivery and continuous deployment precisely, plus the words around them: artifact, environment, rollback, feature flag, trunk-based development, branch protection.
-- Build a real pipeline for this site: on every push, a clean machine installs, builds, runs a link checker and a "every lesson renders" test, and deploys to GitHub Pages. Then break production on purpose and time your rollback.
-- Map all of it onto ML: what "the build is green" should mean for a model, and where your validation harness fits.
+- Tell apart the three things people mean by "CI/CD" (checking every change automatically, keeping every checked change ready to ship, and shipping it automatically), plus the handful of words around them: the packaged build you ship, the places it runs, going back to the last good version, switches that hide unfinished code, everyone working on one main line, and rules that stop unchecked code from merging.
+- Build a real automatic assembly line for this site: on every push, a fresh borrowed computer installs, builds, checks every link, checks every lesson page exists, and publishes to GitHub Pages. Then break the live site on purpose and time how fast you can undo it.
+- Map all of it onto ML: what "all the checks passed" should mean for a model, and where your validation harness fits.
 
-Prerequisites: you've used git and GitHub Actions. That's it. Rough time: one evening for the reading and the `.git` spelunking, one for the pipeline and the drill.
+You only need to have used git and GitHub Actions before. Budget one evening for the reading and for poking around inside git's storage, and one for the assembly line and the undo drill.
 
 ## The Problem
 

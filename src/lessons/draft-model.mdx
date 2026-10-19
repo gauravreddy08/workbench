@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import DraftOverlap from '../components/figures/DraftOverlap.astro';
 import DraftFit from '../components/figures/DraftFit.astro';
 
+A draft model is the small, fast helper that guesses the next few words so your big model only has to check them, and this lesson is about training that helper to guess the way your big model would, not just to write well.
+
+On your Spark that is the difference between a speed-up you can barely see and one you can put on the scoreboard. Every guess the big model throws away is wasted work, and every guess it keeps is a word you got almost for free. The helper you used last time is a decent writer with its own habits, so a lot of its guesses get thrown away. Teach it your big model's habits and more of them survive, with no change at all to what your server finally writes. The same move, a small model trained to copy a big one, is how labs make cheap fast models out of expensive slow ones.
+
+This picks up exactly where [Speculative decoding](/lessons/speculative-decoding/) left off, with your guess-and-check decoder, its speed formula and your best result so far. It leans on [Memory math for models](/lessons/memory-math/) to decide what to save to disk, and it is a small, complete training run, a cousin of [Train a small LM](/lessons/tiny-lm/). Next, [Fine-tuning and LoRA](/lessons/lora/) shows how to do this kind of retraining while touching only a sliver of the model, and [Inside vLLM and SGLang](/lessons/serving-engines/) is where the fancier helpers you meet at the end get deployed for real.
+
 ## Today
 
-- Say precisely what makes a draft model good: not "smart", but *close to the target's distribution*. Show that the acceptance rate α is exactly `Σ min(p, q)`, which is one minus the total variation distance between the two.
-- Explain knowledge distillation: training a student on the teacher's full probability vectors instead of on single "correct" tokens, why that carries far more signal per example, what temperature does, and the difference between forward and reverse KL.
-- Build a distillation dataset from your own 8B: generate answers on prompts like your real traffic, then store the 8B's top-64 logits per token in about 388 bytes instead of 250 KB.
-- Fine-tune Llama 3.2 1B two ways (plain cross-entropy on the 8B's text, and KL on its logits), build a second draft from the 8B's own first 4 layers, and measure α before and after for each.
-- Plug the winner into your speculative decoder, record the end-to-end speedup on `SCOREBOARD.md`, and, as a stretch, train Medusa heads that draft with no second model at all.
+- Say precisely what makes a helper model good: not "smart", but *close to the big model in how it spreads its bets* over the next word. Show that the fraction of guesses kept is exactly the overlap of the two models' bets, which is one minus a standard measure of how far apart they are.
+- Explain how a small "student" model learns from a big "teacher": it trains on the teacher's full list of odds for every possible next word instead of on the one word that was picked, why that carries far more signal per example, what the knob that flattens those odds does, and the two directions you can measure "how different" in, which push the student differently.
+- Build a training set from your own 8B: have it answer prompts like your real traffic, then save only its 64 favourite next words (with their scores) per position, about 388 bytes instead of 250 KB.
+- Retrain Llama 3.2 1B two ways (once on the 8B's text alone, once on its saved odds), build a second helper from the 8B's own first 4 layers, and measure how many guesses get kept before and after for each.
+- Plug the winner into your speculative decoder, record the end-to-end speed-up on `SCOREBOARD.md`, and, as a stretch, train a few tiny add-ons on the big model itself that do the guessing with no second model at all.
 
-Prerequisites: [Speculative decoding](/lessons/speculative-decoding/) (you need your `spec_greedy`, `spec_sample` and `sweep.py`, and the α, K, c speedup formula). Helpful: [Why ~17 tokens per second?](/lessons/bandwidth-bound/) and [Memory math for models](/lessons/memory-math/). This is probably your first LLM training run, so it's also a soft introduction to [the full training loop](/lessons/tiny-lm/). Time: an evening for the idea, a weekend for the build (most of it waiting for the Spark).
+You need [Speculative decoding](/lessons/speculative-decoding/) first: you will reuse your `spec_greedy`, `spec_sample` and `sweep.py`, and the speed formula built from how often guesses are kept, how many you make per round and how much each one costs. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) and [Memory math for models](/lessons/memory-math/) help. If you haven't done [Train a small LM](/lessons/tiny-lm/) yet, this is probably your first time training a language model, and a gentle first taste of the full loop. Plan on an evening for the idea and a weekend for the build, most of it waiting for the Spark.
 
 ## The Problem
 

@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import HarnessTraceReplay from '../components/figures/HarnessTraceReplay.astro';
 import HarnessBudget from '../components/figures/HarnessBudget.astro';
 
+A coding agent is a language model plus a layer of ordinary code wrapped around it, and that wrapper is called the harness. The model can only write text, like "please open core.py". The harness is what actually opens the file, runs the command, decides what's allowed, and decides when to stop.
+
+That wrapper matters more than it sounds. Give the same model two different harnesses and it can score very differently on the same coding test. You've already built two at TinyFish, a coding agent with tools that look up where things are defined, and a web agent that drives a browser, and both worked in the demo. The hard version is the one that runs on its own, overnight, across hundreds of tasks, with nobody watching.
+
+This leans on [Waiting vs working](/lessons/waiting-vs-working/), [Rate limits](/lessons/rate-limits/), [How does a container isolate a process?](/lessons/containers/) and [Prefix caching](/lessons/prefix-caching/). From here, [Managing context](/lessons/context-management/) deals with the conversation that grows every step, [What makes a task long-horizon?](/lessons/long-horizon/) stretches tasks to hundreds of steps, and [What is an RL environment?](/lessons/rl-environments/) turns the test runner you build here into something a model can train in.
+
 ## Today
 
-- Draw the agent loop from memory: call the model, run the tools it asked for, append the results, repeat, and say exactly what makes it stop.
-- Write tool definitions a model uses well: names, descriptions, input schemas, errors that help it recover, and outputs that don't flood its context.
-- Read and write the raw tool-calling messages (`tool_use` and `tool_result` blocks), including several tool calls in one turn.
-- Fence an agent in: path checks, timeouts that actually kill things, a scrubbed environment, a permission gate for writes and commands, and when to reach for a container.
-- Build a small coding agent with no framework, trace every step to JSONL, look at the trace in a viewer you wrote, score it on five tasks, then change one tool and measure the difference.
+- Draw from memory the loop at the heart of every agent: ask the model, run whatever tools it asked for, hand back the results, repeat, and say exactly what makes it stop.
+- Write tools a model uses well: clear names and explanations, a precise shape for the inputs, error messages that help it recover, and outputs short enough not to bury the model in text it has to reread every turn.
+- Read and write the raw messages that carry a tool request and its answer, including a reply that asks for several tools at once.
+- Fence an agent in: keep it inside its folder, use timeouts that really kill runaway commands, strip secrets from what its commands can see, make it ask before editing or running anything, and know when to reach for a container.
+- Build a small coding agent with no framework, record every step to a log file, look at that log in a viewer you wrote, score the agent on five tasks, then change one tool and measure the difference.
 
-Prerequisites: you've called an LLM API before (you have). Helpful: [How does a container isolate a process?](/lessons/containers/) for the sandbox part, and [Prefix caching](/lessons/prefix-caching/) for why the bill isn't as bad as it first looks. Rough time: one evening for the idea and the loop, one more for the tools, traces and measurements. API spend: well under $5 if you use a small model and cap it.
+All you need is to have called an LLM API before, which you have. [How does a container isolate a process?](/lessons/containers/) helps with the fencing part, and [Prefix caching](/lessons/prefix-caching/) explains why the bill isn't as bad as it first looks. Plan on one evening for the idea and the loop, and one more for the tools, logs and measurements. API spend should stay well under $5 with a small model and a spending cap.
 
 ## The Problem
 

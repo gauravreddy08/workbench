@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import TokTrainer from '../components/figures/TokTrainer.astro';
 import TokMerges from '../components/figures/TokMerges.astro';
 
+Before a language model reads a single word, a small program chops your text into pieces and swaps each piece for a number from a fixed list, because numbers are all the model can take in. That program is the tokenizer, and its pieces, usually a word or part of a word, are tokens.
+
+Almost everything you count in this field is counted in those pieces. Fireworks, the service you are benchmarking your inference server against, bills per token, and your own server's speed is measured in tokens per second. Your cross-encoder can only read so many tokens of a page before it has to cut the rest off, and an agent's memory fills up token by token. When a model can't count the letters in a word, or mangles a long number, the tokenizer is usually the first suspect.
+
+This is the first step of the model you already built in GPT-2: the IDs that went into its first layer came from here. It explains a line item in [How much memory does a model need?](/lessons/memory-math/), where the size of that fixed list turns out to be a surprising share of a small model, and it sets up [Train a small LM, end to end](/lessons/tiny-lm/), where you will train your own tokenizer before you train the model.
+
 ## Today
 
-- Say what a token actually is, in one sentence, and why models use neither letters nor whole words.
-- Explain UTF-8 well enough to see why a byte-level tokenizer can never meet a character it doesn't know.
-- Train a byte-pair encoding (BPE) tokenizer from scratch, encode and decode with it, and prove it round-trips any Unicode string.
-- Load GPT-2's real merge table into your own encoder and match `tiktoken` token for token.
-- Explain, with numbers you measured, why tokens drive your bill and context window, why models fumble spelling and long arithmetic, and why the same sentence costs several times more in Telugu than in English.
+- Say what a token actually is, in one sentence, and why models cut text into neither single letters nor whole words.
+- Explain how computers store text as bytes (the UTF-8 standard, where one character takes 1 to 4 bytes) well enough to see why a tokenizer built on bytes can never meet a character it doesn't know.
+- Train a tokenizer from scratch by repeatedly gluing together the most common neighbouring pair of pieces (the method is called byte-pair encoding, BPE), use it to turn text into numbers and back, and prove the round trip works for any text in any language.
+- Load GPT-2's real list of glued pairs into your own code and match OpenAI's tokenizer library, `tiktoken`, token for token.
+- Explain, with numbers you measured, why tokens drive your bill and how much text fits in a model, why models fumble spelling and long arithmetic, and why the same sentence costs several times more in Telugu than in English.
 
-Prerequisites: Python, and the idea of an embedding table from your GPT-2 build. No ML theory needed. Rough time: one evening for the core build, a second for the comparisons and the failure hunt. Everything runs on your Mac; the Spark is only needed if you want to run a local model in the last task.
+All you need is Python and the embedding table from your GPT-2 build (the lookup that turns each token number into a learned vector); no ML theory. Plan on one evening for the core build and a second for the comparisons and the failure hunt. Everything runs on your Mac; the Spark is only needed if you want to run a local model in the last task.
 
 ## The Problem
 

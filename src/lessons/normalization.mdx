@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import NormRipple from '../components/figures/NormRipple.astro';
 
+Normalization is deciding how to split your data into separate tables so that every fact, like a person's email or a model's size, is written down in exactly one place.
+
+It sounds like tidying up, but it decides whether your numbers can be trusted. Wherever a fact is copied, the copies can drift apart, and then a dashboard counts one model as two, or a plot quietly splits one person's runs in half. Experiment results, eval scores for your ranker, logs of what an agent did: anything people keep adding to for months grows these copies, and nobody notices until a number looks wrong. "Design the tables for this" is also a staple of interviews, and the reasoning here is what they're listening for.
+
+[Why not a JSON file?](/lessons/why-databases/) showed why data belongs in a database at all. This lesson is about its shape. It leans on [Indexes and B-trees](/lessons/indexes/) to explain why putting split-up tables back together is cheap, and on [Transactions](/lessons/transactions/) for keeping a big data move all-or-nothing. The cost it leaves you with, copies that go out of date, is the whole subject of [Caching and Redis](/lessons/caching/).
+
 ## Today
 
 - Look at any table (a spreadsheet, a CSV, a Postgres table someone else made) and point at the exact facts that are stored more than once, and the bugs that copying invites.
-- Say what a functional dependency is in one plain sentence, and use it to explain 1NF, 2NF, 3NF and BCNF without reciting definitions.
-- Pick keys on purpose: primary, foreign, natural, surrogate, and know which one breaks when an email address changes.
-- Take a messy CSV of your own experiment runs, find its contradictions with SQL, design a clean schema with constraints that refuse bad data, migrate into it, and rebuild the original view with joins.
-- Decide when to break the rules on purpose (dashboards, warehouses, caches, document stores, JSON columns), and say what you pay for it: staleness.
+- Say in one plain sentence the rule behind all of this, "if you know this column, you know that one", and use it to explain the four classic levels of tidy table design (called normal forms: 1NF, 2NF, 3NF and BCNF) without reciting definitions.
+- Choose on purpose which columns identify a row and how one table points at another, and decide between a real-world identifier like an email and a made-up number, knowing which one breaks when an email address changes.
+- Take a messy CSV of your own experiment runs, find its contradictions with SQL, design clean tables with rules the database itself enforces to refuse bad data, move the data across, and rebuild the original sheet by stitching the tables back together.
+- Decide when to break the rules on purpose (dashboards, analytics warehouses, caches, document databases, JSON columns), and say what you pay for it: copies that go out of date.
 
-Prerequisites: basic SQL (`SELECT`, `WHERE`, `GROUP BY`, `JOIN` at the "I've written one" level). Everything runs in SQLite, which ships with macOS and Python. Rough time: one evening.
+You'll need basic SQL, at the level of having written a `SELECT` with a `WHERE`, a `GROUP BY` and a `JOIN` once or twice. Everything runs in SQLite, the small database that ships with macOS and Python. Plan on one evening.
 
 ## The Problem
 

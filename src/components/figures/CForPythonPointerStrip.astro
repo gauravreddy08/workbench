@@ -1,0 +1,138 @@
+---
+// Memory strip: 32 bytes holding one C array. Pick the element type and an index i,
+// see where p + i lands (base + i * sizeof), which bytes *(p + i) reads, and its value.
+// Addresses are made up (but shaped like real stack addresses).
+// Usage: <CForPythonPointerStrip />
+---
+<div class="cps" data-fig="c-for-python-pointer-strip">
+  <div class="ctl" role="group" aria-label="Element type">
+    <span>TYPE</span>
+    <button class="btn" type="button" data-t="char" aria-pressed="false">char</button>
+    <button class="btn" type="button" data-t="int" aria-pressed="true">int</button>
+    <button class="btn" type="button" data-t="double" aria-pressed="false">double</button>
+  </div>
+  <div class="ctl">
+    <label>i <input type="range" min="0" max="7" step="1" value="0" data-in="i" /> <output>0</output></label>
+  </div>
+  <p class="cps-decl mono" data-o="decl"></p>
+  <svg class="cps-svg" viewBox="0 0 340 170" role="img" aria-label="32 bytes of memory in two rows of 16. The bytes of element i are highlighted, with arrows from p and from p + i."></svg>
+  <dl class="cps-read">
+    <div><dt class="label">p</dt><dd class="readout" data-o="p"></dd></div>
+    <div><dt class="label">p + i</dt><dd class="readout" data-o="pi"></dd></div>
+    <div><dt class="label">*(p + i), same as p[i]</dt><dd class="readout" data-o="val"></dd></div>
+  </dl>
+  <p class="cps-note" data-o="note"></p>
+</div>
+
+<style>
+  .cps-decl { margin: 14px 0 0; font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .cps-svg { width: 100%; max-width: 520px; margin: 8px auto 0; display: block; }
+  .cps-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px 16px; margin: 12px 0 0; }
+  .cps-read div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .cps-read dt { font-size: 10px; }
+  .cps-read dd { margin: 2px 0 0; font-size: 15px; overflow-wrap: anywhere; }
+  .cps-note { margin: 12px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const BASE = 0x16fd0040; // made-up address
+  const BYTES = 32, PER_ROW = 16, CELL = 20, X0 = 10, ROW_Y = [46, 116], CELL_H = 26;
+  const TEXT = 'pointers are just numbers, ok?!';
+  const TYPES = {
+    char: { size: 1, decl: 'char a[32] = "pointers are just numbers, ok?!";', val: (i: number) => `'${TEXT[i] ?? '\\0'}'` },
+    int: { size: 4, decl: 'int a[8] = {10, 20, 30, 40, 50, 60, 70, 80};', val: (i: number) => String((i + 1) * 10) },
+    double: { size: 8, decl: 'double a[4] = {0.5, 1.5, 2.5, 3.5};', val: (i: number) => (i + 0.5).toFixed(1) },
+  } as const;
+  type T = keyof typeof TYPES;
+  const hex = (n: number) => '0x' + n.toString(16);
+
+  function el(name: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, String(attrs[k]));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="c-for-python-pointer-strip"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.cps-svg')!;
+    const inp = root.querySelector<HTMLInputElement>('[data-in="i"]')!;
+    const outI = inp.parentElement!.querySelector('output')!;
+    const o = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const tBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-t]')];
+    let type: T = 'int';
+
+    // arrowhead marker, unique per instance
+    const mid = 'cps-a-' + Math.random().toString(36).slice(2, 8);
+    const defs = el('defs', {});
+    const marker = el('marker', { id: mid, markerWidth: 8, markerHeight: 8, refX: 7, refY: 4, orient: 'auto' });
+    marker.appendChild(el('path', { d: 'M0,0 L8,4 L0,8 z', class: 'fill-blue' }));
+    defs.appendChild(marker);
+    svg.appendChild(defs);
+    const layer = el('g', {});
+    svg.appendChild(layer);
+
+    const cellXY = (b: number) => ({ x: X0 + (b % PER_ROW) * CELL, y: ROW_Y[Math.floor(b / PER_ROW)] });
+
+    function render() {
+      const t = TYPES[type];
+      const n = BYTES / t.size;
+      inp.max = String(n - 1);
+      if (Number(inp.value) > n - 1) inp.value = String(n - 1);
+      const i = Number(inp.value);
+      outI.textContent = String(i);
+      layer.innerHTML = '';
+
+      // byte cells
+      for (let b = 0; b < BYTES; b++) {
+        const { x, y } = cellXY(b);
+        const mine = b >= i * t.size && b < (i + 1) * t.size;
+        layer.appendChild(el('rect', { x: x + 1, y, width: CELL - 2, height: CELL_H, class: mine ? 'fill-blue' : 'fill-paper', 'stroke-width': 1 }));
+        if (type === 'char') {
+          const ch = TEXT[b] === ' ' ? '·' : TEXT[b] ?? '\\0';
+          layer.appendChild(el('text', { x: x + CELL / 2, y: y + 17, 'text-anchor': 'middle', class: mine ? '' : 'blue-t', style: mine ? 'fill:var(--paper)' : '' }, ch));
+        }
+      }
+      // element outlines + index labels
+      for (let k = 0; k < n; k++) {
+        const s = cellXY(k * t.size);
+        const w = t.size * CELL;
+        layer.appendChild(el('rect', { x: s.x, y: s.y - 2, width: w, height: CELL_H + 4, class: 'ink', fill: 'none', 'stroke-width': 1.2 }));
+        if (type !== 'char') {
+          layer.appendChild(el('text', { x: s.x + w / 2, y: s.y + 17, 'text-anchor': 'middle', class: k === i ? 'strong' : '', style: k === i ? 'fill:var(--paper)' : '' }, t.val(k)));
+        }
+        if (type !== 'char' || k % 4 === 0) {
+          layer.appendChild(el('text', { x: s.x + 2, y: s.y + CELL_H + 16 }, `a[${k}]`));
+        }
+      }
+      // row address labels
+      layer.appendChild(el('text', { x: 330, y: ROW_Y[0] - 30, 'text-anchor': 'end' }, 'a starts at ' + hex(BASE)));
+
+      // arrows: p -> byte 0, p+i -> first byte of element i
+      const p0 = cellXY(0), pi = cellXY(i * t.size);
+      layer.appendChild(el('line', { x1: p0.x + 6, y1: p0.y - 20, x2: p0.x + 6, y2: p0.y - 4, class: 'blue', 'stroke-width': 1.3, 'marker-end': `url(#${mid})` }));
+      layer.appendChild(el('text', { x: p0.x + 12, y: p0.y - 10, class: 'blue-t' }, 'p'));
+      if (i > 0) {
+        layer.appendChild(el('line', { x1: pi.x + 6, y1: pi.y - 20, x2: pi.x + 6, y2: pi.y - 4, class: 'blue', 'stroke-width': 1.3, 'marker-end': `url(#${mid})` }));
+        const right = pi.x > 250;
+        layer.appendChild(el('text', { x: right ? pi.x : pi.x + 12, y: pi.y - 10, class: 'blue-t', 'text-anchor': right ? 'end' : 'start' }, 'p+' + i));
+      }
+
+      o('decl').textContent = `${t.decl}  ${type} *p = a;`;
+      o('p').textContent = hex(BASE);
+      o('pi').textContent = `${hex(BASE)} + ${i}×${t.size} = ${hex(BASE + i * t.size)}`;
+      o('val').textContent = t.val(i);
+      o('note').textContent = type === 'char'
+        ? 'A char is one byte, so p + 1 is the very next byte. Text in C is just this: a row of bytes, ending in a zero byte.'
+        : `sizeof(${type}) is ${t.size}, so p + 1 moves ${t.size} bytes, not 1. C scales the step by the type. That is the whole reason a pointer has a type: it tells C how far one step is and how many bytes to read at the end.`;
+    }
+
+    tBtns.forEach((b) => b.addEventListener('click', () => {
+      type = b.dataset.t as T;
+      tBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    inp.addEventListener('input', render);
+    render();
+  });
+</script>

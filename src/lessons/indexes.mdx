@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import IndexHeight from '../components/figures/IndexHeight.astro';
 import IndexBTree from '../components/figures/IndexBTree.astro';
 
+An index is a small, sorted copy of one column of a table, kept next to it, so the database can jump straight to the rows you want instead of reading every row to find them. It is the same trick as the alphabetical index at the back of a book.
+
+It's the single biggest speed lever you have in a database. The right one can make a query thousands of times faster, and the wrong set of them can quietly halve how fast you can write data in. If you ever keep logs of what your ranker showed and what people clicked, both of those will happen to you. "Why is this query slow?" and "why not index every column?" are also two of the most common database questions in interviews, and both have a precise answer.
+
+You've already seen why reading from memory is about a thousand times faster than reading from an SSD in [How slow is slow?](/lessons/latency-numbers/), and how disks move data in fixed-size chunks in [What happens when you save a file?](/lessons/files-and-disks/). In [Why not a JSON file?](/lessons/why-databases/) you built a store that could find one key fast but couldn't keep keys in order. This lesson fixes that, and it sets up [Transactions](/lessons/transactions/) and [Nearest neighbors at scale](/lessons/vector-search/), which asks how you'd index things that can't be sorted at all.
+
 ## Today
 
-- Say exactly what a database index is, physically: a second, sorted copy of some columns, stored in pages, pointing back at the rows.
-- Explain why a B-tree finds one row among a billion in about four page reads, and do the arithmetic yourself from the page size and key size.
-- Read an `EXPLAIN ANALYZE` plan and say why Postgres chose a sequential scan, an index scan, a bitmap scan or an index-only scan, including when it ignores your index on purpose.
-- Pick column order for a composite index, and know when a covering index skips the table entirely.
-- Explain why every index makes writes slower, measure by how much, and describe the write-optimized alternative (LSM-trees) that RocksDB and Cassandra use.
+- Say exactly what an index is, physically: a second, sorted copy of some columns, stored in the same fixed-size chunks the table uses, with each entry pointing back at its row.
+- Explain how a wide, shallow tree of those chunks finds one row among a billion in about four reads from disk, and do the arithmetic yourself from the chunk size and the key size. (This tree is the B-tree.)
+- Read the report Postgres prints when you ask how it ran a query, and say why it chose to read the whole table, use the index, or something in between, including when it ignores your index on purpose.
+- Choose the column order for an index built on several columns at once, and know when an index holds everything a query needs, so the table itself never gets read.
+- Explain why every index slows down writes, measure by how much, and describe the alternative design that writes faster by only ever appending (the LSM-tree, used by RocksDB and Cassandra).
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (RAM vs SSD, about 1,000x) and [Files, disks and fsync](/lessons/files-and-disks/) (data moves in fixed-size blocks, the page cache). Rough time: one evening for Postgres, one for the B+tree.
+Before this, do [How slow is slow?](/lessons/latency-numbers/) (memory versus SSD, about 1,000x apart) and [What happens when you save a file?](/lessons/files-and-disks/) (data moves in fixed-size blocks, and the operating system keeps recently used ones in spare memory). Plan on one evening for the Postgres half and one for writing the tree yourself.
 
 ## The Problem
 
@@ -633,7 +639,7 @@ Time 1 million random inserts into your tree (order 128), into a plain Python li
 
 Fill this in. Run each query twice and keep the second (the first pays for loading pages into cache). Your Postgres version and disk will differ from mine; the ratios shouldn't.
 
-| Experiment | Your prediction | Your result | My result (M4 Pro, Postgres 16, warm cache) |
+| Experiment | Your prediction | Your result | My result (M4 Pro, Postgres 17, warm cache) |
 | --- | --- | --- | --- |
 | `user_id = 4242`, no index, 1 worker | | | Seq Scan, 198 ms, 46,729 pages |
 | Same, default parallel scan | | | 2 workers, 64 ms |

@@ -10,15 +10,21 @@ import PrefixHashChain from '../components/figures/PrefixHashChain.astro';
 import PrefixRadix from '../components/figures/PrefixRadix.astro';
 import PrefixPool from '../components/figures/PrefixPool.astro';
 
+Before a model writes a single word of its answer, it reads your whole prompt and builds a set of notes about it in GPU memory, one entry per word-piece. Prefix caching means keeping those notes after the answer is done, so the next request that starts with the same text can pick up where the last one stopped instead of reading it all over again.
+
+This matters because almost nothing you send is new. Your agents resend the same long instructions on every step, and every chat turn resends the whole conversation. Without a cache, your Spark server spends about a second rereading text it saw a moment ago, every single time. It is also why Anthropic and OpenAI charge less for input they have seen recently, and part of why Fireworks can look faster than you on repeated prompts.
+
+You already know where the notes come from ([The KV cache, by hand](/lessons/kv-cache/)) and how an operating system chops memory into small numbered pieces it can hand out and share ([Virtual memory](/lessons/virtual-memory/)). Here those two ideas meet, inside the server from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). After this, the memory managers inside [vLLM and SGLang](/lessons/serving-engines/) will look familiar, because you will have built a small one.
+
 ## Today
 
-- Put a byte count on the KV cache of one request, and explain why giving every request a max-length slab of memory wastes most of the GPU.
-- Explain PagedAttention: fixed-size blocks, a block table per sequence, and why it is the same trick as virtual memory pages.
-- Explain how blocks get shared, inside one request (parallel samples, beam search, with copy-on-write) and across requests (prefix caching: a hash per block, looked up like a dictionary).
-- Build a block-hashed prefix cache into your server: hashing, lookup, reference counts, LRU and TTL eviction. Measure TTFT on a shared 2,000-token system prompt and hit rate against cache size.
-- Say exactly what prefix caching speeds up (time to first token) and what it does not (each decode step), and how the same idea becomes cache-aware routing and the "prompt caching" line on an API bill.
+- Put a byte count on the notes one request keeps in memory (its KV cache), and explain why reserving room for the longest possible answer, for every request, leaves most of the GPU empty.
+- Explain how servers cut that memory into small fixed-size blocks, with a lookup table per request saying where each block lives (vLLM calls this PagedAttention), and why it is the same trick as virtual memory pages.
+- Explain how blocks get shared: inside one request (several answers to one prompt point at the same blocks, and a block is copied only when one of them needs to write to it) and across requests (each block gets a fingerprint of all the text up to it, looked up like a dictionary).
+- Build that cache into your server: the fingerprints, the lookup, a count of who is using each block, and two rules for throwing blocks out (least recently used goes first, and anything idle too long expires). Measure the wait for the first word with a shared 2,000-token system prompt, and how often the cache hits as you change its size.
+- Say exactly what this speeds up (the wait before the first word of the answer) and what it does not (each word after that), and how the same idea becomes sending requests to the machine that already holds their prompt, and the "prompt caching" line on an API bill.
 
-Prerequisites: [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) (your server, harness and `SCOREBOARD.md`) and [Virtual memory and the OOM killer](/lessons/virtual-memory/) (pages, page tables, copy-on-write). It helps to have read [The KV cache, by hand](/lessons/kv-cache/) and [Batching](/lessons/batching/), but this lesson recaps what it needs. Time: one evening for the idea and the cache, one for wiring it in and measuring.
+You need the server, harness and `SCOREBOARD.md` from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), plus pages, page tables and copy-on-write from [Virtual memory and the OOM killer](/lessons/virtual-memory/). [The KV cache, by hand](/lessons/kv-cache/) and [Batching](/lessons/batching/) help, but everything needed from them is recapped here. Plan on two evenings: one for the idea and the cache, one for wiring it in and measuring.
 
 ## The Problem
 

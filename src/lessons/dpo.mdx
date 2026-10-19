@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import DPOLossSurface from '../components/figures/DPOLossSurface.astro';
 
+Preference tuning teaches a model from pairs of answers where someone only said "this one is better than that one", instead of from perfect answers someone had to sit down and write. DPO, short for Direct Preference Optimization, is the simplest popular way to do it: a single short formula you train with exactly like an ordinary round of extra training on examples.
+
+It matters because judging is far cheaper than writing. You can pick the better of two explanations in three seconds; writing the best one yourself takes minutes and wears you out. For years, using those judgments meant a fragile, hardware-hungry training setup that many labs couldn't get to work, and DPO collapsed it into a few lines of code. It's also closer to your work than it looks: the math it starts from is the same "A should score above B" loss you'd use to train your cross-encoder ranker, and "derive DPO" is a standard interview question.
+
+It builds on [Train a tiny LM](/lessons/tiny-lm/), for how a model scores a piece of text, and [Why training needs so much memory](/lessons/training-memory/), for why the older approach needed so much hardware. It uses [LoRA](/lessons/lora/) and [LLM judges](/lessons/llm-judges/) as tools, and it hands off to [RL with verifiable rewards](/lessons/grpo/), where the model learns from its own fresh attempts instead of a fixed pile of pairs.
+
 ## Today
 
-- Explain why preference data ("A is better than B") is easier to collect and often more useful than demonstrations, and what the Bradley-Terry model turns it into.
-- Draw the classic RLHF pipeline (SFT, reward model, PPO with a KL penalty) and say exactly why PPO is heavy: four models in memory, and a training loop that breaks easily.
-- Derive the DPO loss yourself, step by step, from "maximize reward without drifting too far from the reference", and say in plain words what β and the "implicit reward" are.
-- Write the DPO loss and a correct sequence log-prob function in PyTorch, check them by hand, then preference-tune a 0.5B instruct model on the Spark and match TRL's `DPOTrainer`.
-- Recognise the failure modes on a training dashboard (both log-probs falling, overfitting, answers getting longer) and know which variant (IPO, KTO, SimPO, ORPO) was invented to fix which.
+- Explain why "A is better than B" data is easier to collect, and often more useful, than written-out perfect answers, and how a 1952 method for ranking chess players turns those comparisons into a score for each answer.
+- Draw the classic three-stage recipe for training on human preferences (copy good examples, train a separate scoring model, then a trial-and-error loop that keeps the model close to where it started) and say exactly why the last stage is heavy: four models in memory at once, and a training loop that breaks easily.
+- Derive the DPO formula yourself, step by step, from "score as high as you can without drifting too far from the starting model", and say in plain words what its one dial (β, how tightly the model is leashed to where it started) and its "hidden score" mean.
+- Write the formula, plus the function that measures how likely the model finds a whole answer, in PyTorch, check both by hand, then tune a small chat model (0.5 billion parameters) on the Spark and match the widely used open-source version in Hugging Face's TRL library.
+- Recognise the warning signs on a training chart (both answers getting less likely, memorising the training pairs, answers getting longer) and know which follow-up method (IPO, KTO, SimPO, ORPO) was invented to fix which.
 
-Prerequisites: [Train a tiny LM](/lessons/tiny-lm/) (log-probs, cross-entropy, a training loop), [Why training needs so much memory](/lessons/training-memory/) (the bytes-per-parameter bill), and ideally [LoRA](/lessons/lora/) and [LLM judges](/lessons/llm-judges/), which this lesson uses as tools. Rough time: one evening for the idea and the math, one for the build, one for training and evaluation on the Spark.
+Come in with [Train a tiny LM](/lessons/tiny-lm/), for how a model scores text one token at a time and what a training loop looks like, and [Why training needs so much memory](/lessons/training-memory/), for the bytes-per-parameter bill. [LoRA](/lessons/lora/) and [LLM judges](/lessons/llm-judges/) help too, since this lesson uses both as tools. Plan on one evening for the idea and the math, one for the build, and one for training and evaluation on the Spark.
 
 ## The Problem
 

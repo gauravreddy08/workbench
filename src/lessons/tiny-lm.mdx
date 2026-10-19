@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import TinyLMLossExplorer from '../components/figures/TinyLMLossExplorer.astro';
 import TinyLMCompute from '../components/figures/TinyLMCompute.astro';
 
+Training a language model means showing a program billions of words of text and, every time it guesses the next word wrong, nudging its numbers a tiny bit so it guesses better next time. You have built the model itself, the arrangement of numbers that does the guessing, several times. What you have never done is the whole job, end to end: choose the text, chop it up, feed it in fast enough, keep the nudging going all night, save your progress, and then check whether what came out is any good.
+
+That whole job matters more than it sounds. Almost every idea you will want to test later, a new twist on the model's design, a cleaner pile of text, a small helper model that speeds up the server on your Spark, gets judged by comparing two training runs. A broken run does not crash. It just quietly scores worse, and a good idea looks like a bad one. So what you are really building here is a run you can trust, plus the habits that catch the silent mistakes in the first five minutes instead of the fifth hour.
+
+This pulls together a lot of what came before: [Tokenizers](/lessons/tokenizers/), [fp32, bf16, fp16, fp8](/lessons/number-formats/), [Why training needs so much memory](/lessons/training-memory/) and the crash-safe save from [Files and disks](/lessons/files-and-disks/). And it becomes the yardstick for the rest of the track: [Data a model can eat](/lessons/data-pipelines/) changes only the text, [Train your own draft model](/lessons/draft-model/) reuses this loop, and [Comparing transformer variants](/lessons/architecture-compute/) finally gives your own ideas a fair test.
+
 ## Today
 
-- Run the whole lifecycle once, for real: raw web text, tokenizer, a file of token IDs on disk, a data loader, a 124M-parameter GPT, a training run of a couple of billion tokens on the Spark, a checkpoint, samples, and an eval score.
-- Know which training-loop details actually decide whether a run works (learning-rate schedule, warmup, which weights get weight decay, gradient clipping, batch size in tokens) and why each one is there.
-- Read a loss curve like a doctor reads a chart: say what a number means (loss to perplexity, ln of the vocab size at step 0) and tell a healthy curve from too-high LR, too-low LR, no warmup, overfitting, and a data bug.
-- Estimate how long a run will take before you start it (6 × params × tokens), measure how close you got (MFU), and know the Chinchilla rule of about 20 tokens per parameter.
+- Run the whole thing once, for real: raw web text, chopped into word pieces and saved to disk as numbers, fed in batches to a 124-million-number GPT for a night on the Spark, then saved, sampled from and scored.
+- Know the handful of training settings that decide whether a run works (how big each step is and how that changes over the run, a gentle ramp-up at the start, which numbers get pulled toward zero, a cap on any single wild step, how much text goes into each step) and why each one is there.
+- Read the chart of the model's error over time like a doctor reads a chart: know what the error should be before training even starts, and tell a healthy run from one whose steps are too big, too small, missing the ramp-up, memorising instead of learning, or fed by a buggy data pipeline.
+- Estimate how long a run will take before you start it, from just the model's size and the amount of text, then measure what fraction of the chip's top speed you actually used. Plus the rule of thumb for how much text a model of a given size deserves: about 20 word pieces per number in the model.
 - Have a debugging routine that catches most broken runs in the first five minutes instead of the fifth hour.
 
-Prerequisites: you have written a GPT-2 forward pass before (you have, several times). Helpful but not required: [Tokenizers](/lessons/tokenizers/), [fp32, bf16, fp16, fp8](/lessons/number-formats/), [Why training needs so much memory](/lessons/training-memory/), and the atomic-save recipe from [Files and disks](/lessons/files-and-disks/). Rough time: two evenings of building, one overnight run, one morning of evaluating.
+You need to have written a GPT-2 forward pass before, which you have, several times. It helps, but is not required, to have done [Tokenizers](/lessons/tokenizers/), [fp32, bf16, fp16, fp8](/lessons/number-formats/), [Why training needs so much memory](/lessons/training-memory/), and the crash-safe save from [Files and disks](/lessons/files-and-disks/). Plan on two evenings of building, one overnight run and one morning of evaluating.
 
 ## The Problem
 

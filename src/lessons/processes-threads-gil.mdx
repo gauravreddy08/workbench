@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import ThreadsScheduler from '../components/figures/ThreadsScheduler.astro';
 import ThreadsRace from '../components/figures/ThreadsRace.astro';
 
+Every running program needs two things from your computer: a private patch of memory to keep its stuff in, and at least one worker stepping through its instructions. How many workers a program gets, what they share, and whether they can truly work at the same moment decides whether a 20-core machine finishes your job 20 times faster, or no faster at all.
+
+This decides real outcomes in ML work. The loader that is supposed to keep the GPU fed with batches, a scraper pulling thousands of pages, an agent firing off a dozen tool calls at once: each one either spreads across your cores or quietly runs on one. Python adds its own twist, a rule inside the interpreter that lets only one worker run Python code at a time, and it explains most "I added workers and nothing got faster" surprises.
+
+This builds on [Where do my variables live?](/lessons/stack-and-heap/), whose picture of a program's memory becomes the floor plan the workers move around in, and on the speed intuitions from [How slow is slow?](/lessons/latency-numbers/). It sets up [Waiting vs working](/lessons/waiting-vs-working/), which asks how to wait on thousands of slow requests at once without hiring thousands of workers.
+
 ## Today
 
-- Say what a process is, what a thread is, and exactly which parts of memory each one owns and shares.
-- Explain how one CPU core runs many programs "at once", what a context switch costs, and the difference between concurrency and parallelism.
-- Make a race condition happen on purpose, then fix it with a lock.
-- Explain the GIL: what it locks, why it exists, when it lets go, and what free-threaded Python changes.
-- Predict, before running anything, whether threads, processes, or neither will speed up a given Python job, and check yourself against a stopwatch on your Mac and the Spark.
+- Say what a process is (a running program, walled off with its own memory) and what a thread is (one worker inside it), and exactly which parts of memory each keeps private and which they share.
+- Explain how one CPU core juggles many programs by switching between them very fast, what each switch costs, and the difference between tasks taking turns and tasks truly running at the same instant.
+- Make two threads corrupt a shared number on purpose by bumping into each other, then fix it with a lock, a token only one thread can hold at a time.
+- Explain Python's one-at-a-time rule (the GIL): what it guards, why it exists, when it steps aside, and what the new Python build without it changes.
+- Predict, before running anything, whether more threads, more processes, or neither will speed up a given Python job, and check yourself with a stopwatch on your Mac and the Spark.
 
-Prerequisites: [Where do my variables live?](/lessons/stack-and-heap/) (the address space picture: code, globals, heap, stack). Rough time: one evening to read and build, plus a session on the Spark.
+Read [Where do my variables live?](/lessons/stack-and-heap/) first, since you'll reuse its picture of a program's memory: code, globals, heap and stack. Budget one evening to read and build, plus a session on the Spark.
 
 ## The Problem
 

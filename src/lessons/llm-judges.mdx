@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import JudgeBiasSim from '../components/figures/JudgeBiasSim.astro';
 
+An LLM judge is a language model you hand someone else's answer to, along with grading instructions, and ask for a mark. It's the cheapest way to grade thousands of answers that no simple program can check, like "is this search result actually what the person wanted?" It never gets tired. It also has habits that have nothing to do with quality, and it won't tell you about them.
+
+That matters the moment a judge's verdict decides something. If you use one to decide whether the new cross-encoder beats the old one, its habits become your conclusion. If you use one to grade an agent's runs every night, its blind spots become the agent's blind spots. And if you ever train a model to please a judge, the model will learn those habits on purpose.
+
+This builds on [Why is the eval separate?](/lessons/why-evals-are-separate/), which explains why the grader shouldn't share the model's blind spots, and on [Is that improvement real?](/lessons/statistics-for-evals/), which gives you error bars for any score, including a judge's. It leads to [Ranking metrics and eval sets](/lessons/ranking-metrics/), where a trusted judge can label results at scale, and to [Rewards and verifiers](/lessons/verifiers-rewards/), where grading becomes the signal a model trains on.
+
 ## Today
 
 - Explain why people grade model outputs with another model, and the three ways to ask it: score one answer, compare two, or check against a known-good answer.
-- Name the judge's known biases (position, length, self-preference, confident tone, formatting) and the specific fix for each, including which fixes do *not* work for which bias.
-- Treat a judge as what it is, a classifier, and measure it like one: agreement with your own labels, Cohen's kappa, a confusion matrix, and whether its confidence means anything.
-- Write rubrics that a model can apply consistently, for search-result relevance and for "did the agent finish the task".
+- Name the judge's known habits (favouring whichever answer is shown first, favouring longer answers, favouring its own writing, trusting a confident tone, rewarding tidy formatting) and the specific fix for each, including which fixes do *not* work for which habit.
+- Treat a judge as what it is, a sorter that puts each item in a bucket, and measure it like one: how often it agrees with your own labels, how much of that agreement beats lucky guessing, which mistakes it makes, and whether its stated confidence means anything.
+- Write grading instructions that a model can apply consistently, for search-result relevance and for "did the agent finish the task".
 - Work out what a judging run costs before you start it, and when you should not use a judge at all.
 
-Prerequisites: [Why is the eval separate?](/lessons/why-evals-are-separate/) (why the grader must not share the model's blind spots) and ideally [Is that improvement real?](/lessons/statistics-for-evals/) (confidence intervals). Rough time: one evening to read, one evening to label 100 pairs, one to build and iterate the judge. API spend: a few dollars at most.
+Read [Why is the eval separate?](/lessons/why-evals-are-separate/) first, and ideally [Is that improvement real?](/lessons/statistics-for-evals/) too. Budget one evening to read, one to label 100 pairs yourself, and one to build and improve the judge, for a few dollars of API spend at most.
 
 ## The Problem
 

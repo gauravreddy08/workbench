@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import APITimeline from '../components/figures/APITimeline.astro';
 import APIPipeline from '../components/figures/APIPipeline.astro';
 
+An API is the list of requests one program promises to accept from another, and what it promises to send back. Its life is everything that happens to that promise: deciding what it says, keeping it, changing it without hurting the people who rely on it, and one day ending it.
+
+The moment anyone else's code depends on your server, even one script of your own, every change you make can break something you can't see. Your model server on the Spark already has a client like that: the benchmark script you race it against Fireworks with. In the scene below, a thirty-second tidy-up quietly spoils weeks of its numbers without a single error. It's also a question interviewers ask, and the obvious answer misses most of it.
+
+It builds on [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), which gave you the server and its one real client, and on [Rate limits](/lessons/rate-limits/), which taught a server to tell a caller to slow down. [HTTP from scratch](/lessons/http-from-scratch/) fills in the layer underneath. Afterwards, [Observability](/lessons/observability/) is how you count who's still on an old version, and [Load balancing](/lessons/load-balancing/) is where a promise kept by one server has to be kept by twenty.
+
 ## Today
 
-- Answer "what's an API lifecycle?" in an interview, and say out loud that the phrase has two meanings: the months-long life of an API *product* (design to retirement) and the milliseconds-long life of one *request* inside a server.
-- Design an endpoint the way API teams do: contract first in OpenAPI, one error shape everywhere, idempotency keys on POST, API keys with per-key rate limits.
-- Tell an additive change from a breaking one, including the sneaky kind that breaks nobody loudly and everybody quietly.
-- Ship a breaking change safely: v2 next to v1, Deprecation and Sunset headers, a contract test that would have caught the break, and a migrated client.
-- Walk one request through your server stage by stage and name the status code each stage can return.
+- Answer "what's an API lifecycle?" in an interview, and point out that the phrase means two things: the months-long life of an API as a product, from first design to switching it off, and the milliseconds-long trip one request takes through your server.
+- Design an endpoint (one address your server answers at) the way API teams do: write the exact promise down first, in a standard format called OpenAPI; give every error the same shape; let clients retry a request without it running twice; and give each caller their own secret key with their own speed limit.
+- Tell a change that only adds something from one that breaks existing clients, including the sneaky kind that breaks nobody loudly and everybody quietly.
+- Ship a breaking change safely: run the new version next to the old one, stamp every reply from the old one with "this is going away on this date", write a test that would have caught the break, and move a real client over.
+- Walk one request through your server stage by stage, and name the three-digit status code each stage can send back.
 
-Prerequisites: [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/) (your OpenAI-compatible `server_naive.py` and `bench.py`) and [Rate limits](/lessons/rate-limits/) (your token bucket). [HTTP from scratch](/lessons/http-from-scratch/) helps but is not required. Time: one evening to read, two to build. Everything runs on your Mac with a fake model; swap in the Spark at the end.
+Before this, do [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), which gives you the OpenAI-style server (`server_naive.py`) and benchmark script (`bench.py`) you'll change here, and [Rate limits](/lessons/rate-limits/), for the token bucket you'll reuse. [HTTP from scratch](/lessons/http-from-scratch/) helps but isn't required. Budget one evening to read and two to build. Everything runs on your Mac with a fake model, and you swap in the Spark at the end.
 
 ## The Problem
 

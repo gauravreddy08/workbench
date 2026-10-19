@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import ArchFlopBreakdown from '../components/figures/ArchFlopBreakdown.astro';
 import ArchIsoFlop from '../components/figures/ArchIsoFlop.astro';
 
+Every few weeks someone changes how a language model is wired inside and announces that the new version is more efficient. Checking the claim sounds easy: train both, see which does better. The catch is that you have to decide what stays the same between the two runs (the number of adjustable weights, the amount of arithmetic you pay for, or the hours on the clock), and that choice alone can pick the winner before either run starts.
+
+It matters any time you change a model you train or serve. A change that looks like a wash on a training chart can let your Spark answer several times as many people at once. A change that looks like a clear win can turn out to be one run that got a luckier random start and a better-tuned setting than the other. Research labs like this question in interviews for exactly that reason: it separates people who repeat results from people who can check them.
+
+You bring the GPT you wrote from scratch, [Why does the KV cache exist?](/lessons/kv-cache/) for the notes a model keeps about everything it has already read, and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) for why writing each new word is slowed by moving bytes, not by arithmetic. The same counting carries straight into [Training on many GPUs](/lessons/distributed-training/), and the luck question gets its full treatment in [Is that improvement real?](/lessons/statistics-for-evals/).
+
 ## Today
 
-- Count the FLOPs of a transformer forward pass from first principles, including the parts the famous `2N` rule leaves out, and check your count against PyTorch's own counter.
-- Explain where `6ND` comes from, and what MFU measures.
-- Say what "a fair comparison" means (equal parameters, equal FLOPs, equal wall-clock) and build an example where the answer flips depending on which one you pick.
-- Run a small isoFLOP sweep on the Spark comparing MHA, GQA and MQA, with tuned learning rates and more than one seed.
+- Count, from first principles, how many arithmetic steps (FLOPs) one pass through a transformer costs, including the two pieces the famous shortcut of "2 steps per weight" leaves out, and check your count against PyTorch's own counter.
+- Explain why training costs about three times a plain pass (the `6ND` rule: 6 steps for every weight, for every token it trains on), and how to measure what share of the chip's top speed your training really uses (MFU).
+- Say what "a fair comparison" means (same number of weights, same amount of arithmetic, or same hours on the clock) and build an example where the winner flips depending on which one you pick.
+- On the Spark, give three attention designs that differ only in how many heads share one set of stored keys and values (MHA, GQA, MQA) the same arithmetic budget across several model sizes, each with its own tuned learning rate and more than one random start.
 - Separate "cheaper to train" from "cheaper to serve", measure both, and write a one-page answer to "which is more compute efficient, and for what?"
 
-Prerequisites: you have written a GPT from scratch (you have), and [the KV cache lesson](/lessons/kv-cache/) for why decoding reads the cache every step. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) helps for the inference half. Rough time: an evening to read and write the code, one night of Spark time for the sweep, an evening to measure and write up.
+The main thing you need is the GPT you've already written from scratch. Read [the KV cache lesson](/lessons/kv-cache/) first for why writing each new word means re-reading everything the model has stored, and [Why ~17 tokens per second?](/lessons/bandwidth-bound/) helps with the serving half. Budget an evening to read and write the code, one night of Spark time for the sweep, and an evening to measure and write up.
 
 ## The Problem
 

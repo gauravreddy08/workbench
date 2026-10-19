@@ -1,0 +1,128 @@
+---
+// One block of 12 floats, four different tensor "views" of it. Pick a view and a cell (row, col);
+// see offset = storage_offset + row*stride[0] + col*stride[1], and which slot of the flat buffer it reads.
+// Strides are in elements, the way PyTorch's t.stride() reports them (NumPy reports bytes).
+// Usage: <CForPythonStrides />
+---
+<div class="cfs" data-fig="c-for-python-strides">
+  <div class="ctl" role="group" aria-label="View">
+    <span>VIEW</span>
+    <button class="btn" type="button" data-v="t" aria-pressed="true">t</button>
+    <button class="btn" type="button" data-v="tT" aria-pressed="false">t.T</button>
+    <button class="btn" type="button" data-v="sl" aria-pressed="false">t[:, 1:3]</button>
+    <button class="btn" type="button" data-v="ev" aria-pressed="false">t[:, ::2]</button>
+  </div>
+  <div class="ctl">
+    <label>row <input type="range" min="0" max="2" step="1" value="1" data-in="r" /> <output>1</output></label>
+    <label>col <input type="range" min="0" max="3" step="1" value="2" data-in="c" /> <output>2</output></label>
+  </div>
+  <svg class="cfs-svg" viewBox="0 0 340 230" role="img" aria-label="Top: the tensor as a grid of rows and columns. Bottom: the same numbers as one flat row of 12 slots in memory. The chosen cell is highlighted in both."></svg>
+  <dl class="cfs-read">
+    <div><dt class="label">shape</dt><dd class="readout" data-o="shape"></dd></div>
+    <div><dt class="label">stride</dt><dd class="readout" data-o="stride"></dd></div>
+    <div><dt class="label">offset</dt><dd class="readout" data-o="off"></dd></div>
+    <div><dt class="label">contiguous?</dt><dd class="readout" data-o="contig"></dd></div>
+  </dl>
+  <p class="cfs-math mono" data-o="math"></p>
+  <p class="cfs-note" data-o="note"></p>
+</div>
+
+<style>
+  .cfs-svg { width: 100%; max-width: 520px; margin: 14px auto 0; display: block; }
+  .cfs-read { display: grid; grid-template-columns: repeat(auto-fit, minmax(70px, 1fr)); gap: 8px 16px; margin: 12px 0 0; }
+  .cfs-read div { border-top: 1px solid var(--rule); padding-top: 6px; }
+  .cfs-read dt { font-size: 10px; }
+  .cfs-read dd { margin: 2px 0 0; font-size: 15px; }
+  .cfs-math { margin: 12px 0 0; font-size: 12.5px; color: var(--ink-2); overflow-wrap: anywhere; }
+  .cfs-note { margin: 8px 0 0; font-size: 15px; line-height: 1.5; color: var(--ink-2); min-height: 3em; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  type View = { shape: [number, number]; stride: [number, number]; offset: number; contig: boolean; note: string };
+  const VIEWS: Record<string, View> = {
+    t: { shape: [3, 4], stride: [4, 1], offset: 0, contig: true,
+      note: 't = torch.arange(12.).reshape(3, 4). Rows sit one after another in memory: step 4 slots to go down a row, 1 slot to go right. Reading a row is walking forward through memory.' },
+    tT: { shape: [4, 3], stride: [1, 4], offset: 0, contig: false,
+      note: 'Transpose copied nothing. It swapped the shape and the strides. Same 12 numbers, same memory, new rule for finding them. Walking a row of t.T now jumps 4 slots at a time.' },
+    sl: { shape: [3, 2], stride: [4, 1], offset: 1, contig: false,
+      note: 'Slicing columns 1 and 2: same strides, but the view starts 1 slot in and skips the rest of each row. Still no copy. The gaps are why it is not contiguous.' },
+    ev: { shape: [3, 2], stride: [4, 2], offset: 0, contig: false,
+      note: 'Every other column: the column stride becomes 2. Any step pattern that is "start here, jump this far" is free. Anything else (like t[[2, 0, 1]]) needs a copy.' },
+  };
+  const CELL = 26, GX = 10, GY = 22, SX = 14, SY = 190;
+
+  function el(name: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, name);
+    for (const k in attrs) e.setAttribute(k, String(attrs[k]));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-fig="c-for-python-strides"]').forEach((root) => {
+    const svg = root.querySelector<SVGSVGElement>('.cfs-svg')!;
+    const rIn = root.querySelector<HTMLInputElement>('[data-in="r"]')!;
+    const cIn = root.querySelector<HTMLInputElement>('[data-in="c"]')!;
+    const o = (k: string) => root.querySelector<HTMLElement>(`[data-o="${k}"]`)!;
+    const vBtns = [...root.querySelectorAll<HTMLButtonElement>('[data-v]')];
+    let view = 't';
+
+    function render() {
+      const v = VIEWS[view];
+      const [R, C] = v.shape;
+      rIn.max = String(R - 1); cIn.max = String(C - 1);
+      if (Number(rIn.value) > R - 1) rIn.value = String(R - 1);
+      if (Number(cIn.value) > C - 1) cIn.value = String(C - 1);
+      const r = Number(rIn.value), c = Number(cIn.value);
+      rIn.parentElement!.querySelector('output')!.textContent = String(r);
+      cIn.parentElement!.querySelector('output')!.textContent = String(c);
+      const at = (i: number, j: number) => v.offset + i * v.stride[0] + j * v.stride[1];
+      const off = at(r, c);
+      svg.innerHTML = '';
+
+      // logical grid
+      svg.appendChild(el('text', { x: GX, y: GY - 8, class: 'strong' }, 'WHAT YOU SEE'));
+      const inView = new Set<number>();
+      for (let i = 0; i < R; i++) for (let j = 0; j < C; j++) {
+        const k = at(i, j); inView.add(k);
+        const sel = i === r && j === c;
+        const x = GX + j * CELL, y = GY + i * CELL;
+        svg.appendChild(el('rect', { x, y, width: CELL - 2, height: CELL - 2, class: sel ? 'fill-blue' : 'fill-wash', 'stroke-width': 1 }));
+        svg.appendChild(el('text', { x: x + (CELL - 2) / 2, y: y + 16, 'text-anchor': 'middle', style: sel ? 'fill:var(--paper)' : '' }, String(k)));
+      }
+      // right-hand label
+      const lx = GX + 4 * CELL + 24;
+      svg.appendChild(el('text', { x: lx, y: GY + 12 }, `shape (${R}, ${C})`));
+      svg.appendChild(el('text', { x: lx, y: GY + 30 }, `stride (${v.stride[0]}, ${v.stride[1]})`));
+      svg.appendChild(el('text', { x: lx, y: GY + 48 }, `storage offset ${v.offset}`));
+      svg.appendChild(el('text', { x: lx, y: GY + 84, class: 'blue-t' }, `[${r}, ${c}] → slot ${off}`));
+
+      // flat storage
+      svg.appendChild(el('text', { x: SX, y: SY - 34, class: 'strong' }, 'WHAT IS IN MEMORY (12 FLOATS)'));
+      for (let k = 0; k < 12; k++) {
+        const x = SX + k * CELL;
+        const sel = k === off;
+        svg.appendChild(el('rect', { x, y: SY - 22, width: CELL - 2, height: CELL - 2, class: sel ? 'fill-blue' : inView.has(k) ? 'fill-wash' : 'fill-paper', 'stroke-width': 1 }));
+        svg.appendChild(el('text', { x: x + (CELL - 2) / 2, y: SY - 6, 'text-anchor': 'middle', style: sel ? 'fill:var(--paper)' : '' }, String(k)));
+        svg.appendChild(el('text', { x: x + (CELL - 2) / 2, y: SY + 18, 'text-anchor': 'middle', 'font-size': 9 }, '+' + k * 4));
+      }
+      svg.appendChild(el('text', { x: SX, y: SY + 34, 'font-size': 9 }, 'byte offset from the data pointer (float = 4 B)'));
+
+      o('shape').textContent = `(${R}, ${C})`;
+      o('stride').textContent = `(${v.stride[0]}, ${v.stride[1]})`;
+      o('off').textContent = String(v.offset);
+      o('contig').textContent = v.contig ? 'yes' : 'no';
+      o('math').textContent = `data[${v.offset} + ${r}×${v.stride[0]} + ${c}×${v.stride[1]}] = data[${off}]`;
+      o('note').textContent = v.note;
+    }
+
+    vBtns.forEach((b) => b.addEventListener('click', () => {
+      view = b.dataset.v!;
+      vBtns.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      render();
+    }));
+    rIn.addEventListener('input', render);
+    cIn.addEventListener('input', render);
+    render();
+  });
+</script>

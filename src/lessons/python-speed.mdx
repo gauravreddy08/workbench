@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import PySpeedEvalLoop from '../components/figures/PySpeedEvalLoop.astro';
 import PySpeedLaunch from '../components/figures/PySpeedLaunch.astro';
 
+Python doesn't hand your code to the CPU. A large program written in C reads your code one small step at a time and carries out each step, and that middleman is why a plain Python loop over numbers runs 30 to 100 times slower than the same loop translated ahead of time into the CPU's own instructions.
+
+It matters because almost everything fast you use from Python, NumPy and PyTorch included, works by handing big chunks of work to precompiled code and keeping Python out of the innermost loop. Knowing exactly where that hand-off happens, and what each hand-off costs, tells you which few lines of your ranking pipeline are worth touching. It also explains a stranger thing: why a GPU answering one request at a time can sit idle most of the time.
+
+It builds on [Where do my variables live?](/lessons/stack-and-heap/) (every Python value is a little package on the shared memory pool), [Processes, threads and the GIL](/lessons/processes-threads-gil/), and [Why is NumPy 100x faster?](/lessons/cpu-caches/). It leads into [Why ~17 tokens per second?](/lessons/bandwidth-bound/), [batching](/lessons/batching/) and [serving engines](/lessons/serving-engines/). You'll compile and run some C as the fast baseline, but it's given to you whole, with notes; [C for Python people](/lessons/c-for-python/) has more if you want it.
+
 ## Today
 
-- Explain the difference between a compiler, an interpreter and a JIT, and say which one CPython is (the answer is "a bit of all three, mostly the second").
-- Read Python bytecode with `dis`, and walk through what the interpreter does, step by step, to run `a + b`.
-- Say exactly where the time goes in a pure-Python loop: dispatch, type checks, boxing, refcounts, pointer chasing. Then put numbers on it from your own Mac.
-- Write the same loop in C, call it from Python, and measure what crossing the Python/C boundary costs per call.
-- Explain how PyTorch is fast despite Python, where eager mode still loses, and what `torch.compile` and CUDA graphs actually fix. Then measure it, including the compile time nobody puts in their benchmark.
+- Explain the three ways a computer can run a program (translate it all first, read and act on it one step at a time, or start step by step and translate the parts that keep repeating), and say which one standard Python uses.
+- Print the simple instructions Python turns your function into, and walk through everything Python does, step by step, to run `a + b`.
+- Say where the time goes in a pure-Python loop, piece by piece, and put numbers on each piece from your own Mac.
+- Time the same loop as Python, as NumPy and as compiled C (the C is given), and measure what a single call from Python into compiled code costs.
+- Explain how PyTorch is fast despite Python, where it still loses when each step is tiny, and what its built-in compiler fixes. Then measure it, including the compile time nobody puts in their benchmark.
 
-Prerequisites: [Where do my variables live?](/lessons/stack-and-heap/) (every Python value is a heap object with a header), [Processes, threads and the GIL](/lessons/processes-threads-gil/), and ideally [Why is NumPy 100x faster?](/lessons/cpu-caches/). A C compiler (`cc`), `uv`, and a few hundred MB for PyTorch. Rough time: an evening for the Mac parts, an hour on the Spark.
+Prerequisites: [Where do my variables live?](/lessons/stack-and-heap/) (every Python value is a heap object with a header), [Processes, threads and the GIL](/lessons/processes-threads-gil/), and ideally [Why is NumPy 100x faster?](/lessons/cpu-caches/). A C compiler (`cc`) to build the given C files, `uv`, and a few hundred MB for PyTorch. Rough time: an evening for the Mac parts, an hour on the Spark.
 
 ## The Problem
 
@@ -120,7 +126,7 @@ Nothing in that bytecode says "integer". `BINARY_OP +` is the same instruction f
 
 ### The eval loop
 
-The interpreter's heart is one giant C function, `_PyEval_EvalFrameDefault` in `Python/ceval.c`, usually just called the <Term w="eval loop">The loop at the center of CPython: fetch the next bytecode instruction, jump to the C code for it, run that, repeat. Every line of Python you run goes through it.</Term>. Stripped to its bones it looks like this:
+The interpreter's heart is one giant C function, `_PyEval_EvalFrameDefault` in `Python/ceval.c`, usually just called the <Term w="eval loop">The loop at the center of CPython: fetch the next bytecode instruction, jump to the C code for it, run that, repeat. Every line of Python you run goes through it.</Term>. Stripped to its bones it looks like this. To read it: `for (;;)` is `while True`, `*next_instr++` means "read the instruction here, then move on to the next one", and `switch` is C's version of a `match` statement.
 
 ```c
 for (;;) {
@@ -461,33 +467,106 @@ Then pick one function from your real ranking code, something with a loop, and `
 
 </Task>
 
-<Task id="t2" title="The same sum, six ways" agent="hands">
+<Task id="t2c" title="Build the C side of the ladder" agent="ok">
 
-This is the core build. Sum the squares of 10 million float64s, and time each version with `time.perf_counter()`, best of 5.
+The ladder in Figure 004 needs two pieces of C: a plain function that sums squares over packed doubles, and a real Python extension that walks a Python list. Both are given whole. Your job is to build them, read them, and then (in the next task) time them from Python.
 
-First, the C, in `sumsq.c`. You write the function body:
+**Piece 1: `sumsq.c`**, the fastest thing a straightforward loop can be.
 
 ```c
-#include <stddef.h>
+#include <stddef.h>   // size_t: C's type for "a count of things in memory"
 
 // Sum of xs[i] * xs[i] over n doubles.
+// xs points at the first of n doubles packed side by side in memory.
 double sum_squares(const double *xs, size_t n) {
-    ...
+    double s = 0.0;                    // a raw 8-byte double: no box, no header
+    for (size_t i = 0; i < n; i++) {
+        s += xs[i] * xs[i];            // xs[i] = "the double i steps past xs"
+    }
+    return s;
 }
 
+// One add, so you can time the cost of a single call from Python.
 double add(double a, double b) { return a + b; }
 ```
 
-Build it twice, so you can compare:
+What the lines do:
+
+- Every variable has a type that never changes: `double` is an 8-byte float (Python's `float`), `size_t` is a whole number big enough to count bytes. The compiler knows the types before the program runs, which is the whole reason it can skip the type checks the eval loop does.
+- `const double *xs` is a <Term w="pointer">A variable whose value is a memory address. `double *xs` means "xs holds the address of a double". Add an index and you step through memory: `xs[3]` is the double 3 × 8 = 24 bytes past the first one.</Term>: the address of the first number, not the numbers themselves. `const` promises the function won't change them. From Python you'll pass NumPy's buffer address here, so C reads NumPy's packed float64s directly, with no copying.
+- `xs[i]` treats that address as the start of an <Term w="array" label="array (C)">A run of values of one type packed side by side in memory, with no headers and no per-element pointers. Exactly the layout of a NumPy array's data buffer.</Term> and reads the i-th double. There is no length check: C trusts that `n` is right.
+- The `for` line is Python's `for i in range(n)`, spelled out: start at 0, keep going while `i < n`, add 1 each time.
+
+Build it twice, with different optimization settings, so you can compare:
 
 ```bash
 cc -O2 -shared -fPIC -o libsumsq_o2.dylib sumsq.c
 cc -O3 -ffast-math -mcpu=native -shared -fPIC -o libsumsq_fast.dylib sumsq.c
 ```
 
-(On the Spark, use `.so` instead of `.dylib`. On ARM64 Linux, `-mcpu=native` works with recent gcc/clang.)
+`-shared -fPIC` makes a <Term w="shared library">A file of compiled functions that other programs load while they run (.dylib on macOS, .so on Linux), instead of a standalone program with a main(). Python's ctypes can load one and call its functions by name.</Term> instead of a program, so Python can load it. `-O2` is the usual "optimize sensibly" level. `-O3 -ffast-math` goes further: `-ffast-math` lets the compiler reorder the additions, which changes rounding in the last digits but lets it keep several running sums at once. `-mcpu=native` lets it use every instruction this exact CPU has. (On the Spark, use `.so` instead of `.dylib`. On ARM64 Linux, `-mcpu=native` works with recent gcc and clang.)
 
-Then `ladder.py`:
+**Piece 2: `fastsum.c`**, a CPython extension that walks a Python *list* in C. Same loop, but every element is still a pointer to a float box.
+
+```c
+// fastsum.c: a tiny CPython extension. Python can `import fastsum` once it's compiled.
+#define PY_SSIZE_T_CLEAN
+#include <Python.h>    // CPython's C API: PyObject, PyList_*, PyFloat_*
+
+// Called from Python as fastsum.sum_squares(a_list). arg is the list, as a PyObject*.
+static PyObject *sum_squares(PyObject *self, PyObject *arg) {
+    if (!PyList_Check(arg)) {
+        PyErr_SetString(PyExc_TypeError, "need a list");
+        return NULL;                                   // NULL means "raise the error I set"
+    }
+    Py_ssize_t n = PyList_GET_SIZE(arg);               // how many items in the list
+    double s = 0.0;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *item = PyList_GET_ITEM(arg, i);      // pointer to the i-th float box
+        double x = PyFloat_AsDouble(item);             // open the box: read the raw double
+        if (x == -1.0 && PyErr_Occurred()) {           // -1.0 plus a pending error = not a float
+            return NULL;
+        }
+        s += x * x;
+    }
+    return PyFloat_FromDouble(s);                      // box the answer as a Python float
+}
+
+// Boilerplate: the module's table of functions, and the function Python calls on import.
+static PyMethodDef methods[] = {
+    {"sum_squares", sum_squares, METH_O, "sum of x*x over a list of floats"},
+    {NULL, NULL, 0, NULL},
+};
+static struct PyModuleDef mod = {PyModuleDef_HEAD_INIT, "fastsum", NULL, -1, methods};
+PyMODINIT_FUNC PyInit_fastsum(void) { return PyModule_Create(&mod); }
+```
+
+What the lines do:
+
+- `PyObject *` is "a pointer to some Python object". Inside CPython, every Python value you've ever touched is one of these: the address of a box on the heap, as in Figure 002.
+- `PyList_GET_ITEM(arg, i)` reads the i-th pointer out of the list's array of pointers. `PyFloat_AsDouble` follows it to the box, checks it really is a float, and reads the 8 raw bytes out. That's two memory reads and a type check per element, where `sumsq.c` does one read. The ladder will show you what that costs.
+- `PyFloat_FromDouble(s)` makes a new float box for the answer, because Python can only receive Python objects.
+- `return NULL` is how C code tells the interpreter "raise an exception". The error message was set just before.
+- The last block is the same for every extension: a table saying "the Python name `sum_squares` is this C function, taking one argument (`METH_O`)", and an init function that `import fastsum` calls.
+
+Build it against the Python in your venv (the `include` path is where `Python.h` lives; `EXT_SUFFIX` is the filename ending this Python expects, like `.cpython-314-darwin.so`):
+
+```bash
+INC=$(python -c "import sysconfig; print(sysconfig.get_paths()['include'])")
+EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
+cc -O2 -shared -fPIC -undefined dynamic_lookup -I"$INC" fastsum.c -o "fastsum$EXT"
+python -c "import fastsum; print(fastsum.sum_squares([1.0, 2.0, 3.0]))"   # 14.0
+```
+
+(`-undefined dynamic_lookup` is a macOS flag: it lets the extension find Python's C functions when it's loaded. On Linux, drop it.)
+
+Want to read more C than this? [C for Python people](/lessons/c-for-python/) goes slowly through pointers, arrays and compiler flags.
+
+</Task>
+
+<Task id="t2" title="The same sum, six ways" agent="hands">
+
+This is the core build. Sum the squares of 10 million float64s, and time each version with `time.perf_counter()`, best of 5. The C pieces from the last task are already built; the Python that loads, calls and times them is yours. Write `ladder.py`:
 
 ```python
 import ctypes, time
@@ -518,35 +597,9 @@ def best(f, k: int = 5) -> float:
 # Print ms, ns per element, and speedup over pure python. Check all answers agree to ~6 digits.
 ```
 
-Hints: get the pointer once, outside the timed lambda. `-ffast-math` may change the last digits of the answer; that's the reassociation, not a bug.
+Hints: get the pointer once, outside the timed lambda. In `load`, the C signature `double sum_squares(const double *, size_t)` becomes `argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_size_t]` and `restype = ctypes.c_double`; without them, ctypes guesses "int" and you get nonsense back. `-ffast-math` may change the last digits of the answer; that's the reassociation, not a bug.
 
-Now the sixth row: a real CPython extension that walks the *list* in C. The boilerplate is below (it's the same for every extension); the loop inside `sum_squares` is yours. Use `PyList_GET_SIZE`, `PyList_GET_ITEM`, and `PyFloat_AsDouble`, and return `PyFloat_FromDouble(s)`.
-
-```c
-// fastsum.c
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
-
-static PyObject *sum_squares(PyObject *self, PyObject *arg) {
-    if (!PyList_Check(arg)) { PyErr_SetString(PyExc_TypeError, "need a list"); return NULL; }
-    // your loop here. If PyFloat_AsDouble returns -1.0 and PyErr_Occurred(), return NULL.
-}
-
-static PyMethodDef methods[] = {
-    {"sum_squares", sum_squares, METH_O, "sum of x*x over a list of floats"},
-    {NULL, NULL, 0, NULL},
-};
-static struct PyModuleDef mod = {PyModuleDef_HEAD_INIT, "fastsum", NULL, -1, methods};
-PyMODINIT_FUNC PyInit_fastsum(void) { return PyModule_Create(&mod); }
-```
-
-```bash
-INC=$(python -c "import sysconfig; print(sysconfig.get_paths()['include'])")
-EXT=$(python -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))")
-cc -O2 -shared -fPIC -undefined dynamic_lookup -I"$INC" fastsum.c -o "fastsum$EXT"
-```
-
-(`-undefined dynamic_lookup` is a macOS flag: it lets the extension find Python's C functions when it's loaded. On Linux, drop it.) Then `import fastsum` from the same folder and add it to the ladder. If you'd rather not touch the C API, `cffi` is a reasonable alternative to `ctypes` for the raw-array version; the lesson is the same.
+Then the sixth row: `import fastsum` from the same folder and time `fastsum.sum_squares(xs_list)`. It does the same loop as `py_sum`, on the same list, minus the eval loop.
 
 </Task>
 
@@ -641,7 +694,7 @@ Have an agent review your timing code for anything unfair: missing syncs, timing
 <DoneWhen>
 
 - `bytecode.py` shows at least three instructions changing to specialized versions, and you can say what guard each one checks.
-- `ladder.py` prints all six rows, all answers agree, and your own C function and extension loop are in there.
+- `ladder.py` prints all six rows, all answers agree, and you can say what each C file does differently from the pure-Python loop.
 - You know your machine's per-call cost for Python, ctypes, NumPy and PyTorch.
 - You've profiled `prep.py` with both profilers and fixed its top hotspot.
 - The compile table below is filled in for Mac and Spark, including compile time, and you can explain each speedup or slowdown in one sentence.

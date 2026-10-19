@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import PacketJourney from '../components/figures/PacketJourney.astro';
 import PacketSubnet from '../components/figures/PacketSubnet.astro';
 
+Everything your computer sends to another computer, from a prompt to a model API to a file copied onto the Spark, leaves as a stream of small envelopes, each with an address written on the front, handed from machine to machine until it arrives.
+
+That trip is part of every number you measure. When you benchmark your Spark's inference server against Fireworks, some of the time on the clock isn't the model at all: it's the envelopes crossing a room, a city or an ocean. Knowing what happens on the way tells you which milliseconds code can win back and which ones belong to the speed of light. It also explains small daily mysteries, like why you can reach the Spark from the couch but not from a coffee shop without Tailscale.
+
+This builds on [How slow is slow?](/lessons/latency-numbers/), which gave you the round-trip numbers; here you find out where they come from. It's the ground floor for everything about networks that follows: [TCP and UDP](/lessons/tcp-vs-udp/), [What happens when you hit enter?](/lessons/what-happens-url/), [How does HTTPS keep secrets?](/lessons/tls/) and [Your home server, explained](/lessons/ssh-and-tailscale/).
+
 ## Today
 
-- Draw the stack from memory: an SSE event inside HTTP, inside TCP, inside IP, inside a Wi-Fi frame, and say what each layer's address (MAC, IP, port) is for.
-- Follow one packet hop by hop: what each router reads, what it rewrites (the link-layer frame, the TTL), and what it never touches.
-- Read an IP address with a prefix like `192.168.86.0/24`, tell private from public, and explain what NAT in your home router is doing and why nobody on the internet can connect to your laptop directly.
-- Explain TTL, MTU, ARP, and why the internet is "best effort", each in a sentence.
-- Trace the route to servers on three continents, capture your own packets, and decode an IPv4 and TCP header byte by byte with a parser you wrote.
+- Draw from memory how one streamed token gets wrapped in envelope after envelope before it leaves your laptop, and say what address each envelope carries: which program, which machine anywhere on Earth, which box on your own Wi-Fi.
+- Follow one envelope router by router: what each router reads, what it rewrites (the outermost wrapper, and a counter that ticks down at every stop), and what it never even looks at.
+- Read an address written like `192.168.86.0/24`, tell an address that only works inside your home from one the whole internet can reach, and explain how your router lets every device in the house share one outside address, and why that means nobody on the internet can reach your laptop directly.
+- Say in one sentence each: why every envelope has a limit on how many stops it can make, why there's a largest envelope size, how your laptop finds the router's hardware address, and why the internet only promises to *try*.
+- Trace the route to servers on three continents, record your own traffic, and decode the labels on the front of a real envelope byte by byte with a parser you wrote.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (the round-trip numbers and the speed of light in fiber). No networking background needed: this is the first lesson of the Wire track. Rough time: one evening, plus `sudo` on your Mac for the capture.
+Before this, read [How slow is slow?](/lessons/latency-numbers/) for the round-trip numbers and how fast light travels in fiber. No networking background needed: this is the first lesson of the Wire track. Budget one evening, plus admin rights (`sudo`) on your Mac to record traffic.
 
 ## The Problem
 

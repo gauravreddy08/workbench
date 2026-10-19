@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import LBSimulator from '../components/figures/LBSimulator.astro';
 import LBHashRing from '../components/figures/LBHashRing.astro';
 
+A load balancer is the front desk of a service: every request walks up to it, and it decides which of several identical copies of your program gets to handle it. Running more copies is how one machine's worth of work becomes many, and the moment you do it, anything a copy was quietly remembering in its own memory stops being shared.
+
+This is the step every real service takes, and it's where your work lives too. An inference fleet with eight GPUs needs something deciding which GPU gets each prompt, and a bad decision can make a quick question wait a full second behind someone's essay. Send a chat's next turn to the GPU that already processed its earlier turns and you skip redoing most of that work; send it anywhere else and you pay for it again. Interviewers ask "what breaks when you add a second server?" because the answer shows whether you've run anything for real.
+
+It builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/), where you saw that one running program can't see another's memory, and [How slow is slow?](/lessons/latency-numbers/), for what a trip across the network costs. It helps to have done [p99 and load testing](/lessons/tail-latency/) before the Measure section. Next come [Rate limits and backpressure](/lessons/rate-limits/), for when even a well-spread fleet gets more traffic than it can take, and [Prefix caching](/lessons/prefix-caching/), the GPU-side half of that chat-turn trick.
+
 ## Today
 
-- Explain the difference between making one machine bigger and adding more machines, and why the second one forces you to think about state.
-- Say what a load balancer actually does, and what an L4 balancer can and can't see compared to an L7 one.
-- Pick a balancing algorithm on purpose: round robin, least connections, power of two random choices, consistent hashing, and the prefix-aware routing LLM servers use to hit their KV caches.
-- Explain why sticky sessions are a trap, and what "stateless servers, state in a shared store" actually means in code.
-- Take a server out of rotation without dropping requests, and find the single points of failure in a diagram.
+- Explain the difference between making one machine bigger and adding more machines, and why the second forces you to think about what each machine remembers between requests.
+- Say what a load balancer actually does, and how much of a request it can see depending on whether it only reads the addresses on the outside or opens it up and reads the request itself.
+- Pick on purpose how the balancer chooses a server: take turns, send to the least busy, peek at two random servers and take the less busy one, map each user to a fixed server in a way that survives adding servers, and route each LLM prompt to the GPU that has already worked through its beginning.
+- Explain why pinning each user to one server is a trap, and what "servers that forget everything, with the memory kept in one shared store" looks like in code.
+- Take a server out of rotation without dropping a single request, and spot the parts of a diagram whose failure takes everything down.
 
-Prerequisites: [Processes, threads and the GIL](/lessons/processes-threads-gil/) (what lives in a process's memory, and lost updates) and [How slow is slow?](/lessons/latency-numbers/) (network round trips). [Why do people care about p99?](/lessons/tail-latency/) helps for the Measure section. Rough time: one evening.
+You'll want [Processes, threads and the GIL](/lessons/processes-threads-gil/) (what lives in a process's memory, and how two writers can lose an update) and [How slow is slow?](/lessons/latency-numbers/) (what a network round trip costs) first; [p99 and load testing](/lessons/tail-latency/) helps for the Measure section. About one evening.
 
 ## The Problem
 

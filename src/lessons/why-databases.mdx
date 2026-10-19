@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import DBLogIndex from '../components/figures/DBLogIndex.astro';
 
+A database is a program whose whole job is to keep your data safe on disk and hand it back fast, even when the machine crashes or ten programs are writing at once. Most of us start without one: a Python dict, saved to a JSON file, works fine until the day it quietly doesn't.
+
+That day comes sooner than you'd think. A cache for a crawler, the results of an eval run, the labels behind your ranker's training data: all of them start life as "just a file", and all of them eventually slow to a crawl, lose records, or come back half-written. Knowing exactly why, and what a real database does about each failure, is also the difference between "I'd just use a real database" and an answer that survives a follow-up question in an interview.
+
+This builds on [What happens when you save a file?](/lessons/files-and-disks/), which showed how bytes travel from your program to the disk and how a save can be made crash-safe. Here you'll build a tiny database of your own on top of those tricks. It sets up the next three lessons: [indexes](/lessons/indexes/) for finding things fast, [transactions](/lessons/transactions/) for many writers at once, and [normalization](/lessons/normalization/) for deciding how to shape the data.
+
 ## Today
 
-- Name the four things that go wrong when "the database" is a JSON file, and make each one happen on your Mac: rewrites that get slower as data grows, crashes mid-write, two writers erasing each other's work, and reading everything to find one record.
-- Explain what a storage engine is, and build the simplest real one: an append-only log plus an in-memory hash index, the design Riak shipped as Bitcask.
-- Make it survive `kill -9` and a torn write, using recovery-by-replay and a checksum on every record. Add compaction so the log doesn't grow forever.
-- Explain write-ahead logging as the one idea under almost every database, and sketch the two big engine shapes, B-trees and LSM-trees, in one picture each.
-- Say what a database does beyond storing bytes (concurrency control, a query language, durability promises), and when SQLite is the right answer and when you want Postgres.
+- Name the four ways a JSON file fails as a database, and make each one happen on your Mac: saves that get slower as the data grows, a crash that wrecks the file mid-save, two programs erasing each other's work, and having to read everything to find one record.
+- Build the simplest real database core: a file you only ever add to the end of, plus a dict in memory that remembers where each record lives. Riak, a real database, shipped exactly this design under the name Bitcask.
+- Make it survive the process being killed mid-write and a half-written record at the end of the file, by re-reading the file on startup and giving every record a small fingerprint that proves it's whole. Then add a cleanup step so the file doesn't grow forever.
+- Explain the one idea under almost every database, "write down what you're about to do before you do it", and sketch the two big ways real databases organize data on disk, one picture each.
+- Say what a database does beyond storing bytes (keeping many writers from colliding, letting you ask questions in a query language, promising what survives a crash), and when SQLite, a database that lives in a single file, is the right answer and when you want Postgres, a database that runs as a separate server.
 
-Prerequisites: [Why did my checkpoint come back broken?](/lessons/files-and-disks/) (the page cache, `fsync`, temp-file-plus-rename, journaling). This lesson builds directly on all four. Rough time: one evening to read, one to build.
+You should have done [What happens when you save a file?](/lessons/files-and-disks/) first, because this lesson leans on its ideas about the operating system's write buffer, forcing data to disk, and crash-safe saves. Plan on one evening to read and one to build.
 
 ## The Problem
 

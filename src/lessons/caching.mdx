@@ -6,15 +6,21 @@ import Task from '../components/Task.astro';
 import DoneWhen from '../components/DoneWhen.astro';
 import CacheSim from '../components/figures/CacheSim.astro';
 
+A cache is a notebook of answers you've already worked out, kept somewhere fast, so that when the same question comes again you read the answer instead of working it out again.
+
+On the Spark that's the difference between two seconds of GPU time and about one millisecond for a question your model has already answered. It's the cheapest speedup there is. It's also the easiest way to hand someone a wrong answer with total confidence, because the notebook has no idea when its answers stop being true. Every eval you run through a cached server, and every number on your Fireworks scoreboard, depends on getting that second half right.
+
+You've met smaller versions of this already: the chip's own small, fast memory in [Why is NumPy 100x faster?](/lessons/cpu-caches/), the operating system keeping file contents in memory in [What happens when you save a file?](/lessons/files-and-disks/), and the GPU reusing work on prompts that start the same way in [Paged attention and prefix caching](/lessons/prefix-caching/). Here the idea moves up into your own code, in front of the server from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/). After this, [Nearest neighbors at scale](/lessons/vector-search/) is the machinery behind the "match by meaning" cache you'll catch lying at the end, and [Queues and logs](/lessons/queues/) is where "do the work later" becomes a design of its own.
+
 ## Today
 
-- Explain why caches work at all (repetition, and the lopsided popularity called Zipf), and recognise the same idea at every layer from the CPU to your browser.
-- Do the hit-rate arithmetic in your head, and say why a cache transforms your p50 but barely touches your p99.
-- Pick a TTL on purpose, name the four ways to wire a cache into code, and explain why invalidation is the hard part.
-- Build an LRU cache with a TTL from a hash map and a doubly linked list, with tests.
-- Put Redis in front of your inference server, measure hit rate and latency under a Zipf workload, cause a cache stampede and fix it, and catch a semantic cache returning a wrong answer.
+- Explain why keeping a few answers handy works at all: requests repeat, and a handful of popular ones make up most of the traffic. Spot the same trick at every layer, from the chip to your browser.
+- Work out in your head how much faster things get for a given share of repeat requests, and say why the typical request gets dramatically faster while the slowest 1% barely change.
+- Decide on purpose how long a stored answer may be trusted, name the four standard ways to wire a cache into code, and explain why knowing when a stored answer has gone stale is the hard part.
+- Build, with tests, a cache that throws out whatever was used longest ago when it's full and drops answers once they're too old.
+- Put Redis (a shared, in-memory store) in front of your inference server, measure it under realistic lopsided traffic, cause a pile-up where hundreds of requests redo the same work at once and fix it, and catch a cache that matches questions by meaning returning a wrong answer.
 
-Prerequisites: your server and harness from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/), and the async load generator from [Waiting vs working](/lessons/waiting-vs-working/). [Paged attention and prefix caching](/lessons/prefix-caching/) is the GPU-memory cousin of this lesson; you don't need it first, but the two make each other clearer. Rough time: one evening for the idea and the LRU class, one for Redis, the workload and the stampede.
+You'll want the server and benchmark harness from [Baseline: my Spark vs Fireworks](/lessons/baseline-vs-fireworks/) and the load generator from [Waiting vs working](/lessons/waiting-vs-working/); [Paged attention and prefix caching](/lessons/prefix-caching/) is a close cousin that helps but isn't required. Plan on two evenings: one for the idea and your own cache class, one for Redis, the traffic experiments and the pile-up.
 
 ## The Problem
 

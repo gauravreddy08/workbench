@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import RankLab from '../components/figures/RankLab.astro';
 import RankBootstrap from '../components/figures/RankBootstrap.astro';
 
+A ranker takes a search and a pile of possible results and puts them in order, best first. A ranking metric is the single number that says how good that order was, and an eval set is the collection of searches, with human-graded results, that you compute it on.
+
+This is your job right now. The moment you say the new cross-encoder is better, people will ask which number, measured on which searches, graded by whom, and whether the gap is bigger than luck. Without answers you can't ship. With the wrong answers you ship a model that wins in a notebook and loses on real traffic.
+
+It builds on [Why is the eval separate?](/lessons/why-evals-are-separate/), which explains why the measuring stick has to stay independent of the model, and pairs with [Nearest neighbors at scale](/lessons/vector-search/), the fast first pass that hands your ranker its candidates. It hands off to [Is that improvement real?](/lessons/statistics-for-evals/) for the statistics and [LLMs as judges](/lessons/llm-judges/) for letting a model do the grading.
+
 ## Today
 
-- Derive precision@k, recall@k, MRR, MAP and NDCG from nothing, say in one sentence what each rewards and what it ignores, and pick the right one for web search, question answering, or retrieval for RAG.
-- Explain every piece of NDCG: why gains are graded, why the discount is a logarithm, and why you divide by the ideal.
-- Build an eval set the way TREC does: sample real queries across head, torso and tail, pool candidates from several systems, write labeling guidelines, and measure whether two labelers agree (Cohen's kappa).
-- Know what offline metrics can't see (clicks, position bias) and what unjudged documents do to a new model's score.
-- Report "my cross-encoder vs the baseline" as a delta with a 95% confidence interval from a paired bootstrap over queries, not as two numbers side by side.
+- Build the standard ranking scores from nothing: the share of good results in the top few (precision@k), the share of all good results you found (recall@k), how high the first good result sits (MRR), and two that credit every good result by its position (MAP and NDCG). Say what each rewards and ignores, and pick the right one for web search, question answering, or fetching passages for an LLM to read (RAG).
+- Explain every piece of NDCG: why results are graded 0 to 3 instead of yes or no, why lower positions are shrunk by a logarithm, and why you divide by the best score that was possible.
+- Build an eval set the way the long-running TREC search competitions do: sample real searches from the very common to the one-off, judge the combined top results of several different systems, write labeling rules, and measure whether two labelers agree more than chance would explain (Cohen's kappa).
+- Know what scores computed on a fixed, stored set can't see (what users actually click, and their habit of clicking whatever is on top), and what results nobody has graded do to a new model's score.
+- Report "my cross-encoder vs the baseline" as a difference with a 95% range of plausible values, found by resampling your searches thousands of times (a paired bootstrap), not as two numbers side by side.
 
-Prerequisites: none formally. It helps to have [Why are the evaluator and the model different systems?](/lessons/why-evals-are-separate/) in mind, and this lesson hands off to [Is that improvement real?](/lessons/statistics-for-evals/). Rough time: an evening for the idea and the from-scratch metrics, a weekend for the public benchmark, and a week of calendar time (mostly waiting for a second labeler) for the real eval set.
+Nothing is required, but it helps to have [Why are the evaluator and the model different systems?](/lessons/why-evals-are-separate/) in mind, and this lesson hands off to [Is that improvement real?](/lessons/statistics-for-evals/). Budget an evening for the idea and the from-scratch metrics, a weekend for the public benchmark, and a week of calendar time (mostly waiting for a second labeler) for the real eval set.
 
 ## The Problem
 

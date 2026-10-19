@@ -9,19 +9,25 @@ import DataMinHash from '../components/figures/DataMinHash.astro';
 import DataLSHCurve from '../components/figures/DataLSHCurve.astro';
 import DataPacking from '../components/figures/DataPacking.astro';
 
+A data pipeline is the assembly line that turns a messy pile of real-world text, like a full copy of Wikipedia, into a clean, compact file of numbers that a model can learn from without wasting a single step.
+
+It matters because a model learns exactly what you show it, junk included. Feed it page code, copy-pasted boilerplate and the same article written ten thousand times, and it will spend its limited brain on those. Teams at the frontier labs spend as much care on this assembly line as on the model, and the Anthropic research engineer posting that sent you here names it as part of the job. It is also the same skill your cross-encoder ranker needs at work: before blaming the model, look hard at what it is being fed.
+
+You already have the pieces. [Train a small LM](/lessons/tiny-lm/) gave you a training run you trust, [Tokenizers](/lessons/tokenizers/) turns text into numbers, and [Threads, processes and the GIL](/lessons/processes-threads-gil/) is how you spread slow Python work across every core. This lesson changes only the data and measures what that buys. Next, [Why evals are separate](/lessons/why-evals-are-separate/) takes the "did the test leak into the training data?" question further, and [Train your own draft model](/lessons/draft-model/) shows how the choice of data decides how well a small model can imitate a big one.
+
 ## Today
 
-- Turn a raw Wikipedia dump into fixed-length token shards a trainer can read at full speed, and say what every stage in between is for.
-- Explain the quality filters real datasets use (C4, Gopher, FineWeb), both the hand-written rules and the model-based kind, and why each one exists.
-- Explain MinHash and LSH in plain words: how you find near-duplicate documents among millions without comparing every pair.
-- Decontaminate a training set against an eval set, pack documents into sequences, and pick an attention mask, a shuffle and a file format on purpose.
-- Measure where the time goes in a data pipeline, and measure what cleaning buys you: two tiny-LM runs, same token budget, raw vs clean.
+- Turn a raw Wikipedia download into files of fixed-length rows of word-piece numbers that a training run can read at full speed, and say what every step in between is for.
+- Explain the rules real datasets use to throw out bad text (from the T5, Gopher and FineWeb teams), both the hand-written checks and the kind where a small model acts as the judge, and why each one exists.
+- Explain, in plain words, how you find documents that are almost copies of each other among hundreds of thousands, without comparing every pair. (The two tricks are called MinHash and LSH; you will meet them properly below.)
+- Make sure no test material sneaks into the training text, lay many documents end to end so no space is wasted, and choose on purpose whether one document may look at its neighbour, how to shuffle, and what file format to store it in.
+- Measure where the time goes in the pipeline, and measure what cleaning buys you: two small-model training runs on the same amount of text, raw versus clean.
 
-Prerequisites: [Threads, processes and the GIL](/lessons/processes-threads-gil/) (every stage here is CPU-bound Python, so you will be using worker processes), and ideally [Tokenizers](/lessons/tokenizers/) and [Train a small LM](/lessons/tiny-lm/), since the last task trains two of them. Rough time: one evening for the pipeline, one more for the two training runs.
+You will want [Threads, processes and the GIL](/lessons/processes-threads-gil/) first, because every step here is slow, single-core Python that you will spread across worker processes. [Tokenizers](/lessons/tokenizers/) and [Train a small LM](/lessons/tiny-lm/) help too, since the last task trains two models. Plan on one evening for the pipeline and one more for the two training runs.
 
 ## The Problem
 
-You trained your [tiny LM](/lessons/tiny-lm/) on Wikipedia. You sample from it, and it writes this:
+Say you train your [tiny LM](/lessons/tiny-lm/) on a raw Wikipedia dump instead of the ready-made FineWeb-Edu sample. You sample from it, and it writes this:
 
 ```text
 The city is in the north of the country. {{cite web|url=http://www.|title=Population

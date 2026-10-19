@@ -7,16 +7,22 @@ import DoneWhen from '../components/DoneWhen.astro';
 import EngineMap from '../components/figures/EngineMap.astro';
 import EngineJourney from '../components/figures/EngineJourney.astro';
 
+vLLM and SGLang are the free, open-source programs most teams use to run language models for real users: you point one at a model and it turns a GPU into a server that answers many people at once, quickly. They are roughly what your hand-built server would become after a few years and a few hundred contributors.
+
+They are the bar. Part of the gap between your Spark and Fireworks on the scoreboard is hardware, but a lot of it is software, and these engines are where most of that software gap gets closed. Almost any serious inference setup, at a startup or at an AI lab, is one of these or something shaped like them inside. Being able to open one up and say where its time goes is the difference between using an inference server and understanding one.
+
+This is the capstone of the track. Every piece you built yourself, [the KV cache](/lessons/kv-cache/), [batching](/lessons/batching/), [prefix caching](/lessons/prefix-caching/), [quantization](/lessons/quantization/) and [speculative decoding](/lessons/speculative-decoding/), shows up here in production form, so their code reads as a list of ideas you already know rather than a wall of files. After this, [FlashAttention and kernels](/lessons/flash-attention/) goes one level down, into the GPU code these engines call.
+
 ## Today
 
-- Draw vLLM's architecture from memory: which process does what, what crosses between them, and what one trip around the engine loop does.
+- Draw vLLM's layout from memory: which of its separate running programs does what, what they pass to each other, and what one turn of its main loop does.
 - For each box in that drawing, name the lesson in this track where you built a toy version, and say what the real one adds.
-- Explain how SGLang makes different bets on the same skeleton (RadixAttention, cache-aware scheduling, structured outputs), and where TensorRT-LLM and llama.cpp fit.
+- Explain how SGLang makes different bets on the same skeleton (keeping finished requests' notes in a tree so later prompts can reuse them, picking which request to run next by what is already cached, and forcing output to follow a format like JSON), and where two other engines, NVIDIA's TensorRT-LLM and the laptop-friendly llama.cpp, fit.
 - Run vLLM and SGLang on the Spark, benchmark them with your own harness against your server and Fireworks, and add their rows to `SCOREBOARD.md`.
-- Trace one request through vLLM's source to the scheduler step, the block allocation and the forward call, then profile a running engine to see where its time actually goes.
-- Explain, at the level of "draw it on a whiteboard", tensor parallelism and disaggregated prefill/decode.
+- Follow one request through vLLM's source code to the moment it is scheduled, given memory, and run through the model, then time every part of a running engine to see where its time actually goes.
+- Explain, at the level of "draw it on a whiteboard", two ways past one GPU: splitting each layer's math across several GPUs (tensor parallelism), and reading prompts and writing answers on separate machines (disaggregated prefill and decode).
 
-Prerequisites: everything so far in this track, in your own simplified versions: [the baseline server and harness](/lessons/baseline-vs-fireworks/), [the KV cache](/lessons/kv-cache/), [batching](/lessons/batching/), [prefix caching](/lessons/prefix-caching/), [quantization](/lessons/quantization/), [speculative decoding](/lessons/speculative-decoding/). Time: an evening to get both engines running and benchmarked, an evening reading code, an hour profiling.
+You need everything so far in this track, in your own simplified versions: [the baseline server and harness](/lessons/baseline-vs-fireworks/), [the KV cache](/lessons/kv-cache/), [batching](/lessons/batching/), [prefix caching](/lessons/prefix-caching/), [quantization](/lessons/quantization/) and [speculative decoding](/lessons/speculative-decoding/). Plan on an evening to get both engines running and benchmarked, an evening reading code, and an hour of profiling.
 
 ## The Problem
 

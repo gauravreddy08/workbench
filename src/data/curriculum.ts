@@ -37,6 +37,13 @@ export const tracks: Track[] = [
         build: 'A small benchmark that measures each rung of the latency ladder on your laptop and your DGX Spark.',
       },
       {
+        slug: 'c-for-python',
+        title: 'C for Python people.',
+        question: 'How do I read the C under Python, PyTorch and CUDA without learning to write it?',
+        why: 'The code that decides how fast your model runs is C or C++. Reading it is how you stop taking speed claims on trust.',
+        build: 'Compile and run three tiny C programs, then read real code: a CPython list, a llama.cpp loop, a CUDA kernel.',
+      },
+      {
         slug: 'stack-and-heap',
         title: 'Where do my variables live?',
         question: 'What are the stack and the heap, and where does a Python object actually sit in memory?',
@@ -84,7 +91,7 @@ export const tracks: Track[] = [
         title: 'Why is Python slow?',
         question: 'What does the Python interpreter actually do, and how does PyTorch get speed anyway?',
         why: 'Knowing where Python ends and C/CUDA begins tells you what is worth optimizing.',
-        build: 'Disassemble bytecode, write the same loop as a C extension, then try torch.compile on a small model.',
+        build: 'Disassemble bytecode, race the same loop in Python, NumPy and a ready-made C version, then try torch.compile on a small model.',
       },
     ],
   },

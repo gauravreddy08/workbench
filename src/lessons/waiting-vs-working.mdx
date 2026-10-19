@@ -7,15 +7,21 @@ import DoneWhen from '../components/DoneWhen.astro';
 import WaitingTimeline from '../components/figures/WaitingTimeline.astro';
 import WaitingLoop from '../components/figures/WaitingLoop.astro';
 
+Every piece of code spends its time either working, with the processor busy computing, or waiting, with the processor idle until an answer comes back from a disk, the network or another machine. Most code around models is the waiting kind: a call to a model API spends well under a millisecond on your machine and about two seconds waiting on someone else's GPU.
+
+How you handle that waiting decides whether a server holds up when real traffic arrives. The benchmark you'll run against Fireworks needs one laptop to keep hundreds of requests open at once. An agent that makes several model calls per step either makes them one after another or all at the same time, and the difference is seconds per step. Both come down to what your program does with its hands while it waits.
+
+This builds on [How slow is slow?](/lessons/latency-numbers/), which showed that a network round trip is an eternity to a processor, and [Processes, threads and the GIL](/lessons/processes-threads-gil/), which ended by asking whether thousands of threads is really the cheapest way to wait. The answer here sets up [Why ~17 tokens per second?](/lessons/bandwidth-bound/), which asks the same question of the GPU, and [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/), where the load tester you build becomes your benchmark.
+
 ## Today
 
-- Tell, for any piece of code, whether it is mostly **waiting** or mostly **working**, and why that one question decides whether threads, processes or async will help.
-- Say exactly what happens to a sync server when 100 people hit it at once (it doesn't crash; they stand in line), and exactly what async changes (it isn't a queue; it's one worker that never stands still).
-- Build a 40-line event loop out of Python generators and the OS's "tell me when this socket is ready" call, so `await` stops being magic.
-- Use Little's Law to answer "how many requests do I need in flight?" and "how many can one process hold?" with a number.
-- Build a real async load generator (you'll reuse it to benchmark Fireworks in [lesson 6](/lessons/baseline-vs-fireworks/)), then use it to watch a sync server stall, a thread pool cope, an async server shrug, and one planted `time.sleep` bring the async server to its knees.
+- Tell, for any piece of code, whether it is mostly **waiting** or mostly **working**, and why that one question decides whether more threads, more processes, or async (one worker juggling many waits) will help.
+- Say exactly what happens to a server that handles one request at a time when 100 people hit it at once (it doesn't crash; they stand in line), and what async changes (it isn't a line; it's one worker that never stands still).
+- Build a 40-line event loop, the small engine at the heart of async, out of Python functions that can pause halfway and the operating system's "tell me when this connection has data" call, so `await` stops being magic.
+- Use one rule from the study of waiting lines (Little's Law: requests open at once = requests per second × seconds each) to answer "how many requests do I need open at once?" and "how many can one process hold?" with a number.
+- Build a real load tester, a tool that fires many requests and times them (you'll reuse it to benchmark Fireworks in [Baseline vs Fireworks](/lessons/baseline-vs-fireworks/)), then use it to watch a one-at-a-time server stall, a pool of threads cope, an async server shrug, and one planted `time.sleep` bring the async server to its knees.
 
-Prerequisites: [How slow is slow?](/lessons/latency-numbers/) (a network round trip is millions of CPU cycles) and [Processes, threads and the GIL](/lessons/processes-threads-gil/) (threads help with waiting; each one costs a stack). Python 3.11 or newer. Rough time: one evening for the idea and the toy loop, one for the servers and measurements.
+Read [How slow is slow?](/lessons/latency-numbers/) first (a network round trip is millions of ticks of the processor's clock) and [Processes, threads and the GIL](/lessons/processes-threads-gil/) (threads help with waiting, but each one costs memory). You'll need Python 3.11 or newer. Budget one evening for the idea and the toy loop, and one for the servers and measurements.
 
 ## The Problem
 
