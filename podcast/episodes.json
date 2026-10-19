@@ -1,23 +1,5 @@
 [
   {
-    "slug": "waiting-vs-working",
-    "title": "Waiting vs working.",
-    "description": "What do sync and async actually mean, and why does my server stall under load? Every LLM app spends most of its life waiting on a network. Async is how one process waits on thousands of things.",
-    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-b11ca406.mp3",
-    "bytes": 26220712,
-    "seconds": 3278,
-    "pubDate": "2026-10-16T21:02:29.548Z"
-  },
-  {
-    "slug": "speculative-decoding",
-    "title": "Speculative decoding.",
-    "description": "How can a small model make a big model faster without changing its output at all? The trick you are fascinated by. Implementing it teaches sampling, verification and probability.",
-    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-b9e0bfe4.mp3",
-    "bytes": 31811961,
-    "seconds": 3976,
-    "pubDate": "2026-10-16T21:07:13.249Z"
-  },
-  {
     "slug": "bandwidth-bound",
     "title": "Why ~17 tokens per second?",
     "description": "Why is LLM decoding limited by memory speed, and how fast should my Spark be before I run anything? One division predicts your server's speed. Every optimization in this track is a way around it.",
@@ -25,5 +7,383 @@
     "bytes": 6557613,
     "seconds": 820,
     "pubDate": "2026-10-19T22:33:38.601Z"
+  },
+  {
+    "slug": "latency-numbers",
+    "title": "How slow is slow?",
+    "description": "How long does it actually take to read from RAM, an SSD, or the network? Every \"how does this scale?\" answer starts with these numbers. Without them you are guessing.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/latency-numbers-2136db8c.mp3",
+    "bytes": 6928134,
+    "seconds": 866,
+    "pubDate": "2026-10-19T22:45:26.728Z"
+  },
+  {
+    "slug": "c-for-python",
+    "title": "C for Python people.",
+    "description": "How do I read the C under Python, PyTorch and CUDA without learning to write it? The code that decides how fast your model runs is C or C++. Reading it is how you stop taking speed claims on trust.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/c-for-python-cb6ad408.mp3",
+    "bytes": 7093855,
+    "seconds": 887,
+    "pubDate": "2026-10-19T22:47:49.503Z"
+  },
+  {
+    "slug": "stack-and-heap",
+    "title": "Where do my variables live?",
+    "description": "What are the stack and the heap, and where does a Python object actually sit in memory? Memory leaks, recursion limits, and \"why is this list so big\" all come back to this.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/stack-and-heap-63a25a59.mp3",
+    "bytes": 6853946,
+    "seconds": 857,
+    "pubDate": "2026-10-19T22:49:56.581Z"
+  },
+  {
+    "slug": "processes-threads-gil",
+    "title": "Processes, threads and the GIL.",
+    "description": "What is the difference between a process and a thread, and why does Python have a lock that ruins threads? Picking threads vs processes wrong makes a data loader or server 8x slower, silently.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/processes-threads-gil-f0dcdd56.mp3",
+    "bytes": 7708882,
+    "seconds": 964,
+    "pubDate": "2026-10-19T22:50:56.014Z"
+  },
+  {
+    "slug": "waiting-vs-working",
+    "title": "Waiting vs working.",
+    "description": "What do sync and async actually mean, and why does my server stall under load? Every LLM app spends most of its life waiting on a network. Async is how one process waits on thousands of things.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-7731ba95.mp3",
+    "bytes": 7752349,
+    "seconds": 969,
+    "pubDate": "2026-10-16T21:02:29.548Z"
+  },
+  {
+    "slug": "cpu-caches",
+    "title": "Why is NumPy 100x faster?",
+    "description": "Why is looping over a NumPy array so much faster than a Python list of the same numbers? Memory layout and caches decide speed long before the algorithm does. Same idea scales up to GPUs.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/cpu-caches-09f87503.mp3",
+    "bytes": 7403563,
+    "seconds": 925,
+    "pubDate": "2026-10-19T22:52:27.771Z"
+  },
+  {
+    "slug": "virtual-memory",
+    "title": "Virtual memory and the OOM killer.",
+    "description": "What is virtual memory, and why did Linux kill my process when I had \"free\" memory? Loading a 70B model, mmap, swap, and OOM kills on the Spark all live here.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/virtual-memory-7b404912.mp3",
+    "bytes": 6633682,
+    "seconds": 829,
+    "pubDate": "2026-10-19T22:53:10.371Z"
+  },
+  {
+    "slug": "files-and-disks",
+    "title": "What happens when you save a file?",
+    "description": "What actually happens between file.write() and the bytes being safe on disk? Fast model loading (safetensors, mmap) and data that survives a crash both depend on it.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/files-and-disks-9882e8d7.mp3",
+    "bytes": 6839736,
+    "seconds": 855,
+    "pubDate": "2026-10-19T22:53:48.903Z"
+  },
+  {
+    "slug": "python-speed",
+    "title": "Why is Python slow?",
+    "description": "What does the Python interpreter actually do, and how does PyTorch get speed anyway? Knowing where Python ends and C/CUDA begins tells you what is worth optimizing.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/python-speed-3fe70b80.mp3",
+    "bytes": 6323974,
+    "seconds": 790,
+    "pubDate": "2026-10-19T22:54:33.001Z"
+  },
+  {
+    "slug": "packets-and-ip",
+    "title": "How does data travel?",
+    "description": "What is an IP address, a packet, and a route, and what happens between my laptop and a server? The base layer under every API call, every SSH session, and every latency number you measure.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/packets-and-ip-c61dc9b3.mp3",
+    "bytes": 7255814,
+    "seconds": 907,
+    "pubDate": "2026-10-19T22:55:42.205Z"
+  },
+  {
+    "slug": "tcp-vs-udp",
+    "title": "TCP and UDP.",
+    "description": "Why are there two transport protocols, and what is TCP doing for me that UDP is not? Head-of-line blocking, handshakes, and timeouts show up in every distributed system.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tcp-vs-udp-22520ef2.mp3",
+    "bytes": 7667922,
+    "seconds": 958,
+    "pubDate": "2026-10-19T22:56:22.189Z"
+  },
+  {
+    "slug": "what-happens-url",
+    "title": "What happens when you hit enter?",
+    "description": "Step by step, what happens between typing a URL and seeing the page? A classic interview question and a map of the whole stack: DNS, TCP, TLS, HTTP, rendering.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/what-happens-url-f445770c.mp3",
+    "bytes": 6782893,
+    "seconds": 848,
+    "pubDate": "2026-10-19T22:56:49.889Z"
+  },
+  {
+    "slug": "tls",
+    "title": "How does HTTPS keep secrets?",
+    "description": "How do two machines that have never met agree on a secret over a public network? Certificates, keys, and handshakes are behind every \"SSL error\" you will ever debug.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tls-dc837704.mp3",
+    "bytes": 7458733,
+    "seconds": 932,
+    "pubDate": "2026-10-19T22:58:12.925Z"
+  },
+  {
+    "slug": "http-from-scratch",
+    "title": "HTTP from scratch.",
+    "description": "What is HTTP really, under the frameworks? FastAPI and friends are thin layers over a text protocol. Knowing it makes every API bug readable.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/http-from-scratch-0abe676c.mp3",
+    "bytes": 7001695,
+    "seconds": 875,
+    "pubDate": "2026-10-19T22:58:42.189Z"
+  },
+  {
+    "slug": "streaming",
+    "title": "Polling, SSE and WebSockets.",
+    "description": "How do servers push data to clients, and why do LLM APIs stream with SSE? Token streaming, time-to-first-token, and dropped connections all depend on this choice.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/streaming-bb1e0914.mp3",
+    "bytes": 6554269,
+    "seconds": 819,
+    "pubDate": "2026-10-19T22:59:00.332Z"
+  },
+  {
+    "slug": "ssh-and-tailscale",
+    "title": "Your home server, explained.",
+    "description": "What actually happens when I SSH into my home server over Tailscale? You already use it. Knowing keys, NAT, and WireGuard turns magic into something you can fix.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ssh-and-tailscale-c56975b3.mp3",
+    "bytes": 7308268,
+    "seconds": 913,
+    "pubDate": "2026-10-19T23:00:45.634Z"
+  },
+  {
+    "slug": "api-lifecycle",
+    "title": "The life of an API.",
+    "description": "What is an API lifecycle, from design to deprecation? An interview question you missed, and a real job: versioning, idempotency, auth, rate limits, docs.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/api-lifecycle-9c18f87b.mp3",
+    "bytes": 6930015,
+    "seconds": 866,
+    "pubDate": "2026-10-19T23:01:07.592Z"
+  },
+  {
+    "slug": "why-databases",
+    "title": "Why not a JSON file?",
+    "description": "What does a database give you that writing JSON to disk does not? Durability, concurrency, and queries are problems you only notice once they break.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/why-databases-c42d4941.mp3",
+    "bytes": 7283190,
+    "seconds": 910,
+    "pubDate": "2026-10-19T23:01:34.622Z"
+  },
+  {
+    "slug": "indexes",
+    "title": "Indexes and B-trees.",
+    "description": "What is a database index, why does it make reads fast, and why does it make writes slower? The single most common fix for a slow query, and the root of many slow writes.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/indexes-dbdbd409.mp3",
+    "bytes": 7040774,
+    "seconds": 880,
+    "pubDate": "2026-10-19T23:03:12.233Z"
+  },
+  {
+    "slug": "transactions",
+    "title": "Transactions.",
+    "description": "What does a transaction guarantee, and what goes wrong without one? Double charges, lost updates, and corrupted counters are all missing transactions.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/transactions-9d7cf91b.mp3",
+    "bytes": 7002322,
+    "seconds": 875,
+    "pubDate": "2026-10-19T23:03:30.410Z"
+  },
+  {
+    "slug": "normalization",
+    "title": "Normalization.",
+    "description": "Why do databases split data into many tables, and when should you not? You hit this at work. Good schemas make bugs impossible instead of just unlikely.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/normalization-ac936a33.mp3",
+    "bytes": 6237456,
+    "seconds": 780,
+    "pubDate": "2026-10-19T23:03:41.911Z"
+  },
+  {
+    "slug": "caching",
+    "title": "Caching and Redis.",
+    "description": "When should you cache, how long should things live (TTL), and how do caches go wrong? The cheapest speedup there is, and the source of the hardest bugs (stale data).",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/caching-ceb6c0e5.mp3",
+    "bytes": 7203987,
+    "seconds": 900,
+    "pubDate": "2026-10-19T23:05:37.785Z"
+  },
+  {
+    "slug": "vector-search",
+    "title": "Nearest neighbors at scale.",
+    "description": "How do you find the closest embedding among 100 million without checking them all? The retrieval half of your ranking work. Recall vs speed is a dial you should be able to set.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/vector-search-89207eaf.mp3",
+    "bytes": 7036803,
+    "seconds": 880,
+    "pubDate": "2026-10-19T23:05:53.512Z"
+  },
+  {
+    "slug": "queues",
+    "title": "Queues and logs.",
+    "description": "What is a message queue, and why do big systems put one between every pair of services? Batch jobs, retries, and smoothing traffic spikes all use queues.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/queues-187828b8.mp3",
+    "bytes": 7246201,
+    "seconds": 906,
+    "pubDate": "2026-10-19T23:06:07.931Z"
+  },
+  {
+    "slug": "back-of-envelope",
+    "title": "How does it scale?",
+    "description": "How do you estimate whether a design will hold up before you build it? The question that stumps you in interviews. It is arithmetic with the latency numbers, nothing more.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/back-of-envelope-dfcf7497.mp3",
+    "bytes": 6217603,
+    "seconds": 777,
+    "pubDate": "2026-10-19T23:07:38.579Z"
+  },
+  {
+    "slug": "load-balancing",
+    "title": "Load balancers and state.",
+    "description": "What happens when you run three copies of a server, and why does state break everything? The first step from one machine to many. Stateless design is the whole trick.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/load-balancing-2aa7198e.mp3",
+    "bytes": 5941123,
+    "seconds": 743,
+    "pubDate": "2026-10-19T23:08:02.504Z"
+  },
+  {
+    "slug": "tail-latency",
+    "title": "p99 and load testing.",
+    "description": "Why do people care about p99, and how do you measure it without lying to yourself? Averages hide the users who are suffering. Most load tests measure it wrong.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tail-latency-d46470df.mp3",
+    "bytes": 6741933,
+    "seconds": 843,
+    "pubDate": "2026-10-19T23:08:07.332Z"
+  },
+  {
+    "slug": "rate-limits",
+    "title": "Rate limits and backpressure.",
+    "description": "How does a system say \"slow down\" instead of falling over? Every public API, including the ones you call, does this. So should yours.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/rate-limits-1dadd820.mp3",
+    "bytes": 7042028,
+    "seconds": 880,
+    "pubDate": "2026-10-19T23:10:02.724Z"
+  },
+  {
+    "slug": "ci-cd",
+    "title": "Why every team has a pipeline.",
+    "description": "What problem do source control and CI/CD actually solve? You know how to use them; this is why they exist and what a good pipeline protects you from.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ci-cd-8e151150.mp3",
+    "bytes": 6523549,
+    "seconds": 815,
+    "pubDate": "2026-10-19T23:10:16.680Z"
+  },
+  {
+    "slug": "containers",
+    "title": "Containers vs VMs.",
+    "description": "What is a container really, and how is it different from a virtual machine? You ship everything in Docker. It is just Linux features with good packaging.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/containers-68e81aad.mp3",
+    "bytes": 6776415,
+    "seconds": 847,
+    "pubDate": "2026-10-19T23:10:18.631Z"
+  },
+  {
+    "slug": "design-docs",
+    "title": "Writing a design doc.",
+    "description": "How do engineers decide on a design before building it, in writing? Listed in research engineer roles. Writing forces the thinking that code lets you skip.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/design-docs-c9226301.mp3",
+    "bytes": 5891386,
+    "seconds": 736,
+    "pubDate": "2026-10-19T23:12:11.765Z"
+  },
+  {
+    "slug": "baseline-vs-fireworks",
+    "title": "Baseline: my Spark vs Fireworks.",
+    "description": "How does a naive model server on my own hardware compare to a commercial inference API? You cannot improve what you have not measured. This is the scoreboard for the whole track.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/baseline-vs-fireworks-aae28fbf.mp3",
+    "bytes": 5521910,
+    "seconds": 690,
+    "pubDate": "2026-10-19T23:12:25.817Z"
+  },
+  {
+    "slug": "observability",
+    "title": "Logs, metrics and traces.",
+    "description": "How do you know what a running system is doing, and why it got slow at 3am? You cannot fix what you cannot see. Production debugging is mostly this.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/observability-50a0550e.mp3",
+    "bytes": 7322269,
+    "seconds": 915,
+    "pubDate": "2026-10-19T23:12:32.989Z"
+  },
+  {
+    "slug": "memory-math",
+    "title": "How much memory does a model need?",
+    "description": "How much memory do the weights, the KV cache and activations take, and how many users fit? Decides which models you can serve, at what context length, for how many people.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/memory-math-14322212.mp3",
+    "bytes": 5770387,
+    "seconds": 721,
+    "pubDate": "2026-10-19T23:14:05.187Z"
+  },
+  {
+    "slug": "kv-cache",
+    "title": "The KV cache, by hand.",
+    "description": "What exactly does the KV cache store, and how much does it save? The most important inference optimization, and the thing every later trick builds on.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/kv-cache-97c19b22.mp3",
+    "bytes": 5552003,
+    "seconds": 694,
+    "pubDate": "2026-10-19T23:14:13.909Z"
+  },
+  {
+    "slug": "batching",
+    "title": "Batching and continuous batching.",
+    "description": "Why does serving many users at once make each token cheaper, and what is continuous batching? The reason inference companies make money. It turns spare compute into throughput.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/batching-1f1010cf.mp3",
+    "bytes": 5509789,
+    "seconds": 689,
+    "pubDate": "2026-10-19T23:14:19.610Z"
+  },
+  {
+    "slug": "speculative-decoding",
+    "title": "Speculative decoding.",
+    "description": "How can a small model make a big model faster without changing its output at all? The trick you are fascinated by. Implementing it teaches sampling, verification and probability.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-e45a55c5.mp3",
+    "bytes": 5947602,
+    "seconds": 743,
+    "pubDate": "2026-10-16T21:07:13.249Z"
+  },
+  {
+    "slug": "prefix-caching",
+    "title": "Paged attention and prefix caching.",
+    "description": "How do servers share KV cache between requests with the same prefix, and when do they evict it? System prompts and chat history repeat constantly. Reusing them cuts time to first token.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/prefix-caching-035a0b46.mp3",
+    "bytes": 7018413,
+    "seconds": 877,
+    "pubDate": "2026-10-19T23:16:26.000Z"
+  },
+  {
+    "slug": "quantization",
+    "title": "Quantization.",
+    "description": "What do you lose when you store weights in 8 or 4 bits, and what do you gain? Halving bytes per weight roughly doubles decode speed on a bandwidth-bound machine.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/quantization-f6c9eeb8.mp3",
+    "bytes": 6505786,
+    "seconds": 813,
+    "pubDate": "2026-10-19T23:16:28.441Z"
+  },
+  {
+    "slug": "flash-attention",
+    "title": "FlashAttention and kernels.",
+    "description": "Why is attention slow on long contexts, and how does FlashAttention fix it without changing the math? Your first step into GPU kernels, and listed in research engineer roles (new attention mechanisms).",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/flash-attention-20afe513.mp3",
+    "bytes": 6580601,
+    "seconds": 823,
+    "pubDate": "2026-10-19T23:18:33.374Z"
+  },
+  {
+    "slug": "serving-engines",
+    "title": "Inside vLLM and SGLang.",
+    "description": "What do production inference engines do that your server does not yet? Reading real systems code is how you level up after building your own.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/serving-engines-7b937a79.mp3",
+    "bytes": 6581855,
+    "seconds": 823,
+    "pubDate": "2026-10-19T23:18:37.865Z"
+  },
+  {
+    "slug": "number-formats",
+    "title": "fp32, bf16, fp16, fp8.",
+    "description": "How are decimal numbers stored in bits, and why did everyone switch to bf16? Precision vs range decides whether training is stable. You mixed these up; most people do.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/number-formats-5e520b39.mp3",
+    "bytes": 7094691,
+    "seconds": 887,
+    "pubDate": "2026-10-19T23:19:05.225Z"
   }
 ]

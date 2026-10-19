@@ -35,6 +35,7 @@ export const tracks: Track[] = [
         question: 'How long does it actually take to read from RAM, an SSD, or the network?',
         why: 'Every "how does this scale?" answer starts with these numbers. Without them you are guessing.',
         build: 'A small benchmark that measures each rung of the latency ladder on your laptop and your DGX Spark.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/latency-numbers-2136db8c.mp3',
       },
       {
         slug: 'c-for-python',
@@ -42,6 +43,7 @@ export const tracks: Track[] = [
         question: 'How do I read the C under Python, PyTorch and CUDA without learning to write it?',
         why: 'The code that decides how fast your model runs is C or C++. Reading it is how you stop taking speed claims on trust.',
         build: 'Compile and run three tiny C programs, then read real code: a CPython list, a llama.cpp loop, a CUDA kernel.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/c-for-python-cb6ad408.mp3',
       },
       {
         slug: 'stack-and-heap',
@@ -49,6 +51,7 @@ export const tracks: Track[] = [
         question: 'What are the stack and the heap, and where does a Python object actually sit in memory?',
         why: 'Memory leaks, recursion limits, and "why is this list so big" all come back to this.',
         build: 'Poke at real addresses and object sizes from Python and C, then blow the stack on purpose.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/stack-and-heap-63a25a59.mp3',
       },
       {
         slug: 'processes-threads-gil',
@@ -56,6 +59,7 @@ export const tracks: Track[] = [
         question: 'What is the difference between a process and a thread, and why does Python have a lock that ruins threads?',
         why: 'Picking threads vs processes wrong makes a data loader or server 8x slower, silently.',
         build: 'Run the same CPU job and the same network job with threads and with processes; explain every timing.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/processes-threads-gil-f0dcdd56.mp3',
       },
       {
         slug: 'waiting-vs-working',
@@ -63,7 +67,7 @@ export const tracks: Track[] = [
         question: 'What do sync and async actually mean, and why does my server stall under load?',
         why: 'Every LLM app spends most of its life waiting on a network. Async is how one process waits on thousands of things.',
         build: 'A server that calls a slow fake LLM. Hammer it, watch it stall, rebuild it async, hammer it again.',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-b11ca406.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/waiting-vs-working-7731ba95.mp3',
       },
       {
         slug: 'cpu-caches',
@@ -71,6 +75,7 @@ export const tracks: Track[] = [
         question: 'Why is looping over a NumPy array so much faster than a Python list of the same numbers?',
         why: 'Memory layout and caches decide speed long before the algorithm does. Same idea scales up to GPUs.',
         build: 'Sum the same numbers five ways (list, array, strided, random order, vectorized) and explain the gaps.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/cpu-caches-09f87503.mp3',
       },
       {
         slug: 'virtual-memory',
@@ -78,6 +83,7 @@ export const tracks: Track[] = [
         question: 'What is virtual memory, and why did Linux kill my process when I had "free" memory?',
         why: 'Loading a 70B model, mmap, swap, and OOM kills on the Spark all live here.',
         build: 'Allocate memory you never touch, then touch it; watch RSS vs virtual size and trigger the OOM killer safely.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/virtual-memory-7b404912.mp3',
       },
       {
         slug: 'files-and-disks',
@@ -85,6 +91,7 @@ export const tracks: Track[] = [
         question: 'What actually happens between file.write() and the bytes being safe on disk?',
         why: 'Fast model loading (safetensors, mmap) and data that survives a crash both depend on it.',
         build: 'Load the same model weights with torch.load and with mmap\'d safetensors; time cold vs warm page cache.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/files-and-disks-9882e8d7.mp3',
       },
       {
         slug: 'python-speed',
@@ -92,6 +99,7 @@ export const tracks: Track[] = [
         question: 'What does the Python interpreter actually do, and how does PyTorch get speed anyway?',
         why: 'Knowing where Python ends and C/CUDA begins tells you what is worth optimizing.',
         build: 'Disassemble bytecode, race the same loop in Python, NumPy and a ready-made C version, then try torch.compile on a small model.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/python-speed-3fe70b80.mp3',
       },
     ],
   },
@@ -107,6 +115,7 @@ export const tracks: Track[] = [
         question: 'What is an IP address, a packet, and a route, and what happens between my laptop and a server?',
         why: 'The base layer under every API call, every SSH session, and every latency number you measure.',
         build: 'Trace the path to a few servers, capture your own packets, and read them byte by byte.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/packets-and-ip-c61dc9b3.mp3',
       },
       {
         slug: 'tcp-vs-udp',
@@ -114,6 +123,7 @@ export const tracks: Track[] = [
         question: 'Why are there two transport protocols, and what is TCP doing for me that UDP is not?',
         why: 'Head-of-line blocking, handshakes, and timeouts show up in every distributed system.',
         build: 'Build a tiny reliable channel on top of UDP: sequence numbers, acks, retries. Then compare to TCP.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tcp-vs-udp-22520ef2.mp3',
       },
       {
         slug: 'what-happens-url',
@@ -121,6 +131,7 @@ export const tracks: Track[] = [
         question: 'Step by step, what happens between typing a URL and seeing the page?',
         why: 'A classic interview question and a map of the whole stack: DNS, TCP, TLS, HTTP, rendering.',
         build: 'Fetch a page by hand with raw sockets, timing each phase (DNS, connect, TLS, first byte).',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/what-happens-url-f445770c.mp3',
       },
       {
         slug: 'tls',
@@ -128,6 +139,7 @@ export const tracks: Track[] = [
         question: 'How do two machines that have never met agree on a secret over a public network?',
         why: 'Certificates, keys, and handshakes are behind every "SSL error" you will ever debug.',
         build: 'Do a toy key exchange by hand, then inspect a real TLS handshake and certificate chain.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tls-dc837704.mp3',
       },
       {
         slug: 'http-from-scratch',
@@ -135,6 +147,7 @@ export const tracks: Track[] = [
         question: 'What is HTTP really, under the frameworks?',
         why: 'FastAPI and friends are thin layers over a text protocol. Knowing it makes every API bug readable.',
         build: 'Write an HTTP/1.1 server on raw sockets that serves JSON, handles keep-alive, and survives curl.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/http-from-scratch-0abe676c.mp3',
       },
       {
         slug: 'streaming',
@@ -142,6 +155,7 @@ export const tracks: Track[] = [
         question: 'How do servers push data to clients, and why do LLM APIs stream with SSE?',
         why: 'Token streaming, time-to-first-token, and dropped connections all depend on this choice.',
         build: 'Stream tokens from a fake model three ways and measure latency and overhead of each.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/streaming-bb1e0914.mp3',
       },
       {
         slug: 'ssh-and-tailscale',
@@ -149,6 +163,7 @@ export const tracks: Track[] = [
         question: 'What actually happens when I SSH into my home server over Tailscale?',
         why: 'You already use it. Knowing keys, NAT, and WireGuard turns magic into something you can fix.',
         build: 'Harden your SSH server (keys only, config, fail2ban), then map how Tailscale punches through your router.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ssh-and-tailscale-c56975b3.mp3',
       },
       {
         slug: 'api-lifecycle',
@@ -157,6 +172,7 @@ export const tracks: Track[] = [
         why: 'An interview question you missed, and a real job: versioning, idempotency, auth, rate limits, docs.',
         build: 'Design, version, and deprecate an endpoint of your inference server without breaking a client.',
         source: 'interview',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/api-lifecycle-9c18f87b.mp3',
       },
     ],
   },
@@ -172,6 +188,7 @@ export const tracks: Track[] = [
         question: 'What does a database give you that writing JSON to disk does not?',
         why: 'Durability, concurrency, and queries are problems you only notice once they break.',
         build: 'Build a tiny key-value store with an append-only log, crash it mid-write, and recover.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/why-databases-c42d4941.mp3',
       },
       {
         slug: 'indexes',
@@ -179,6 +196,7 @@ export const tracks: Track[] = [
         question: 'What is a database index, why does it make reads fast, and why does it make writes slower?',
         why: 'The single most common fix for a slow query, and the root of many slow writes.',
         build: 'Load a million rows into Postgres, read EXPLAIN plans with and without an index, then build a mini B-tree.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/indexes-dbdbd409.mp3',
       },
       {
         slug: 'transactions',
@@ -186,6 +204,7 @@ export const tracks: Track[] = [
         question: 'What does a transaction guarantee, and what goes wrong without one?',
         why: 'Double charges, lost updates, and corrupted counters are all missing transactions.',
         build: 'Write a race condition that loses money, then fix it with transactions and isolation levels.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/transactions-9d7cf91b.mp3',
       },
       {
         slug: 'normalization',
@@ -194,6 +213,7 @@ export const tracks: Track[] = [
         why: 'You hit this at work. Good schemas make bugs impossible instead of just unlikely.',
         build: 'Take a messy spreadsheet of runs and evals, find the update bugs it allows, and normalize it.',
         source: 'work',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/normalization-ac936a33.mp3',
       },
       {
         slug: 'caching',
@@ -201,6 +221,7 @@ export const tracks: Track[] = [
         question: 'When should you cache, how long should things live (TTL), and how do caches go wrong?',
         why: 'The cheapest speedup there is, and the source of the hardest bugs (stale data).',
         build: 'Put Redis in front of your inference server for repeated prompts; measure hit rate and staleness.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/caching-ceb6c0e5.mp3',
       },
       {
         slug: 'vector-search',
@@ -208,6 +229,7 @@ export const tracks: Track[] = [
         question: 'How do you find the closest embedding among 100 million without checking them all?',
         why: 'The retrieval half of your ranking work. Recall vs speed is a dial you should be able to set.',
         build: 'Brute force vs IVF vs HNSW on a real embedding set; plot recall against latency.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/vector-search-89207eaf.mp3',
       },
       {
         slug: 'queues',
@@ -215,6 +237,7 @@ export const tracks: Track[] = [
         question: 'What is a message queue, and why do big systems put one between every pair of services?',
         why: 'Batch jobs, retries, and smoothing traffic spikes all use queues.',
         build: 'Move slow work out of a request into a worker queue; kill workers and make sure nothing is lost.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/queues-187828b8.mp3',
       },
     ],
   },
@@ -231,6 +254,7 @@ export const tracks: Track[] = [
         why: 'The question that stumps you in interviews. It is arithmetic with the latency numbers, nothing more.',
         build: 'Estimate the hardware needed to serve your ranker at 1k, 100k, 10M queries a day; check one estimate for real.',
         source: 'interview',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/back-of-envelope-dfcf7497.mp3',
       },
       {
         slug: 'tail-latency',
@@ -238,6 +262,7 @@ export const tracks: Track[] = [
         question: 'Why do people care about p99, and how do you measure it without lying to yourself?',
         why: 'Averages hide the users who are suffering. Most load tests measure it wrong.',
         build: 'Load-test your server, find the knee in the latency curve, and catch coordinated omission.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tail-latency-d46470df.mp3',
       },
       {
         slug: 'load-balancing',
@@ -245,6 +270,7 @@ export const tracks: Track[] = [
         question: 'What happens when you run three copies of a server, and why does state break everything?',
         why: 'The first step from one machine to many. Stateless design is the whole trick.',
         build: 'Run three copies behind nginx, break sessions with in-memory state, then fix it.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/load-balancing-2aa7198e.mp3',
       },
       {
         slug: 'rate-limits',
@@ -252,6 +278,7 @@ export const tracks: Track[] = [
         question: 'How does a system say "slow down" instead of falling over?',
         why: 'Every public API, including the ones you call, does this. So should yours.',
         build: 'Add a token-bucket limiter and a bounded queue to your server; flood it and watch it shed load gracefully.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/rate-limits-1dadd820.mp3',
       },
       {
         slug: 'containers',
@@ -259,6 +286,7 @@ export const tracks: Track[] = [
         question: 'What is a container really, and how is it different from a virtual machine?',
         why: 'You ship everything in Docker. It is just Linux features with good packaging.',
         build: 'Build a "container" by hand with namespaces and cgroups, then compare it to a Docker run.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/containers-68e81aad.mp3',
       },
       {
         slug: 'ci-cd',
@@ -266,6 +294,7 @@ export const tracks: Track[] = [
         question: 'What problem do source control and CI/CD actually solve?',
         why: 'You know how to use them; this is why they exist and what a good pipeline protects you from.',
         build: 'Set up CI/CD for this very site: tests, build, deploy on push, and a rollback.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ci-cd-8e151150.mp3',
       },
       {
         slug: 'observability',
@@ -273,6 +302,7 @@ export const tracks: Track[] = [
         question: 'How do you know what a running system is doing, and why it got slow at 3am?',
         why: 'You cannot fix what you cannot see. Production debugging is mostly this.',
         build: 'Instrument your inference server with metrics and traces; find a slowdown you planted.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/observability-50a0550e.mp3',
       },
       {
         slug: 'design-docs',
@@ -281,6 +311,7 @@ export const tracks: Track[] = [
         why: 'Listed in research engineer roles. Writing forces the thinking that code lets you skip.',
         build: 'Write a fault-tolerance design doc for a training job that must survive node failures.',
         source: 'Anthropic research engineer posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/design-docs-c9226301.mp3',
       },
     ],
   },
@@ -304,6 +335,7 @@ export const tracks: Track[] = [
         question: 'How does a naive model server on my own hardware compare to a commercial inference API?',
         why: 'You cannot improve what you have not measured. This is the scoreboard for the whole track.',
         build: 'A streaming server on the Spark and a benchmark harness measuring TTFT, tokens/sec and p99 against Fireworks.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/baseline-vs-fireworks-aae28fbf.mp3',
       },
       {
         slug: 'memory-math',
@@ -311,6 +343,7 @@ export const tracks: Track[] = [
         question: 'How much memory do the weights, the KV cache and activations take, and how many users fit?',
         why: 'Decides which models you can serve, at what context length, for how many people.',
         build: 'A calculator for weights + KV cache, checked against real memory readings on the Spark.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/memory-math-14322212.mp3',
       },
       {
         slug: 'kv-cache',
@@ -318,6 +351,7 @@ export const tracks: Track[] = [
         question: 'What exactly does the KV cache store, and how much does it save?',
         why: 'The most important inference optimization, and the thing every later trick builds on.',
         build: 'Add a KV cache to your own GPT-2, measure the speedup, and watch memory grow with length.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/kv-cache-97c19b22.mp3',
       },
       {
         slug: 'batching',
@@ -325,6 +359,7 @@ export const tracks: Track[] = [
         question: 'Why does serving many users at once make each token cheaper, and what is continuous batching?',
         why: 'The reason inference companies make money. It turns spare compute into throughput.',
         build: 'Static batching, then continuous batching, in your server; plot throughput vs latency.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/batching-1f1010cf.mp3',
       },
       {
         slug: 'prefix-caching',
@@ -332,6 +367,7 @@ export const tracks: Track[] = [
         question: 'How do servers share KV cache between requests with the same prefix, and when do they evict it?',
         why: 'System prompts and chat history repeat constantly. Reusing them cuts time to first token.',
         build: 'Prefix cache with TTL and LRU eviction in your server; measure TTFT on repeated system prompts.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/prefix-caching-035a0b46.mp3',
       },
       {
         slug: 'quantization',
@@ -339,6 +375,7 @@ export const tracks: Track[] = [
         question: 'What do you lose when you store weights in 8 or 4 bits, and what do you gain?',
         why: 'Halving bytes per weight roughly doubles decode speed on a bandwidth-bound machine.',
         build: 'Serve the same model in bf16, fp8, int4; measure speed and quality on a small eval.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/quantization-f6c9eeb8.mp3',
       },
       {
         slug: 'speculative-decoding',
@@ -346,7 +383,7 @@ export const tracks: Track[] = [
         question: 'How can a small model make a big model faster without changing its output at all?',
         why: 'The trick you are fascinated by. Implementing it teaches sampling, verification and probability.',
         build: 'Implement speculative sampling from the paper, prove the output distribution matches, and tune draft length.',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-b9e0bfe4.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/speculative-decoding-e45a55c5.mp3',
       },
       {
         slug: 'serving-engines',
@@ -354,6 +391,7 @@ export const tracks: Track[] = [
         question: 'What do production inference engines do that your server does not yet?',
         why: 'Reading real systems code is how you level up after building your own.',
         build: 'Benchmark vLLM and SGLang on the Spark against your server, then trace one request through vLLM\'s code.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/serving-engines-7b937a79.mp3',
       },
       {
         slug: 'flash-attention',
@@ -362,6 +400,7 @@ export const tracks: Track[] = [
         why: 'Your first step into GPU kernels, and listed in research engineer roles (new attention mechanisms).',
         build: 'Write naive attention, then a tiled version in Triton; compare speed and memory.',
         source: 'Anthropic research engineer posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/flash-attention-20afe513.mp3',
       },
     ],
   },
@@ -377,6 +416,7 @@ export const tracks: Track[] = [
         question: 'How are decimal numbers stored in bits, and why did everyone switch to bf16?',
         why: 'Precision vs range decides whether training is stable. You mixed these up; most people do.',
         build: 'Decode floats bit by bit, then train the same model in fp16 and bf16 and watch one blow up.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/number-formats-5e520b39.mp3',
       },
       {
         slug: 'training-memory',
