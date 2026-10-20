@@ -385,5 +385,185 @@
     "bytes": 7094691,
     "seconds": 887,
     "pubDate": "2026-10-19T23:19:05.225Z"
+  },
+  {
+    "slug": "training-memory",
+    "title": "Why training needs so much memory.",
+    "description": "Why does training a model take many times the memory of running it? Optimizer states, gradients and activations decide what you can train on the Spark.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/training-memory-a80e960f.mp3",
+    "bytes": 7292176,
+    "seconds": 911,
+    "pubDate": "2026-10-19T23:28:54.198Z"
+  },
+  {
+    "slug": "tokenizers",
+    "title": "Tokenizers.",
+    "description": "What is a token, and how does a tokenizer decide where words split? Token counts set your costs, context limits and odd model failures (spelling, numbers).",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tokenizers-b4f5c43a.mp3",
+    "bytes": 6891563,
+    "seconds": 861,
+    "pubDate": "2026-10-19T23:28:56.097Z"
+  },
+  {
+    "slug": "draft-model",
+    "title": "Train your own draft model.",
+    "description": "Can I distill a small model that predicts what my big model will say? Connects training back to inference: a better draft model means faster speculative decoding.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/draft-model-a3778dd6.mp3",
+    "bytes": 6322720,
+    "seconds": 790,
+    "pubDate": "2026-10-20T06:59:45.931Z"
+  },
+  {
+    "slug": "data-pipelines",
+    "title": "Data a model can eat.",
+    "description": "How do you turn raw text like Wikipedia into training data a model learns well from? Listed in research engineer roles. Data quality matters more than model tricks.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/data-pipelines-1536a51a.mp3",
+    "bytes": 7207122,
+    "seconds": 901,
+    "pubDate": "2026-10-20T07:00:07.193Z"
+  },
+  {
+    "slug": "lora",
+    "title": "Fine-tuning and LoRA.",
+    "description": "How do you adapt a big model by training only a tiny fraction of it? The cheapest way to specialize a model, and a good look at low-rank math.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/lora-47d1b71a.mp3",
+    "bytes": 7252470,
+    "seconds": 907,
+    "pubDate": "2026-10-20T07:02:01.291Z"
+  },
+  {
+    "slug": "architecture-compute",
+    "title": "Comparing transformer variants.",
+    "description": "How do you compare the compute efficiency of two transformer designs fairly? Listed in research engineer roles. MHA vs GQA vs MQA is a real tradeoff in serving cost.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/architecture-compute-3d5320f7.mp3",
+    "bytes": 6254175,
+    "seconds": 782,
+    "pubDate": "2026-10-20T07:02:03.502Z"
+  },
+  {
+    "slug": "why-evals-are-separate",
+    "title": "Why is the eval separate?",
+    "description": "If the evaluator and the model are both just models, why are they different systems? A confusion you named. Getting this right is what separates a demo from a result.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/why-evals-are-separate-bbce4a91.mp3",
+    "bytes": 5997548,
+    "seconds": 750,
+    "pubDate": "2026-10-20T07:03:56.632Z"
+  },
+  {
+    "slug": "distributed-training",
+    "title": "Training on many GPUs.",
+    "description": "How do you split a model and its training across many GPUs? Scaling training jobs to thousands of GPUs is a core research engineer skill.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/distributed-training-66e4167b.mp3",
+    "bytes": 6622188,
+    "seconds": 828,
+    "pubDate": "2026-10-20T07:04:05.289Z"
+  },
+  {
+    "slug": "ranking-metrics",
+    "title": "Ranking metrics and eval sets.",
+    "description": "How do you prove a new ranker is better: which metric, which data, how sure? Your current work. The eval set matters more than the metric.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ranking-metrics-aa84706b.mp3",
+    "bytes": 5959096,
+    "seconds": 745,
+    "pubDate": "2026-10-20T07:05:45.356Z"
+  },
+  {
+    "slug": "llm-judges",
+    "title": "LLMs as judges.",
+    "description": "When can you trust a model to grade another model? Cheap evals at scale, with biases you have to measure (position, length, self-preference).",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/llm-judges-c41dbd18.mp3",
+    "bytes": 5721068,
+    "seconds": 715,
+    "pubDate": "2026-10-20T07:07:32.065Z"
+  },
+  {
+    "slug": "attention-viz",
+    "title": "Seeing attention.",
+    "description": "What is a model looking at when it predicts the next token? Listed in research engineer roles, and a good way to make attention concrete.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/attention-viz-b5d4d3de.mp3",
+    "bytes": 6172882,
+    "seconds": 772,
+    "pubDate": "2026-10-20T07:09:27.658Z"
+  },
+  {
+    "slug": "context-management",
+    "title": "Managing context.",
+    "description": "What should go into a model's context window, and what happens when it fills up? You do this well by instinct. This makes it measurable: compaction, retrieval, memory.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/context-management-1897b788.mp3",
+    "bytes": 7008800,
+    "seconds": 876,
+    "pubDate": "2026-10-20T07:11:37.397Z"
+  },
+  {
+    "slug": "tiny-lm",
+    "title": "Train a small LM, end to end.",
+    "description": "What does the full loop of training a language model actually look like? The step you have never done at scale: data, tokenizer, model, training, eval, in one pipeline.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tiny-lm-8fd9ed2f.mp3",
+    "bytes": 6780176,
+    "seconds": 847,
+    "pubDate": "2026-10-20T07:13:59.069Z"
+  },
+  {
+    "slug": "long-horizon",
+    "title": "What makes a task long-horizon?",
+    "description": "Why do agents that succeed at 10-step tasks fail at 100-step ones? Listed in Code RL roles. Error compounds; you can put numbers on it.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/long-horizon-d82c9f37.mp3",
+    "bytes": 6834093,
+    "seconds": 854,
+    "pubDate": "2026-10-20T07:14:00.537Z"
+  },
+  {
+    "slug": "statistics-for-evals",
+    "title": "Is that improvement real?",
+    "description": "When a score goes from 71.2 to 72.0, is that real or noise? Most \"wins\" in ML are noise. Bootstrap and paired tests fix that.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/statistics-for-evals-9aff754a.mp3",
+    "bytes": 5824095,
+    "seconds": 728,
+    "pubDate": "2026-10-20T07:14:02.194Z"
+  },
+  {
+    "slug": "verifiers-rewards",
+    "title": "Rewards and verifiers.",
+    "description": "How do you turn \"good code\" into a number a model can learn from without being gamed? Listed in Code RL roles. Reward hacking is what happens when this is wrong.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/verifiers-rewards-2fcd92e9.mp3",
+    "bytes": 6556150,
+    "seconds": 819,
+    "pubDate": "2026-10-20T07:16:12.287Z"
+  },
+  {
+    "slug": "dpo",
+    "title": "Preference tuning with DPO.",
+    "description": "How do you train a model on \"this answer is better than that one\"? You read about DPO and PPO. Implementing DPO makes the loss function make sense.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/dpo-d097c15e.mp3",
+    "bytes": 6129414,
+    "seconds": 766,
+    "pubDate": "2026-10-20T07:16:20.447Z"
+  },
+  {
+    "slug": "grpo",
+    "title": "RL with verifiable rewards.",
+    "description": "How does RL with automatic rewards (like GRPO) teach a model to solve problems? How current reasoning models are trained. Runs on a single Spark at small scale.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/grpo-8a4eaf1b.mp3",
+    "bytes": 6352186,
+    "seconds": 794,
+    "pubDate": "2026-10-20T07:18:07.712Z"
+  },
+  {
+    "slug": "agent-harness",
+    "title": "Inside an agent harness.",
+    "description": "What does a coding agent harness actually do around the model? You built one with AST lookups. This adds tool design, sandboxing and recovery.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/agent-harness-fe93b301.mp3",
+    "bytes": 6988320,
+    "seconds": 873,
+    "pubDate": "2026-10-20T07:18:29.025Z"
+  },
+  {
+    "slug": "rl-environments",
+    "title": "What is an RL environment?",
+    "description": "What is an environment in reinforcement learning, and how do you build one for coding? The core of Code RL work: tasks, sandboxes, and a loop a model can learn from.",
+    "url": "https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/rl-environments-c2c67c38.mp3",
+    "bytes": 6251667,
+    "seconds": 781,
+    "pubDate": "2026-10-20T07:18:34.674Z"
   }
 ]

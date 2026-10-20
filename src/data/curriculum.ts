@@ -424,6 +424,7 @@ export const tracks: Track[] = [
         question: 'Why does training a model take many times the memory of running it?',
         why: 'Optimizer states, gradients and activations decide what you can train on the Spark.',
         build: 'Predict and measure memory for training a 1B model; then cut it with checkpointing and 8-bit Adam.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/training-memory-a80e960f.mp3',
       },
       {
         slug: 'tokenizers',
@@ -431,6 +432,7 @@ export const tracks: Track[] = [
         question: 'What is a token, and how does a tokenizer decide where words split?',
         why: 'Token counts set your costs, context limits and odd model failures (spelling, numbers).',
         build: 'Implement byte-pair encoding from scratch and train it on your own text.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tokenizers-b4f5c43a.mp3',
       },
       {
         slug: 'tiny-lm',
@@ -438,6 +440,7 @@ export const tracks: Track[] = [
         question: 'What does the full loop of training a language model actually look like?',
         why: 'The step you have never done at scale: data, tokenizer, model, training, eval, in one pipeline.',
         build: 'Train a ~100M parameter model on the Spark from raw text to a checkpoint you can sample from.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/tiny-lm-8fd9ed2f.mp3',
       },
       {
         slug: 'data-pipelines',
@@ -446,6 +449,7 @@ export const tracks: Track[] = [
         why: 'Listed in research engineer roles. Data quality matters more than model tricks.',
         build: 'Clean, deduplicate, filter and pack a Wikipedia dump; measure the effect on your tiny LM.',
         source: 'Anthropic research engineer posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/data-pipelines-1536a51a.mp3',
       },
       {
         slug: 'draft-model',
@@ -453,6 +457,7 @@ export const tracks: Track[] = [
         question: 'Can I distill a small model that predicts what my big model will say?',
         why: 'Connects training back to inference: a better draft model means faster speculative decoding.',
         build: 'Distill a draft model for your served model and measure the acceptance-rate gain.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/draft-model-a3778dd6.mp3',
       },
       {
         slug: 'lora',
@@ -460,6 +465,7 @@ export const tracks: Track[] = [
         question: 'How do you adapt a big model by training only a tiny fraction of it?',
         why: 'The cheapest way to specialize a model, and a good look at low-rank math.',
         build: 'LoRA fine-tune a model on the Spark for a task you care about; compare to full fine-tuning on a small one.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/lora-47d1b71a.mp3',
       },
       {
         slug: 'architecture-compute',
@@ -468,6 +474,7 @@ export const tracks: Track[] = [
         why: 'Listed in research engineer roles. MHA vs GQA vs MQA is a real tradeoff in serving cost.',
         build: 'Train two small variants at equal compute; compare loss, FLOPs, memory and decode speed.',
         source: 'Anthropic research engineer posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/architecture-compute-3d5320f7.mp3',
       },
       {
         slug: 'distributed-training',
@@ -476,6 +483,7 @@ export const tracks: Track[] = [
         why: 'Scaling training jobs to thousands of GPUs is a core research engineer skill.',
         build: 'Simulate data, tensor and pipeline parallelism with multiple processes; write down how each would scale.',
         source: 'Anthropic research engineer posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/distributed-training-66e4167b.mp3',
       },
     ],
   },
@@ -491,6 +499,7 @@ export const tracks: Track[] = [
         question: 'If the evaluator and the model are both just models, why are they different systems?',
         why: 'A confusion you named. Getting this right is what separates a demo from a result.',
         build: 'Score a model with a judge that shares its blind spots, watch it lie, then build an independent check.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/why-evals-are-separate-bbce4a91.mp3',
       },
       {
         slug: 'ranking-metrics',
@@ -499,6 +508,7 @@ export const tracks: Track[] = [
         why: 'Your current work. The eval set matters more than the metric.',
         build: 'NDCG, MRR and MAP by hand; then build an eval set for your cross-encoder with confidence intervals.',
         source: 'work',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ranking-metrics-aa84706b.mp3',
       },
       {
         slug: 'statistics-for-evals',
@@ -506,6 +516,7 @@ export const tracks: Track[] = [
         question: 'When a score goes from 71.2 to 72.0, is that real or noise?',
         why: 'Most "wins" in ML are noise. Bootstrap and paired tests fix that.',
         build: 'Bootstrap confidence intervals and a paired test on two model runs; find how many examples you need.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/statistics-for-evals-9aff754a.mp3',
       },
       {
         slug: 'llm-judges',
@@ -513,6 +524,7 @@ export const tracks: Track[] = [
         question: 'When can you trust a model to grade another model?',
         why: 'Cheap evals at scale, with biases you have to measure (position, length, self-preference).',
         build: 'Build a judge, measure its agreement with your own labels, and catch its position bias.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/llm-judges-c41dbd18.mp3',
       },
       {
         slug: 'attention-viz',
@@ -521,6 +533,7 @@ export const tracks: Track[] = [
         why: 'Listed in research engineer roles, and a good way to make attention concrete.',
         build: 'An interactive visualization of attention between tokens for your own GPT-2.',
         source: 'Anthropic research engineer posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/attention-viz-b5d4d3de.mp3',
       },
     ],
   },
@@ -536,6 +549,7 @@ export const tracks: Track[] = [
         question: 'What should go into a model\'s context window, and what happens when it fills up?',
         why: 'You do this well by instinct. This makes it measurable: compaction, retrieval, memory.',
         build: 'Run an agent on a long task with three context strategies and measure success rate and cost.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/context-management-1897b788.mp3',
       },
       {
         slug: 'long-horizon',
@@ -544,6 +558,7 @@ export const tracks: Track[] = [
         why: 'Listed in Code RL roles. Error compounds; you can put numbers on it.',
         build: 'Measure per-step reliability on a task suite and predict long-task success from it.',
         source: 'Anthropic Code RL posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/long-horizon-d82c9f37.mp3',
       },
       {
         slug: 'rl-environments',
@@ -552,6 +567,7 @@ export const tracks: Track[] = [
         why: 'The core of Code RL work: tasks, sandboxes, and a loop a model can learn from.',
         build: 'A gym-style environment of small coding tasks running in a sandbox.',
         source: 'Anthropic Code RL posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/rl-environments-c2c67c38.mp3',
       },
       {
         slug: 'verifiers-rewards',
@@ -560,6 +576,7 @@ export const tracks: Track[] = [
         why: 'Listed in Code RL roles. Reward hacking is what happens when this is wrong.',
         build: 'Write verifiers for your environment, then try to game them yourself before a model does.',
         source: 'Anthropic Code RL posting',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/verifiers-rewards-2fcd92e9.mp3',
       },
       {
         slug: 'dpo',
@@ -567,6 +584,7 @@ export const tracks: Track[] = [
         question: 'How do you train a model on "this answer is better than that one"?',
         why: 'You read about DPO and PPO. Implementing DPO makes the loss function make sense.',
         build: 'Implement DPO from the paper and tune a small model on preference pairs.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/dpo-d097c15e.mp3',
       },
       {
         slug: 'grpo',
@@ -574,6 +592,7 @@ export const tracks: Track[] = [
         question: 'How does RL with automatic rewards (like GRPO) teach a model to solve problems?',
         why: 'How current reasoning models are trained. Runs on a single Spark at small scale.',
         build: 'Train a small model with GRPO on your coding environment and watch reward and behavior change.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/grpo-8a4eaf1b.mp3',
       },
       {
         slug: 'agent-harness',
@@ -581,6 +600,7 @@ export const tracks: Track[] = [
         question: 'What does a coding agent harness actually do around the model?',
         why: 'You built one with AST lookups. This adds tool design, sandboxing and recovery.',
         build: 'A minimal coding agent: tools, sandbox, retries, and a trace viewer to see what it did.',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/agent-harness-fe93b301.mp3',
       },
     ],
   },
