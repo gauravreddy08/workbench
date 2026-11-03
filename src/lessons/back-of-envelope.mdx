@@ -16,7 +16,7 @@ It's arithmetic over things you already have: the speeds of memory, disks and ne
 
 - Answer "how does your solution scale?" with a five-step method you can run out loud, in any interview, on any system.
 - Turn "queries per day" into GPUs, gigabytes and dollars by rounding every number to a power of ten, using a handful of numbers you'll carry in your head.
-- Work three estimates end to end: your cross-encoder ranker serving search, search vectors for a billion web pages, and the per-conversation memory a chat model keeps for every user talking to it at once.
+- Work four estimates end to end: your cross-encoder ranker serving search, search vectors for a billion web pages, the per-conversation memory a chat model keeps for every user talking to it at once, and a URL shortener, where the first question is how many times each link is read for every time one is made.
 - Say which resource gives out first (raw calculation, how fast memory can be read, how much memory there is, network, CPU, money) and what you'd change at 10× and 100× the traffic.
 - Estimate your ranker's capacity on paper, then hit it with steadily rising fake traffic on the Spark to find where it really tops out, and keep a journal of guesses against results so your estimates get measurably better.
 
@@ -364,6 +364,82 @@ Traffic grows 10×: 1,500 responses generating at once, still 4K context. Before
 </Fragment>
 </Predict>
 
+### Worked example 4: a URL shortener, and the first question to ask
+
+The classic design interview: "Design a URL shortener." Someone pastes a long link and gets back a short one; anyone who clicks the short one is sent on to the long one. Before boxes and arrows, ask the step 1 question that decides the shape of everything else: **what's the read:write ratio?** Creating a link is a write. Every click is a read. A link is made once and, if it's shared at all, clicked many times.
+
+**Load.** Assumptions, said out loud: 100 million new links a month, each read 100 times on average over its life, so 100:1. Keep links for 5 years. Peak factor 3×.
+
+**Arithmetic.**
+
+1. **Writes.** A month is about 2.5 × 10⁶ seconds, so 10⁸ ÷ 2.5 × 10⁶ = **40 writes a second** on average (exactly, 38). About 120 at peak.
+2. **Reads.** 100 × 40 = **4,000 redirects a second** on average (exactly, 3,800), and about **12,000** at peak.
+3. **Rows.** 10⁸ a month × 12 × 5 years = **6 × 10⁹ links**.
+4. **Bytes per row.** A 7-character code, a long URL (call it 100 bytes), a creation time and an owner: about 150 bytes of data. Round up to **500 bytes** to cover the database's per-row overhead, the index on the code, and the occasional monster URL.
+5. **Storage.** 6 × 10⁹ × 500 bytes = **3 TB**. Three copies for safety: 9 TB.
+
+**Compare.** 3 TB is one big SSD, not one machine's RAM. 12,000 lookups a second, each fetching one row by its key, is within reach of one well-tuned database server answering from memory, but with no headroom, and it all sits on one machine. 120 writes a second is nothing for any database. Redirect bandwidth is tiny: 12,000 × ~500 bytes ≈ 6 MB/s. And the short code fits easily: 62 letters and digits in 7 places is 62⁷ ≈ 3.5 × 10¹² codes for 6 × 10⁹ links (how to hand them out without collisions is [Short IDs and collisions](/lessons/short-ids/)).
+
+**What the ratio decides.** At 100:1 the write path barely matters; every design choice is about the read path. Clicks are likely as lopsided as search queries, the Zipf pattern from example 1: a few links get most of the traffic. So you put copies of the hot ones in front of the database. In order, from closest to the user:
+
+- A <Term w="CDN">Content delivery network: a company's servers in hundreds of cities that keep copies of your responses close to users, so most requests are answered nearby and never reach your machines.</Term> and its <Term w="edge cache">The cache on the CDN's machines nearest the user. If it holds a fresh copy of the response, it answers right there; only misses travel on to your servers.</Term>. A redirect is a few hundred bytes that rarely changes, an ideal thing to cache. The catch, from [HTTP from scratch](/lessons/http-from-scratch/): a click the edge answers never reaches you, so your server can't count it (the CDN's own logs can).
+- An in-memory cache next to your app ([Caching and Redis](/lessons/caching/)). Even the top 1% of links, 6 × 10⁷ of them, is 30 GB: one cache box's RAM.
+- <Term w="read replica">A copy of the database that follows every change made on the main copy (the primary) and answers reads. Replicas add read capacity; every write still goes to the primary.</Term>s behind that, for the misses, so no single database answers all 12,000.
+
+A write-heavy system is a different story. When writes dominate, you can't cache your way out, because the expensive part is getting each new item onto disk and into every index. The tools are batching writes, appending instead of updating in place, and storage built for that: the LSM-tree in [Indexes and B-trees](/lessons/indexes/), which turns many small random writes into a few big sequential ones.
+
+<Figure n="006" title="THE RATIO PICKS THE DESIGN" caption="Same product, two paths. Redirects are read 100 times per write, so copies go in front of the database. Recording each click is one write per read, so the click log is write-heavy and wants appending and batching instead.">
+<svg viewBox="0 0 560 280" role="img" aria-label="Left: the read-heavy redirect path with edge cache, app cache, replicas and one primary. Right: the write-heavy click log with a buffer, batches and an append-only store">
+  <text x="10" y="20" class="strong">REDIRECTS · 100 : 1 READ-HEAVY</text>
+  <text x="10" y="36">4,000/s avg · 12,000/s peak</text>
+  <rect x="10" y="50" width="250" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="72" class="strong">EDGE CACHE (CDN)</text>
+  <text x="250" y="72" text-anchor="end">nearest the user</text>
+  <rect x="10" y="98" width="250" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="22" y="120" class="strong">APP CACHE</text>
+  <text x="250" y="120" text-anchor="end">hot links in RAM</text>
+  <rect x="10" y="146" width="250" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="168" class="strong">READ REPLICAS</text>
+  <text x="250" y="168" text-anchor="end">only the misses</text>
+  <rect x="10" y="194" width="250" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="22" y="216" class="strong">PRIMARY DB</text>
+  <text x="250" y="216" text-anchor="end">40 writes/s</text>
+  <line x1="135" y1="84" x2="135" y2="98" class="ink" stroke-width="1" />
+  <line x1="135" y1="132" x2="135" y2="146" class="ink" stroke-width="1" />
+  <line x1="135" y1="180" x2="135" y2="194" class="ink dash" stroke-width="1" />
+  <text x="135" y="252" text-anchor="middle" class="blue-t">EACH LAYER STOPS MOST OF</text>
+  <text x="135" y="266" text-anchor="middle" class="blue-t">WHAT REACHES IT</text>
+  <text x="300" y="20" class="strong">CLICK LOG · WRITE-HEAVY</text>
+  <text x="300" y="36">one event per click · 4,000/s</text>
+  <rect x="300" y="50" width="250" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="312" y="72" class="strong">BUFFER / QUEUE</text>
+  <text x="540" y="72" text-anchor="end">absorb bursts</text>
+  <rect x="300" y="98" width="250" height="34" class="fill-paper" stroke-width="1.2" />
+  <text x="312" y="120" class="strong">BATCH</text>
+  <text x="540" y="120" text-anchor="end">1,000 rows per write</text>
+  <rect x="300" y="146" width="250" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="312" y="168" class="strong">APPEND-ONLY STORE</text>
+  <text x="540" y="168" text-anchor="end">LSM-tree, logs</text>
+  <line x1="425" y1="84" x2="425" y2="98" class="ink" stroke-width="1" />
+  <line x1="425" y1="132" x2="425" y2="146" class="ink" stroke-width="1" />
+  <text x="425" y="210" text-anchor="middle">≈ 35 GB/day · ≈ 13 TB/year</text>
+  <text x="425" y="252" text-anchor="middle" class="blue-t">NOTHING TO CACHE: EVERY</text>
+  <text x="425" y="266" text-anchor="middle" class="blue-t">EVENT IS NEW</text>
+</svg>
+</Figure>
+
+<Predict id="shortener-ratio">
+
+Now say each click is also recorded for analytics: one small event (link, time, country, referrer), about 100 bytes. After one year, which is bigger: the table of links, or the log of clicks?
+
+<Fragment slot="answer">
+
+The clicks, by about twenty times. A year of links is 1.2 × 10⁹ × 500 bytes ≈ 0.6 TB. Clicks arrive at 4,000 a second, so 4,000 × 100 bytes = 400 KB/s; × 86,400 seconds ≈ 35 GB a day, and × 365 ≈ 13 TB a year (with the exact 3,800 a second, 33 GB and 12 TB). The redirect path is read-heavy, but the click log hanging off it is pure writes, at a hundred times the rate of link creation. Same product, two opposite ratios, two designs: caches and replicas for redirects; a queue, batching and an append-only store for clicks. Saying that out loud is what turns "design a URL shortener" from boxes into an answer.
+
+</Fragment>
+
+</Predict>
+
 ### Saying it out loud: the interview script
 
 The arithmetic is half of it. The other half is narrating so the interviewer can follow, correct your assumptions, and see your judgement. Here's a script. Practise it until it's boring.
@@ -551,6 +627,12 @@ Then add three new estimates from your actual week, unrelated to this ranker, an
 
 </Task>
 
+<Task id="t6" title="Run the URL shortener estimate yourself" agent="hands">
+
+Paper again, no peeking at worked example 4. Pick your own assumptions for a link shortener (new links a month, reads per link, retention, bytes per row), and write the five steps in the journal: writes/s and reads/s, average and peak, rows and storage after 5 years, and the layer you'd add first. Then change one assumption: a pastebin, where most pastes are read about once, so roughly 1:1. Which of your answers changed, and which design choices flipped? Finally add the click log from the prediction and size it for a year.
+
+</Task>
+
 <DoneWhen>
 
 - Your journal has the three paper estimates and their measured counterparts, with ratios.
@@ -656,13 +738,22 @@ Turn users into a rate, because machines fail per second, not per user. A billio
 
 </details>
 
+6. **"Design a URL shortener." What do you ask first, and what numbers come out?**
+
+<details>
+<summary>Model answer</summary>
+
+First, the read:write ratio, because it decides which half of the system matters. Creating a link is a write and every click is a read, so I'd assume something like 100 reads per link. With 100 million new links a month: a month is about 2.5 × 10⁶ seconds, so 40 writes a second, and 4,000 reads a second, around 12,000 at a 3× peak. Over five years that's 6 × 10⁹ links; at about 500 bytes each including overhead and the index, 3 TB, 9 TB with three copies. Writes are trivial. The read path is the design: a CDN edge cache for hot redirects (knowing the clicks it answers never reach my servers), an in-memory cache in front of the database (the top 1% of links is about 30 GB), and read replicas for the misses. If they want click analytics, that part flips to write-heavy: one event per click, about 13 TB a year, so a queue, batching and an append-only store like an LSM-tree, not the same database the redirects read from.
+
+</details>
+
 ## Go Deeper
 
 - **Jon Bentley, *Programming Pearls*, 2nd edition (1999), Column 7: "The Back of the Envelope"**. The original essay for programmers. Short, funny, full of estimates (including the Rule of 72 and Little's law) and a plea to sanity-check everything.
 - **Jeff Dean, "Designs, Lessons and Advice from Building Large Distributed Systems"** (LADIS 2009 keynote). Where "Numbers Everyone Should Know" became famous, followed immediately by worked back-of-envelope designs. Watch how he uses them, not just the table.
 - **Simon Eskildsen, *Napkin Math*** ([github.com/sirupsen/napkin-math](https://github.com/sirupsen/napkin-math)). A modern, measured table of system numbers (memory, SSD, network, cloud costs) with the benchmark code to reproduce them, plus a newsletter of worked problems. The best place to refresh your cheat-sheet.
 - **Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 1**. "Describing load" and "Describing performance": how to pick the load parameters that matter (the Twitter fan-out example) and why percentiles beat averages.
-- **Alex Xu, *System Design Interview: An Insider's Guide*, chapter 2, "Back-of-the-envelope estimation"**. Interview-shaped: the powers-of-two table, availability numbers, and a worked QPS and storage estimate. Then read the rest of the book's designs for practice problems.
+- **Alex Xu, *System Design Interview: An Insider's Guide*, chapter 2, "Back-of-the-envelope estimation"**. Interview-shaped: the powers-of-two table, availability numbers, and a worked QPS and storage estimate. Then read the rest of the book's designs for practice problems; chapter 8, "Design a URL shortener", is worked example 4 as a whole interview.
 - **Jared Kaplan et al., "Scaling Laws for Neural Language Models"** (OpenAI, 2020). Where the "2N FLOPs per token forward, 6N for training" accounting is laid out. Section 2.1 is the part you need.
 - **Jacob Austin et al., *How to Scale Your Model*** (Google DeepMind, 2025, [jax-ml.github.io/scaling-book](https://jax-ml.github.io/scaling-book/)). Back-of-envelope for ML hardware, taken all the way: rooflines, memory, communication, and how to estimate training and inference cost on real accelerators.
 - **Carol Chen, "Transformer Inference Arithmetic"** (kipp.ly, 2022). A compact walk through KV cache sizes, FLOPs and memory-bound versus compute-bound for transformer inference, exactly the arithmetic of worked example 3.
@@ -671,4 +762,4 @@ Turn users into a rate, because machines fail per second, not per user. A billio
 
 This lesson is arithmetic over things you've already learned. [How slow is slow?](/lessons/latency-numbers/) is where the capacity table came from. [Waiting vs working](/lessons/waiting-vs-working/) gave you Little's law, which turned up three times here: in-flight queries, concurrent chats, and crawler concurrency. [Why ~17 tokens per second?](/lessons/bandwidth-bound/) is the compute-versus-bandwidth split that decides which bar to watch.
 
-Next, [p99 and load testing](/lessons/tail-latency/) takes the knee in your load test seriously: why latency explodes near 100% utilization and how to measure it without lying. [Load balancers and state](/lessons/load-balancing/) is what you need once "8 H100s" becomes 8 servers. [Nearest neighbors at scale](/lessons/vector-search/) answers worked example 2's search problem, [How much memory does a model need?](/lessons/memory-math/) does example 3's memory math in more depth, and [batching](/lessons/batching/) is the main lever for both the ranker's small-model problem and the KV-bound chat server.
+Next, [p99 and load testing](/lessons/tail-latency/) takes the knee in your load test seriously: why latency explodes near 100% utilization and how to measure it without lying. [Load balancers and state](/lessons/load-balancing/) is what you need once "8 H100s" becomes 8 servers. [Nearest neighbors at scale](/lessons/vector-search/) answers worked example 2's search problem, [How much memory does a model need?](/lessons/memory-math/) does example 3's memory math in more depth, and [batching](/lessons/batching/) is the main lever for both the ranker's small-model problem and the KV-bound chat server. Worked example 4 gets built for real in [Build a URL shortener](/lessons/url-shortener/), with its codes from [Short IDs and collisions](/lessons/short-ids/), its read path from [Caching and Redis](/lessons/caching/), and its write-heavy click log heading for the LSM-tree in [Indexes and B-trees](/lessons/indexes/).

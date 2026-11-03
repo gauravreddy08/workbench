@@ -20,6 +20,7 @@ It reuses two ideas from earlier lessons, how machines are addressed in [Packets
 - Use a short settings file and a few tunnelling flags (`~/.ssh/config`, `-L`, `-R`, `-D`, `ProxyJump`) so that opening a Jupyter notebook running on the Spark in your laptop's browser is one short command.
 - Explain why your laptop can't reach your home server from a cafe without help (the router shares one public address among every device in the house and turns away strangers), and why poking a hole in the router for it is the risky fix.
 - Explain what Tailscale really does: encrypted tunnels straight between your devices (WireGuard), a central server that only swaps public keys and never sees your traffic, a trick for slipping through two routers at once, and relay servers for when that trick fails. Then prove it with Tailscale's own diagnostics and by watching the packets go by.
+- Put something running on your laptop on the public internet for ten minutes, with no open port and no public address, explain why Cloudflare Tunnel, ngrok, Tailscale Funnel and `ssh -R` all work the same way underneath, and say what you must add before strangers can use it.
 
 [Packets and IP](/lessons/packets-and-ip/) and [How does HTTPS keep secrets?](/lessons/tls/) aren't strictly required first; they just make a few sections click faster. [TCP vs UDP](/lessons/tcp-vs-udp/) also helps: it explains why WireGuard sends its packets the quick, no-guarantees way. Budget one evening on the home server, plus half an hour with the Spark.
 
@@ -453,6 +454,86 @@ It costs a little CPU, nothing you'll notice at keyboard speeds or even at hundr
 - **Tailscale SSH.** `sudo tailscale set --ssh` on the server makes `tailscaled` itself answer port 22 on the Tailscale address and log you in based on your tailnet identity and an `ssh` rule in the policy file. No `authorized_keys` to manage. The trade: your login now depends on your Tailscale (and Google/GitHub) account security, instead of a key file on your laptop. Your normal sshd keeps working on the LAN. Check the docs for exact flags; this area changes.
 - **Key expiry.** Device keys expire after 180 days by default, and the device drops off the tailnet until you log in again. For a headless server that's a nasty surprise; disable key expiry for it in the admin console.
 
+### Public doors without opening a port
+
+Everything so far keeps strangers out. Sometimes you want the opposite: a webhook from GitHub has to reach a server on your laptop, or you want to show a friend your URL shortener before it's deployed anywhere. The laptop is still behind NAT, maybe CGNAT, with no public address, and port forwarding is the risky fix you already ruled out (and impossible behind CGNAT).
+
+The trick is the one DERP uses. NAT only stops connections that start outside, so start the connection from inside. A small program on your laptop dials out to a provider's servers at the <Term w="edge">The provider's machines that face the public internet, spread around the world close to users. "At the edge" means at the provider's front door, before anything reaches you.</Term> and keeps that connection open. The provider gives you a public hostname. When a visitor asks for it, the edge accepts the visitor's connection and sends the request back down the connection your laptop already opened. The program on your laptop hands it to `localhost:8000`, and the reply goes back up the same way. Your router only ever sees an outgoing connection, which it was always happy to allow.
+
+<Figure n="007" title="A DOOR THAT OPENS OUTWARD" caption="The laptop dials out first and keeps the line open. Visitors talk to the provider's public hostname, and their requests ride back down the line that's already there. Nothing on the router was opened.">
+<svg viewBox="0 0 640 270" role="img" aria-label="A tunnel program on a laptop behind NAT holds an outgoing connection to a provider's edge; a visitor's request reaches the edge and is sent back down that connection to localhost">
+  <rect x="10" y="40" width="250" height="190" class="ink dash" stroke-width="1" />
+  <text x="20" y="32" class="strong">BEHIND NAT · NO PUBLIC ADDRESS</text>
+  <rect x="20" y="70" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="80" y="88" text-anchor="middle" class="strong">YOUR APP</text>
+  <text x="80" y="104" text-anchor="middle">localhost:8000</text>
+  <rect x="20" y="160" width="120" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="80" y="178" text-anchor="middle" class="strong">cloudflared</text>
+  <text x="80" y="194" text-anchor="middle">or ngrok, ssh -R</text>
+  <line x1="80" y1="114" x2="80" y2="160" class="ink" stroke-width="1" />
+  <rect x="160" y="138" width="95" height="88" class="fill-paper" stroke-width="1.2" />
+  <text x="207" y="156" text-anchor="middle" class="strong">ROUTER</text>
+  <text x="207" y="220" text-anchor="middle">no port open</text>
+  <rect x="370" y="150" width="120" height="64" class="fill-wash" stroke-width="1.2" />
+  <text x="430" y="174" text-anchor="middle" class="strong">PROVIDER EDGE</text>
+  <text x="430" y="192" text-anchor="middle">public hostname</text>
+  <text x="430" y="206" text-anchor="middle">+ TLS cert</text>
+  <rect x="510" y="60" width="120" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="570" y="78" text-anchor="middle" class="strong">VISITOR</text>
+  <text x="570" y="94" text-anchor="middle">anywhere</text>
+  <line x1="140" y1="172" x2="364" y2="172" class="blue" stroke-width="1.5" marker-end="url(#pt7a)" />
+  <text x="312" y="166" text-anchor="middle" class="blue-t">1 · DIAL OUT</text>
+  <line x1="570" y1="104" x2="470" y2="146" class="ink" stroke-width="1.2" marker-end="url(#pt7b)" />
+  <text x="500" y="116" text-anchor="end">2 · GET https://…</text>
+  <line x1="364" y1="196" x2="146" y2="196" class="ink dash" stroke-width="1.2" marker-end="url(#pt7b)" />
+  <text x="300" y="250" text-anchor="middle">3 · REQUEST RIDES BACK DOWN THE SAME CONNECTION</text>
+  <line x1="300" y1="200" x2="300" y2="238" class="ink" stroke-width="0.8" />
+  <defs>
+    <marker id="pt7a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+    <marker id="pt7b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+You've already met one of these. It's `ssh -R` from the forwarding section, with someone else running the public end. `ssh -R 8080:localhost:8000 vps` makes a server you rent listen on its port 8080 and carry those connections back down your SSH connection (for anyone other than the VPS itself to reach that port, its sshd needs `GatewayPorts` turned on, because remote forwards listen on loopback by default). The tunnel services are that idea, packaged: they run the public servers, hand out the hostnames, and put TLS certificates on them for you.
+
+**Cloudflare Tunnel.** The small program is `cloudflared`, and without any account you can get a <Term w="quick tunnel">Cloudflare's account-free, throwaway tunnel: a random hostname under trycloudflare.com that lives only as long as the cloudflared process. Meant for testing, with no uptime guarantee.</Term>:
+
+```bash
+python3 -m http.server 8000 --bind 127.0.0.1 &
+cloudflared tunnel --url http://localhost:8000
+# INF |  Your quick Tunnel has been created! Visit it at ...
+# INF |  https://<four-random-words>.trycloudflare.com
+```
+
+When I ran this on my Mac, with no account and no config file, the log showed cloudflared connecting out to Cloudflare over QUIC on port 7844, and the URL answered from the internet within seconds. The response came back with `server: cloudflare`, and my local server logged the visitor as `127.0.0.1`, because from its side the visitor *is* cloudflared, on the same machine. (The real address travels in a header Cloudflare adds; at the time of writing it's `CF-Connecting-IP`.) Ctrl-C, and the URL is dead. For a stable name on your own domain you make a named tunnel instead, which needs a Cloudflare account, a domain whose DNS Cloudflare runs, and a DNS record pointing the hostname at the tunnel. The commands for that flow have changed over time; follow the current docs.
+
+**ngrok.** The same shape, older and aimed at developers: `ngrok http 8000`. It wants a free account and an auth token before it starts. It also runs a page on `localhost:4040` that lists every request that came through and lets you replay one, which is very handy when you're debugging a webhook.
+
+**Tailscale Funnel.** Tailscale's version, publishing a local port at your machine's `ts.net` name (`tailscale funnel 8000`; the syntax has moved between versions, so check `--help`). Two differences. It only offers ports 443, 8443 and 10000. And TLS ends on *your* machine, so Tailscale's relays carry bytes they can't read. Cloudflare and ngrok end TLS at their edge, so they see your traffic in plain text; that's also what lets them cache, filter and check logins in front of you.
+
+| | Who runs the public end | Account needed | Public name | Who can read the traffic |
+| --- | --- | --- | --- | --- |
+| `ssh -R` to a VPS | you | a rented server with a public IP | the server's address or your domain | you |
+| Tailscale Funnel | Tailscale | Tailscale, with Funnel allowed in the policy | `<machine>.<tailnet>.ts.net` | only your machine |
+| Cloudflare quick tunnel | Cloudflare | none | random `*.trycloudflare.com`, gone when you stop | Cloudflare and you |
+| Cloudflare named tunnel | Cloudflare | Cloudflare, plus a domain on its DNS | your own domain | Cloudflare and you |
+| ngrok | ngrok | free account + auth token | a hostname under ngrok's domain | ngrok and you |
+
+<Predict id="public-tunnel-port">
+
+The quick tunnel is running and strangers can load your page. Run `lsof -nP -iTCP -sTCP:LISTEN` on the laptop. Which new port is open to the internet?
+
+<Fragment slot="answer">
+
+None. On my Mac the only thing cloudflared listened on was `127.0.0.1:20241`, its own local metrics page, reachable only from the laptop itself. Everything else it holds is *outgoing*: a QUIC (UDP) connection to Cloudflare on port 7844, which `lsof -nP -a -c cloudflared -i` shows. There's no door for a scanner to find, which is the point. The door is on Cloudflare's side, and the only way through it is the hostname.
+
+</Fragment>
+
+</Predict>
+
+**Public means public.** The moment the URL exists, anyone who has it, guesses it, or finds it in a log can reach whatever is on that port, with no Tailscale identity and no ufw in the way. First, check what you're about to publish: `lsof -nP -iTCP:8000 -sTCP:LISTEN` tells you which program really owns that port, and it isn't always the one you think (another project's dev server, a notebook with no password, a tool you forgot was running). Then think about what the app lets a stranger *do*. A URL shortener on a public URL is a free redirect service for anyone, and phishers love fresh, clean-looking short links, because the link a spam filter sees isn't where it sends you. So before it goes public: require a login or a shared secret to create links, put a rate limit on creation ([Rate limits](/lessons/rate-limits/)), and stop the tunnel when you're done.
+
 ## Build It
 
 You'll do this on the home server (Ubuntu or Debian assumed; adjust package commands otherwise), your Mac, and the Spark. **Before touching sshd or the firewall, open a second SSH session to the server and leave it open.** An existing session survives a bad config; a new one might not. If you can, also have a keyboard and screen on the server, or at least be on the home LAN.
@@ -647,6 +728,22 @@ Optional: `tailscale serve` can put a real HTTPS address (`https://homeserver.<t
 
 </Task>
 
+<Task id="t8" title="Open a public door for ten minutes" agent="hands">
+
+On the Mac, serve something harmless on loopback only, and check that the port you're about to publish is really yours:
+
+```bash
+mkdir -p /tmp/pub && echo 'hello from behind NAT' > /tmp/pub/index.html
+python3 -m http.server 8000 --bind 127.0.0.1 --directory /tmp/pub
+lsof -nP -iTCP:8000 -sTCP:LISTEN        # in another terminal: is it python, and only python?
+```
+
+Then `brew install cloudflared` and run `cloudflared tunnel --url http://localhost:8000`. Open the trycloudflare.com URL on your phone with Wi-Fi *and* Tailscale off, so the request really comes from the internet. While it works, answer from your own terminal: what address does the server log for your phone? Which new port shows up in `lsof -nP -iTCP -sTCP:LISTEN`? What does `curl -sI` against the public URL say in its `server` header? Then Ctrl-C cloudflared, reload on the phone, and stop the server.
+
+If you have time, do the same with `tailscale funnel` and compare who ends TLS: the certificate the phone sees should belong to your `ts.net` name in one case and to Cloudflare's hostname in the other.
+
+</Task>
+
 <DoneWhen>
 
 - `ssh home` and `ssh spark` work with no flags, and `ssh -o PubkeyAuthentication=no home` is refused.
@@ -655,6 +752,7 @@ Optional: `tailscale serve` can put a real HTTPS address (`https://homeserver.<t
 - Jupyter on the Spark opens at `localhost:8888` on your Mac, and you can explain why the direct 100.x URL fails.
 - You've seen the same SSH session as TCP on `tailscale0` and as UDP on the physical interface, and filled in the Measure table.
 - Your phone opens the Workbench site over the tailnet, and doesn't without Tailscale.
+- A quick tunnel served a page to your phone over cellular with no new listening port on the Mac, and the URL died when you stopped it.
 
 </DoneWhen>
 
@@ -731,6 +829,13 @@ Tailscale is a mesh: every device can talk to every other directly, so the contr
 
 </details>
 
+<details>
+<summary>6. How do Cloudflare Tunnel or ngrok put a server on your laptop on the internet without a public IP or an open port? What would you add before exposing a URL shortener that way?</summary>
+
+A program on the laptop makes an outgoing connection to the provider's edge and keeps it open. NAT allows outgoing connections, so nothing on the router changes. The provider gives you a public hostname; when someone requests it, the edge takes their connection and sends the request back down the already-open connection to the program, which passes it to localhost and sends the reply back the same way. It's the same idea as `ssh -R` to a server you rent, except the provider runs the public end, the hostnames and the certificates. Cloudflare's quick tunnels need no account and give a random trycloudflare.com name that dies with the process; a named tunnel on your own domain needs an account and DNS on Cloudflare. Tailscale Funnel does the same through Tailscale, with TLS ending on your machine instead of at the provider. The catch is that public really means public: anyone with the link can use it. For a shortener that means it can be abused to disguise phishing links, so require auth to create links, rate-limit creation, check that the port is the app you think it is, and shut the tunnel when you're done.
+
+</details>
+
 ## Go Deeper
 
 - **Tailscale, "How Tailscale works"** by Avery Pennarun ([tailscale.com/blog/how-tailscale-works](https://tailscale.com/blog/how-tailscale-works)). The whole architecture, control plane vs data plane, in one long, friendly post.
@@ -740,10 +845,11 @@ Tailscale is a mesh: every device can talk to every other directly, so the contr
 - **OpenSSH manual pages: `ssh(1)`, `ssh_config(5)`, `sshd_config(5)`** (also at [man.openbsd.org](https://man.openbsd.org/ssh_config)). The authoritative list of every option, including the "first obtained value" rule.
 - **Michael W. Lucas, _SSH Mastery_** (2nd ed., 2018). A short book covering keys, agents, forwarding, jump hosts and certificates with practical sysadmin taste.
 - **Qualys Security Advisory, "regreSSHion: RCE in OpenSSH's server" (CVE-2024-6387)**, July 2024. A real, readable account of how a pre-login sshd bug works, and why exposure matters more than config.
+- **Cloudflare docs, "Cloudflare Tunnel"** (developers.cloudflare.com, under Cloudflare One). How `cloudflared` connects out to the edge, named tunnels versus quick tunnels, and the limits on quick ones. The architecture page is the same picture as Figure 007, with Cloudflare's names on it.
 - **Tailscale docs: "Tailscale SSH", "Tailscale Serve", "Tailscale Funnel", and "Using UFW to lock down an Ubuntu server"** on tailscale.com/kb. Check these for current command syntax.
 
 ## Connections
 
 This lesson leans on [How slow is slow?](/lessons/latency-numbers/) (a handshake is a stack of round trips) and pairs with [TLS](/lessons/tls/), which uses the same Diffie-Hellman-plus-signature idea with certificates instead of known_hosts. [Packets and IP](/lessons/packets-and-ip/) goes deeper on addresses, routing and NAT, and [TCP vs UDP](/lessons/tcp-vs-udp/) explains why a tunnel protocol like WireGuard wants UDP underneath (tunnelling TCP inside TCP makes two layers of retries fight each other).
 
-It also sets up everything you'll do on the Spark from here on: the `-L` forward is how you'll reach the inference server in [Serving engines](/lessons/serving-engines/) and the dashboards in [Observability](/lessons/observability/) without opening anything to the network.
+It also sets up everything you'll do on the Spark from here on: the `-L` forward is how you'll reach the inference server in [Serving engines](/lessons/serving-engines/) and the dashboards in [Observability](/lessons/observability/) without opening anything to the network. And when something does need to be public for a while, like a demo of [Build a URL shortener](/lessons/url-shortener/), the tunnels at the end of The Idea are how, with [Rate limits](/lessons/rate-limits/) in front before strangers find it.

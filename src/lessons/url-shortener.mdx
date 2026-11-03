@@ -1,0 +1,882 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import UrlShortenerRedirects from '../components/figures/UrlShortenerRedirects.astro';
+
+A URL shortener turns a long, ugly web address into a short one, like `sho.rt/aZ3kQ9p`, and when anyone opens the short one, it sends them on to the long one. That's the whole product: remember a pair, and hand out one half when someone shows you the other.
+
+It's the most common "design and build" interview question there is, because it's small enough to build in forty minutes and deep enough to talk about for an hour. These days the forty minutes often come with a coding agent beside you, and then the interview stops being about whether you can type the code. It's about whether you thought before you prompted, whether you understand every line the agent wrote, and what you say when the interviewer asks "now how would this handle a billion clicks a day?"
+
+This is a capstone. Nearly every lesson in the Scale track shows up in it once: [HTTP from scratch](/lessons/http-from-scratch/) for the redirect itself, [Short IDs](/lessons/short-ids/) for making the codes, [Indexes](/lessons/indexes/) for finding them fast, [Caching](/lessons/caching/), [Load balancing](/lessons/load-balancing/), [Queues](/lessons/queues/) and [Rate limits](/lessons/rate-limits/) for scaling it, [Back-of-envelope estimates](/lessons/back-of-envelope/) for knowing how much to scale it, and the tunnel from [SSH and Tailscale](/lessons/ssh-and-tailscale/) for putting it on the internet. This page doesn't re-teach those. It strings them together and links out whenever you want the depth.
+
+## Today
+
+- Turn "build a URL shortener" into a one-page spec before touching the keyboard, and hand that spec to a coding agent as the prompt.
+- Explain exactly what happens when someone clicks a short link: which program answers, what it sends back, and who makes the second request.
+- Choose between a "moved for good" and a "moved for now" redirect on purpose, knowing which one quietly stops clicks from reaching you.
+- Put a server on your laptop on a public web address for ten minutes, and say what changes the moment strangers can reach it.
+- Answer "how would you productionize this?" in layers, starting from a rough count of clicks per second, and say where a queue belongs (and where it does not).
+
+You'll want most of the Scale track behind you, but you can read this first and follow the links as you go. Plan on one evening to read and build v1, and a second for the scaling experiments. Python, FastAPI, SQLite, Redis.
+
+## The Problem
+
+A candidate sits down for an AI-assisted interview. The prompt is three lines: "Build a simple URL shortener using Claude Code. Then explain your solution. Then tell us how you'd productionize it."
+
+They open the terminal and type: `build a URL shortener`. The agent produces a tidy FastAPI app in about a minute. The candidate runs it, pastes a link into the form, clicks the short link, lands on the right page. "It works."
+
+Then the interviewer starts asking, and each answer gets a little thinner.
+
+"What status code does your redirect return?" The candidate scrolls. The agent used FastAPI's `RedirectResponse(url)`, whose default is 307. They hadn't decided anything; the library had. "Why that one and not 301?" A guess about rewrites.
+
+"What happens if two people shorten the same URL at the same moment?" Nobody knows. There's no test for it. (In the Build you'll find that the obvious version of this code crashes with a 500 when you try it with twenty threads.)
+
+"Can I try it from my phone?" It's on `localhost`. "And if it were public, what's the first thing that would go wrong?"
+
+"Walk me through it." The candidate says "it maps a URL to a URL", which is close but blurs the one thing that matters: the table maps a **short code** to a **long URL**, and the whole system is two operations on that table.
+
+"How would you scale it?" The answer goes straight to boxes: Kafka in front "to balance the load", a bigger database, maybe microservices. No numbers, so no way to know which box matters. And the Kafka box is in a place where it can't work, for reasons this lesson will make obvious.
+
+None of this was about typing speed. The agent typed fine. What was missing was the thinking that should have happened *before* the prompt and *after* the code: decide the behaviour, read what got written, run it, break it, and be able to say why each line is there. That's the skill being interviewed now, and it's what you'll practise here.
+
+<Origin year="2002" title="Links that broke in half">
+
+In January 2002, Kevin Gilbertson was running a website for unicyclists and kept running into the same annoyance: long web addresses pasted into emails and newsgroup posts got wrapped across lines by mail programs, and the broken halves didn't work when clicked. He wrote a small site that would store a long address and hand back a short one that redirected to it. He called it TinyURL.
+
+The idea sat quietly for years, then exploded when Twitter limited posts to 140 characters and every character in a link was a character not spent on words. Bitly (2008) added the thing that turned shortening into a business: it counted every click, and told you who clicked, when and from where. Around 2010-2011 Twitter began wrapping every link in its own `t.co` shortener, partly for the same counts and partly so it could check each destination against lists of known malware and phishing sites before sending anyone there.
+
+Those two later additions, counting clicks and policing destinations, are what make the "simple" interview question deep. Counting forces you to choose your redirect carefully and to keep a write off the critical path. Policing exists because a short link hides where it goes, which makes it a favourite tool for scams the moment the service is public.
+
+</Origin>
+
+## The Idea
+
+### The whole system in one breath
+
+Strip away everything and there is one table and two operations.
+
+The table pairs a <Term w="short code">The few characters after the slash in a short link, like aZ3kQ9p. It's the key the server looks up. Seven characters from a 62-letter alphabet give about 3.5 trillion possibilities.</Term> with a long URL. **Shortening** is a write: someone sends a long URL, the server makes up a new code, stores the pair, and hands back the short link. **Following** is a read: someone's browser asks for `/aZ3kQ9p`, the server looks up the code, and answers with a <Term w="redirect">A response that says "what you want is at a different address". The server sends a 3xx status and a Location header; the browser then makes a brand-new request to that address on its own.</Term>: a tiny response whose only real content is a `Location` header holding the long URL. The browser reads that header and goes there itself, in a second request your server never sees.
+
+<Figure n="001" title="TWO OPERATIONS, ONE TABLE" caption="Shortening is a rare write: make up a code, store the pair. Following is the common read: look up the code, answer 302 with a Location header. The browser makes the second request to the target itself; your server is out of the picture by then.">
+<svg viewBox="0 0 640 300" role="img" aria-label="A client posts a long URL and gets a short code; a browser gets a 302 with Location and then fetches the target site directly">
+  <defs>
+    <marker id="us1-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="10" y="20" class="strong">SHORTEN (RARE)</text>
+  <rect x="10" y="34" width="110" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="60" text-anchor="middle" class="strong">CREATOR</text>
+  <line x1="120" y1="48" x2="246" y2="48" class="blue" stroke-width="1.2" marker-end="url(#us1-a)" />
+  <text x="183" y="42" text-anchor="middle" class="blue-t">POST /shorten</text>
+  <line x1="250" y1="66" x2="124" y2="66" class="ink" stroke-width="1.2" />
+  <text x="183" y="84" text-anchor="middle">201 · code aZ3kQ9p</text>
+  <rect x="250" y="34" width="140" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="320" y="54" text-anchor="middle" class="strong">SHORTENER</text>
+  <text x="320" y="70" text-anchor="middle">app + table</text>
+  <rect x="440" y="24" width="190" height="70" class="fill-paper" stroke-width="1.2" />
+  <text x="452" y="42" class="strong">LINKS</text>
+  <line x1="440" y1="50" x2="630" y2="50" class="ink" stroke-width="1" />
+  <text x="452" y="66">code → long url</text>
+  <text x="452" y="84" class="blue-t">aZ3kQ9p → https://…/long</text>
+  <line x1="390" y1="56" x2="438" y2="56" class="ink" stroke-width="1" />
+  <line x1="10" y1="118" x2="630" y2="118" class="ink dash" stroke-width="1" />
+  <text x="10" y="142" class="strong">FOLLOW (EVERY CLICK)</text>
+  <rect x="10" y="160" width="110" height="120" class="fill-paper" stroke-width="1.2" />
+  <text x="65" y="225" text-anchor="middle" class="strong">BROWSER</text>
+  <rect x="250" y="160" width="140" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="320" y="186" text-anchor="middle" class="strong">SHORTENER</text>
+  <rect x="440" y="236" width="190" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="535" y="262" text-anchor="middle" class="strong">TARGET SITE</text>
+  <line x1="120" y1="172" x2="246" y2="172" class="blue" stroke-width="1.2" marker-end="url(#us1-a)" />
+  <text x="183" y="166" text-anchor="middle" class="blue-t">1 GET /aZ3kQ9p</text>
+  <line x1="250" y1="194" x2="124" y2="194" class="ink" stroke-width="1.2" />
+  <text x="183" y="214" text-anchor="middle">2 · 302 Found</text>
+  <text x="183" y="228" text-anchor="middle">Location: https://…/long</text>
+  <line x1="120" y1="258" x2="436" y2="258" class="blue" stroke-width="1.2" marker-end="url(#us1-a)" />
+  <text x="278" y="252" text-anchor="middle" class="blue-t">3 GET /long (server not involved)</text>
+</svg>
+</Figure>
+
+Hold that picture, because every later question is about one of its arrows. "How do you make codes?" is arrow one. "301 or 302?" is arrow two. "How do you count clicks?" is about what the server does between receiving arrow one and sending arrow two. "How does it scale?" is mostly about arrow one in the bottom half, because that's the one that happens on every click.
+
+### Write the spec before the prompt
+
+The fastest way to look junior in an agent-assisted interview is to type the problem statement into the agent. The agent will happily make every design decision for you, silently, and you'll learn what they were when the interviewer asks.
+
+The fix costs five minutes. Before prompting, write the decisions down. Each line is a question you'd want to ask the interviewer anyway, and asking them out loud *is* the design discussion they're hoping to see. The spec is just your answers, written in a form an agent can follow.
+
+The questions:
+
+- **What are the endpoints, exactly?** Inputs, outputs, status codes.
+- **What counts as a valid URL?** Only `http` and `https`? Max length? What about a link to our own short links (a loop)?
+- **Same URL twice: same code or a new one?** Either is defensible. Same code saves space and is idempotent; a new code per request lets two people track their own clicks separately. Pick one and say why.
+- **How are codes made?** Length, alphabet, random or counter, what happens on a collision. ([Short IDs](/lessons/short-ids/) is the deep version.)
+- **Which redirect status?** Decided below.
+- **Where does data live?** SQLite is right for an interview: one file, real SQL, a real `UNIQUE` constraint.
+- **Local only, or public?** Changes what "done" means. Ask.
+- **How will we know it works?** Name the tests up front.
+
+Here's what the resulting prompt looks like. It's long for a prompt and short for a spec, and it took about five minutes to write:
+
+```text
+Build a URL shortener in one file, app.py, with FastAPI and SQLite (stdlib sqlite3,
+no ORM). Plus test_app.py with pytest and FastAPI's TestClient.
+
+Endpoints
+- POST /shorten  JSON {"url": "..."} -> 201 {"code", "short_url", "url"}
+- GET /{code}    -> 302 with Location: <long url>. Unknown code -> 404.
+                    Also answer HEAD the same way (curl -I and link previews use it).
+- GET /          -> a minimal HTML page with one input and a button that calls
+                    POST /shorten with fetch and shows the short link.
+
+Rules
+- Accept only absolute http/https URLs with a host, at most 2048 chars, trimmed.
+  Reject links that point at our own BASE_URL. Bad input -> 400 with a message.
+- Codes: 7 characters from base62 (0-9A-Za-z), generated with the secrets module.
+  On a code collision, retry with a new code (up to 5 times).
+- Same long URL twice returns the existing code. This must be correct under
+  concurrent requests: rely on a UNIQUE constraint, not check-then-insert.
+- Table links(id INTEGER PRIMARY KEY, code TEXT UNIQUE NOT NULL,
+  url TEXT UNIQUE NOT NULL, created_at TEXT). One sqlite3 connection per request.
+- BASE_URL and DB_PATH come from environment variables.
+
+Tests
+- shorten then follow: 302 and the exact Location
+- unknown code -> 404
+- rejects: javascript:, ftp:, no scheme, empty, too long, our own BASE_URL
+- same URL twice -> same code; 20 concurrent requests for one URL -> all 201, one code
+- a forced code collision is retried (monkeypatch the code generator)
+
+Don't add auth, users, analytics or a cache yet. Keep it under ~120 lines plus tests.
+Explain any decision you had to make that this spec doesn't cover.
+```
+
+Notice what it does. It fixes the redirect status (the library default is 307), names the concurrency trap so the agent can't miss it, rules out scope creep, and asks the agent to surface its own guesses. That last line is the cheapest insurance in agent-assisted work: the agent made decisions you didn't specify, and now it tells you which.
+
+### 301 or 302
+
+The status code on arrow two is the one decision that changes how the product behaves, and [HTTP from scratch](/lessons/http-from-scratch/) has the full story of the four redirect codes. The short version:
+
+- `301 Moved Permanently` and `308 Permanent Redirect` mean "this has moved for good". They're <Term w="heuristically cacheable">Allowed to be stored and reused by a cache even when the response says nothing about caching; the cache picks a lifetime itself. In the HTTP spec, 301 and 308 are, 302 and 307 aren't.</Term>: a browser may remember the answer, for as long as it likes, and on the next click go straight to the target without asking you.
+- `302 Found` and `307 Temporary Redirect` mean "go there for now, ask me next time". A browser only stores them if you explicitly say it may.
+- 307 and 308 also promise to keep the request method (a POST stays a POST). For a click, which is always a GET, that difference doesn't matter.
+
+A redirect is also not a <Term w="rewrite">A server quietly handling a request as if it had asked for a different path, and answering it directly. The client sends one request, gets one answer, and never learns anything changed.</Term>. A rewrite happens inside one server; a redirect tells the browser to go somewhere else and make a fresh request. A shortener has to redirect, because the target is someone else's site and only the browser can go there.
+
+So why does the choice matter? Because a shortener wants two things that a cached redirect takes away: **counting clicks**, and **being able to change where a link goes** (someone pasted the wrong URL, or a campaign page moved). Once a browser has a 301 stored, that visitor's clicks never reach you again. You can't count them, and if you edit the link, that visitor keeps going to the old place. You can't reach into their browser to clear it.
+
+There are two honest ways out, and you'll see both in the wild:
+
+1. **Send a 302 (or 307).** Every click comes back to you. Simple, and what your spec says.
+2. **Send a 301, but limit how long it may be kept** with a header like `Cache-Control: private, max-age=90`. That says "permanent in meaning, but nobody keep this answer longer than 90 seconds, and no shared cache keep it at all". The big public shorteners do a version of this: when checked in November 2026 (details in [HTTP from scratch](/lessons/http-from-scratch/)), bit.ly, TinyURL and t.co all answered 301, each with a `Cache-Control` that kept caching short or off.
+
+What you must not do is send a bare 301 with no caching instructions and then promise click counts. Try it:
+
+<Figure n="002" title="WHO ANSWERS THE CLICK?" caption="Click the link several times under each setting and watch 'server counted'. Then edit the destination and click again. A bare 301 is a model of the worst case: the browser keeps it with no expiry, and switching the server back to 302 doesn't help that browser. The edge cache stands for a CDN you've told to keep redirects 60 s: fewer requests reach you, and edits take up to a minute to show." wide>
+
+<UrlShortenerRedirects />
+
+</Figure>
+
+<Predict id="switch-back">
+You shipped bare 301s for a week, then noticed click counts were low and switched to 302. A visitor clicked the link on Monday. They click it again today. Does your server see it?
+<Fragment slot="answer">
+
+Probably not. Their browser stored Monday's 301 and has no reason to ask again; your switch only changes what *new* answers say, and this browser isn't asking. How long it holds on is the browser's call (the spec lets it choose a lifetime for an unlabelled 301), and in practice it can be a long time. Clearing the browser cache fixes it for one person. Nothing you do on the server fixes it for everyone. That's why the decision is worth making on purpose before launch, and why limiting it with `Cache-Control` is the safer way to use a 301.
+
+</Fragment>
+</Predict>
+
+### Local or public?
+
+Ask early: "Should this be reachable by other people, or is local fine?" For most interviews local is fine, and saying so explicitly is a point in your favour. If they want a link they can open on their phone, you don't deploy anything. You use a <Term w="tunnel">A program on your machine that dials out to a provider's servers and keeps that connection open. The provider gives you a public address, and requests to it travel back down your connection to a port on localhost. Nothing on your router is opened.</Term>:
+
+```bash
+cloudflared tunnel --url http://localhost:8000
+```
+
+That's a Cloudflare <Term w="quick tunnel">Cloudflare's no-account tunnel: run one command, get a random https://….trycloudflare.com address that forwards to your local port until you stop the program. Meant for testing and demos, with usage limits listed in Cloudflare's docs.</Term>. It prints a random `https://<words>.trycloudflare.com` address, and that address works from anywhere until you press Ctrl-C. `ngrok http 8000` does the same thing. Why this works with no open port, and how it relates to `ssh -R` and Tailscale Funnel, is in [SSH and Tailscale](/lessons/ssh-and-tailscale/). The one shortener-specific gotcha: your app builds short links from `BASE_URL`, so restart it with `BASE_URL` set to the tunnel's address, or it will hand out `localhost` links that work for nobody else.
+
+The moment it's public, the interesting question changes from "does it work" to "who's using it". A shortener is an anonymous, free way to hide where a link goes, and that is exactly what phishing and spam campaigns want. Within hours of a public, unauthenticated shortener existing, scripts can find it and start filling it with links to fake login pages. Say this before the interviewer does. The first defences are cheap, and they're in the scaling section below.
+
+### Explaining it back in ninety seconds
+
+"Explain your solution" is not "read the code aloud". It's a short story with a shape: what it does, the two paths, the one interesting decision in each, and what you'd change. Here's a version you could say without looking:
+
+> "It's one FastAPI app and one SQLite table that maps a short code to a long URL. There are two paths. Shortening is a POST: I validate that it's an http or https URL, generate a seven-character random code from a 62-letter alphabet using `secrets`, and insert it. The table has a unique constraint on the code, so a collision just fails and I retry, and a unique constraint on the URL, so the same URL always gets the same code even when two requests race. Following is a GET when someone clicks the link: I look the code up through the index on the code column, and return a 302 with the long URL in the Location header. The browser then goes there itself. I chose 302 over a plain 301 so every click comes back through us, which we'll want for counting and for editing links. The tests cover the round trip, bad URLs, the 404, the duplicate race and a forced collision. If I kept going, I'd add click counting off the request path, a rate limit on shortening, and a cache in front of lookups."
+
+Notice what's in it: the mapping stated correctly (code to URL), when the GET happens (someone clicks), what the server actually sends back (302 plus `Location`), and the one decision in each path that a thoughtful person would ask about. And notice that you can only say it if you read the code the agent wrote.
+
+### Productionizing: start with the numbers
+
+"How would you productionize it?" is a scaling question, and a scaling question without numbers is a guess. Run the method from [Back-of-envelope estimates](/lessons/back-of-envelope/): state the load, list what can run out, multiply, compare to one machine.
+
+The first sentence that makes you sound like you've done this before: **"A shortener is read-heavy."** Each link is created once and clicked many times. A common working assumption is about 100 clicks per link created. That ratio is an assumption, not a law, so say it as one and invite correction.
+
+Assumptions, out loud: 10 million new links a day, 100 clicks per new link, a peak of 3× the average.
+
+| Quantity | Arithmetic (rounded hard) | Result |
+| --- | --- | --- |
+| Writes, average | 10⁷ per day ÷ 10⁵ seconds per day | ~100 per second |
+| Writes, peak | × 3 | ~300 per second |
+| Redirects, average | 100 × writes, so 10⁹ a day ÷ 10⁵ | ~10,000 per second |
+| Redirects, peak | × 3 | ~30,000 per second |
+| Link storage | 10⁷ a day × ~500 bytes (URL, code, timestamps, index entries) | ~5 GB a day, ~2 TB a year |
+| Click events | 10⁹ a day × ~100 bytes (code, time, a few fields) | ~100 GB a day, ~35 TB a year |
+| Code space | 62⁷ ≈ 3.5 × 10¹²; ten years of links ≈ 3.7 × 10¹⁰ | ~1% used after ten years |
+| Redirect bandwidth | 3 × 10⁴ per second × ~500 bytes | ~15 MB/s: trivial |
+
+Three things jump out, and each one decides a piece of the design.
+
+**Reads dominate.** Thirty thousand lookups a second at peak against three hundred writes. Almost all of the scaling work goes into the read path.
+
+**The clicks are the big data, not the links.** Twenty times more bytes a year. Link storage fits comfortably on one database server for years. Click events want a different kind of store entirely, one built for appending huge volumes and counting over them.
+
+**Seven characters is plenty.** At 1% full, a random code collides about 1% of the time, and one retry fixes it. ([Short IDs](/lessons/short-ids/) works through why the birthday paradox makes collisions show up far sooner than you'd guess, and when that matters.)
+
+Then compare to one machine. In my Measure runs below, one Python process on a laptop handled a few hundred redirects a second with millisecond latency and started falling behind somewhere between 500 and 1,000 per second. Call it 500 a second per process to be safe. 30,000 ÷ 500 = 60 processes at peak, before headroom. That's a handful of machines, not a data centre. It's also not one process, and that's what forces the rest of the design.
+
+### Layer 1: cache the hot codes
+
+Clicks are wildly uneven. A link in a viral post gets millions; most links get a handful, ever. That unevenness is what makes a cache pay. Put a <Term w="cache-aside">The simplest way to wire in a cache: on a read, the app asks the cache first; on a miss, it reads the database and puts the answer into the cache for next time. The app does all the work; the cache is just a fast dictionary.</Term> cache in front of the lookup, keyed by code, in Redis:
+
+1. `GET link:<code>` from Redis. Hit: redirect.
+2. Miss: look it up in the database, `SET link:<code> <url> EX 3600`, redirect.
+
+Short codes are a near-perfect thing to cache, for a reason worth saying out loud: **the mapping almost never changes.** Most caching pain is invalidation, knowing when a stored copy has gone stale ([Caching](/lessons/caching/) has the gory part). Here, a code points at one URL for life, unless you support editing, and then the edit path deletes the one key it changed. The TTL is just a safety net.
+
+The arithmetic from the caching lesson applies directly: what matters is the miss rate. If 90% of clicks hit the cache, the database sees 3,000 lookups a second at peak instead of 30,000, which one database server with an index on `code` handles without strain. A day's worth of clicked links is maybe 10⁸ entries (a guess; it depends on the long tail) at a couple of hundred bytes each in Redis, about 20 GB: one big Redis server's memory, or a small cluster. And one Redis does on the order of 10⁵ simple commands a second, so 30,000 lookups a second fits; you'd still run a replica so a Redis restart isn't an outage.
+
+<Predict id="cache-local">
+In the Build, the "database" is SQLite on the same laptop, and Redis runs in Docker on the same laptop. Will adding the Redis cache make redirects faster, slower, or neither?
+<Fragment slot="answer">
+
+On my Mac it made them slightly *slower*: median 2.1 ms without the cache, 2.8 ms with it. A SQLite lookup on a local file through an index takes tens of microseconds; a Redis round trip into Docker's Linux VM costs more than that. A cache only pays when a hit is much cheaper than a miss. Once I added a 2 ms delay to every database lookup (standing in for a Postgres server across a network, under load), the cache cut the median from 5.0 ms back to 2.8 ms. The caching lesson's rule, in the flesh: caching a fast thing behind a slower hop makes it worse.
+
+</Fragment>
+</Predict>
+
+### Layer 2: many identical app servers, and replicas
+
+Sixty processes means a [load balancer](/lessons/load-balancing/) in front, and that only works if the app servers are <Term w="stateless">Keeping nothing between requests in the process's own memory or disk. Anything a later request needs lives in a shared store (the database, Redis), so any copy can answer any request.</Term>. This app already is, almost by accident: everything it knows lives in the database. Keep it that way: no in-process counters that matter, no local files. Then the balancer can send any click to any server, and you add or remove servers freely.
+
+The load balancer also handles the thing the candidate in the scene tried to handle with Kafka: **servers going down.** It health-checks each one and stops sending traffic to any that fail. For deploys, you roll through the servers a few at a time, each one <Term w="draining">Taking a server out of rotation gracefully: stop sending it new requests, let the ones it already has finish, then shut it down.</Term> before it stops, so no click in flight is dropped. All of that is in [the load balancing lesson](/lessons/load-balancing/), and you'll break it on purpose below.
+
+The database splits in two along the read/write line. One <Term w="primary">The one database server that accepts writes. Changes are copied from it to the replicas.</Term> takes the 300 writes a second. One or more <Term w="read replica">A copy of the database that receives every change from the primary a moment later and answers reads. Adds read capacity and a standby, at the cost of being slightly behind.</Term>s take the cache misses. One subtlety to raise yourself: a replica runs a little behind the primary, so a link created a millisecond ago might not be on the replica yet. If someone shortens a link and clicks it instantly, the click can miss and return 404. Fixes: on a miss, check the primary before answering 404, or put the new link in the cache at creation time.
+
+At this scale you would move from SQLite to Postgres (or MySQL): a separate server that many app processes connect to over the network. SQLite is a file that lives inside one machine; it was the right choice for the interview and the wrong one for sixty processes on six machines.
+
+<Figure n="003" title="THE READ PATH, SCALED" caption="Clicks go through a load balancer to identical stateless app servers. Each looks in Redis first; only misses reach the database, and those go to replicas. Writes, a hundredth of the traffic, go to the primary. The edge in front can answer repeat clicks itself, if you allow it to cache redirects." wide>
+<svg viewBox="0 0 760 330" role="img" aria-label="Browsers to an edge cache, a load balancer, four app servers, Redis, a primary database and two replicas">
+  <defs>
+    <marker id="us3-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <rect x="10" y="130" width="100" height="50" class="fill-paper" stroke-width="1.2" />
+  <text x="60" y="152" text-anchor="middle" class="strong">BROWSERS</text>
+  <text x="60" y="168" text-anchor="middle">30k clicks/s</text>
+  <rect x="140" y="120" width="90" height="70" class="fill-paper dash" stroke-width="1.2" />
+  <text x="185" y="145" text-anchor="middle" class="strong">EDGE</text>
+  <text x="185" y="161" text-anchor="middle">CDN</text>
+  <text x="185" y="177" text-anchor="middle">optional</text>
+  <rect x="260" y="130" width="90" height="50" class="fill-wash" stroke-width="1.2" />
+  <text x="305" y="152" text-anchor="middle" class="strong">LOAD</text>
+  <text x="305" y="168" text-anchor="middle" class="strong">BALANCER</text>
+  <line x1="110" y1="155" x2="136" y2="155" class="blue" stroke-width="1.2" marker-end="url(#us3-a)" />
+  <line x1="230" y1="155" x2="256" y2="155" class="blue" stroke-width="1.2" marker-end="url(#us3-a)" />
+  <rect x="390" y="30" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="440" y="55" text-anchor="middle" class="strong">APP 1</text>
+  <rect x="390" y="95" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="440" y="120" text-anchor="middle" class="strong">APP 2</text>
+  <rect x="390" y="160" width="100" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="440" y="185" text-anchor="middle" class="strong">APP 3</text>
+  <rect x="390" y="225" width="100" height="40" class="fill-paper dash" stroke-width="1.2" />
+  <text x="440" y="250" text-anchor="middle" class="strong">APP N</text>
+  <line x1="350" y1="155" x2="388" y2="50" class="ink" stroke-width="1" />
+  <line x1="350" y1="155" x2="388" y2="115" class="ink" stroke-width="1" />
+  <line x1="350" y1="155" x2="388" y2="180" class="ink" stroke-width="1" />
+  <line x1="350" y1="155" x2="388" y2="245" class="ink" stroke-width="1" />
+  <text x="440" y="290" text-anchor="middle">stateless, health-checked</text>
+  <rect x="560" y="30" width="190" height="56" class="fill-wash" stroke-width="1.2" />
+  <text x="655" y="52" text-anchor="middle" class="strong">REDIS</text>
+  <text x="655" y="70" text-anchor="middle">link:code → url · ~90% hits</text>
+  <rect x="560" y="120" width="190" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="655" y="140" text-anchor="middle" class="strong">REPLICAS</text>
+  <text x="655" y="156" text-anchor="middle">cache misses (~3k/s)</text>
+  <rect x="560" y="200" width="190" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="655" y="220" text-anchor="middle" class="strong">PRIMARY</text>
+  <text x="655" y="236" text-anchor="middle">writes (~300/s)</text>
+  <line x1="490" y1="80" x2="558" y2="58" class="blue" stroke-width="1.2" marker-end="url(#us3-a)" />
+  <text x="520" y="62" class="blue-t">1</text>
+  <line x1="490" y1="140" x2="558" y2="142" class="ink" stroke-width="1" />
+  <text x="520" y="134">2 miss</text>
+  <line x1="490" y1="210" x2="558" y2="222" class="ink dash" stroke-width="1" />
+  <text x="510" y="232">writes</text>
+  <line x1="655" y1="200" x2="655" y2="166" class="ink dash" stroke-width="1" />
+  <text x="662" y="188">copies</text>
+</svg>
+</Figure>
+
+### Layer 3: the edge
+
+The furthest you can push a read is to never let it reach you at all. A <Term w="CDN">Content delivery network. A provider with servers in many cities that sit in front of your site, answer requests from the nearest city, and can keep copies of your responses so repeat requests never reach you.</Term> in front of the shortener can answer repeat clicks from a server near the visitor, if you allow it to keep redirect responses. A header like `Cache-Control: public, s-maxage=60` says "shared caches may keep this for 60 seconds". The redirect gets faster for users far from your servers, and a viral link barely touches you.
+
+You've seen the trade in Figure 002 with the edge switched on: every click the edge answers is a click your servers don't count, and every edit takes up to the cache lifetime to show. The way out is to count at the edge instead. CDNs log every request they answer, and some let you run a little code at the edge, so the counts come from the CDN's logs rather than your app. It's a fine answer to give, as long as you say the trade out loud: you're choosing latency and load over simple, exact, instant counts, which is the same choice as 301 versus 302, one layer further out.
+
+### Writes: codes from many servers at once
+
+Three hundred writes a second is not a load problem. The interesting part is that sixty processes are now making up codes at the same time, and they must never hand out the same code for two different URLs.
+
+There are two families of answers, and [Short IDs](/lessons/short-ids/) works through both properly:
+
+- **Random codes, checked by the database.** What your v1 does. Each server generates seven random base62 characters and inserts; the database's unique constraint is the referee. No coordination between servers at all. The cost is an occasional retry, which stays rare while the code space is mostly empty (1% full means 1% of inserts retry once).
+- **A counter, encoded in base62.** A number that only goes up, turned into letters. Never collides. But one shared counter is a bottleneck and a single point of failure, so in practice each server grabs a block of numbers at a time ("I'll take 1,000,001 to 1,001,000") from the database, or builds IDs from a timestamp plus a machine number, the way Twitter's Snowflake does. And counter codes are *sequential*: `aZ3kQ9p` is followed by `aZ3kQ9q`. Anyone can walk the sequence and read every link ever made, including private ones people assumed nobody would guess. If you use a counter, scramble it first. You'll do the walk in Break It.
+
+Saying "random, with the unique constraint as the referee, until the space gets crowded; and here's what I'd switch to" is a complete answer.
+
+### Clicks: a queue behind the redirect, not in front of it
+
+Now the mistake from the scene, because it's a common one and it hides a real idea.
+
+The candidate drew Kafka (or SQS) in front of the app servers "to balance the load". Here is why that can't work. A redirect is <Term w="synchronous">The caller waits for the answer before it can continue. A browser following a short link can't do anything until it gets the Location header.</Term>: the browser is sitting there, waiting for one header, and can do nothing until it gets it. A queue is the opposite tool: it lets the producer of a job walk away *without* waiting for the job to be done ([Queues](/lessons/queues/) is built on this). Put a queue in front of the redirect and every click becomes: write a message, wait for a worker to pick it up, wait for the worker to somehow send the answer back to a browser connection that it doesn't hold. You've added a broker and two hops to a request that was a single indexed lookup, and gained nothing, because the browser still has to wait for the whole trip.
+
+A queue is not a load balancer. A load balancer forwards each request, live, to a server that answers it while the client waits. A queue stores work for later. Spreading load across servers and surviving servers that die are the load balancer's job, with health checks and draining.
+
+So where does a queue belong? **Behind** the redirect, for the work the browser doesn't need to wait for. And there's exactly one such job here: recording the click. The visitor doesn't care whether you've written down that they clicked. So the redirect handler does the lookup, drops a tiny event ("code aZ3kQ9p, at this time, from this country, this referrer") onto a queue, and answers immediately. Workers on the other side batch those events into the analytics store at their own pace.
+
+<Figure n="004" title="WHERE THE QUEUE GOES" caption="Top: a queue in front of a synchronous request just adds hops; the browser still waits for the whole trip, and the queue can't send the answer back. Bottom: the redirect is answered straight away, and the one thing nobody waits for, recording the click, goes onto a queue behind it." wide>
+<svg viewBox="0 0 760 320" role="img" aria-label="Wrong: browser to queue to worker before redirect. Right: browser to app which redirects immediately and emits a click event to a queue and workers">
+  <defs>
+    <marker id="us4-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+  </defs>
+  <text x="10" y="20" class="strong">WRONG: QUEUE IN FRONT</text>
+  <rect x="10" y="40" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="60" y="66" text-anchor="middle" class="strong">BROWSER</text>
+  <rect x="170" y="40" width="110" height="44" class="fill-wash" stroke-width="1.2" />
+  <text x="225" y="66" text-anchor="middle" class="strong">KAFKA / SQS</text>
+  <rect x="340" y="40" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="390" y="66" text-anchor="middle" class="strong">WORKER</text>
+  <rect x="500" y="40" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="550" y="66" text-anchor="middle" class="strong">DB</text>
+  <line x1="110" y1="62" x2="166" y2="62" class="ink" stroke-width="1.2" />
+  <line x1="280" y1="62" x2="336" y2="62" class="ink" stroke-width="1.2" />
+  <line x1="440" y1="62" x2="496" y2="62" class="ink" stroke-width="1.2" />
+  <path d="M390 84 Q 390 130 60 130 L 60 90" class="blue dash" fill="none" stroke-width="1.2" marker-end="url(#us4-a)" />
+  <text x="225" y="122" text-anchor="middle" class="blue-t">302 BACK TO WHICH CONNECTION?</text>
+  <text x="620" y="56">browser waits</text>
+  <text x="620" y="72">for all of it</text>
+  <line x1="10" y1="152" x2="750" y2="152" class="ink dash" stroke-width="1" />
+  <text x="10" y="176" class="strong">RIGHT: QUEUE BEHIND</text>
+  <rect x="10" y="196" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="60" y="222" text-anchor="middle" class="strong">BROWSER</text>
+  <rect x="170" y="196" width="110" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="225" y="216" text-anchor="middle" class="strong">APP</text>
+  <text x="225" y="232" text-anchor="middle">lookup (cache)</text>
+  <line x1="110" y1="210" x2="166" y2="210" class="ink" stroke-width="1.2" />
+  <line x1="170" y1="228" x2="114" y2="228" class="blue" stroke-width="1.5" marker-end="url(#us4-a)" />
+  <text x="140" y="262" text-anchor="middle" class="blue-t">302 AT ONCE</text>
+  <rect x="340" y="196" width="110" height="44" class="fill-wash" stroke-width="1.2" />
+  <rect x="350" y="210" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="368" y="210" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <rect x="386" y="210" width="14" height="14" class="fill-paper" stroke-width="1" />
+  <text x="395" y="258" text-anchor="middle" class="strong">CLICK EVENTS</text>
+  <line x1="280" y1="218" x2="336" y2="218" class="ink dash" stroke-width="1.2" />
+  <text x="308" y="210" text-anchor="middle">emit</text>
+  <rect x="510" y="196" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="560" y="222" text-anchor="middle" class="strong">WORKERS</text>
+  <rect x="650" y="196" width="100" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="700" y="216" text-anchor="middle" class="strong">ANALYTICS</text>
+  <text x="700" y="232" text-anchor="middle">store</text>
+  <line x1="450" y1="218" x2="506" y2="218" class="ink" stroke-width="1.2" />
+  <line x1="610" y1="218" x2="646" y2="218" class="ink" stroke-width="1.2" />
+  <text x="560" y="280" text-anchor="middle">in batches, at their own pace</text>
+  <text x="560" y="296" text-anchor="middle">slow or down: redirects don't notice</text>
+</svg>
+</Figure>
+
+This is where Kafka genuinely fits, if you like. A billion click events a day is a stream of facts that several systems want: the per-link counters, a fraud detector looking for click farms, a data warehouse. That's the "log many readers share" shape from [the queues lesson](/lessons/queues/). And notice the delivery promise you want: if a few click events get lost in a crash, that's acceptable; if a redirect is slowed down to guarantee every click is counted, it isn't. Counting can be approximate. Redirecting can't be slow.
+
+<Predict id="inline-analytics">
+Your redirect handler writes each click to the analytics store directly, and that write normally takes 1 ms. One afternoon the analytics store slows down and each write takes 200 ms. Your app runs plain `def` endpoints in FastAPI, which uses a pool of 40 threads. You get 300 clicks a second. What happens to redirect latency?
+<Fragment slot="answer">
+
+It collapses, not just slows. Each request now holds a thread for 200 ms, so 40 threads can finish at most 40 ÷ 0.2 = 200 requests a second. At 300 a second the queue of waiting requests grows by about 100 every second, and every new click waits behind all of them. When I ran exactly this, median redirect time went from 2 ms to about 1.7 seconds, and the p99 to 7.4 seconds, while the database the redirects actually need was perfectly healthy. With the write moved behind an in-process queue, the same slow analytics store left the redirect median at 2 ms. An optional side job, made mandatory by putting it on the request path, took down the main job.
+
+</Fragment>
+</Predict>
+
+### Abuse: rate limits and bad destinations
+
+Once it's public, two kinds of abuse arrive. Someone scripts millions of `POST /shorten` calls, filling your database. And someone shortens links to phishing pages, so your domain becomes the friendly face of a scam, and gets added to blocklists, so *every* link on it starts showing warnings.
+
+The defences, roughly in the order you'd add them:
+
+- **A rate limit on creating links**, per IP address or per API key, with a [token bucket](/lessons/rate-limits/) (say, a burst of 20, then a few per minute for anonymous users). Over the limit gets `429 Too Many Requests` with `Retry-After`. Redirects need a much looser limit, or none: they're cheap, and a viral link is supposed to get hammered.
+- **Accounts or API keys** for anything above a trickle, so abuse has a name attached and can be switched off.
+- **Check destinations** against known-bad lists when a link is created, and again later (pages turn malicious after they're shortened). Google Safe Browsing is the well-known service for this.
+- **A way to kill a link**: a `disabled` flag checked on redirect (and the cache key deleted), plus a report-abuse address.
+
+### What doesn't matter much: transactions
+
+Interviewers sometimes probe "how do you handle transactions here?" to see whether you'll reach for machinery you don't need. Shortening is a single `INSERT` into one table. A single statement is already atomic: it either happens completely or not at all. There's nothing to coordinate. The two things that look like they need a transaction are both handled by `UNIQUE` constraints, which the database enforces for you even under concurrent requests:
+
+- **Two random codes collide:** the second insert fails, you retry with a new code.
+- **Two people shorten the same URL at once:** if you check "does this URL exist?" and then insert, both checks can pass before either insert lands, and the second insert crashes. Instead, insert with `ON CONFLICT(url) DO NOTHING` and then read back the code. The constraint is the referee.
+
+That's worth one sentence in the interview, and the second bullet is worth a test, which you'll write. If links had owners and quotas ("create a link and decrement this user's remaining quota"), you'd have two writes that must happen together, and then a [transaction](/lessons/transactions/) earns its place.
+
+### Working with an agent in the room
+
+Everything above is the material. Here's how to carry it in an agent-assisted interview, and it applies just as well to work.
+
+- **Think before you prompt.** Write the spec. It's the design discussion, and it's your chance to ask the interviewer questions. Prompting first and thinking later means the agent made the decisions.
+- **Read every line of the diff.** If you can't explain a line, you don't own it yet. Ask the agent why it did something; don't just accept it.
+- **Run it, and then try to break it.** Bad URLs, unknown codes, the same URL twice at once, `curl -I`. "It works" after one happy click is not a test.
+- **Make the tests yours.** You decide what's tested. The agent can type them.
+- **Narrate.** Say what you're checking and why while you check it. Silence while an agent types looks like you're waiting to be rescued.
+- **Push past "it works".** The interviewer's next questions are always the same: why this status, what if it's public, how does it scale. Get there before they ask.
+
+## Build It
+
+Everything goes in `~/workbench/shortener/`. You'll write a spec, let an agent build v1, review and test it yourself, poke the redirect with curl and a browser, put it on a public address briefly, then add click events and a cache, and load test the redirect path.
+
+I ran all of the code below on an M4 Pro MacBook with Python 3.14, FastAPI 0.162, Starlette 1.10, uvicorn 0.54 and Redis 7 in Docker. Library details move, so if a call has changed, check the docs; the shape will be the same.
+
+<Task id="t1" title="Write the spec yourself" agent="hands">
+
+Before looking at the prompt in The Idea again, set a five-minute timer and write your own spec in `SPEC.md`: endpoints with status codes, URL validation rules, the duplicate rule, how codes are made, the redirect status and why, storage, local or public, and the list of tests. Then compare with the prompt above. Anything you decided differently is fine if you can defend it; anything you left out is a decision the agent would have made silently.
+
+Then say the decisions out loud as if to an interviewer, as questions: "Should the same URL get the same code, or a new one each time? I'd lean same, because...". That's the habit this task is for.
+
+</Task>
+
+<Task id="t2" title="Have the agent build v1 from your spec" agent="ok">
+
+```bash
+mkdir -p ~/workbench/shortener && cd ~/workbench/shortener
+python3 -m venv .venv && source .venv/bin/activate
+pip install fastapi uvicorn httpx pytest redis
+```
+
+Give the agent your spec as the prompt. Then run `pytest -q` and `uvicorn app:app --port 8000`, and open `http://localhost:8000/`.
+
+For comparison, here's the v1 I ended up with after review (yours will differ, and that's fine). It's 110 lines and passes the tests in the prompt.
+
+```python
+# app.py: a URL shortener, v1. FastAPI + SQLite, one file.
+import os, secrets, sqlite3
+from urllib.parse import urlsplit
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel
+
+DB_PATH = os.environ.get("DB_PATH", "links.db")
+BASE_URL = os.environ.get("BASE_URL", "http://localhost:8000").rstrip("/")
+ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"  # base62
+CODE_LEN = 7
+MAX_URL_LEN = 2048
+
+app = FastAPI()
+
+
+def db() -> sqlite3.Connection:
+    # One connection per request: sqlite3 connections shouldn't be shared across threads,
+    # and FastAPI runs plain `def` endpoints in a thread pool.
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db() -> None:
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS links (
+                id         INTEGER PRIMARY KEY,
+                code       TEXT NOT NULL UNIQUE,
+                url        TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            )""")
+
+
+init_db()
+
+
+def new_code() -> str:
+    return "".join(secrets.choice(ALPHABET) for _ in range(CODE_LEN))
+
+
+def validate(url: str) -> str:
+    url = url.strip()
+    if len(url) > MAX_URL_LEN:
+        raise HTTPException(400, "URL too long")
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise HTTPException(400, "URL must be an absolute http(s) URL")
+    if url.startswith(BASE_URL + "/"):
+        raise HTTPException(400, "That is already a short link")
+    return url
+
+
+class ShortenIn(BaseModel):
+    url: str
+
+
+@app.post("/shorten", status_code=201)
+def shorten(body: ShortenIn):
+    url = validate(body.url)
+    with db() as conn:
+        for _ in range(5):  # a collision at 62^7 is rare; retrying is cheap
+            try:
+                conn.execute(
+                    "INSERT INTO links (code, url) VALUES (?, ?) ON CONFLICT(url) DO NOTHING",
+                    (new_code(), url))
+                break
+            except sqlite3.IntegrityError:  # the random code was taken: try another
+                continue
+        else:
+            raise HTTPException(500, "could not allocate a code")
+        (code,) = conn.execute("SELECT code FROM links WHERE url = ?", (url,)).fetchone()
+    return {"code": code, "short_url": f"{BASE_URL}/{code}", "url": url}
+
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return FORM
+
+
+@app.api_route("/{code}", methods=["GET", "HEAD"])  # HEAD: curl -I, link-preview bots
+def follow(code: str):
+    with db() as conn:
+        row = conn.execute("SELECT url FROM links WHERE code = ?", (code,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "no such link")
+    return RedirectResponse(row[0], status_code=302)
+
+
+FORM = """<!doctype html>
+<meta charset="utf-8"><title>shorty</title>
+<form id="f"><input name="url" size="60" placeholder="https://..." autofocus>
+<button>Shorten</button></form>
+<p id="out"></p>
+<script>
+f.onsubmit = async (e) => {
+  e.preventDefault();
+  const r = await fetch("/shorten", {method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({url: f.url.value})});
+  const j = await r.json();
+  out.textContent = r.ok ? j.short_url : ("Error: " + j.detail);
+};
+</script>"""
+```
+
+Two lines worth pausing on. The `with db() as conn:` block commits on success, but in Python's `sqlite3` it does **not** close the connection; that's fine here because the connection is garbage-collected when the function returns, but it's a classic surprise. And `out.textContent`, not `innerHTML`: the page never interprets a URL someone typed as HTML.
+
+</Task>
+
+<Task id="t3" title="Read the diff, and write the tests that catch what it missed" agent="review">
+
+Read every line of what the agent produced before running anything else. For each function, write one sentence in a comment saying what it does and why. Then go hunting. These are the things I've seen agent-written shorteners get wrong, and each one deserves a test you write yourself:
+
+- **The status code.** `RedirectResponse(url)` with no status is a 307 in current Starlette. Is that what your spec said?
+- **HEAD.** `@app.get` answers `HEAD` with `405 Method Not Allowed` in FastAPI. `curl -I` sends HEAD, and so do some link-preview bots. Does yours answer it?
+- **Validation.** `javascript:alert(1)`, `ftp://…`, `example.com` with no scheme, an empty string, a 3,000-character URL, a link to your own `BASE_URL`.
+- **Randomness.** `random.choice` instead of `secrets.choice`: `random` is predictable from its outputs, so codes become guessable.
+- **The duplicate race.** Look for "SELECT, and if nothing, INSERT". Then prove it's a bug.
+
+The race test is the interesting one. The shape:
+
+```python
+import threading
+
+def test_concurrent_duplicates(client):
+    results, errors = [], []
+    def go():
+        try:
+            r = client.post("/shorten", json={"url": "https://race.example"})
+            results.append((r.status_code, r.json()["code"]))
+        except Exception as e:          # TestClient re-raises server exceptions
+            errors.append(e)
+    # start 20 threads, join them all, then assert:
+    #   no errors, every status is 201, and exactly one distinct code
+    ...
+```
+
+For the `client` fixture, point `DB_PATH` at pytest's `tmp_path` with `monkeypatch.setenv`, reload the `app` module so it picks up the variable, and build `TestClient(app.app, follow_redirects=False)` (otherwise the test client follows your 302 and you test example.com instead).
+
+When I wrote the check-then-insert version on purpose and ran this test with 20 threads, it failed on every one of five runs with `IntegrityError: UNIQUE constraint failed: links.url`, which a real server would turn into a 500. With `ON CONFLICT(url) DO NOTHING` it passed every time.
+
+When your tests pass, ask an agent to review your tests (not the app): what behaviour is still untested?
+
+</Task>
+
+<Task id="t4" title="Look at the redirect on the wire" agent="hands">
+
+Shorten something, then look at the raw answer:
+
+```bash
+CODE=$(curl -s -X POST localhost:8000/shorten -H 'content-type: application/json' \
+  -d '{"url": "https://example.com/some/long/path"}' | python3 -c 'import sys,json; print(json.load(sys.stdin)["code"])')
+curl -i localhost:8000/$CODE       # GET: status line, headers, empty body
+curl -I localhost:8000/$CODE       # HEAD: 405 or 302? depends on your route
+curl -iL localhost:8000/$CODE      # -L: curl follows Location, like a browser
+```
+
+You should see `HTTP/1.1 302 Found`, a `location:` header with the long URL, and `content-length: 0`. With `-L` you'll see two responses: yours, then example.com's. That's arrow three of Figure 001, made by the client.
+
+Now the browser. Open DevTools, Network tab, tick "Preserve log", and click your short link three times. Every click should show a 302 from your server, and your uvicorn log should show three GETs.
+
+Then change the route to `status_code=301`, restart, and use a **new** link (so nothing is cached yet). Click it three times. Watch the uvicorn log: how many GETs arrive? In DevTools, the repeat clicks may be marked as served from the browser's cache. Browsers differ in what they keep and for how long; write down what yours did. Then go back to 302 and click that same link again. Does your server hear about it? (Figure 002 predicted the answer.) Finally, try `301` plus a header `Cache-Control: private, max-age=30` (pass `headers=` to `RedirectResponse`) and watch clicks return after 30 seconds.
+
+If you have a real short link from bit.ly or similar, `curl -sI` it too and read its status and `cache-control`.
+
+</Task>
+
+<Task id="t5" title="Put it on a public address, briefly" agent="ok">
+
+```bash
+brew install cloudflared
+cloudflared tunnel --url http://localhost:8000
+```
+
+It prints a `https://<random-words>.trycloudflare.com` address. Restart the app with that address as `BASE_URL` so the links it hands out work for other people:
+
+```bash
+BASE_URL=https://<random-words>.trycloudflare.com uvicorn app:app --port 8000
+```
+
+Open the address on your phone, over mobile data rather than your Wi-Fi, shorten a link, and click it. Look at which client address the uvicorn log shows. The TCP connection itself comes from `cloudflared` on `127.0.0.1`, not from your phone. Uvicorn by default believes `X-Forwarded-For` headers from `127.0.0.1`, so it may print the address from that header instead. Which did you see? It matters for the rate limit you'd add next: a per-IP limit that sees only the tunnel's address puts every visitor in one bucket, and one that trusts a forwarded header has to trust the right proxy (check Cloudflare's docs for which header it sets).
+
+Be deliberate about this step. Before starting the tunnel, check which program is actually listening on the port you're about to expose (`lsof -nP -iTCP:8000 -sTCP:LISTEN`) so you don't publish something else by accident. The address is public: anyone who finds it can create links on your laptop. Keep it up for minutes, not days, and press Ctrl-C when you're done. Don't load test through a quick tunnel; it's for demos and has limits.
+
+</Task>
+
+<Task id="t6" title="Click events behind the redirect, and a cache in front of the lookup" agent="review">
+
+Copy `app.py` to `app2.py` and add two features, each switchable by an environment variable so you can measure with and without.
+
+**Clicks.** Add a table `clicks(code TEXT NOT NULL, ts REAL NOT NULL)`. With `CLICKS=inline`, the redirect handler inserts the click itself before answering. With `CLICKS=queue`, it puts `(code, time.time())` on an in-process `queue.Queue` and answers at once; a background thread drains the queue in batches. A HEAD request is a bot checking the link, not a click: don't record it. The worker is plumbing, so here it is:
+
+```python
+import queue, threading, time
+
+ANALYTICS_DELAY = float(os.environ.get("ANALYTICS_DELAY_MS", "0")) / 1000  # pretend analytics is slow
+events: queue.Queue = queue.Queue(maxsize=100_000)
+
+def write_clicks(batch: list[tuple[str, float]]) -> None:
+    time.sleep(ANALYTICS_DELAY)
+    with db() as conn:
+        conn.executemany("INSERT INTO clicks (code, ts) VALUES (?, ?)", batch)
+
+def click_worker() -> None:
+    while True:
+        batch = [events.get()]                      # block until there's one event
+        while len(batch) < 500:
+            try:
+                batch.append(events.get_nowait())   # then take whatever else is waiting
+            except queue.Empty:
+                break
+        write_clicks(batch)
+
+threading.Thread(target=click_worker, daemon=True).start()
+```
+
+In the handler, use `events.put_nowait(...)` and, if the queue is full, drop the event rather than wait. Be ready to say why dropping is the right call here, and what this toy loses that a real broker wouldn't: every queued event vanishes if the process dies. (That's at-most-once delivery, from [the queues lesson](/lessons/queues/). For click counts, acceptable. For billing, not.)
+
+**The cache.** Write `lookup(code) -> str | None` as cache-aside over Redis, enabled by `CACHE=1`:
+
+```python
+import redis
+r = redis.Redis(decode_responses=True)
+TTL = 3600
+DB_DELAY = float(os.environ.get("DB_DELAY_MS", "0")) / 1000   # pretend the DB is across a network
+stats = {"hits": 0, "misses": 0}
+
+def lookup(code: str) -> str | None:
+    """Cache-aside: try Redis; on a miss, read SQLite (after sleeping DB_DELAY),
+    put the answer in Redis with the TTL, return it. Count hits and misses.
+    Don't cache 'not found' for now (and think about what happens if you did)."""
+    ...
+```
+
+Add `GET /_stats` returning the hit and miss counts and `events.qsize()`. Define it *above* the `/{code}` route, or `/_stats` will be treated as a short code. Start Redis with `docker run -d --rm --name redis -p 6379:6379 redis:7-alpine` (or `brew install redis`).
+
+Then have an agent review `app2.py` for two things: anything slow left on the redirect path, and anything that would break if you ran four copies of this process instead of one.
+
+</Task>
+
+<Task id="t7" title="A load generator for redirects" agent="ok">
+
+Seed 10,000 links, then fire redirects at a fixed rate with a few very popular links and a long tail of rare ones, the way real clicks look. It's *open-loop*: each request is sent on schedule whether or not the previous ones have finished, so a slow server can't quietly slow down the test (that's the coordinated omission trap from [p99 and load testing](/lessons/tail-latency/)).
+
+```python
+# seed.py: python seed.py N  -> creates N links, writes their codes to codes.txt
+import sys, httpx
+n = int(sys.argv[1])
+with httpx.Client(base_url="http://localhost:8000") as c, open("codes.txt", "w") as f:
+    for i in range(n):
+        r = c.post("/shorten", json={"url": f"https://example.com/page/{i}"})
+        r.raise_for_status()
+        f.write(r.json()["code"] + "\n")
+print("seeded", n)
+```
+
+```python
+# load.py: python load.py RATE DURATION  (open loop: arrivals don't wait for answers)
+import asyncio, collections, itertools, random, sys, time, httpx
+
+codes = open("codes.txt").read().split()
+rng = random.Random(0)
+# A few links are very popular, most are rarely clicked (Zipf-like: link i has weight 1/(i+1)).
+cum = list(itertools.accumulate(1 / (i + 1) for i in range(len(codes))))
+
+async def one(client, code, out):
+    t = time.perf_counter()
+    try:
+        r = await client.get(f"/{code}")
+        out.append((time.perf_counter() - t, r.status_code))
+    except Exception as e:
+        out.append((time.perf_counter() - t, type(e).__name__))
+
+async def main(rate, duration):
+    out, tasks = [], []
+    limits = httpx.Limits(max_connections=500, max_keepalive_connections=500)
+    async with httpx.AsyncClient(base_url="http://localhost:8000", limits=limits,
+                                 timeout=10, follow_redirects=False) as client:
+        start = time.perf_counter()
+        next_t = start
+        while next_t - start < duration:
+            code = rng.choices(codes, cum_weights=cum)[0]
+            tasks.append(asyncio.create_task(one(client, code, out)))
+            next_t += rng.expovariate(rate)
+            await asyncio.sleep(max(0, next_t - time.perf_counter()))
+        await asyncio.gather(*tasks)
+    lat = sorted(l for l, _ in out)
+    pct = lambda p: lat[min(len(lat) - 1, int(p / 100 * len(lat)))] * 1000
+    print(f"n={len(out)}  p50={pct(50):.2f} ms  p99={pct(99):.2f} ms  max={lat[-1]*1000:.1f} ms")
+    print("statuses:", dict(collections.Counter(s for _, s in out)))
+
+asyncio.run(main(float(sys.argv[1]), float(sys.argv[2])))
+```
+
+`follow_redirects=False` matters: you're measuring your server's answer, not example.com's. Run `python seed.py 10000` once against `app2`, then `python load.py 300 20`. Before each measured run, send a few seconds of warm-up traffic (`python load.py 50 3`) so connection setup and first-request costs don't land in your numbers.
+
+</Task>
+
+<DoneWhen>
+
+- You wrote a spec before prompting, and can list every decision in it from memory.
+- Your own tests cover the round trip, the 404, bad URLs, HEAD, a forced collision and the 20-thread duplicate race, and you watched the race test fail against a check-then-insert version.
+- You've seen the `302` and `Location` with curl, and watched a bare 301 stop clicks from reaching your server in a real browser.
+- You opened your shortener from your phone through a tunnel, and shut the tunnel down.
+- `app2.py` records clicks through a queue and caches lookups in Redis, both switchable, and the Measure tables are filled in with your predictions next to the results.
+- You can give the ninety-second explanation and the layered "productionize it" answer without notes.
+
+</DoneWhen>
+
+## Measure
+
+Run `app2` with one uvicorn process (`uvicorn app2:app --port 8000`), restarting it between runs with the environment variables in each row. Use `python load.py 300 20` after a warm-up. Write your prediction for the median first. Mine are from an M4 Pro; your absolute numbers will differ, the shape shouldn't.
+
+**1. Does the cache help?**
+
+| Run | Your prediction (p50) | Your p50 | Your p99 | Hit rate | My p50 | My p99 |
+| --- | --- | --- | --- | --- | --- | --- |
+| `CACHE=0` | | | | n/a | 2.1 ms | 9.7 ms |
+| `CACHE=1` | | | | | 2.8 ms | 10.4 ms |
+| `CACHE=0 DB_DELAY_MS=2` | | | | n/a | 5.0 ms | 12.2 ms |
+| `CACHE=1 DB_DELAY_MS=2` | | | | | 2.8 ms | 10.9 ms |
+
+Hit rate is hits ÷ (hits + misses) from `/_stats`. Mine was about 68% for a 20-second run starting from an empty cache: every link is a miss the first time it's clicked, and the long tail of rare links keeps producing first clicks. Run for two minutes and it climbs (mine reached 84%), because the popular links are all in by then and they're most of the traffic.
+
+What it should tell you:
+
+- **With a local SQLite file, the cache is a loss.** The lookup it replaces takes tens of microseconds; a Redis round trip into Docker takes more. That's the caching lesson's rule: a cache only helps if a hit is much cheaper than a miss.
+- **With a database that's 2 ms away, it's a big win.** The median falls back to roughly the cache round trip. In production the database *is* across a network, and under load it gets slower, which is when the cache matters most.
+- **Most of the 2 ms is not the lookup.** It's Python: the load generator, the HTTP parsing, FastAPI's routing, a thread hop. Measure a single `SELECT` with `time.perf_counter()` inside the handler if you want to see how small the database part is.
+
+**2. Inline or queued clicks?**
+
+| Run | Your prediction (p50) | Your p50 | Your p99 | My p50 | My p99 |
+| --- | --- | --- | --- | --- | --- |
+| `CLICKS=off` | | | | 2.1 ms | 9.3 ms |
+| `CLICKS=inline` | | | | 1.7 ms | 7.2 ms |
+| `CLICKS=inline ANALYTICS_DELAY_MS=50` | | | | 58 ms | 71 ms |
+| `CLICKS=queue ANALYTICS_DELAY_MS=50` | | | | 2.0 ms | 8.7 ms |
+| `CLICKS=inline ANALYTICS_DELAY_MS=200` | | | | 1,662 ms | 7,401 ms |
+| `CLICKS=queue ANALYTICS_DELAY_MS=200` | | | | 1.6 ms | 5.9 ms |
+
+What it should tell you:
+
+- **A fast inline write is invisible.** A local SQLite insert costs about as much as the noise between runs (my inline run was even a little faster than "off", which is noise). If the analytics store were always this fast, inline would be fine. The point of the queue is what happens when it isn't.
+- **50 ms inline adds 50 ms to every click.** Every visitor pays for your bookkeeping.
+- **200 ms inline is a cliff, not a slope.** 40 threads × (1 ÷ 0.2 s) = 200 requests a second of capacity against 300 arriving. The backlog grows every second; latency is set by how long the test ran, not by the work. This is the utilization knee from [p99 and load testing](/lessons/tail-latency/), triggered by a side job.
+- **Queued, the redirect doesn't notice** at 50 ms. Check `/_stats` during the 200 ms queued run: does `queued` climb? One batch writer taking up to 500 events per 200 ms write can keep up with 2,500 clicks a second, so it shouldn't; mine ended the run with 8 events waiting. Batching is what saves it.
+
+**3. Find the ceiling.** With `CACHE=0 CLICKS=queue`, run `load.py` at 300, 500, 700 and 1,000 per second. Find where p99 stops being a few milliseconds. On my Mac, 500 a second was still fine (p50 1.9 ms, p99 19 ms) and 1,000 a second was not (p50 34 ms, p99 180 ms). Part of that ceiling is the load generator itself, also single-threaded Python; watch `top` to see which process is at 100% CPU. Then redo the back-of-envelope with your number: how many processes for 30,000 a second at peak, keeping each at about 60% of its ceiling?
+
+## Break It
+
+**1. Ship a bare 301 and watch the clicks vanish.** Switch the redirect to a plain `status_code=301`, run with `CLICKS=queue`, and click a fresh link ten times in a browser. Then `sqlite3 links.db "select count(*) from clicks where code='<code>'"`. Compare with ten clicks on a 302 link. Then "fix" it by going back to 302, and click the first link again. Your dashboard is now wrong for every visitor who clicked during the 301 window, and you can't fix it from the server. Say in one sentence what you'd ship instead.
+
+**2. Restart the server mid-load.** Run `python load.py 300 20` and, five seconds in, from another terminal, `kill -9` the uvicorn process and start it again. Count the errors in the status line. Then repeat with a plain `kill` (SIGTERM), which lets uvicorn finish in-flight requests before exiting, and start the new process as soon as the old one is gone. On my Mac, the `kill -9` run had 234 `ConnectError`s and 1 `ReadError` out of 4,490 requests; the SIGTERM run had 134 and 1. Fewer, but not zero: while the new process starts, nothing is listening at all. One process can't be restarted without a gap, however politely. That's what two processes behind a load balancer, health checks and draining fix, as in [Load balancing](/lessons/load-balancing/), and it's the real answer to "what if a container goes down?" (not a queue in front).
+
+**3. Put the slow analytics write inline.** You did this in Measure; now do it at the edge of disaster. `CLICKS=inline ANALYTICS_DELAY_MS=200` at 300 a second. While it's melting, `curl` a redirect by hand and time it. Then imagine explaining to the interviewer that the redirects were down because the click-counting database was slow. That sentence is the whole argument for a queue behind the redirect.
+
+**4. Use sequential codes, then walk them.** Replace `new_code()` with base62 of the row's `id` (insert with a temporary placeholder code, then update the row's code from its `id`). Shorten five links. Now write ten lines that loop over the base62 encodings of 1 to 1,000 and `curl` each one, printing every `Location` that comes back. You've just read every link anyone ever made, including the "private" ones. Three fixes, in increasing strength: random codes (what v1 does); a counter scrambled by a reversible shuffle before encoding (see [Short IDs](/lessons/short-ids/)); a rate limit on 404s per IP, which also slows down someone guessing random codes.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. "Explain your solution."</summary>
+
+It's one FastAPI app with one SQLite table that maps a short code to a long URL, and two operations on it. Shortening is a POST: I check the URL is an absolute http or https URL under 2,048 characters and isn't one of our own links, generate a seven-character code from a 62-character alphabet with `secrets`, and insert it. Unique constraints do the hard parts: a code collision makes the insert fail and I retry with a new code, and a unique constraint on the URL with `ON CONFLICT DO NOTHING` means the same URL always gets the same code, even when two requests race. Following is a GET, which happens when someone clicks the link: I look the code up through its index and return a 302 with the long URL in the Location header, and the browser makes the second request to the target itself. I chose 302 over a plain 301 because a browser can keep a 301 forever and then its clicks never come back to us, so we couldn't count them or change the destination. I also answer HEAD so curl and link previews work. The tests cover the round trip, the 404, bad URLs, a forced collision and a 20-thread duplicate race, which I confirmed fails against a check-then-insert version. Next I'd add click events off the request path, a rate limit on shortening, and a cache in front of the lookup.
+
+</details>
+
+<details>
+<summary>2. "How would you productionize this?"</summary>
+
+First the shape of the load: it's read-heavy. Assuming 10 million new links a day and about 100 clicks per link, that's roughly 100 writes a second and 10,000 redirects a second on average, maybe 30,000 at peak. So almost all the work is on the read path. I'd move from SQLite to Postgres, with the primary taking writes and read replicas taking lookups. In front of the database, a Redis cache keyed by code, cache-aside with a TTL; codes almost never change, so invalidation is easy, and because clicks are concentrated on popular links, a 90% hit rate cuts database reads to about 3,000 a second. The app servers are stateless, so I run as many as I need behind a load balancer with health checks, and deploy by draining them a few at a time; one Python process does a few hundred redirects a second, so that's on the order of 60-100 processes. Optionally a CDN can cache redirects for a short time, trading exact click counts for latency. For writes, random codes with the unique constraint as the referee need no coordination between servers; if I wanted a counter, I'd hand out ID blocks per server and scramble them so codes aren't guessable. Clicks are about twenty times more data than links, so they go behind the redirect: the app emits an event to a queue or log like Kafka and answers immediately, and workers batch them into an analytics store. Finally, abuse: rate limits on link creation, checking destinations against malware and phishing lists, and a way to disable a link.
+
+</details>
+
+<details>
+<summary>3. "Why not put Kafka in front to handle the load?"</summary>
+
+Because a redirect is synchronous. The browser is waiting for one header and can't do anything until it gets it. A queue is for work the caller doesn't wait for: it stores a job so a worker can do it later. Putting one in front of the redirect adds a broker and two hops to what is a single indexed lookup, and the worker still has to get the answer back to a browser connection it doesn't hold, so the browser waits for the whole trip anyway. A queue isn't a load balancer. Spreading requests across servers and surviving a server dying is the load balancer's job, with health checks, plus rolling deploys that drain each server first. Where Kafka does belong is behind the redirect, for click events: nobody waits for those, there are a billion a day, several systems want them, and losing a few in a crash is acceptable. It also protects the redirect: when I made the analytics write slow and inline, redirect latency went from 2 ms to over a second; queued, it stayed at 2 ms.
+
+</details>
+
+<details>
+<summary>4. "301 or 302? What do the big shorteners do?"</summary>
+
+A plain 301 says "moved for good", and browsers are allowed to remember it without being told how long, so later clicks go straight to the target and never reach the shortener. That breaks click counting and makes it impossible to change a link for anyone who already visited. A 302 (or 307) says "for now", so the browser asks every time. Either use a 302, or use a 301 with a `Cache-Control` header that limits how long it may be kept, like `private, max-age=90`. The big ones do the second: when checked in November 2026, bit.ly, TinyURL and t.co all returned 301 with short or no caching. The status says what the redirect means; Cache-Control says how long anyone may remember it. And it's a redirect, not a rewrite: the browser makes a second request to someone else's site, which a rewrite inside our server couldn't do.
+
+</details>
+
+<details>
+<summary>5. "How do you generate codes so two servers never collide, and how long should they be?"</summary>
+
+Size first: 62 characters per position, so seven characters give about 3.5 trillion codes. At 10 million links a day, ten years is about 37 billion, about 1% of the space. With random codes, each server picks seven random characters with a secure random generator and inserts; the database's unique constraint is the referee, and a collision just means retry. At 1% full, that's about one retry per hundred inserts, which is nothing, and no coordination is needed between servers. Note that collisions start appearing long before the space is "full", because of the birthday paradox, so you watch the retry rate and add a character when it climbs. The alternative is a counter encoded in base62, which never collides, but needs coordination: either each server reserves a block of numbers from the database, or IDs are built from a timestamp, a machine number and a sequence, like Twitter's Snowflake. Counters are sequential, so anyone could walk every link, which means I'd scramble the number before encoding it.
+
+</details>
+
+## Go Deeper
+
+- **RFC 9110, _HTTP Semantics_, section 15.4 "Redirection 3xx"** ([rfc-editor.org/rfc/rfc9110](https://www.rfc-editor.org/rfc/rfc9110)), especially 15.4.2 (301), 15.4.3 (302), 15.4.8 (307) and 15.4.9 (308), plus section 15.1 for which status codes are "heuristically cacheable". Short, precise, and the final word on the 301 argument.
+- **MDN, "Redirections in HTTP"** ([developer.mozilla.org](https://developer.mozilla.org/en-US/docs/Web/HTTP/Redirections)). A friendlier tour of the same codes, with a table of which ones keep the method and which are permanent, and what browsers actually do.
+- **Cloudflare docs, "Quick Tunnels" (TryCloudflare), under Cloudflare Tunnel**. The one-command tunnel from this lesson, what it's for, and its current limits. Read the limits before you rely on it for anything.
+- **Alex Xu, _System Design Interview: An Insider's Guide_ (Volume 1), the chapter "Design a URL Shortener"**. The standard interview treatment: estimates, hash-plus-collision vs base62-of-an-ID, 301 vs 302. Good for seeing how an interviewer expects the conversation to go.
+- **Donne Martin, _The System Design Primer_** (github.com/donnemartin/system-design-primer), the solution "Design Pastebin.com (or Bit.ly)". A free, worked design with back-of-envelope numbers, a read-heavy architecture, and analytics computed from logs.
+- **Ryan King, "Announcing Snowflake"** (Twitter Engineering blog, 2010). Why Twitter needed IDs generated on many machines without coordination, and the timestamp-plus-machine-plus-sequence layout. The deep version is in [Short IDs](/lessons/short-ids/).
+- **Martin Kleppmann, _Designing Data-Intensive Applications_, chapter 1 (reliability, scalability) and chapter 5 (replication)**. Why a read-heavy system scales by copying data, what replication lag does to "I just created it, why is it 404?", and how to reason about load before choosing tools.
+- **Google Safe Browsing API documentation**. The well-known way to check whether a destination URL is known malware or phishing, which a public shortener needs on day one.
+
+## Connections
+
+This lesson is the Scale track in one project. The redirect is [HTTP from scratch](/lessons/http-from-scratch/) (status codes, `Location`, caching headers), and the click that triggers it is the trip from [What happens when you type a URL](/lessons/what-happens-url/). The code lookup is an [index](/lessons/indexes/) on a unique column, and the codes themselves are [Short IDs](/lessons/short-ids/). The numbers come from [Back-of-envelope estimates](/lessons/back-of-envelope/), and the ceiling you measured is the knee from [p99 and load testing](/lessons/tail-latency/). Scaling it uses [Caching](/lessons/caching/), [Load balancing](/lessons/load-balancing/) and [Containers](/lessons/containers/) for the stateless servers, [Queues](/lessons/queues/) for click events behind the redirect, and [Rate limits](/lessons/rate-limits/) for abuse. The public link is the tunnel from [SSH and Tailscale](/lessons/ssh-and-tailscale/). And if you wrote the spec in t1 properly, you've written a small [design doc](/lessons/design-docs/): goals, non-goals, decisions, and how you'll know it works.

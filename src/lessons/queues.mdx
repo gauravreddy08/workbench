@@ -14,7 +14,7 @@ It builds on [Waiting vs working](/lessons/waiting-vs-working/), where you met t
 
 ## Today
 
-- Explain what a queue between two programs is, and the four reasons systems use one: the two sides run at different speeds, traffic arrives in bursts, failed work can be retried without the user knowing, and one event can feed many readers.
+- Explain what a queue between two programs is, and the four reasons systems use one: the two sides run at different speeds, traffic arrives in bursts, failed work can be retried without the user knowing, and one event can feed many readers. Plus the one place a queue doesn't belong: in front of someone waiting for an answer right now.
 - Say exactly what happens when a worker dies halfway through a job: how the worker signals "done", how the job is loaned out with a deadline so a dead worker's job comes back, and where a job goes when it fails every single time.
 - Explain the three promises a queue can make (a job runs at most once, at least once, or exactly once), why the last one is mostly a marketing word, and why the real answer is a worker that can safely do the same job twice.
 - Tell a to-do-list queue (Celery, RQ, SQS) apart from a keep-everything event history (Kafka), where readers track their own position, the history is split into lanes, and order only holds inside one lane.
@@ -355,6 +355,74 @@ Three consequences you should be able to say out loud:
 
 Kafka's delivery semantics are the same story as before, told with offsets. If you commit the offset *before* processing, a crash skips records: at-most-once. If you commit *after*, a crash replays from the last commit: at-least-once, possibly a few hundred duplicates. The client's default, auto-commit every 5 seconds in the background, can do either depending on timing, which is why serious consumers turn it off and commit after they've processed.
 
+### One worker, or every subscriber: pub/sub
+
+Look at what a consumer group just did. Inside one group, the records are *shared out*: each goes to one member. Across groups, they're *copied*: every group gets all of them. Those are the two ways a message can travel, and the managed services you'll meet each do one of them.
+
+A job queue only shares out. Point five workers at one SQS queue and each message goes to whichever worker asks first; they compete for the work. That's what you want for "summarize document 81723", which should happen once. It's the wrong shape for reason 4 at the top of this page, "one event, many readers", because a queue has no idea that the summarizer and the search indexer are different services that *both* need every event.
+
+<Predict id="fanout">
+
+The summarizer and a new search indexer both need every saved document. You point both at the same SQS queue the API already writes to. No errors anywhere. What does each one see?
+
+<Fragment slot="answer">
+
+About half each. To the queue they're just two more consumers competing for messages, so each message goes to whichever asked first. The summarizer quietly skips half the documents and the indexer misses the other half, and nothing fails, so nothing tells you. A queue is one inbox. Two services that both need everything need two inboxes.
+
+</Fragment>
+
+</Predict>
+
+Copying is <Term w="publish-subscribe">A messaging shape where a producer publishes to a named topic and every subscriber to that topic gets its own copy of each message. The producer doesn't know who the subscribers are. Usually shortened to pub/sub.</Term>, also called <Term w="fan-out">One message in, a copy out to each of many receivers.</Term>. The producer publishes once to a **topic**; every subscription gets its own copy. On AWS that's SNS (Simple Notification Service): a topic pushes each message to every subscriber, which can be an SQS queue, a Lambda function, an HTTP endpoint, email and a few more. EventBridge is the AWS service actually named an *event bus*: a topic with routing rules, where each rule matches events by their content and sends the matches to its targets. Google Cloud Pub/Sub does both shapes in one product: every subscription on a topic gets every message, and the workers pulling from one subscription share it out between them.
+
+The pattern you'll see most on AWS puts the two together: **SNS in front, one SQS queue per service behind it.**
+
+<Figure n="006" title="FAN-OUT, THEN SHARE-OUT" caption="The API publishes once. The topic copies each message into every subscribed queue, so each service gets its own inbox and works at its own pace. Inside each queue, the workers share the messages out as before. A slow or crashed indexer delays only the indexer's queue.">
+<svg viewBox="0 0 640 245" role="img" aria-label="An API publishes to a topic, which copies each message into three queues, each drained by two workers">
+  <rect x="10" y="95" width="90" height="44" class="fill-paper" stroke-width="1.2" />
+  <text x="55" y="114" text-anchor="middle" class="strong">API</text>
+  <text x="55" y="130" text-anchor="middle">publish once</text>
+  <line x1="100" y1="117" x2="138" y2="117" class="ink" stroke-width="1.2" />
+  <rect x="140" y="80" width="120" height="74" class="fill-wash" stroke-width="1.2" />
+  <text x="200" y="104" text-anchor="middle" class="strong">TOPIC</text>
+  <text x="200" y="122" text-anchor="middle">docs-saved</text>
+  <text x="200" y="140" text-anchor="middle">(SNS)</text>
+  <line x1="260" y1="110" x2="328" y2="40" class="blue" stroke-width="1.2" />
+  <line x1="260" y1="117" x2="328" y2="117" class="blue" stroke-width="1.2" />
+  <line x1="260" y1="124" x2="328" y2="194" class="blue" stroke-width="1.2" />
+  <rect x="330" y="20" width="130" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="395" y="44" text-anchor="middle">SUMMARIZE QUEUE</text>
+  <rect x="330" y="97" width="130" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="395" y="121" text-anchor="middle">INDEX QUEUE</text>
+  <rect x="330" y="174" width="130" height="40" class="fill-paper" stroke-width="1.2" />
+  <text x="395" y="198" text-anchor="middle">ANALYTICS QUEUE</text>
+  <line x1="460" y1="34" x2="508" y2="28" class="ink" stroke-width="1" />
+  <line x1="460" y1="46" x2="508" y2="52" class="ink" stroke-width="1" />
+  <line x1="460" y1="111" x2="508" y2="105" class="ink" stroke-width="1" />
+  <line x1="460" y1="123" x2="508" y2="129" class="ink" stroke-width="1" />
+  <line x1="460" y1="188" x2="508" y2="182" class="ink" stroke-width="1" />
+  <line x1="460" y1="200" x2="508" y2="206" class="ink" stroke-width="1" />
+  <rect x="510" y="20" width="70" height="16" class="fill-paper" stroke-width="1" />
+  <text x="545" y="32" text-anchor="middle">WORKER</text>
+  <rect x="510" y="44" width="70" height="16" class="fill-paper" stroke-width="1" />
+  <text x="545" y="56" text-anchor="middle">WORKER</text>
+  <rect x="510" y="97" width="70" height="16" class="fill-paper" stroke-width="1" />
+  <text x="545" y="109" text-anchor="middle">WORKER</text>
+  <rect x="510" y="121" width="70" height="16" class="fill-paper" stroke-width="1" />
+  <text x="545" y="133" text-anchor="middle">WORKER</text>
+  <rect x="510" y="174" width="70" height="16" class="fill-paper" stroke-width="1" />
+  <text x="545" y="186" text-anchor="middle">WORKER</text>
+  <rect x="510" y="198" width="70" height="16" class="fill-paper" stroke-width="1" />
+  <text x="545" y="210" text-anchor="middle">WORKER</text>
+  <text x="295" y="236" text-anchor="middle" class="blue-t">COPY TO EVERY QUEUE</text>
+  <text x="545" y="236" text-anchor="middle">SHARED WITHIN EACH</text>
+</svg>
+</Figure>
+
+Why not have SNS deliver straight to the services? Because a topic on its own is a poor place to wait. SNS hands a message to each subscriber and is done with it; it retries a failing endpoint for a while, but it isn't keeping a backlog for a service that's down for an hour. The queue behind it is: each service gets a durable inbox with its own leases, its own retries and DLQ, and its own lag graph, so the indexer being slow or mid-deploy costs the summarizer nothing. Adding a fifth service is one more queue subscribed to the topic, and the producer never changes. (Redis has a `PUBLISH`/`SUBSCRIBE` too, and it keeps nothing at all: a subscriber that isn't connected at that moment just misses the message. "Pub/sub" names the copying, not a promise to store anything.)
+
+Kafka is the log version of the same picture. The topic is copied to every consumer group, since each group keeps its own offset, and shared out within a group, partition by partition. One Kafka topic with three consumer groups does what SNS plus three SQS queues does, with replay thrown in.
+
 ### Consumer lag: the one number to watch
 
 How do you know whether a queue is healthy? Not by its size alone; a big backlog that's shrinking is fine. You watch <Term w="consumer lag">How far behind the consumers are. In Kafka, the newest offset minus the committed offset, per partition. In a job queue, the number of waiting messages, or better, the age of the oldest one.</Term>.
@@ -382,7 +450,7 @@ If the process dies between 1 and 2, the document exists and its job never will.
 
 The fix is the <Term w="outbox pattern">Write the outgoing message into an "outbox" table in the same database transaction as the business change. A separate relay process reads the outbox and publishes to the broker, deleting or marking rows once sent.</Term>: write the message to an `outbox` table *in the same database transaction* as the document. Now they either both exist or neither does. A separate small process, the relay, reads unsent outbox rows, publishes them to the queue, and marks them sent.
 
-<Figure n="006" title="THE TRANSACTIONAL OUTBOX" caption="The document row and the message commit together, so they can't disagree. The relay publishes from the outbox; if it crashes after publishing but before marking the row sent, it publishes again on restart. At-least-once, again, so the consumer still needs to be idempotent.">
+<Figure n="007" title="THE TRANSACTIONAL OUTBOX" caption="The document row and the message commit together, so they can't disagree. The relay publishes from the outbox; if it crashes after publishing but before marking the row sent, it publishes again on restart. At-least-once, again, so the consumer still needs to be idempotent.">
 <svg viewBox="0 0 640 190" role="img" aria-label="The API writes a document row and an outbox row in one transaction; a relay publishes outbox rows to the queue">
   <rect x="10" y="66" width="80" height="44" class="fill-paper" stroke-width="1.2" />
   <text x="50" y="92" text-anchor="middle" class="strong">API</text>
@@ -407,6 +475,20 @@ The fix is the <Term w="outbox pattern">Write the outgoing message into an "outb
 
 The relay can poll the table every few hundred milliseconds, or read the database's own write-ahead log with a <Term w="change data capture">Reading a database's internal change log (Postgres WAL, MySQL binlog) to stream every committed change to other systems. Debezium is the common tool. Often shortened to CDC.</Term> tool like Debezium. Notice that CDC is Kreps' argument made literal: the database already has a log; you're just letting other systems read it.
 
+### Where a queue doesn't belong
+
+Every use of a queue in this lesson has one thing in common: nobody is standing at the counter waiting for the result. The user who saved a document got a 202 in 15 ms and moved on. That's the rule, and it's worth saying flatly because it's the most common way queues get misused in design interviews: **a queue belongs where nobody is waiting on the answer right now.**
+
+Take the redirect in a [URL shortener](/lessons/url-shortener/). `GET /x7Kp2` must answer "go to this long URL", and a browser is holding that connection open until it does. Put SQS or Kafka in front, so requests go into the queue and workers take them out, and three things go wrong:
+
+- **Nobody can answer.** A queue carries messages one way. The browser is still connected to whatever accepted the request, so that thing now has to wait for a worker to pick up the job, do a one-millisecond lookup, and send the result back through some reply channel: two extra broker hops, and a waiting room, on the hottest path you have.
+- **A spike becomes a spinner.** A queue absorbs a burst by making work wait. For a summary, a minute's wait is invisible. For a redirect, it's a spinner, then a timeout, then a retry that makes the burst bigger.
+- **A deploy becomes a timeout.** Yes, the queue keeps the request while the worker restarts. The person doesn't stay. By the time a new worker picks it up, the browser gave up long ago, and the work gets done for nobody.
+
+A queue is also not a load balancer: it doesn't check who's ready, route around a slow copy, or answer for anyone. What keeps live requests flowing through spikes and deploys is having servers ready to answer: a [load balancer](/lessons/load-balancing/) that only sends requests to ready copies, more copies when load grows, and old copies drained before they stop. Background jobs survive a deploy because they wait in a queue; live requests survive one because something else is always ready to serve them.
+
+The right shape is **answer first, then enqueue the side effect.** The redirect is served straight from a cache or the database. The click it caused (`{"code": "x7Kp2", "ts": ..., "referrer": ...}`) goes onto a queue for the analytics workers, who count it whenever they get to it. If they're mid-deploy, clicks pile up and get counted a minute late, and no one waited. Even the enqueue shouldn't be able to break the redirect: if the broker is down, drop or buffer the click and send the user on. That's at-most-once by choice, the trade from earlier, because a lost click count is much cheaper than a broken link.
+
 ### Which one do I reach for?
 
 | Need | Reach for | Why |
@@ -414,6 +496,7 @@ The relay can poll the table every few hundred milliseconds, or read the databas
 | Background jobs in a Python app | Celery or RQ on Redis | Simple, per-job retries. Turn on `acks_late` in Celery, or a worker crash loses the task. |
 | Jobs on AWS, no servers to run | SQS (+ DLQ via redrive policy) | Visibility timeout and DLQ built in. Standard queues are at-least-once with best-effort order. |
 | Jobs, and you already have Postgres | A jobs table + `SELECT ... FOR UPDATE SKIP LOCKED` | Jobs commit in the same transaction as your data. No outbox needed. Fine up to thousands of jobs/s. |
+| One event, several services, on AWS | SNS topic → one SQS queue per service | Fan-out from the topic, and each service gets its own durable inbox, retries and DLQ. |
 | Events many systems read, replay, history | Kafka, or Redpanda (Kafka-compatible) | Retention, offsets, consumer groups, per-key order. |
 | Something in between, already on Redis | Redis Streams (`XADD`, `XREADGROUP`, `XACK`) | A log with consumer groups and a per-consumer pending list, so you can reclaim stuck messages. |
 
@@ -660,6 +743,14 @@ An agent can explain client errors and config options; write the consumer loop y
 
 </Task>
 
+<Task id="t7" title="Put a queue in front of a waiting request, on purpose" agent="hands">
+
+Add one route to `api.py` that does the wrong thing deliberately: `GET /score/{doc_id}` enqueues the job, then checks `results.db` every 50 ms until the score appears or 5 s pass, and returns the score or a 504. Write it as `async def` and wait with `await asyncio.sleep(0.05)`: a plain `def` handler would hold one of FastAPI's worker threads (about 40 by default) for the whole wait, and you'd be measuring that limit instead.
+
+Start four workers by hand (`for i in 1 2 3 4; do python worker.py & done`) and fire 20 requests a second at `/score/<id>` with fresh IDs for 30 s, using the open-loop generator from t1. Ten seconds in, play a deploy: `pkill -f worker.py`, wait 8 s, start four again. Count 200s and 504s, then look in `results.db`: the jobs behind the 504s were scored anyway, after their callers had gone. Repeat the same deploy during `POST /docs` traffic. Every request still gets its 202 in milliseconds, and the backlog drains when the workers return. Same queue, same deploy: harmless for jobs, an outage for requests.
+
+</Task>
+
 <DoneWhen>
 
 - `POST /docs` answers in a few milliseconds no matter how slow scoring is, and `GET /jobs/<id>` reports pending, done (with score) or dead.
@@ -667,6 +758,7 @@ An agent can explain client errors and config options; write the consumer loop y
 - With `IDEM=0` and a widened ack gap, you can show duplicates in `scores_naive` and explain exactly which line of Figure 003 made each one.
 - You have a throughput-vs-workers table and can point at the knee and say what caused it.
 - After a fix and a re-drive, the DLQ is empty and every document has exactly one score.
+- You watched the same worker restart cost `POST /docs` nothing and `GET /score` a burst of 504s, and can say why.
 
 </DoneWhen>
 
@@ -717,6 +809,7 @@ Then use your number. If one machine tops out at P docs/s, re-scoring 5 million 
 2. **No attempt limit.** Set `max_attempts` to a huge number. The poison jobs bounce between pending and in-flight forever, using a worker each time. With one poison message per 1,000 jobs and a slow failure (say the tokenizer hangs 10 s before crashing), a growing fraction of your pool ends up doing nothing but failing. Then put the limit back.
 3. **Ack before work.** Move `ack` before `apply` and rerun the chaos test. Now you'll be short: fewer than 1,998 rows, nothing in the DLQ for them, and no error anywhere. Silent loss is worse than duplicates, because nothing tells you.
 4. **Producer faster than consumers, no bound.** Run 2 workers and a producer at 500 docs/s for a few minutes. Watch `redis-cli info memory` climb and the oldest job's age grow without limit. Then add a guard to `enqueue`: if `LLEN q:pending` exceeds a limit, raise, and have the API return 503 with `Retry-After`. That's backpressure from [Rate limits](/lessons/rate-limits/), applied at the door of the queue.
+5. **Two services, one queue.** Write `indexer.py`, a second kind of consumer that claims from the same `q:pending` and just appends each `doc_id` to `indexed.txt`. Run 4 workers and 2 indexers on 2,000 documents. Rows in `scores` plus lines in `indexed.txt` come to about 2,000, not 2,000 each, and nothing errored. Then fix it the SNS-and-SQS way: give `q.py` a queue name (`q:<name>:pending` and friends) and write `publish(payload, queues=["rank", "index"])`, which enqueues one copy per queue. That's fan-out in ten lines.
 
 ## Explain It Back
 
@@ -757,6 +850,13 @@ Throughput needed: 50M / 43,200 s ≈ 1,160 docs/s. Measure one worker's real th
 
 </details>
 
+<details>
+<summary>6. Asked to productionize a URL shortener, someone says "put Kafka or SQS in front as an event bus, so it absorbs load and requests survive a container going down". What do you say? And what are SQS, SNS, EventBridge and Kafka, in a line each?</summary>
+
+A queue belongs where nobody is waiting for the answer, and a redirect is the opposite: a browser is holding the connection open. In front of it, a queue adds broker hops and a waiting room to a millisecond lookup, can't send the answer back by itself, and turns a spike or a deploy into spinners and timeouts; the request survives the restart but the user doesn't wait for it. Live traffic survives load and deploys through ready servers: a load balancer that routes only to ready replicas, more replicas (and a cache) as load grows, and rolling deploys that drain old copies. The queue goes *behind* the redirect, for the side effect: serve the redirect, then enqueue the click for analytics, and don't let a broker outage break the link. The names: SQS is a queue, one inbox whose consumers share the messages. SNS is a topic that copies each message to every subscriber, often one SQS queue per service. EventBridge is AWS's event bus: a topic with content-based routing rules. Kafka is a log: kept for a retention period, copied to every consumer group, shared out by partition within a group, and replayable. None of them is a load balancer.
+
+</details>
+
 ## Go Deeper
 
 - **Jay Kreps, "The Log: What every software engineer should know about real-time data's unifying abstraction"** (LinkedIn Engineering blog, December 2013). The essay behind this lesson. Long, clear, and it will change how you see databases, replication and data pipelines. Expanded into the short O'Reilly book **_I Heart Logs_** (Kreps, 2014).
@@ -766,6 +866,8 @@ Throughput needed: 50M / 43,200 s ≈ 1,160 docs/s. Measure one worker's real th
 - **Amazon SQS Developer Guide: "Amazon SQS visibility timeout" and "Using dead-letter queues"**. The clearest official write-up of leases, redelivery, and redrive policies, with the real defaults and limits.
 - **Tyler Treat, "You Cannot Have Exactly-Once Delivery"** (Brave New Geek blog, 2015). A short, sharp argument for why delivery guarantees stop at at-least-once, and what people really mean by "exactly-once".
 - **Neha Narkhede, "Exactly-once Semantics Are Possible: Here's How Kafka Does It"** (Confluent blog, 2017). The other side: what Kafka's idempotent producer and transactions actually guarantee, and where the boundary is. Read it right after Treat.
+- **Gregor Hohpe and Bobby Woolf, _Enterprise Integration Patterns_ (Addison-Wesley, 2003), "Point-to-Point Channel" and "Publish-Subscribe Channel"** (summaries at [enterpriseintegrationpatterns.com](https://www.enterpriseintegrationpatterns.com/)). The book that named the two shapes in the pub/sub section, along with "Competing Consumers" and "Dead Letter Channel". Old, and every broker since still fits its vocabulary.
+- **Amazon SNS Developer Guide, the section on fanout to Amazon SQS queues**. The official SNS-in-front, one-queue-per-service pattern, with subscription filter policies for services that only want some of the messages.
 - **Chris Richardson, "Pattern: Transactional outbox"** ([microservices.io](https://microservices.io/patterns/data/transactional-outbox.html)). The outbox pattern and its relatives (polling publisher, log tailing) in one page.
 
 ## Connections
@@ -773,3 +875,5 @@ Throughput needed: 50M / 43,200 s ≈ 1,160 docs/s. Measure one worker's real th
 This lesson leans on [Waiting vs working](/lessons/waiting-vs-working/) for Little's Law and on [Rate limits and backpressure](/lessons/rate-limits/) for the idea that a buffer hides overload: a queue is a deliberately enormous buffer, so you need lag alerts and a bound to get the pressure signal back. The idempotent write is [Transactions](/lessons/transactions/) at work, and it's the same idempotency-key trick as API retries in [the API lifecycle](/lessons/api-lifecycle/). The "where's the knee" measurement is the same shape as [p99 and load testing](/lessons/tail-latency/), and the "is the bottleneck cores or something shared?" question comes from [Processes, threads and the GIL](/lessons/processes-threads-gil/), since each worker is a separate process exactly so CPU-bound scoring can use every core.
 
 Looking ahead: [Data pipelines](/lessons/data-pipelines/) is this lesson at training-data scale, where chunked, idempotent, replayable jobs are the whole design. [Batching](/lessons/batching/) is what a worker should do with a chunk once it has one on a GPU. And [Observability](/lessons/observability/) is where consumer lag and oldest-message age become dashboards and alerts.
+
+For live requests, the tool is a different one: [Load balancing](/lessons/load-balancing/) is how a request survives a spike or a deploy (ready servers, draining, rolling restarts), and [the URL shortener](/lessons/url-shortener/) shows both in one design, the balancer in front of the redirect and a queue behind it for the clicks.

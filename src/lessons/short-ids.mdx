@@ -1,0 +1,752 @@
+import Term from '../components/Term.astro';
+import Figure from '../components/Figure.astro';
+import Origin from '../components/Origin.astro';
+import Predict from '../components/Predict.astro';
+import Task from '../components/Task.astro';
+import DoneWhen from '../components/DoneWhen.astro';
+import ShortIdsBirthday from '../components/figures/ShortIdsBirthday.astro';
+
+A short ID is a tiny name you hand out for something bigger: the `aB3x9Qz` at the end of a short link, an order number, an invite code. Every one must be different from every other one ever handed out, and it should be short enough to read aloud.
+
+It sounds like the easiest part of any system, and it's the part people get wrong in interviews. Pick the codes at random and they start clashing far, far sooner than the size of the space suggests. Pick them in order and anyone can count your customers by making two links a week apart. Run the code on many servers at once and two of them will hand out the same name in the same millisecond. Each of those has a precise answer, and the answers are short once you've seen them.
+
+You know from [Indexes](/lessons/indexes/) that a database can keep a column sorted and find any value in a few page reads; here that same structure becomes the referee that refuses duplicates. [Transactions](/lessons/transactions/) showed you the bug where two requests both check, both decide it's safe, and both write; here it comes back wearing a different hat. This lesson is the core of the [URL shortener](/lessons/url-shortener/) capstone, and the ID schemes at the end are the ones you'll meet in every big system's primary keys.
+
+## Today
+
+- Count in base 62 by hand, turn a number into a short code and back, and say exactly why people use 62 symbols instead of 64 for links.
+- Say how many codes a given length gives you, and predict, within a few percent, how many random codes you can hand out before two of them clash. Then measure it. (This is the birthday paradox.)
+- Compare the three ways to make codes (count up, pick at random, hash the link) and say what each one leaks, risks and costs.
+- Explain why "insert it and let the database refuse duplicates" is correct and "check first, then insert" is not, and prove it by hammering a real table from eight processes.
+- Hand out unique IDs from many servers without a clash: blocks of numbers per server, IDs built from the clock plus a machine number, and the newer kind of random ID that sorts by time.
+
+Before this, do [Indexes](/lessons/indexes/) (a unique index is a B-tree that refuses duplicates) and skim the lost-update and write-skew parts of [Transactions](/lessons/transactions/). Everything runs in plain Python and SQLite on your Mac. One evening.
+
+## The Problem
+
+You watched a friend do an interview: "Build a URL shortener with Claude Code, then explain it and make it production-ready." The agent produced something that worked in ten minutes. The core of it looked like this:
+
+```python
+def make_code() -> str:
+    return base64.b64encode(os.urandom(6)).decode()[:6]
+
+def shorten(url: str) -> str:
+    code = make_code()
+    if db.execute("SELECT 1 FROM links WHERE code = ?", (code,)).fetchone():
+        code = make_code()                       # try once more
+    db.execute("INSERT INTO links (code, url) VALUES (?, ?)", (code, url))
+    return code
+```
+
+Then the interviewer started asking questions, and each one landed on a different crack.
+
+"Why 6 characters? How many links before two of them get the same code?" The tempting answer is "64⁶ is about 69 billion, so never." The real answer is that the first clash is expected after about **330,000** links, less than five millionths of the space. (6 base64 characters hold 36 bits; you'll derive the 330,000 yourself.)
+
+"I see a `+` and a `/` in some codes. What happens when someone clicks `sho.rt/ab+c/d`?" About 17% of 6-character base64 codes contain one of those two characters, and both of them mean something in a URL.
+
+"Two servers, same moment, same random code. What happens?" Both check, both see it's free, both insert. Either you now have two links with one code, or one user gets an error page, depending on whether the table has a uniqueness rule. The retry-once line doesn't help with either.
+
+"Could I use a counter instead?" Sure, and then link 1,000,000 is followed by 1,000,001, and a competitor who makes a link on Monday and another on Friday knows exactly how many links your customers made that week.
+
+None of these are exotic. They are the four questions of this lesson, and every system that hands out names faces them.
+
+<Origin year="2002" title="Short links, and the day tweet IDs got too big">
+
+In January 2002, Kevin Gilbertson launched TinyURL because long links pasted into newsgroup posts and emails kept getting wrapped across lines and broken. A short link is just a row in a table: a short code pointing at a long URL. The whole service is a lookup and a redirect. The only genuinely interesting decision is how to choose the code.
+
+Eight years later the same question showed up at a much larger scale. Twitter gave every tweet a number from one counter in MySQL. In June 2009 those numbers passed 2,147,483,647, the largest value a signed 32-bit integer can hold, and third-party apps that stored tweet IDs in 32-bit fields broke. People called it the Twitpocalypse. Then Twitter began moving tweet storage to Cassandra, which has no built-in counter, and needed a way for many machines to mint tens of thousands of IDs a second, independently, with no clashes, that still sorted roughly by time and fit in 64 bits. In 2010 they published the design as Snowflake: an ID built from the current millisecond, a machine number and a small counter. Discord, Instagram (with its own variant) and many others copied it, and you'll build one at the end.
+
+</Origin>
+
+## The Idea
+
+### What a short code has to be
+
+Write down the requirements before choosing anything, because the three strategies later each give up a different one.
+
+1. **Short.** People read it, type it, and fit it in a tweet. Every character costs.
+2. **Unique.** Two links must never share a code, ever, across every server, for the life of the service. This one is not negotiable: a clash sends someone to the wrong page.
+3. **Safe inside a URL.** No character that a browser, a proxy or a web framework will reinterpret.
+4. **Ideally not guessable.** Nobody should be able to list other people's links by trying codes one after another.
+
+The first three are about the alphabet and the length. The fourth is about how you pick codes.
+
+### Counting in base 62
+
+You already count in base 10: ten symbols, `0` to `9`, and when you run out you carry into the next column. `427` means 4 hundreds, 2 tens and 7 ones, and each column is worth 10 times the one to its right.
+
+A short code is the same thing with more symbols. Take every character that is completely boring in a URL: the ten digits, the 26 lowercase letters and the 26 uppercase letters. That's 62. Give each a value: `0`-`9` are 0-9, `a`-`z` are 10-35, `A`-`Z` are 36-61. Now each column is worth 62 times the one to its right, and that's <Term w="base62">Writing numbers with 62 symbols (0-9, a-z, A-Z) instead of 10. Each extra character multiplies the number of possible codes by 62. The order of the alphabet is a convention; libraries differ, so pick one and never change it.</Term>.
+
+To turn a number into base 62, do what you'd do by hand for any base: divide by 62, the remainder is the last character, repeat with what's left.
+
+<Figure n="001" title="ONE MILLION IN BASE 62" caption="Divide by 62, keep the remainder, repeat. The remainders, read from the bottom up, are the code: 1,000,000 becomes 4c92. Going back is the reverse: 4·62³ + 12·62² + 9·62 + 2 = 1,000,000.">
+<svg viewBox="0 0 640 270" role="img" aria-label="The base62 alphabet, and repeated division of one million by 62 giving the code 4c92">
+  <text x="20" y="22" class="strong">THE ALPHABET · 62 SYMBOLS</text>
+  <rect x="20" y="34" width="110" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="75" y="56" text-anchor="middle" class="strong">0 1 2 … 9</text>
+  <rect x="140" y="34" width="230" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="255" y="56" text-anchor="middle" class="strong">a b c … z</text>
+  <rect x="380" y="34" width="240" height="34" class="fill-wash" stroke-width="1.2" />
+  <text x="500" y="56" text-anchor="middle" class="strong">A B C … Z</text>
+  <text x="75" y="84" text-anchor="middle" class="blue-t">VALUES 0-9</text>
+  <text x="255" y="84" text-anchor="middle" class="blue-t">VALUES 10-35</text>
+  <text x="500" y="84" text-anchor="middle" class="blue-t">VALUES 36-61</text>
+  <text x="20" y="122" class="strong">1,000,000 → BASE 62</text>
+  <text x="20" y="148">1,000,000 ÷ 62 = 16,129</text>
+  <text x="250" y="148">remainder 2</text>
+  <text x="380" y="148" class="blue-t">→ '2'</text>
+  <text x="20" y="172">   16,129 ÷ 62 = 260</text>
+  <text x="250" y="172">remainder 9</text>
+  <text x="380" y="172" class="blue-t">→ '9'</text>
+  <text x="20" y="196">      260 ÷ 62 = 4</text>
+  <text x="250" y="196">remainder 12</text>
+  <text x="380" y="196" class="blue-t">→ 'c'</text>
+  <text x="20" y="220">        4 ÷ 62 = 0</text>
+  <text x="250" y="220">remainder 4</text>
+  <text x="380" y="220" class="blue-t">→ '4'</text>
+  <line x1="450" y1="222" x2="450" y2="144" class="blue" stroke-width="1.5" marker-end="url(#si-arr)" />
+  <defs><marker id="si-arr" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" class="fill-blue" /></marker></defs>
+  <text x="462" y="180">READ UPWARD</text>
+  <rect x="470" y="196" width="110" height="34" class="fill-wash" stroke-width="2" />
+  <text x="525" y="218" text-anchor="middle" class="strong">4c92</text>
+  <text x="20" y="258">EACH COLUMN IS WORTH 62× THE ONE TO ITS RIGHT: 62³ · 62² · 62¹ · 62⁰</text>
+</svg>
+</Figure>
+
+Decoding is the other direction: start at 0, and for each character, multiply what you have by 62 and add the character's value. `"4c92"`: 0·62 + 4 = 4; 4·62 + 12 = 260; 260·62 + 9 = 16,129; 16,129·62 + 2 = 1,000,000. That's the whole algorithm, both ways, and you'll write it in Build It.
+
+### How many codes a length gives you
+
+Each character multiplies the count by 62. So N characters give 62ᴺ codes:
+
+| Length | Possible codes (62ᴺ) | Roughly | Bits of information |
+| --- | --- | --- | --- |
+| 4 | 14,776,336 | 15 million | 23.8 |
+| 5 | 916,132,832 | 916 million | 29.8 |
+| 6 | 56,800,235,584 | 57 billion | 35.7 |
+| 7 | 3,521,614,606,208 | 3.5 trillion | 41.7 |
+| 8 | 218,340,105,584,896 | 218 trillion | 47.6 |
+
+The last column says the same thing in bits. One base62 character carries log₂ 62 ≈ 5.95 <Term w="bits">The number of yes/no questions needed to pin down a value. A code with b bits of information has 2^b possible values. 7 base62 characters ≈ 41.7 bits, because 2^41.7 ≈ 62^7.</Term>, a hair under 6. You'll need bits in a minute, because the rule for when random codes clash is easiest to say in bits.
+
+Two other numbers from the same arithmetic. A 64-bit integer, the biggest number most databases store natively, is at most 11 base62 characters. A full 128-bit UUID is 22.
+
+### Why not base64?
+
+<Term w="base64">A standard way (RFC 4648) to write arbitrary bytes as text using 64 symbols: A-Z, a-z, 0-9, plus + and /, with = added at the end as padding. Each character carries exactly 6 bits, which is why it's the default for encoding binary data.</Term> is the encoding everyone has in their fingers, and it's what the agent reached for. It has two more symbols than base62, so each character carries exactly 6 bits, which makes it neat for turning raw bytes into text. The trouble is which two symbols, and the padding.
+
+| Character | What it means in a URL |
+| --- | --- |
+| `/` | Separates path segments. `sho.rt/ab/cd` asks for the path `ab`, then `cd`; your router never sees a code called `ab/cd`. |
+| `+` | In query strings and form data, decoders turn it into a space. `?c=ab+cd` arrives as `ab cd`. |
+| `=` | Padding on the end, and also the separator between a query-string key and its value. |
+
+You can escape all of these as `%2F`, `%2B`, `%3D`, but then your 6-character code is 8 characters, and every layer between the user and your server (browsers, proxies, chat apps that turn text into links, analytics scripts) has to get the escaping right. About 17% of random 6-character base64 codes contain a `+` or a `/`, so this isn't a rare edge.
+
+The standard has an answer: <Term w="base64url">The URL-safe variant of base64 from RFC 4648, section 5: + becomes - and / becomes _. Padding is usually dropped. Used in JWTs and many tokens.</Term> swaps `+` for `-` and `/` for `_`, and you usually drop the padding. Those two are genuinely safe in URLs, and base64url is a perfectly good choice for long tokens (JSON Web Tokens use it). For short codes that humans see, most people still pick base62, for small human reasons: a hyphen splits a word when you double-click it, `a-_b` reads like punctuation, and codes ending in `-` or `_` look like typos. Base62 costs you 0.05 bits per character, which is nothing.
+
+Some services go further and drop characters people confuse, like `0`/`O` and `1`/`l`/`I`. Bitcoin addresses use <Term w="base58">Base62 minus 0, O, I and l, so a code read aloud or copied by hand can't be misread. Each character carries about 5.86 bits.</Term> for exactly that reason. Same idea, smaller alphabet.
+
+### Three ways to pick the code
+
+Now the real decision. The alphabet and the length tell you how many codes exist. They don't tell you which one to hand out next.
+
+**1. Count, then encode.** Keep a counter. Link 1 gets `1`, link 62 gets `10`, link 1,000,000 gets `4c92`. In a database this is the auto-incrementing primary key you get for free. There are no clashes, ever, because no number is handed out twice. Codes are as short as possible: you don't need 7 characters until link 56.8 billion. And in [Indexes](/lessons/indexes/) you saw that ever-increasing keys always land in the rightmost leaf of the B-tree, which is the cheapest possible insert.
+
+The cost is that the codes are a story anyone can read. They are <Term w="enumerable">Possible to list completely by counting through them. If codes are sequential, an outsider can visit 1, 2, 3, ... and see every link, including ones meant to be shared with only one person.</Term>: anyone can walk `4c92`, `4c93`, `4c94` and see every link people made, including ones meant for one recipient. And they leak volume. Make a link on Monday, another on Friday, subtract, and you know how many links all your competitor's users made that week. In World War II, Allied statisticians did exactly this with the serial numbers on captured German tanks and estimated production more accurately than the spies did. It's still called the German tank problem.
+
+**2. Pick at random, let the database refuse duplicates.** Draw 7 characters from a cryptographically secure random source, and try to insert. If that code is already taken, the database says so, and you draw again. Nothing about one code tells you anything about any other, so there's no volume to read and no order to walk. The cost: clashes can happen, so you need a uniqueness rule in the database and a retry loop, and you need to know how often retries happen. That's the next section, and it's the surprise.
+
+**3. Hash the URL, keep the first few characters.** Run the long URL through SHA-256, write the result in base62, keep 7 characters. The same URL always gives the same code, so if a million people shorten the same news article you store it once, and you can check "have I seen this URL?" without storing anything new.
+
+Two catches. First, a <Term w="hash function">A function that turns any input into a fixed-size, scrambled-looking output. The same input always gives the same output, and any change to the input changes the output completely. SHA-256 outputs 256 bits.</Term> truncated to 7 characters is just 41.7 bits of scrambled output, and different URLs collide exactly as often as random codes do. You still need the uniqueness rule, and a way to resolve a clash (hash `url + "#1"`, then `url + "#2"`, ...), and now the code for a URL depends on what was inserted before it. Second, the "free" deduplication isn't free: to find an existing link for a URL you have to look it up by URL, which means a unique index on the URL column, and with that index you could deduplicate random codes just as well. And often you don't want deduplication at all: two customers shortening the same URL usually want separate click counts and the right to delete their own link.
+
+| | Count + base62 | Random + unique rule + retry | Hash of URL, truncated |
+| --- | --- | --- | --- |
+| Clashes | Never | Rare; retry | Rare; rehash with a suffix |
+| Guessable / enumerable | Yes: next code is +1 | No (with a secure random source) | No, but anyone with the URL can compute its code |
+| Leaks how many links you have | Yes | No | No |
+| Same URL twice | Two codes | Two codes | One code |
+| Code length | Grows from 1 char | Fixed | Fixed |
+| Many servers | Needs a shared counter (see later) | Only the database's uniqueness check | Same as random |
+| B-tree inserts | Always at the right edge: cheap | Random spots: costlier | Random spots: costlier |
+
+Most real shorteners use the database's own counter internally (it's the primary key) and either show it directly, show it scrambled (later), or show a separate random code. The rest of this section is about making option 2 safe, because it's the one with a trap.
+
+### The birthday paradox
+
+How many people do you need in a room before there's a 50% chance that two of them share a birthday?
+
+<Predict id="birthday-room">
+
+Guess before reading on. 365 possible birthdays. How many people for a coin-flip chance that some two share one? And how many for 99.9%?
+
+<Fragment slot="answer">
+
+**23 people** gives 50.7%. **70 people** gives 99.9%.
+
+Most people guess somewhere around 180, half of 365. The trick is that the question isn't "does someone share *my* birthday?" (that does need about 253 other people for 50%). It's "do *any two* people share one?", and the number of pairs grows much faster than the number of people. 23 people make 23 × 22 / 2 = 253 pairs. Each pair matches with probability 1/365, so you'd expect 253/365 ≈ 0.69 matching pairs, which is already a lot of chances.
+
+</Fragment>
+
+</Predict>
+
+The reason is in the pairs. Add one person to a room of 22, and they don't get one new chance to match, they get 22: one with each person already there. So the number of chances grows like the *square* of the crowd.
+
+<Figure n="002" title="PEOPLE GROW LINEARLY, PAIRS GROW AS THE SQUARE" caption="Five people make ten pairs; every line is a separate chance of a shared birthday. Double the people and you roughly quadruple the lines. That square is why clashes arrive at about the square root of the space, not halfway through it.">
+<svg viewBox="0 0 640 230" role="img" aria-label="Five dots with all ten lines between them, next to a table of people versus pairs">
+  <line x1="110" y1="40" x2="176.6" y2="88.4" class="blue" stroke-width="1.2" />
+  <line x1="110" y1="40" x2="151.1" y2="166.6" class="blue" stroke-width="1.2" />
+  <line x1="110" y1="40" x2="68.9" y2="166.6" class="blue" stroke-width="1.2" />
+  <line x1="110" y1="40" x2="43.4" y2="88.4" class="blue" stroke-width="1.2" />
+  <line x1="176.6" y1="88.4" x2="151.1" y2="166.6" class="blue" stroke-width="1.2" />
+  <line x1="176.6" y1="88.4" x2="68.9" y2="166.6" class="blue" stroke-width="1.2" />
+  <line x1="176.6" y1="88.4" x2="43.4" y2="88.4" class="blue" stroke-width="1.2" />
+  <line x1="151.1" y1="166.6" x2="68.9" y2="166.6" class="blue" stroke-width="1.2" />
+  <line x1="151.1" y1="166.6" x2="43.4" y2="88.4" class="blue" stroke-width="1.2" />
+  <line x1="68.9" y1="166.6" x2="43.4" y2="88.4" class="blue" stroke-width="1.2" />
+  <circle cx="110" cy="40" r="9" class="fill-wash" stroke-width="1.5" />
+  <circle cx="176.6" cy="88.4" r="9" class="fill-wash" stroke-width="1.5" />
+  <circle cx="151.1" cy="166.6" r="9" class="fill-wash" stroke-width="1.5" />
+  <circle cx="68.9" cy="166.6" r="9" class="fill-wash" stroke-width="1.5" />
+  <circle cx="43.4" cy="88.4" r="9" class="fill-wash" stroke-width="1.5" />
+  <text x="110" y="210" text-anchor="middle" class="strong">5 PEOPLE · 10 PAIRS</text>
+  <text x="270" y="40" class="strong">PEOPLE</text>
+  <text x="380" y="40" class="strong">PAIRS = n(n−1)/2</text>
+  <line x1="270" y1="50" x2="620" y2="50" class="ink" stroke-width="1" />
+  <text x="270" y="74">5</text><text x="380" y="74">10</text>
+  <text x="270" y="98">10</text><text x="380" y="98">45</text>
+  <text x="270" y="122" class="blue-t">23</text><text x="380" y="122" class="blue-t">253  ≈ 0.69 × 365</text>
+  <text x="270" y="146">70</text><text x="380" y="146">2,415</text>
+  <text x="270" y="170">4,526 codes</text><text x="380" y="170">≈ 10.2 million ≈ 0.69 × 62⁴</text>
+  <text x="270" y="210" class="blue-t">50% WHEN PAIRS ≈ 0.69 × SPACE</text>
+</svg>
+</Figure>
+
+Now swap birthdays for codes. You have N possible codes and you've handed out n at random.
+
+1. There are n(n−1)/2, roughly n²/2, pairs of codes.
+2. Each pair clashes with probability 1/N.
+3. So you expect about **n² / 2N** clashing pairs.
+4. Turned into a probability, the chance that *no* pair clashes is about e^(−n²/2N). Set that to one half and solve: **n ≈ √(2 ln 2 · N) ≈ 1.18 √N**.
+
+That's the <Term w="birthday bound">The rule that random picks from N possibilities start colliding after about √N picks, not N/2. With b-bit random values, expect collisions around 2^(b/2). Named after the birthday paradox.</Term>. You'll also see a slightly different constant, √(πN/2) ≈ 1.25 √N. That's the *average* number of draws until the first clash, rather than the point of a 50% chance. They're the same idea, about 6% apart, and you'll measure both.
+
+In bits, it's even simpler: **b random bits start clashing at about 2^(b/2)**. Half the bits. Your 41.7-bit, 7-character codes behave like 21 bits, about two million, as far as "first clash" goes.
+
+| Code | Space N | √N | 50% clash by (1.18√N) | Mean first clash (1.25√N) |
+| --- | --- | --- | --- | --- |
+| 3 chars | 238,328 | 488 | 575 | 612 |
+| 4 chars | 14,776,336 | 3,844 | 4,526 | 4,818 |
+| 6 base64 chars | 68,719,476,736 | 262,144 | 308,651 | 328,549 |
+| 6 chars | 56,800,235,584 | 238,328 | 280,610 | 298,700 |
+| 7 chars | 3,521,614,606,208 | 1,876,597 | 2,209,524 | 2,351,965 |
+| UUIDv4 | 5.3 × 10³⁶ | 2.3 × 10¹⁸ | 2.7 × 10¹⁸ | 2.9 × 10¹⁸ |
+
+("chars" means base62 characters; the agent's 6 base64 characters are 36 bits; a UUIDv4 has 122 random bits.) Look at the 4-character row. Fifteen million codes, and the first clash comes at around 4,800. About a third of a thousandth of the space. That's the number you'll predict and then measure in Build It.
+
+<Predict id="four-char">
+
+You draw random 4-character base62 codes, one at a time, until one repeats. Over 1,000 runs of that experiment, what's the average number of draws? What's the smallest you'd expect to see in 1,000 runs? The largest?
+
+<Fragment slot="answer">
+
+The average should be about **4,818** (1.25 × 3,844) and the median about 4,526. On my Mac, 1,000 runs with Python's `secrets` gave a mean of **4,762** and a median of **4,510**, within about 1% of the formula.
+
+The spread is the part people don't expect: the shortest run clashed after **105** codes, the longest went **15,022**. A clash after a hundred draws from fifteen million is unlucky, but over a thousand runs something that unlucky happens. Your service is one run, so you don't get to average.
+
+</Fragment>
+
+</Predict>
+
+### "Some clash somewhere" vs "my insert clashes"
+
+Here's the part that makes random codes usable anyway. The birthday bound answers "has *any* pair ever clashed?" That's the right question if you never check. But you do check: the database refuses a duplicate, and you draw again. The question that matters for a retry loop is different: **when I draw one new code, what's the chance it's already taken?**
+
+That's just the fraction of the space already used: **n / N**. With 100 million links in a 7-character space, it's 100,000,000 / 3,521,614,606,208, about **1 in 35,000**. A retry is a rounding error. You'd expect around 1,400 retries over all 100 million inserts, each one costing a single extra database round trip.
+
+And the average number of tries per insert, when a fraction f of the space is full, is 1 / (1 − f). At 10% full, 1.1 tries. At 50% full, 2. At 90% full, 10. At 99%, 100. I measured that by filling a 3-character space (238,328 codes) to 99%: 1.10, 2.00, 4.01, 9.76 and 68.7 tries per insert around 10%, 50%, 75%, 90% and 99% full, against 1.10, 1.98, 3.92, 9.52 and 66.7 from the formula at the middle of each window. The formula is exact; random codes are fine until the space is a meaningful fraction full, and then they fall off a cliff.
+
+So both statements are true at once, and you need both in an interview: **with 7-character random codes, a clash somewhere is certain after a few million links, and still almost no single insert ever has to retry.** The first is why you need the uniqueness rule. The second is why the retry loop is cheap.
+
+Move the sliders. The blue curve is "some two links share a code, if nobody checked". The dashed one is "the next new code is taken", which is what a retry costs you.
+
+<Figure n="003" title="THE BIRTHDAY CURVE FOR SHORT CODES" caption="Blue: probability that at least two of n random codes are the same, 1 − e^(−n(n−1)/2N); the dot marks 50%, at 1.18√N. Dashed: probability that a fresh code is already taken, n/N. Try 7 characters at 10 million links (a clash is certain, a retry is 1 in 350,000), then 4 characters at 10 million (two thirds full: three tries per insert).">
+
+<ShortIdsBirthday />
+
+</Figure>
+
+The last readout is the one to stare at: **random guesses per real link found**. That's N / n, and it's the same number as the retry rate, upside down. With 100 million links in a 7-character space, someone guessing codes at random finds a real link once every 35,000 tries. At 100 requests a second, that's one stranger's link every six minutes. "Not guessable" is about how *sparse* the space is, not just how random the codes are. If the links point at private documents, you need longer codes, or rate limits on lookups, or both. Researchers have done exactly this scan against real short-link services and found shared cloud documents and map directions people assumed were private (see Go Deeper).
+
+### Where uniqueness actually comes from
+
+So the plan for random codes is: draw, insert, and if the code is taken, draw again. The only question left is who decides "taken". The tempting answer is your code:
+
+```python
+if not db.execute("SELECT 1 FROM links WHERE code = ?", (c,)).fetchone():
+    db.execute("INSERT INTO links (code, url) VALUES (?, ?)", (c, url))
+```
+
+That's a check, then an action, with a gap between them. You met this shape in [Transactions](/lessons/transactions/): it's the "at most 3 sessions" bug, where two requests both count, both see room, and both insert. Here two servers draw the same code (rare, but you just computed it's certain eventually), both check, both see nothing, and both insert.
+
+<Figure n="004" title="CHECK-THEN-INSERT vs INSERT-AND-CATCH" caption="Left: both servers ask 'is aB3x free?' before either writes, both hear yes, and both insert. Without a unique rule you now have two links with one code; with one, server B crashes with an error it never planned for. Right: each server just inserts. The unique index lets exactly one win, and the loser draws a new code." wide>
+<svg viewBox="0 0 760 310" role="img" aria-label="Two timelines: check then insert produces a duplicate; insert and catch the conflict produces one winner and a retry">
+  <defs><marker id="si-ark" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0 L7 3.5 L0 7 z" style="fill:var(--ink)" /></marker></defs>
+  <text x="10" y="20" class="strong">CHECK, THEN INSERT</text>
+  <text x="10" y="56">SERVER A</text>
+  <text x="10" y="146">DATABASE</text>
+  <text x="10" y="236">SERVER B</text>
+  <line x1="90" y1="52" x2="360" y2="52" class="ink dash" stroke-width="1" />
+  <line x1="90" y1="232" x2="360" y2="232" class="ink dash" stroke-width="1" />
+  <rect x="90" y="128" width="270" height="28" class="fill-paper" stroke-width="1.2" />
+  <circle cx="110" cy="52" r="4" class="fill-blue" />
+  <text x="104" y="40">SELECT aB3x</text>
+  <line x1="110" y1="56" x2="110" y2="126" class="ink" stroke-width="1" marker-end="url(#si-ark)" />
+  <circle cx="160" cy="232" r="4" class="fill-blue" />
+  <text x="150" y="252">SELECT aB3x</text>
+  <line x1="160" y1="228" x2="160" y2="158" class="ink" stroke-width="1" marker-end="url(#si-ark)" />
+  <text x="225" y="146" text-anchor="middle">"none" · "none"</text>
+  <circle cx="260" cy="52" r="4" class="fill-blue" />
+  <text x="240" y="40">INSERT aB3x</text>
+  <line x1="260" y1="56" x2="260" y2="126" class="blue" stroke-width="1.5" marker-end="url(#si-arr)" />
+  <circle cx="320" cy="232" r="4" class="fill-blue" />
+  <text x="290" y="252">INSERT aB3x</text>
+  <line x1="320" y1="228" x2="320" y2="158" class="blue" stroke-width="1.5" marker-end="url(#si-arr)" />
+  <text x="10" y="282" class="blue-t">NO UNIQUE RULE: TWO ROWS, ONE CODE</text>
+  <text x="10" y="300" class="blue-t">WITH A UNIQUE RULE: B CRASHES</text>
+  <text x="400" y="20" class="strong">INSERT, CATCH THE CONFLICT</text>
+  <text x="400" y="56">SERVER A</text>
+  <text x="400" y="146">UNIQUE INDEX</text>
+  <text x="400" y="236">SERVER B</text>
+  <line x1="490" y1="52" x2="750" y2="52" class="ink dash" stroke-width="1" />
+  <line x1="490" y1="232" x2="750" y2="232" class="ink dash" stroke-width="1" />
+  <rect x="490" y="128" width="260" height="28" class="fill-wash" stroke-width="1.2" />
+  <circle cx="520" cy="52" r="4" class="fill-blue" />
+  <text x="500" y="40">INSERT aB3x · OK</text>
+  <line x1="520" y1="56" x2="520" y2="126" class="blue" stroke-width="1.5" marker-end="url(#si-arr)" />
+  <circle cx="580" cy="232" r="4" class="fill-blue" />
+  <text x="540" y="252">INSERT aB3x</text>
+  <line x1="580" y1="228" x2="580" y2="158" class="blue" stroke-width="1.5" marker-end="url(#si-arr)" />
+  <text x="600" y="146">B: "taken"</text>
+  <circle cx="690" cy="232" r="4" class="fill-blue" />
+  <text x="750" y="252" text-anchor="end">INSERT Qz7p · OK</text>
+  <line x1="690" y1="228" x2="690" y2="158" class="blue" stroke-width="1.5" marker-end="url(#si-arr)" />
+  <text x="400" y="282" class="blue-t">EXACTLY ONE WINNER</text>
+  <text x="400" y="300" class="blue-t">THE LOSER DRAWS A NEW CODE</text>
+</svg>
+</Figure>
+
+The fix is to stop asking and let the database be the referee. Declare the column unique:
+
+```sql
+CREATE TABLE links (
+  id   INTEGER PRIMARY KEY,
+  code TEXT NOT NULL UNIQUE,
+  url  TEXT NOT NULL
+);
+```
+
+A <Term w="unique constraint">A rule in the schema that no two rows may have the same value in a column. The database enforces it with a unique index and rejects any insert or update that would break it, no matter how many clients are writing at once.</Term> is enforced with a <Term w="unique index">A B-tree index (from the indexes lesson) that refuses to hold two equal keys. Inserting into it finds the leaf where the key belongs; if the key is already there, the insert fails.</Term>. That's the same B-tree from [Indexes](/lessons/indexes/), with one extra rule: when an insert walks down to the leaf where the key belongs and finds it already there, it fails instead of adding a second copy. The database makes that find-and-insert one step that nothing else can interleave with (for the B-tree, it holds a lock on the leaf page while it checks and writes; Postgres additionally waits for any other in-progress transaction that inserted the same key, to see whether it commits). So when two inserts of `aB3x` race, exactly one wins. The other gets a uniqueness error, which you catch and treat as "draw again".
+
+The pattern is called **insert and catch the conflict**, and it beats check-then-insert three ways:
+
+- **It's correct.** Your check was a guess about the future; the index is the truth at the moment of writing.
+- **It's faster.** One round trip instead of two in the common case.
+- **The index you need for it is the index you needed anyway**, because every redirect looks links up by code. Without it, the "check" in check-then-insert is a scan of the whole table. In my runs, 40,000 check-then-inserts without a unique index took 11.9 s; with the unique index, 2.4 s.
+
+Two details that differ by database. In SQLite (and in Python's `sqlite3`), a failed insert raises `sqlite3.IntegrityError` and you can just loop. In Postgres, an error inside a transaction aborts the whole transaction, so the clean way is `INSERT ... ON CONFLICT (code) DO NOTHING RETURNING id`: if nothing comes back, the code was taken, and the transaction is still usable. Both databases support that `ON CONFLICT` form, which is often called an <Term w="upsert">Insert, or if the row would break a unique rule, do something else instead (nothing, or update the existing row). Written INSERT ... ON CONFLICT in Postgres and SQLite.</Term>.
+
+And the primary key itself is a unique constraint. The auto-increment counter from strategy 1 is unique for the same reason: the database owns it.
+
+### Many servers: where does the next number come from?
+
+Random codes need no coordination beyond the unique index. Counters do. With one database, the counter is easy: the database hands out the next number, atomically. Postgres calls it a <Term w="sequence">A database object that hands out increasing numbers. Each call to nextval() returns a new value, even across concurrent transactions, and is never rolled back, so failed inserts leave gaps.</Term>, SQLite and MySQL an auto-increment key.
+
+The trouble starts when you grow. Split the links table across 16 database servers, or run in three regions, and there is no single place that knows "the next number". Make one, and every insert anywhere in the world waits on a round trip to it (tens of milliseconds across an ocean, from [How slow is slow?](/lessons/latency-numbers/)), and when it's down, nobody can create anything. One counter is a <Term w="single point of failure">One component whose failure stops the whole system, no matter how many copies of everything else you run.</Term> and a bottleneck. Three standard ways out.
+
+**Hand out blocks.** The counter doesn't hand out one number; it hands out a thousand. Each server, on start-up and whenever it runs out, does one atomic update:
+
+```sql
+UPDATE counters SET next = next + 1000 WHERE name = 'links' RETURNING next;
+```
+
+If that returns 3,001, the server owns 2,001 through 3,000 and hands them out from memory with no further coordination. The counter now sees one request per thousand IDs instead of one per ID. If a server crashes, the rest of its block is never used, which is fine: IDs need to be unique, not consecutive. IDs are no longer in exact creation order across servers, only roughly. This idea is old and has many names (hi/lo in the Hibernate library, "segments" elsewhere).
+
+<Figure n="005" title="ID BLOCKS: ASK RARELY, HAND OUT OFTEN" caption="One small counter row hands each server a range of 1,000. Servers then mint IDs locally. The counter is touched once per thousand links, and a crashed server only wastes the rest of its range.">
+<svg viewBox="0 0 640 230" role="img" aria-label="A counter row handing three servers consecutive ranges of a thousand IDs">
+  <rect x="230" y="20" width="180" height="50" class="fill-wash" stroke-width="1.5" />
+  <text x="320" y="42" text-anchor="middle" class="strong">COUNTER ROW</text>
+  <text x="320" y="60" text-anchor="middle" class="blue-t">next = 3,001</text>
+  <rect x="20" y="140" width="180" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="110" y="162" text-anchor="middle" class="strong">SERVER A</text>
+  <text x="110" y="182" text-anchor="middle">owns 1 … 1,000</text>
+  <rect x="230" y="140" width="180" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="162" text-anchor="middle" class="strong">SERVER B</text>
+  <text x="320" y="182" text-anchor="middle">owns 1,001 … 2,000</text>
+  <rect x="440" y="140" width="180" height="56" class="fill-paper" stroke-width="1.2" />
+  <text x="530" y="162" text-anchor="middle" class="strong">SERVER C</text>
+  <text x="530" y="182" text-anchor="middle">owns 2,001 … 3,000</text>
+  <line x1="260" y1="70" x2="120" y2="138" class="blue" stroke-width="1.2" marker-end="url(#si-arr)" />
+  <line x1="320" y1="70" x2="320" y2="138" class="blue" stroke-width="1.2" marker-end="url(#si-arr)" />
+  <line x1="380" y1="70" x2="520" y2="138" class="blue" stroke-width="1.2" marker-end="url(#si-arr)" />
+  <text x="205" y="118" class="blue-t">+1000</text>
+  <text x="330" y="108" class="blue-t">+1000</text>
+  <text x="435" y="118" text-anchor="end" class="blue-t">+1000</text>
+  <text x="20" y="222">EACH SERVER: NEXT ID FROM MEMORY · ASK AGAIN ONLY WHEN ITS RANGE RUNS OUT</text>
+</svg>
+</Figure>
+
+Flickr ran a famous version of this with two tiny MySQL servers, called ticket servers, whose only job was handing out numbers. One gave out odd numbers and the other even ones, so either could die and the other kept going.
+
+**Build the ID from the clock.** Snowflake removes the counter entirely. Each machine is given a number once, at deploy time. Then any machine can mint an ID by itself, by packing three things into a 64-bit integer:
+
+<Figure n="006" title="A SNOWFLAKE ID, 64 BITS" caption="Twitter's layout: one unused sign bit (so the ID is a positive signed 64-bit integer), 41 bits of milliseconds since a custom epoch, 10 bits of machine number, and a 12-bit counter that resets every millisecond. Widths are to scale.">
+<svg viewBox="0 0 640 170" role="img" aria-label="A 64-bit bar split into 1 sign bit, 41 timestamp bits, 10 machine bits and 12 sequence bits">
+  <rect x="20" y="40" width="9" height="40" class="fill-paper" stroke-width="1.2" />
+  <rect x="29" y="40" width="369" height="40" class="fill-wash" stroke-width="1.2" />
+  <rect x="398" y="40" width="90" height="40" class="fill-paper" stroke-width="1.2" />
+  <rect x="488" y="40" width="108" height="40" class="fill-wash" stroke-width="1.2" />
+  <text x="24" y="30" text-anchor="middle">1</text>
+  <text x="213" y="30" text-anchor="middle" class="strong">41 BITS</text>
+  <text x="443" y="30" text-anchor="middle" class="strong">10</text>
+  <text x="542" y="30" text-anchor="middle" class="strong">12</text>
+  <text x="213" y="65" text-anchor="middle" class="blue-t">MILLISECONDS SINCE EPOCH</text>
+  <text x="443" y="65" text-anchor="middle">MACHINE</text>
+  <text x="542" y="65" text-anchor="middle" class="blue-t">SEQUENCE</text>
+  <text x="24" y="104" text-anchor="middle">0</text>
+  <text x="213" y="104" text-anchor="middle">2⁴¹ ms ≈ 69.7 YEARS</text>
+  <text x="443" y="104" text-anchor="middle">1,024</text>
+  <text x="542" y="104" text-anchor="middle">4,096 / ms</text>
+  <text x="20" y="140">HIGH BITS ARE TIME, SO IDS SORT BY CREATION TIME (TO THE MILLISECOND)</text>
+  <text x="20" y="160">NO COORDINATION WHILE RUNNING: EACH MACHINE ONLY NEEDS A UNIQUE NUMBER AND A CLOCK</text>
+</svg>
+</Figure>
+
+- **41 bits of time**: milliseconds since a custom starting point (Twitter's is in November 2010). 2⁴¹ milliseconds is about 69.7 years, so Twitter's IDs run out in 2080.
+- **10 bits of machine number**: up to 1,024 machines. (Twitter's code split this into 5 bits of datacenter and 5 of worker.)
+- **12 bits of sequence**: a counter for IDs made in the same millisecond on the same machine, up to 4,096. If a machine somehow needs a 4,097th in one millisecond, it waits for the next millisecond.
+
+That's 4,096,000 IDs per second per machine, about 4 billion per second across 1,024 machines, with no network traffic at all. Two machines can't clash because their machine bits differ. One machine can't clash with itself because time or the sequence always moves forward. And because time is in the high bits, sorting by ID sorts by creation time, which is why tweet IDs also tell you, roughly, when a tweet was posted.
+
+The two things that break it are both about its assumptions. If two machines are given the same machine number (a config mistake, a recycled container), they can mint identical IDs. And if a machine's clock jumps *backwards* (a time-sync correction), it could re-issue IDs it already issued; Twitter's implementation refuses to make IDs until the clock catches up again. Instagram's variant, built inside Postgres, used 41 bits of time, 13 bits of shard number and 10 bits of sequence: same idea, different split.
+
+A Snowflake ID written in base62 is 11 characters. Good for internal keys, a bit long for a short link.
+
+**Use a big random number: UUIDs.** A <Term w="UUID">Universally unique identifier: a 128-bit value, usually written as 36 characters like 3f2a6c1e-8b4d-4f0a-9c77-2e1d5b8a9f03. Several versions exist; v4 is random, v7 starts with a timestamp.</Term> is the "pick at random" strategy taken to its limit. Version 4 has 122 random bits. By the birthday bound, the first clash is expected after about 2.9 × 10¹⁸ of them: make a billion a second and you'd expect your first clash after about 92 years. So nobody checks. Every machine generates them independently and the database's primary key is the backstop that will, in practice, never fire.
+
+The catch is the one you measured in [Indexes](/lessons/indexes/): random keys land at random spots in the B-tree, so every insert touches a different leaf, the working set no longer fits in cache, and pages split all over the tree. **UUIDv7** (standardized in RFC 9562, 2024) fixes that by putting a 48-bit millisecond timestamp first and filling the rest with 74 bits of randomness. New keys land at the right edge of the tree, like a counter, but machines still need no coordination. On my Mac, inserting 2 million UUIDv4 primary keys into a SQLite table with an 8 MB cache took about **21 seconds**; the same with UUIDv7 took **1.6 seconds**. Python 3.14 added `uuid.uuid7()` to the standard library, and Postgres 18 added a built-in `uuidv7()` function.
+
+At 22 base62 characters, UUIDs are wrong for a short link but often right for the internal primary key. Many systems use both: a UUIDv7 or Snowflake as the row's real key, and a separate short code for humans.
+
+### Hiding a counter
+
+Last trick. Suppose you want the counter's best property (never a clash, no retries) without its worst one (anyone can read and walk the sequence). Scramble it: show the user not `encode(id)` but `encode(scramble(id))`, where `scramble` is a <Term w="permutation">A reshuffling of a set: every input maps to exactly one output in the same set, and no two inputs share an output. So scrambling distinct IDs always gives distinct codes, and you can always undo it.</Term> of the number range. Because every input has its own output, distinct IDs still give distinct codes, so there's still nothing to retry.
+
+The neat way to build a reversible scramble is a <Term w="Feistel network">A way to build a reversible scramble from any one-way mixing function: split the bits into halves L and R, replace them with R and L xor F(R), and repeat a few rounds. It can always be undone by running the rounds backward, whatever F is.</Term>. Split the 40-bit ID into two 20-bit halves, L and R. One round replaces (L, R) with (R, L xor F(R)), where F is any mixing function at all, for example a keyed hash of R cut to 20 bits. Four rounds scramble thoroughly. And it can always be undone: knowing the new pair, you can recompute F(R) and xor it back out, whatever F was. That's the trick DES used, and it's why it works with a hash that can't itself be reversed. 2⁴⁰ is about 1.1 trillion, which fits in 7 base62 characters. Run it on IDs 1, 2, 3 with a key and you get codes like `iMLvQ4k`, `drYt842`, `8VPuRdB`, with no visible order.
+
+Be honest about what this buys. It hides the order and the volume from a casual observer. It's obfuscation, not proven security: a home-made 4-round cipher with a secret key is not something to bet private documents on, and it doesn't change the density argument at all. With 100 million links in a 7-character space, a random guess still finds a real link 1 in 35,000 times, scrambled or not. Libraries like Sqids (formerly Hashids) do a lighter version of this with a shuffled alphabet, and say plainly in their docs that it isn't encryption. If guessing a code must be infeasible, use random codes from a secure source, make them long enough that the space stays sparse, and rate-limit lookups.
+
+## Build It
+
+Everything goes in `~/workbench/short-ids/`. Standard library only: `secrets`, `sqlite3`, `multiprocessing`, `hmac`.
+
+```text
+short-ids/
+  base62.py        # Task 1
+  test_base62.py
+  birthday.py      # Task 2
+  store.py         # Task 3: table + insert_with_retry
+  hammer.py        # Task 3: many processes at once
+  idblocks.py      # Task 4 (optional)
+  snowflake.py     # Task 4 (optional)
+```
+
+<Task id="t0" title="Set up" agent="ok">
+
+```bash
+mkdir -p ~/workbench/short-ids && cd ~/workbench/short-ids
+python3 --version                   # 3.12+ is fine; 3.14 has uuid.uuid7() built in
+python3 -c "import sqlite3; print(sqlite3.sqlite_version)"   # 3.35+ for RETURNING
+pip install pytest                  # or use `python3 -m pytest` from a venv
+```
+
+</Task>
+
+<Task id="t1" title="Base62 by hand, with a round-trip test" agent="hands">
+
+No libraries. You're writing the division ladder from Figure 001 and its reverse.
+
+```python
+# base62.py
+ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+BASE = len(ALPHABET)
+INDEX = {c: i for i, c in enumerate(ALPHABET)}   # char -> value, O(1)
+
+def encode(n: int) -> str:
+    """Non-negative int -> base62 string. encode(0) == "0".
+    Repeatedly divmod by 62, collect remainders, reverse at the end.
+    Raise ValueError for negative n."""
+
+def decode(s: str) -> int:
+    """Base62 string -> int. Start at 0; for each char: n = n * 62 + value.
+    Raise ValueError on an empty string or a character not in ALPHABET."""
+
+def encode_fixed(n: int, width: int) -> str:
+    """Like encode, but left-padded with '0' to exactly `width` chars.
+    Raise ValueError if n doesn't fit (n >= 62 ** width)."""
+```
+
+Then the tests:
+
+```python
+# test_base62.py
+import random
+from base62 import encode, decode, encode_fixed
+
+def test_known_values():
+    assert encode(0) == "0" and encode(61) == "Z" and encode(62) == "10"
+    assert encode(1_000_000) == "4c92" and decode("4c92") == 1_000_000
+
+def test_round_trip_random():
+    rng = random.Random(0)
+    for _ in range(100_000):
+        n = rng.randrange(2 ** 64)
+        assert decode(encode(n)) == n
+```
+
+Add your own: round-trip every number from 0 to 10,000; `encode(62**7 - 1) == "ZZZZZZZ"` and `encode(62**7)` is 8 characters; `encode(2**64 - 1)` is 11 characters; `decode("ab+c")` raises; `encode_fixed(5, 7) == "0000005"`, and `encode_fixed(62**7, 7)` raises.
+
+Hint: Python's `divmod(n, 62)` gives the quotient and remainder in one call. The classic bug is the loop condition: `while n > 0` returns an empty string for 0. Your `encode(0)` test catches it.
+
+</Task>
+
+<Task id="t2" title="Predict, then measure, the first clash" agent="hands">
+
+Write your predictions in a comment at the top of the file first: for 3- and 4-character codes, the average and median number of draws until the first repeat, using 1.25√N and 1.18√N.
+
+```python
+# birthday.py
+import math, secrets, statistics
+from base62 import ALPHABET
+
+def random_code(length: int) -> str:
+    """`length` characters from ALPHABET using secrets.choice (a secure source)."""
+
+def draws_until_first_clash(length: int) -> int:
+    """Draw codes into a set until one is already there. Return how many draws
+    that took, counting the one that clashed."""
+
+def experiment(length: int, trials: int) -> None:
+    """Run `trials` times. Print mean, median, min, max, the two predictions,
+    and the fraction of trials that clashed at or before 1.18 * sqrt(N)
+    (should be about 0.5)."""
+
+if __name__ == "__main__":
+    experiment(3, 2000)
+    experiment(4, 1000)       # about 30 s on my Mac
+```
+
+Then the second experiment, which is the one that matters for a real service. Fill a 3-character space (use integers from `secrets.randbelow(62**3)` here, it's the same thing and faster) and, for each new code, count how many draws it took to find a free one. Report the average tries per insert in windows around 10%, 50%, 75%, 90% and 99% full, next to 1 / (1 − f).
+
+Hint: a set is fine for "already taken". Don't use a list; `in` on a list is a scan, and at 200,000 entries you'll be waiting all evening.
+
+</Task>
+
+<Task id="t3" title="A table that can't hold duplicates, hammered from eight processes" agent="review">
+
+The setup is boilerplate:
+
+```python
+# store.py
+import sqlite3, secrets
+from base62 import ALPHABET
+
+DB = "links.db"
+
+def connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB, timeout=30, isolation_level=None)   # autocommit
+    conn.execute("PRAGMA journal_mode=WAL")      # readers don't block the writer
+    conn.execute("PRAGMA busy_timeout=30000")    # wait for the write lock, don't fail
+    return conn
+
+def create(unique: bool) -> None:
+    conn = connect()
+    conn.execute("DROP TABLE IF EXISTS links")
+    conn.execute(f"""CREATE TABLE links (
+        id   INTEGER PRIMARY KEY,
+        code TEXT NOT NULL {'UNIQUE' if unique else ''},
+        url  TEXT NOT NULL)""")
+```
+
+The two functions that teach are yours:
+
+```python
+def insert_with_retry(conn, url: str, length: int, max_tries: int = 10) -> tuple[str, int]:
+    """Draw a code, INSERT it. On sqlite3.IntegrityError, draw again.
+    Return (code, attempts). Raise after max_tries: if that ever fires at
+    a sane fill level, something is wrong (bad randomness, a full space)."""
+
+def check_then_insert(conn, url: str, length: int) -> str:
+    """The broken version, on purpose: SELECT to see if the code exists,
+    draw again if it does, otherwise INSERT. No exception handling."""
+```
+
+Then `hammer.py`: start 8 processes with `multiprocessing.Pool(8)`; each opens its own connection (never share a SQLite connection across processes) and inserts its share of links. Afterwards, one query tells you everything: `SELECT count(*), count(DISTINCT code) FROM links`. Print rows, distinct codes, duplicates, total retries, and any errors each worker caught.
+
+Run four configurations:
+
+1. `insert_with_retry`, unique table, 3-character codes, 8 × 5,000 inserts.
+2. `check_then_insert`, **no** unique rule, 2-character codes (3,844 possible), 8 × 300 inserts. Run it three times.
+3. `check_then_insert`, unique table, same sizes. Count how many workers' inserts blew up with `IntegrityError`.
+4. `insert_with_retry` again at 2 characters, 8 × 300, unique table.
+
+The tiny code spaces in 2-4 are there to make clashes common enough to see in seconds; the race is the same at 7 characters, just rarer.
+
+Then have an agent review `hammer.py` for anything that could hide a race: a shared connection, a pool that runs workers one after another, a `DISTINCT` count that's quietly wrong because of trailing whitespace or case-insensitive comparison (SQLite compares `TEXT` case-sensitively by default; check that yours does, since `aB3x` and `AB3X` are different codes).
+
+</Task>
+
+<Task id="t4" title="Optional: an ID-block allocator and a Snowflake generator" agent="hands">
+
+**Blocks.** A table `counters(name TEXT PRIMARY KEY, next INTEGER NOT NULL)` with one row. Write:
+
+```python
+class BlockAllocator:
+    def __init__(self, conn, name: str = "links", block: int = 1000): ...
+    def _refill(self) -> None:
+        """One statement: UPDATE counters SET next = next + ? WHERE name = ?
+        RETURNING next. You now own [returned - block, returned)."""
+    def next_id(self) -> int:
+        """Hand out the next id in the current block; refill when empty."""
+```
+
+Run 8 threads, each with its own connection and its own allocator, each taking 50,000 IDs. Check that all 400,000 are distinct. Then count how many times the counter row was touched (it should be 400).
+
+**Snowflake.** Write `Snowflake(machine_id)` with `next_id()` that packs `(ms - EPOCH) << 22 | machine_id << 12 | sequence`, where `ms` is `time.time_ns() // 1_000_000`. Same millisecond as last time: bump the sequence; if it wraps past 4,095, spin until the clock moves. New millisecond: reset the sequence to 0. Clock went backwards: raise. Protect it with a `threading.Lock`. Then write `parse(id) -> (ms, machine, seq)`, generate a million IDs, and check they are distinct and already sorted. How many IDs per millisecond does your Python manage? Does it ever reach the 4,096 limit?
+
+</Task>
+
+<DoneWhen>
+
+- `pytest -q` passes, including 100,000 random round trips through `encode`/`decode`.
+- Your first-clash experiment lands within a few percent of 1.25√N (mean) and 1.18√N (median) for 3 and 4 characters, and about half the trials clash before 1.18√N.
+- Your fill experiment matches 1 / (1 − f) at every fill level.
+- `hammer.py` shows zero duplicates with the unique rule and retry, and at least one duplicate (or one `IntegrityError`) from `check_then_insert` in three runs.
+- You can say, without notes, why the second statement in the table below is not a contradiction: "a clash is certain after a few million 7-character links" and "almost no insert ever retries".
+
+</DoneWhen>
+
+## Measure
+
+Fill in your numbers. Mine are from an M4 Pro, Python 3.14, SQLite 3.53.
+
+**First clash, random codes.**
+
+| Code length | Space | Predicted mean (1.25√N) | Predicted median (1.18√N) | Your mean / median | Mine |
+| --- | --- | --- | --- | --- | --- |
+| 3 chars, 2,000 trials | 238,328 | 612 | 575 | | mean 613, median 577 |
+| 4 chars, 1,000 trials | 14,776,336 | 4,818 | 4,526 | | mean 4,762, median 4,510; min 105, max 15,022 |
+| 5 chars, 200 trials | 916,132,832 | 37,935 | 35,637 | | mean 38,643, median 38,746 |
+
+The 3- and 4-character means land within about 1% of the formula. The 5-character run, with only 200 trials, is off by a couple of percent, and its median is further off: that's what 200 samples of a quantity this spread out looks like. In the 4-character run, 50.1% of trials had clashed by 4,526 draws, which is exactly what "median" promises.
+
+**Tries per insert as the space fills** (3 characters, filled to 99%).
+
+| Fill | 1 / (1 − f) | Yours | Mine |
+| --- | --- | --- | --- |
+| ~10% | 1.10 | | 1.10 |
+| ~50% | 1.98 | | 2.00 |
+| ~75% | 3.92 | | 4.01 |
+| ~90% | 9.52 | | 9.76 |
+| ~99% | 66.7 | | 68.7 |
+
+(The formula column uses the middle of each 1%-wide window, which is why 50% reads 1.98.) This is the curve to remember when someone proposes "6 characters, random, we'll never get that big": the retries don't creep up, they hit a wall.
+
+**The hammer.** 8 processes, SQLite in WAL mode.
+
+| Configuration | Rows | Distinct codes | Duplicates | Retries / errors | Yours |
+| --- | --- | --- | --- | --- | --- |
+| Retry, unique, 3 chars, 40,000 inserts | 40,000 | 40,000 | 0 | 3,755 retries | |
+| Check-then-insert, no unique, 2 chars, 2,400 inserts | 2,400 | 2,395-2,397 | 3-5 per run | n/a | |
+| Check-then-insert, unique, same | 2,397-2,400 | all distinct | 0 | 0-3 `IntegrityError`s per run | |
+| Retry, unique, 2 chars, 2,400 inserts | 2,400 | 2,400 | 0 | 1,392 retries | |
+
+Read the rows in pairs. **Check-then-insert without the unique rule silently stored duplicates** in all three runs, and with only 300 inserts per process. With the rule, the database caught every one, but because the code didn't expect a conflict, those were lost links and error pages. With insert-and-retry, the same unlucky draws simply cost a retry.
+
+The 3,755 retries in the first row are predictable too. Filling 40,000 of 238,328 codes (17%) should cost about N·ln(1/(1 − n/N)) − n ≈ 3,787 extra draws; that's the 1 / (1 − f) curve added up over the whole fill.
+
+**Primary key order** (2 million rows, SQLite, `WITHOUT ROWID`, 8 MB page cache).
+
+| Key | Insert time | Yours |
+| --- | --- | --- |
+| UUIDv4 (random) | ~21 s | |
+| UUIDv7 (time-ordered) | ~1.6 s | |
+
+That's the B-tree story from [Indexes](/lessons/indexes/) at 13x: random keys pull a different leaf into cache for nearly every insert; time-ordered keys keep appending to the same few pages. Try a bigger cache (`PRAGMA cache_size=-512000`, 512 MB) and watch the gap shrink, because once the whole tree fits in memory a random leaf is cheap. The gap is about cache misses, not about UUIDs.
+
+## Break It
+
+**1. Seed every worker the same.** Give each process `random.Random(int(time.time()))` "for reproducibility" and use it to draw 7-character codes. All eight processes start within the same second, so they get the same seed and draw the same sequence of codes, in lockstep. On my Mac, 8 × 5,000 inserts with 7-character codes, where you'd expect zero retries, took **140,628**. Every worker after the first to reach each code loses and retries, again and again. This is the real-world version: containers started together, each seeding from the clock. Use `secrets`, which reads from the operating system's secure random source and has no seed to get wrong. (Python's `random` module is also predictable: its docs say plainly not to use it for anything security-related.)
+
+**2. Lose the leading zeros.** Generate random codes with `encode(secrets.randbelow(62**7))` instead of `encode_fixed(..., 7)`. About 1 in 62 codes comes out shorter than 7 characters. Now store them, and have some other part of the system pad codes to 7 characters "to normalize" them: `"abc"` and `"0000abc"` are the same number but different strings, and you've built two names for one link, or worse, one name that resolves differently depending on which code path reads it. Decide once whether a code is a string or a number, and make every layer agree.
+
+**3. Cross the 2⁵³ line.** Generate a Snowflake ID and send it to a browser as a JSON number. JavaScript stores all numbers as 64-bit floats, which hold integers exactly only up to 2⁵³ (about 9 × 10¹⁵). A current Snowflake is about 2 × 10¹⁸. In Python, `int(float(x))` shows the damage: `2117490424925942011` comes back as `2117490424925942016`. The last digits are silently wrong, and now the client asks for a tweet that doesn't exist. Twitter's API added an `id_str` field for exactly this. Send big IDs as strings.
+
+**4. Fill a small space.** Use 3-character random codes in your hammer and insert 230,000 links (97% of the space) with `max_tries = 10`. Watch retries per insert climb, and then watch `insert_with_retry` start raising: at 97% full, the chance that 10 draws in a row are all taken is 0.97¹⁰ ≈ 74%. Your retry limit is now a feature switch that turns the service off. Real services watch the fill fraction and add a character long before this.
+
+## Explain It Back
+
+Answer out loud, in plain words, as if in an interview. Then check.
+
+<details>
+<summary>1. Why base62 and not base64 for short links? How many 7-character codes are there?</summary>
+
+Base64 uses `+`, `/` and `=` padding. In a URL, `/` splits the path, `+` turns into a space in query strings and forms, and `=` is the key-value separator; you'd have to percent-escape them, which makes codes longer and depends on every layer escaping correctly. Base64url swaps in `-` and `_`, which are safe, and it's fine for long tokens, but for short human-facing codes people prefer just letters and digits: they double-click cleanly, read aloud, and don't look like punctuation. Base62 is 0-9, a-z, A-Z. 7 characters give 62⁷ = 3,521,614,606,208, about 3.5 trillion codes, or about 41.7 bits.
+
+</details>
+
+<details>
+<summary>2. You pick 7-character codes at random. When does the first clash happen, and why is that not a problem?</summary>
+
+By the birthday paradox, the number of pairs grows as the square of the number of codes, so clashes start around the square root of the space: a 50% chance after about 1.18 × √(3.5 trillion) ≈ 2.2 million links. With 100 million links, many clashes would have happened if nobody checked. But we do check: the code column has a unique index, so a clash just makes the insert fail and we draw again. The chance a single new code is taken is the fraction used, 100 million / 3.5 trillion ≈ 1 in 35,000, so retries are negligible until the space is a sizable fraction full; tries per insert are 1 / (1 − fill). The thing to watch is the fill fraction, and the same number, upside down, is how many random guesses an attacker needs per real link.
+
+</details>
+
+<details>
+<summary>3. Why is "check if the code exists, then insert" wrong, and what do you do instead?</summary>
+
+Because there's a gap between the check and the insert. Two servers can draw the same code, both check, both see nothing, and both insert: either a duplicate (no unique rule) or a crash on the second (with one). It's the same check-then-act race as write skew in transactions; the check can't lock a row that doesn't exist yet. Instead, put a unique constraint on the column and just insert. The database's unique index makes the check and the write one step, so exactly one insert wins and the other gets a conflict, which you catch and retry with a new code. In Postgres, use `INSERT ... ON CONFLICT (code) DO NOTHING RETURNING id` so the conflict doesn't abort the transaction. It's also one round trip instead of two.
+
+</details>
+
+<details>
+<summary>4. Counter, random, or hash of the URL? What does each cost?</summary>
+
+A counter encoded in base62 never clashes, gives the shortest codes, and inserts cheaply at the right edge of the B-tree, but it's enumerable (anyone can walk the codes) and leaks your volume (two links a week apart tell a competitor how many you made). Random codes leak nothing and need no coordination beyond the unique index, at the cost of rare retries and random inserts into the index. Hashing the URL gives the same code for the same URL, so you can deduplicate, but truncated hashes clash like random codes, so you still need the unique rule and a rehash-on-clash scheme, dedup needs an index on the URL anyway, and most products want separate links per user. A common answer: database counter as the internal key, random 7-8-character code for the public link.
+
+</details>
+
+<details>
+<summary>5. How does this scale to 10,000 new links a second, from 50 servers, for 10 years?</summary>
+
+First the total: 10,000 × 86,400 × 365 × 10 ≈ 3.2 trillion links. That's 90% of the 7-character space, which for random codes means 10 tries per insert by the end, and nearly every random guess by an attacker hits a real link. So go to 8 characters (218 trillion): 1.4% full at the end, about 1.015 tries per insert. For the IDs themselves, one central counter is a bottleneck and a single point of failure for 50 servers, especially across regions. Options: each server leases blocks of, say, 10,000 IDs from a counter row, so the counter sees one request a second instead of 10,000; or Snowflake-style IDs (41 bits of time, 10 of machine, 12 of sequence: 4 million per second per machine with no coordination, as long as machine numbers are unique and clocks don't jump back); or UUIDv7 for internal keys, which also sort by time so B-tree inserts stay at the right edge. The unique index on the public code is the one thing that stays, and it's sharded with the table: if links are split across databases by code, each code's uniqueness is checked by exactly one shard.
+
+</details>
+
+## Go Deeper
+
+- **Twitter Engineering, "Announcing Snowflake" (2010)**, and the original code at **[github.com/twitter-archive/snowflake](https://github.com/twitter-archive/snowflake)**. The requirements (tens of thousands of IDs per second, highly available, roughly time-sorted, 64 bits) and the 41/10/12 layout, in the authors' words. The README is short; read it.
+- **Instagram Engineering, "Sharding & IDs at Instagram" (2012).** A Snowflake variant generated inside Postgres with a few lines of PL/pgSQL, and a clear comparison of the options they rejected (UUIDs, a central ticket server).
+- **Flickr, "Ticket Servers: Distributed Unique Primary Keys on the Cheap" (code.flickr.net, 2010).** The odd/even pair of MySQL counters. Short, practical, and the clearest case for "a counter is fine if you're careful about what happens when it dies".
+- **[RFC 9562: Universally Unique IDentifiers (UUIDs)](https://www.rfc-editor.org/rfc/rfc9562)** (2024). Defines UUIDv7 and explains, in its motivation (section 2), why time-ordered keys are better for database indexes. Read sections 5.4 and 5.7 and section 6 on generation.
+- **[RFC 4648: The Base16, Base32, and Base64 Data Encodings](https://www.rfc-editor.org/rfc/rfc4648)**. Section 4 is base64 with `+`, `/` and `=`; section 5 is the URL-safe alphabet. Ten minutes, and you'll never be vague about it again.
+- **Martin Georgiev and Vitaly Shmatikov, "Gone in Six Characters: Short URLs Considered Harmful for Cloud Services" (2016).** They scanned the code space of real URL shorteners and found private cloud documents and map directions. The density argument from this lesson, done for real.
+- **Michael Luby and Charles Rackoff, "How to Construct Pseudorandom Permutations from Pseudorandom Functions" (SIAM Journal on Computing, 1988).** Why a few Feistel rounds over a good keyed function give a permutation that looks random. The theory under the counter-scrambling trick.
+- **Alex Xu, _System Design Interview, Volume 1_, chapters 7 ("Design a unique ID generator in distributed systems") and 8 ("Design a URL shortener").** The interview framing of exactly this material. Useful to check your answers against the format interviewers expect.
+
+## Connections
+
+This lesson leans on [Indexes](/lessons/indexes/): the unique index is the referee, and the UUIDv4 vs UUIDv7 gap is that lesson's random-key insert cost again. The check-then-insert race is the write-skew bug from [Transactions](/lessons/transactions/), and the fix is the same move: let the database enforce the rule instead of checking it yourself. [How slow is slow?](/lessons/latency-numbers/) is why one counter across regions hurts.
+
+Next, the [URL shortener](/lessons/url-shortener/) capstone puts this together with [Caching and Redis](/lessons/caching/) (redirects are a read-heavy, Zipf-shaped workload, and a short code is a perfect cache key) and [Rate limits and backpressure](/lessons/rate-limits/) (the defense against people guessing codes). Snowflake-style IDs come back in [Queues and logs](/lessons/queues/), where ordering by time matters, and the birthday bound comes back anywhere you hash things into buckets, from [Load balancers](/lessons/load-balancing/) to the hash-based near-duplicate detection in [Data a model can eat](/lessons/data-pipelines/).

@@ -1,0 +1,128 @@
+---
+// Who answers a click? One visitor's browser, an optional edge cache, and the shortener's server.
+// Pick the redirect the server sends, click the link a few times, edit the destination, and watch
+// which clicks the server actually sees. A simplified model: an unlabelled 301 is kept by the
+// browser "forever" (real browsers choose their own lifetime, often long); 301 + max-age=90 is kept
+// 90 s; a 302 is never kept by the browser. The edge cache (when on) keeps any answer 60 s.
+// Each click advances the clock 20 s.
+---
+<div class="usr" data-fig="url-shortener-redirects">
+  <div class="ctl">
+    <span>Server sends</span>
+    <button class="btn" type="button" data-mode="302" aria-pressed="true">302</button>
+    <button class="btn" type="button" data-mode="301" aria-pressed="false">301</button>
+    <button class="btn" type="button" data-mode="301ma" aria-pressed="false">301 + max-age=90</button>
+  </div>
+  <div class="ctl">
+    <span>Edge cache</span>
+    <button class="btn" type="button" data-edge="off" aria-pressed="true">Off</button>
+    <button class="btn" type="button" data-edge="on" aria-pressed="false">60 s</button>
+  </div>
+  <div class="ctl">
+    <button class="btn" type="button" data-act="click">Click the link</button>
+    <button class="btn" type="button" data-act="edit">Edit destination</button>
+    <button class="btn" type="button" data-act="wait">Wait 10 min</button>
+    <button class="btn" type="button" data-act="reset">Reset</button>
+  </div>
+  <div class="usr-lanes">
+    <div class="usr-box" data-box="browser"><b>Browser</b><span data-r="bc">nothing kept</span></div>
+    <div class="usr-box" data-box="edge"><b>Edge</b><span data-r="ec">off</span></div>
+    <div class="usr-box" data-box="origin"><b>Your server</b><span data-r="dest">-</span></div>
+  </div>
+  <p class="usr-read">
+    Clicks <span class="readout" data-r="n">0</span> ·
+    server counted <span class="readout" data-r="seen">0</span> ·
+    landed on an old destination <span class="readout" data-r="stale">0</span> ·
+    clock <span class="readout" data-r="t">0:00</span>
+  </p>
+  <ol class="usr-log"></ol>
+</div>
+
+<style is:global>
+  .usr-lanes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
+  .usr-box { border: 1px solid var(--ink); background: var(--paper); padding: 8px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); display: flex; flex-direction: column; gap: 4px; min-width: 0; overflow-wrap: anywhere; transition: background 0.2s; }
+  .usr-box b { color: var(--ink); font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; font-size: 10.5px; }
+  .usr-box.hot { background: var(--blue-wash); border-color: var(--blue); }
+  .usr-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.7; }
+  .usr-log { list-style: none; margin: 8px 0 0; padding: 0; border-top: 1px solid var(--rule); font-family: var(--mono); font-size: 11.5px; color: var(--ink-2); }
+  .usr-log li { padding: 4px 0; border-bottom: 1px solid var(--rule); overflow-wrap: anywhere; }
+  .usr-log li.miss { color: var(--blue); }
+  @media (prefers-reduced-motion: reduce) { .usr-box { transition: none; } }
+</style>
+
+<script>
+  type Entry = { dest: number; until: number } | null;
+  const DESTS = ['old-page.example', 'fixed-page.example', 'third-page.example'];
+
+  document.querySelectorAll<HTMLElement>('[data-fig="url-shortener-redirects"]').forEach((root) => {
+    const s = {
+      mode: '302', edgeOn: false, t: 0, dest: 0, n: 0, seen: 0, stale: 0,
+      browser: null as Entry, edge: null as Entry, log: [] as { text: string; miss: boolean }[],
+    };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+    const box = (k: string) => root.querySelector<HTMLElement>(`[data-box="${k}"]`)!;
+    const list = root.querySelector('ol')!;
+    const clock = (t: number) => `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`;
+    const live = (e: Entry) => e !== null && s.t < e.until;
+    const browserTTL = () => (s.mode === '301' ? Infinity : s.mode === '301ma' ? 90 : 0);
+    const status = () => (s.mode === '302' ? '302' : '301');
+
+    function click() {
+      s.t += 20; s.n++;
+      let where: string, d: number;
+      if (live(s.browser)) {
+        where = 'browser cache'; d = s.browser!.dest;
+      } else if (s.edgeOn && live(s.edge)) {
+        where = 'edge cache'; d = s.edge!.dest;
+      } else {
+        where = 'your server'; d = s.dest; s.seen++;
+        if (s.edgeOn) s.edge = { dest: d, until: s.t + 60 };
+      }
+      if (where !== 'browser cache' && browserTTL() > 0) s.browser = { dest: d, until: s.t + browserTTL() };
+      if (d !== s.dest) s.stale++;
+      ['browser', 'edge', 'origin'].forEach((k) => box(k).classList.remove('hot'));
+      box(where === 'browser cache' ? 'browser' : where === 'edge cache' ? 'edge' : 'origin').classList.add('hot');
+      s.log.unshift({ text: `#${s.n} at ${clock(s.t)}: answered by ${where} (${status()}) → ${DESTS[d]}`, miss: where === 'your server' });
+      s.log = s.log.slice(0, 6);
+    }
+
+    function draw() {
+      r('n').textContent = String(s.n);
+      r('seen').textContent = String(s.seen);
+      r('stale').textContent = String(s.stale);
+      r('t').textContent = clock(s.t);
+      r('dest').textContent = `→ ${DESTS[s.dest]}`;
+      r('bc').textContent = live(s.browser)
+        ? `kept: ${DESTS[s.browser!.dest]}${s.browser!.until === Infinity ? ' (no expiry)' : ` until ${clock(s.browser!.until)}`}`
+        : 'nothing kept';
+      r('ec').textContent = !s.edgeOn ? 'off' : live(s.edge) ? `kept: ${DESTS[s.edge!.dest]} until ${clock(s.edge!.until)}` : 'nothing kept';
+      list.replaceChildren(...s.log.map((l) => {
+        const li = document.createElement('li');
+        li.textContent = l.text;
+        if (l.miss) li.className = 'miss';
+        return li;
+      }));
+    }
+
+    root.querySelectorAll<HTMLButtonElement>('[data-mode]').forEach((b, _, all) => b.addEventListener('click', () => {
+      s.mode = b.dataset.mode!; // note: switching does NOT clear what the browser already kept
+      all.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    root.querySelectorAll<HTMLButtonElement>('[data-edge]').forEach((b, _, all) => b.addEventListener('click', () => {
+      s.edgeOn = b.dataset.edge === 'on';
+      if (!s.edgeOn) s.edge = null;
+      all.forEach((x) => x.setAttribute('aria-pressed', String(x === b)));
+      draw();
+    }));
+    root.querySelectorAll<HTMLButtonElement>('[data-act]').forEach((b) => b.addEventListener('click', () => {
+      const a = b.dataset.act;
+      if (a === 'click') click();
+      if (a === 'edit') { s.dest = (s.dest + 1) % DESTS.length; s.log.unshift({ text: `you edited the link → ${DESTS[s.dest]}`, miss: false }); s.log = s.log.slice(0, 6); }
+      if (a === 'wait') s.t += 600;
+      if (a === 'reset') Object.assign(s, { t: 0, dest: 0, n: 0, seen: 0, stale: 0, browser: null, edge: null, log: [] });
+      draw();
+    }));
+    draw();
+  });
+</script>

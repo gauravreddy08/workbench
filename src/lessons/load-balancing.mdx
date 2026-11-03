@@ -19,7 +19,7 @@ It builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/), 
 - Say what a load balancer actually does, and how much of a request it can see depending on whether it only reads the addresses on the outside or opens it up and reads the request itself.
 - Pick on purpose how the balancer chooses a server: take turns, send to the least busy, peek at two random servers and take the less busy one, map each user to a fixed server in a way that survives adding servers, and route each LLM prompt to the GPU that has already worked through its beginning.
 - Explain why pinning each user to one server is a trap, and what "servers that forget everything, with the memory kept in one shared store" looks like in code.
-- Take a server out of rotation without dropping a single request, and spot the parts of a diagram whose failure takes everything down.
+- Take a server out of rotation without dropping a single request, ship a new version across the whole fleet the same way, and spot the parts of a diagram whose failure takes everything down.
 
 You'll want [Processes, threads and the GIL](/lessons/processes-threads-gil/) (what lives in a process's memory, and how two writers can lose an update) and [How slow is slow?](/lessons/latency-numbers/) (what a network round trip costs) first; [p99 and load testing](/lessons/tail-latency/) helps for the Measure section. About one evening.
 
@@ -342,6 +342,77 @@ Deploys and scale-downs remove backends on purpose. Done carelessly, everything 
 
 At the process level, `docker stop` and Kubernetes send <Term w="SIGTERM">The polite "please shut down" signal. A process can catch it and clean up. If it doesn't exit within the grace period (10 s for docker stop, 30 s by default in Kubernetes), it gets SIGKILL, which cannot be caught.</Term>. Uvicorn catches it, stops accepting connections, finishes in-flight requests, and exits. `kill -9` sends SIGKILL, and everything in flight dies. One Kubernetes subtlety: SIGTERM and "remove this pod from the balancer" happen *at the same time*, so for a moment new requests still arrive at a process that stopped accepting. The usual fix is a `preStop` sleep of a few seconds.
 
+### Deploying without a gap
+
+A deploy is draining done to every server in turn, with a new version started in each one's place. The common shape is a <Term w="rolling deploy">Replacing a fleet's servers with the new version a few at a time, so some copies are always serving. What a Kubernetes Deployment does by default.</Term>, and each step is five moves:
+
+1. **Start** a copy of the new version alongside the old ones.
+2. **Wait until it's ready.** Not "the process started": readiness, from the health-check section. An LLM server still loading weights is up, and useless.
+3. **Shift traffic**: the balancer adds it to the pool and starts choosing it.
+4. **Drain** one old copy, the four steps above.
+5. **Stop** it, and move on to the next.
+
+<Figure n="007" title="A ROLLING DEPLOY" caption="Three backends replaced one at a time. Each new copy starts and becomes ready before an old one stops being chosen, and the old one finishes its in-flight work after that. At every moment three copies are taking new requests.">
+<svg viewBox="0 0 640 250" role="img" aria-label="Three lanes, each showing an old version serving, a new version starting then serving, and the old version draining after the handoff, staggered in time">
+  <text x="10" y="36" class="strong">BACKEND 1</text>
+  <rect x="90" y="24" width="80" height="16" class="fill-paper" stroke-width="1" />
+  <text x="130" y="36" text-anchor="middle">v1</text>
+  <rect x="170" y="24" width="44" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="192" y="36" text-anchor="middle">DRAIN</text>
+  <rect x="126" y="46" width="44" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="148" y="58" text-anchor="middle">START</text>
+  <rect x="170" y="46" width="460" height="16" class="fill-wash" stroke-width="1" />
+  <text x="400" y="58" text-anchor="middle">v2</text>
+  <text x="10" y="106" class="strong">BACKEND 2</text>
+  <rect x="90" y="94" width="230" height="16" class="fill-paper" stroke-width="1" />
+  <text x="205" y="106" text-anchor="middle">v1</text>
+  <rect x="320" y="94" width="44" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="342" y="106" text-anchor="middle">DRAIN</text>
+  <rect x="276" y="116" width="44" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="298" y="128" text-anchor="middle">START</text>
+  <rect x="320" y="116" width="310" height="16" class="fill-wash" stroke-width="1" />
+  <text x="475" y="128" text-anchor="middle">v2</text>
+  <text x="10" y="176" class="strong">BACKEND 3</text>
+  <rect x="90" y="164" width="380" height="16" class="fill-paper" stroke-width="1" />
+  <text x="280" y="176" text-anchor="middle">v1</text>
+  <rect x="470" y="164" width="44" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="492" y="176" text-anchor="middle">DRAIN</text>
+  <rect x="426" y="186" width="44" height="16" class="fill-paper dash" stroke-width="1" />
+  <text x="448" y="198" text-anchor="middle">START</text>
+  <rect x="470" y="186" width="160" height="16" class="fill-wash" stroke-width="1" />
+  <text x="550" y="198" text-anchor="middle">v2</text>
+  <line x1="170" y1="14" x2="170" y2="214" class="blue dash" stroke-width="1" />
+  <line x1="320" y1="14" x2="320" y2="214" class="blue dash" stroke-width="1" />
+  <line x1="470" y1="14" x2="470" y2="214" class="blue dash" stroke-width="1" />
+  <text x="170" y="228" text-anchor="middle" class="blue-t">READY → SHIFT</text>
+  <text x="320" y="228" text-anchor="middle" class="blue-t">READY → SHIFT</text>
+  <text x="470" y="228" text-anchor="middle" class="blue-t">READY → SHIFT</text>
+  <line x1="90" y1="240" x2="630" y2="240" class="ink" stroke-width="1" />
+  <text x="626" y="234" text-anchor="end">TIME →</text>
+</svg>
+</Figure>
+
+The order is the point. Stop the old copy first and start the new one after, and for every step you're one server short. Two dials control how much overlap you allow, named after Kubernetes's settings: <Term w="max surge">How many extra copies, above the normal count, a rolling deploy may run at once. Kubernetes's default is 25% of the replicas.</Term> is capacity you borrow for the deploy, and <Term w="max unavailable">How many copies may be out of service at once during a rolling deploy. Kubernetes's default is also 25%. Zero means "never drop below full strength", which only works if surge is above zero.</Term> is capacity you give up during it.
+
+<Predict id="deploy-capacity">
+Your three backends take 16 requests/s, about 73% busy (the Measure section's load). You roll them with max unavailable 1 and max surge 0, so during each step only two are taking requests. Nothing crashes and every request is drained properly. What happens to the median latency?
+<Fragment slot="answer">
+
+Two backends now have to do 16 × 0.136 s = 2.2 backends' worth of work every second: about 109% busy. Above 100%, the queue grows for as long as the step lasts, and everyone waits behind it. On my Mac, a 45-second run at 16/s had a median of **82 ms** undisturbed and about **2.1 s** with a rolling restart in the middle (two runs, 2,152 and 2,109 ms). Zero errors. The deploy was "clean" and users still had a bad minute.
+
+nginx made the window longer than the restart itself: the restarted backend refused one connection, and the passive check benched it for `fail_timeout` (10 s) even though the new process was up within a second. The rule: the fleet minus max unavailable must carry peak load. If it can't, surge instead (start a fourth copy first, max unavailable 0), or deploy when traffic is low.
+
+</Fragment>
+</Predict>
+
+Two other shapes trade servers for safety.
+
+<Term w="Blue-green deployment">Two full copies of production: one live (blue), one idle (green). Deploy to the idle one, check it, then move all traffic over at once. Moving back is the rollback.</Term> brings up a whole second fleet running the new version, checks it while it takes no user traffic, then flips the balancer from one fleet to the other in a single move. Rollback is flipping back, the same "point production at the previous artifact" trick from [CI/CD](/lessons/ci-cd/), except the old version is still running and warm, so it takes seconds. The cost is twice the servers for the length of the deploy. And both colors talk to the same database, so a schema change has to work for both versions at once, the backward-compatible migration rule from that lesson.
+
+A <Term w="canary">A release where a small slice of real traffic (1%, then 5%, then more) goes to the new version while you compare its errors and latency with the old one. Named after the birds miners carried to detect gas.</Term> sends a small slice of traffic, say 1%, to the new version while you compare its error rate and latency with the old one. If it holds up, widen to 10%, 50%, everyone; if not, pull it, and 1% of users noticed. It's what [CI/CD](/lessons/ci-cd/) suggests for a new ranking model. The balancer does the slicing with weights, the same `weight=` from the algorithms section, or a percentage split in Envoy or a cloud balancer. A rolling deploy only spreads the new version evenly; a canary asks whether it's bad before everyone gets it.
+
+Notice what kept requests alive in all three, because it's the real answer to "what happens when the container goes down during a deploy?". **Live requests survive because the balancer only sends new requests to copies that are ready, and an old copy finishes what it started before it exits.** Nothing is stored and replayed; there is simply always someone ready to answer. Background jobs survive a deploy for a different reason: they sit in a [queue](/lessons/queues/), and a job a restarting worker didn't finish comes back to another worker when its lease runs out. If you've watched SQS messages pile up and then drain while a worker container restarts, that's the second mechanism. It doesn't stretch to live requests: someone waiting on a page can't sit in a queue until a worker comes back. Requests need ready servers; jobs can wait in a queue. The [URL shortener](/lessons/url-shortener/) uses both: the balancer in front for redirects, a queue behind it for click counting.
+
 ### Single points of failure
 
 A <Term w="single point of failure">One component whose failure takes the whole system down. Often abbreviated SPOF.</Term> is anything there's exactly one of in the path of every request. Put your finger on each box in the diagram: if this dies, does everything stop?
@@ -454,7 +525,7 @@ http {
   access_log /dev/stdout lb;
 
   upstream app {
-    zone app 64k;          # share counters across nginx worker processes
+    zone app 256k;         # share counters across nginx worker processes
     # the balancing method goes here (round robin is the default)
     server app1:8000;
     server app2:8000;
@@ -608,6 +679,20 @@ Repeat with `docker compose stop app2` (SIGTERM, 10 s grace) instead of `kill`, 
 
 Two Docker things I couldn't check: a killed container's IP disappears, so nginx may log "host unreachable" or hit the 1 s `proxy_connect_timeout` instead of a fast "connection refused"; and a restarted container may get a new IP that nginx (which resolved `app2` once at startup) won't see until a reload. If app2 never gets traffic again, that's why.
 
+Last, a whole deploy: restart the three backends one at a time under load, waiting for each new one to answer `/healthz` before touching the next. Natively, with each uvicorn's PID saved in `appN.pid` (adapt to however you started them):
+
+```bash
+for n in 1 2 3; do
+  kill -TERM $(cat app$n.pid)                               # drain, then exit
+  while kill -0 $(cat app$n.pid) 2>/dev/null; do sleep 0.1; done
+  SERVER_ID=app$n uvicorn app:app --port 800$n & echo $! > app$n.pid   # "the new version"
+  until curl -sf localhost:800$n/healthz >/dev/null; do sleep 0.2; done
+  sleep 3                                                   # then try 11
+done
+```
+
+Under Docker the middle is `docker compose stop appN && docker compose start appN`, then `docker compose exec nginx nginx -s reload` so nginx picks up the container's new address. Run it during `python load.py 10 45`, once with `sleep 3` between steps and once with `sleep 11`. One run isn't clean even though every backend is up the whole time it fails. Find the nginx error-log line that explains it, and tie it to the passive health check defaults.
+
 </Task>
 
 <DoneWhen>
@@ -617,6 +702,7 @@ Two Docker things I couldn't check: a killed container's IP disappears, so nginx
 - Sessions live in Redis, cart appends are atomic, and killing any app server loses nothing.
 - `load.py` is open-loop and prints p50/p90/p99, and the Measure table is filled in with your predictions beside the results.
 - You can say exactly which requests got a 502 when a backend died, and why the others didn't.
+- You restarted all three backends under load with zero errors, and can explain why the faster roll got 502s while every backend was up.
 
 </DoneWhen>
 
@@ -650,12 +736,15 @@ Then the failure experiments:
 | 6 long POSTs, SIGKILL one backend | | 4 × 200, 2 × 502 |
 | 6 long POSTs, SIGTERM one backend | | 6 × 200 |
 | 14/s POST load, SIGKILL for 7 s | | 0 errors (backend was idle at the instant of the kill; try a few times) |
+| Rolling restart at 10/s, 3 s between steps | | 28-30 × 502, rest 200 (two runs) |
+| Rolling restart at 10/s, 11 s between steps | | 0 errors (two runs) |
 
 Why each happened:
 
 - **SIGKILL with POSTs: two 502s.** The two requests on app2 (one running, one queued) died with it. nginx had sent them and POST isn't idempotent, so no retry. With GET, nginx retried them elsewhere: my GET run logged "upstream prematurely closed connection" and every client still got 200.
 - **SIGTERM: all 200s.** Uvicorn stopped accepting but finished both requests. A *new* request to app2 got "connection refused", and a connection never established is always safe to retry, so nginx sent it elsewhere.
 - **The 14/s run.** Whether anything fails depends on what the backend was doing at that instant. One clean failure test proves little; kill it several times, or while you know it's busy.
+- **The fast rolling restart: 502s with every backend up.** The error log said "no live upstreams". Each restart refused one connection (nginx retried that request elsewhere, so it succeeded), and with `max_fails` 1 nginx benched the backend for `fail_timeout`, 10 s, though its replacement was ready in under a second. With steps 3 s apart, all three were benched at once for a couple of seconds, and nginx had nowhere to send anything. With 11 s, each was back in the pool before the next went. What counts is the balancer's view of who's ready, not the truth. The proper fix is to tell the balancer first (fail readiness, or deregister) and let an active check bring the new copy in, rather than letting refused connections do the telling.
 
 Last, the price of statelessness: time a few hundred `GET /cart` calls with in-memory and with Redis sessions. Expect a fraction of a millisecond of difference (approximate; measure it), against 40-1,000 ms for `/generate`.
 
@@ -668,6 +757,8 @@ Last, the price of statelessness: time a few hundred `GET /cart` calls with in-m
 **3. Kill the only balancer, or the only Redis.** `docker compose kill nginx`: total outage with three healthy app servers. `docker compose kill redis`: every server up, every request failing. Circle both on your diagram and decide what you'd do about each. (Making `/healthz` check Redis just turns the second into "nginx thinks every backend is dead".)
 
 **4. Drain too fast.** Add `--timeout-graceful-shutdown 1` to the `CMD` and repeat the six-long-POSTs test with `docker compose stop app2`. Uvicorn waits a second, then cancels the running request: on my Mac the client got a `500` and the log said "Cancel 1 running task(s), timeout graceful shutdown exceeded". With `docker compose stop -t 1`, SIGKILL arrives instead and you get 502s. Your grace period must outlast your longest request, and LLM generations can run for minutes.
+
+**5. Deploy at peak with nothing spare.** Run the t6 rolling restart (11 s steps) during `python load.py 16 45`, and an undisturbed run at the same rate beside it. My medians: 82 ms undisturbed, about 2.1 s with the restart, and zero errors in both. That's max unavailable 1 with no surge on a fleet at 73%. Now fake a surge: start a fourth backend on port 8004, add it to the upstream and reload before the roll, remove it after, and see how much of the damage it takes back.
 
 ## Explain It Back
 
@@ -708,6 +799,13 @@ For up to about 15 s (3 × 5 s) it still looks healthy and keeps getting its sha
 
 </details>
 
+<details>
+<summary>6. "If a container goes down during a deploy, put a queue like SQS or Kafka in front so requests wait until it's back." What's right and wrong about that?</summary>
+
+What's right: background jobs do survive deploys that way. A job sits in the queue, and if the worker restarts mid-job, the lease runs out and another worker picks it up. What's wrong: a live request has someone waiting on the other end, and a queue can't answer them. It only holds the request until some worker is free, so during a deploy or a spike the user sees a spinner and then a timeout. Nor is a queue a load balancer: it doesn't check who's ready or route around anyone. Live requests survive a deploy because of the balancer: a rolling deploy starts each new copy, waits until it's ready, shifts traffic to it, and drains the old one, so there are always ready servers. Keep enough of them during the roll (surge, or a low max unavailable) that the fleet still carries peak load. Use the queue for the work nobody is waiting on, like recording a click after the redirect has gone out.
+
+</details>
+
 ## Go Deeper
 
 - **Google, _Site Reliability Engineering_, chapters 19 and 20: "Load Balancing at the Frontend" and "Load Balancing in the Datacenter"** (free at [sre.google/books](https://sre.google/books/)). How Google actually does it: DNS and L4 at the edge, then weighted least-loaded balancing, subsetting, and the "lame duck" draining state. The best single read for this lesson.
@@ -717,6 +815,8 @@ For up to about 15 s (3 × 5 s) it still looks healthy and keeps getting its sha
 - **Adam Wiggins, _The Twelve-Factor App_, factor VI "Processes"** ([12factor.net/processes](https://12factor.net/processes)). One page. The canonical statement of "stateless processes, state in backing services, no sticky sessions".
 - **nginx docs: [ngx_http_upstream_module](https://nginx.org/en/docs/http/ngx_http_upstream_module.html)** (every method, `max_fails`, `zone`, `hash ... consistent`) and **[ngx_http_proxy_module's `proxy_next_upstream`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_next_upstream)** (exactly when nginx retries, and why POST is special).
 - **Lianmin Zheng et al., "SGLang: Efficient Execution of Structured Language Model Programs"** (2024, RadixAttention), plus the SGLang router docs for its cache-aware policy. Where prefix-aware routing in LLM serving comes from. Check the current docs; this area moves fast.
+- **Kubernetes docs, "Deployments"** ([kubernetes.io](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)), the rolling update strategy part, plus "Configure Liveness, Readiness and Startup Probes". Where `maxSurge`, `maxUnavailable` and readiness gating are defined, with the real defaults.
+- **Martin Fowler, ["BlueGreenDeployment"](https://martinfowler.com/bliki/BlueGreenDeployment.html), and Danilo Sato, ["CanaryRelease"](https://martinfowler.com/bliki/CanaryRelease.html)** (Fowler's bliki). Two short pages that named the two patterns, with the database caveat spelled out.
 - **Martin Kleppmann, _Designing Data-Intensive Applications_, chapter 1 (scalability) and chapter 6 (partitioning)**. Scaling up vs out, and why naive hash-mod-N partitioning hurts when you rebalance.
 
 ## Connections
@@ -724,3 +824,5 @@ For up to about 15 s (3 × 5 s) it still looks healthy and keeps getting its sha
 Builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/) (three copies are three walled-off address spaces; Break It #2 is the same lost update across machines), [How slow is slow?](/lessons/latency-numbers/) and [Why do people care about p99?](/lessons/tail-latency/).
 
 Sets up [Rate limits and backpressure](/lessons/rate-limits/) (what to do when even least connections can't keep up), [Caching](/lessons/caching/), [Why do we need databases?](/lessons/why-databases/) and [Transactions](/lessons/transactions/) (where the state went and how to keep it safe), and [Containers vs VMs](/lessons/containers/). On the ML side, [the KV cache](/lessons/kv-cache/), [prefix caching](/lessons/prefix-caching/), [batching](/lessons/batching/) and [serving engines](/lessons/serving-engines/) explain what each replica does with the requests you route to it, and why "connections" is a much fuzzier load signal for a batching LLM server than for this toy app.
+
+[CI/CD](/lessons/ci-cd/) decides what gets deployed; the rolling, blue-green and canary shapes here are how it lands without a gap. [Queues](/lessons/queues/) is the other half of surviving a deploy, for work nobody is waiting on, and [the URL shortener](/lessons/url-shortener/) puts the two side by side.

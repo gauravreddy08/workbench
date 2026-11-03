@@ -17,6 +17,7 @@ You already know how one program can serve many visitors at once, with threads i
 - Open a bare connection to example.com, and later to your own server, type a request by hand, and read the reply line by line.
 - Name every part of a request and its reply: the first line that says what you want, the labelled lines of extra information after it (headers), the blank line that ends them, the body, the three-digit number that says how it went, and the two ways a reply can mark where its body ends (state the length up front, or send it in size-labelled pieces).
 - Write a working server using only Python's basic networking module, `socket`. It answers with JSON, sends the right result numbers, reuses one connection for many requests, and shrugs off nonsense. Then make it serve many clients at once, first with threads, then with asyncio.
+- Explain what happens when a link sends you somewhere else (a redirect), why a "permanent" one behaves so differently from a "temporary" one once a browser has seen it, and how that differs from a server quietly answering with a different page in place.
 - Explain the small contract that lets a server like uvicorn hand each request to your Python code (it's called ASGI), write an app against it with no library on top, and list exactly what FastAPI adds.
 - Say in a sentence or two what the two newer versions of HTTP change, and why they were needed.
 
@@ -187,6 +188,74 @@ The 4xx/5xx split matters more than any single code. A 4xx says "retrying the sa
 
 502 and 504 are worth a second look, because you'll debug them. They come from a <Term w="proxy">A server that sits between the client and your app and forwards requests: a load balancer, nginx, an API gateway, Cloudflare. To your app, the proxy is the client.</Term>, not your app. 502 usually means your app crashed, closed the connection early, or sent something that wasn't valid HTTP. 504 means your app was too slow for the proxy's timeout. Neither will appear in your app's logs, because from your app's point of view either nothing happened or it was still working.
 
+### Redirects: "it's over there"
+
+The 3xx row deserves a closer look too, because one of those codes is the entire product of a URL shortener, and the difference between it and its neighbours decides whether the product works.
+
+A <Term w="redirect">A response that says "what you want is at a different address". The server sends a 3xx status and a Location header; the client then makes a brand-new request to that address by itself.</Term> is a response with almost nothing in it:
+
+```http
+HTTP/1.1 302 Found
+Location: https://example.com/a/very/long/path
+Content-Length: 0
+```
+
+The server doesn't fetch the other page for you. It hands back an address, and that's the whole answer. The client (any browser automatically, curl only with `-L`) reads `Location` and makes a second, completely separate request, possibly to a different machine, with its own connection, DNS lookup and TLS handshake. The user asked for one thing; the wire carried two exchanges.
+
+<Figure n="003" title="ONE CLICK, TWO REQUESTS" caption="A redirect is an answer that says 'ask over there'. The browser makes the second request itself. If the first answer was a cacheable 301, the next visit can skip steps 1 and 2 entirely, and the shortener never hears about it.">
+<svg viewBox="0 0 640 270" role="img" aria-label="Sequence diagram: browser asks the shortener, gets a 302 with a Location header, then asks the target site itself">
+  <rect x="20" y="10" width="140" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="90" y="30" text-anchor="middle" class="strong">BROWSER</text>
+  <rect x="250" y="10" width="140" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="320" y="30" text-anchor="middle" class="strong">SHORTENER</text>
+  <rect x="480" y="10" width="140" height="30" class="fill-paper" stroke-width="1.2" />
+  <text x="550" y="30" text-anchor="middle" class="strong">TARGET SITE</text>
+  <line x1="90" y1="40" x2="90" y2="250" class="ink" stroke-width="1" />
+  <line x1="320" y1="40" x2="320" y2="250" class="ink" stroke-width="1" />
+  <line x1="550" y1="40" x2="550" y2="250" class="ink" stroke-width="1" />
+  <line x1="90" y1="70" x2="314" y2="70" class="blue" stroke-width="1.2" marker-end="url(#rd3a)" />
+  <text x="205" y="63" text-anchor="middle" class="blue-t">1 · GET /abc</text>
+  <line x1="320" y1="100" x2="96" y2="100" class="ink" stroke-width="1.2" marker-end="url(#rd3b)" />
+  <text x="205" y="93" text-anchor="middle">2 · 302 + Location: …/long</text>
+  <line x1="90" y1="140" x2="544" y2="140" class="blue" stroke-width="1.2" marker-end="url(#rd3a)" />
+  <text x="435" y="133" text-anchor="middle" class="blue-t">3 · GET /long</text>
+  <line x1="550" y1="170" x2="96" y2="170" class="ink" stroke-width="1.2" marker-end="url(#rd3b)" />
+  <text x="435" y="163" text-anchor="middle">4 · 200 OK + the page</text>
+  <line x1="90" y1="220" x2="544" y2="220" class="blue dash" stroke-width="1.2" marker-end="url(#rd3a)" />
+  <text x="320" y="212" text-anchor="middle" class="blue-t">NEXT VISIT, 301 CACHED: STRAIGHT TO STEP 3</text>
+  <text x="320" y="240" text-anchor="middle">the shortener sees nothing</text>
+  <defs>
+    <marker id="rd3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" class="fill-blue" /></marker>
+    <marker id="rd3b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" style="fill:var(--ink)" /></marker>
+  </defs>
+</svg>
+</Figure>
+
+**Permanent or temporary.** `301 Moved Permanently` and `308 Permanent Redirect` say "this has moved for good; remember the new address". `302 Found` and `307 Temporary Redirect` say "go there for now, but ask me again next time". The word "permanent" has teeth, because of caching. A 301 or 308 is <Term w="heuristically cacheable">Allowed to be stored and reused by a cache even when the response carries no caching instructions; the cache picks a lifetime itself. In the HTTP spec, 200, 301, 308 and 404 are among these; 302 and 307 are not.</Term>: a browser may keep it even if you said nothing about caching, and then the next click on that link goes straight to the target without touching your server at all. A 302 or 307 is only stored if the response explicitly allows it (with `Cache-Control`, coming up under headers). How long a browser keeps an unlabelled 301 is the browser's choice, not yours, and in practice it can be a long time. You can't reach into a visitor's browser to clear it, so a wrong 301 is hard to take back.
+
+**Same method, or GET.** The second split is older and messier. The original 301 and 302 meant "repeat your request at the new address", but early browsers turned a redirected POST into a GET and dropped the body, and so many sites came to depend on that that the spec gave in: after a 301 or 302, a client *may* switch POST to GET. 307 (1999) and 308 (2014) were added to mean the same as 302 and 301 with the rule nailed down: keep the method and the body. I watched curl do both against a tiny server: `curl -L -d 'x=1'` on a 302 printed `Switch from POST to GET` and fetched the target with no body; on a 307 it sent the same POST again, body included. (A trap: `curl -X POST -L` forces POST on every hop and hides the difference. Use `-d` alone.)
+
+| | Keeps method and body | May turn POST into GET |
+|---|---|---|
+| Permanent (may be cached) | `308` | `301` |
+| Temporary (asks you again) | `307` | `302` |
+
+**Redirect vs rewrite.** These sound alike and are opposites. A redirect is visible: the client is told to go elsewhere, makes a second request, and the address bar changes. A <Term w="rewrite">A change the server (or a proxy in front of it, like nginx) makes to the request's path internally, before routing it. The client sends one request and gets one answer; it never learns the path was changed.</Term> is invisible: the server takes `/old-docs/intro`, quietly handles it as `/docs/intro`, and answers 200 to the original request. One request, one response, address bar unchanged. A rewrite can only reach things that server (or the proxy's own backends) can serve; a redirect can send the client anywhere on the internet. A URL shortener has to be a redirect: the target is someone else's site, and only the browser can go there.
+
+<Predict id="redirect-permanent">
+
+You run a URL shortener. The business wants a click count for every link, and wants to be able to fix a link when someone pasted the wrong target. 301 or 302?
+
+<Fragment slot="answer">
+
+302 (or 307). A browser that has cached a 301 goes straight to the target next time: your server never sees the click, so the count comes out low, and if you fix the target, everyone who already visited keeps going to the old one. A 302 brings every click back through you: count it, look the target up fresh, send them on. The price is one request through your server per click, forever, which is exactly the load you'll size in [Build a URL shortener](/lessons/url-shortener/).
+
+What the big ones actually do is subtler. When I checked in November 2026, bit.ly, TinyURL and t.co all answered `301`, each with a `Cache-Control` that limits storage: `private, max-age=90`, `no-store`, and `private, max-age=300`. A 301 for its meaning (this short address will always mean that long one), with caching kept short or off so clicks still come back. The status code says what the redirect means; `Cache-Control` says how long anyone may remember it.
+
+</Fragment>
+
+</Predict>
+
 ### Methods, and two promises: safe and idempotent
 
 The method is a promise about what the request will do. Two properties matter, and they're the reason the method isn't just decoration:
@@ -230,7 +299,7 @@ Opening a TCP connection isn't free. Before the first byte of HTTP can be sent, 
 
 HTTP/1.0 opened a fresh connection for every request and closed it after the response. A web page with 30 images paid 30 handshakes. HTTP/1.1 flipped the default: a connection stays open after a response (it's <Term w="persistent connection">A TCP connection that stays open after one request/response so the next request can reuse it. Also called keep-alive. The default in HTTP/1.1.</Term>), and the client can send its next request down the same pipe. Either side says `Connection: close` to end it.
 
-<Figure n="003" title="FRESH CONNECTIONS VS KEEP-ALIVE" caption="Three requests from the same client. Top: a new TCP connection for each, so every request pays a handshake round trip first (and over HTTPS, a TLS handshake too). Bottom: one connection, kept open, so only the first request pays. This is also why a framework's connection pool matters: reusing connections is most of the speedup." wide>
+<Figure n="004" title="FRESH CONNECTIONS VS KEEP-ALIVE" caption="Three requests from the same client. Top: a new TCP connection for each, so every request pays a handshake round trip first (and over HTTPS, a TLS handshake too). Bottom: one connection, kept open, so only the first request pays. This is also why a framework's connection pool matters: reusing connections is most of the speedup." wide>
 <svg viewBox="0 0 680 230" role="img" aria-label="Timeline comparing three requests on new connections versus one reused connection">
   <text x="10" y="20" class="strong">NEW CONNECTION PER REQUEST</text>
   <line x1="10" y1="62" x2="670" y2="62" class="ink" stroke-width="1" />
@@ -300,7 +369,7 @@ That's the server. Concurrency is a separate question you've already answered tw
 
 Once your server works, look at what you wrote. About half of it is HTTP (reading, parsing, framing, keep-alive, timeouts, error codes). The other half is your API: routes, JSON, validation. Those halves are separable, and the Python world separates them on purpose.
 
-<Figure n="004" title="WHO DOES WHAT" caption="In production Python, the HTTP half and the application half are different programs. The server (uvicorn) owns the socket and speaks HTTP. The framework (FastAPI, built on Starlette) owns routing, validation and middleware. ASGI is the narrow interface between them: one async function call per request." wide>
+<Figure n="005" title="WHO DOES WHAT" caption="In production Python, the HTTP half and the application half are different programs. The server (uvicorn) owns the socket and speaks HTTP. The framework (FastAPI, built on Starlette) owns routing, validation and middleware. ASGI is the narrow interface between them: one async function call per request." wide>
 <svg viewBox="0 0 680 300" role="img" aria-label="Layer diagram from TCP socket through uvicorn, the ASGI interface, FastAPI, to the endpoint function">
   <rect x="10" y="250" width="660" height="38" class="fill-paper" stroke-width="1" />
   <text x="24" y="273" class="strong">KERNEL</text>
@@ -365,7 +434,7 @@ But HTTP/2 moved the head-of-line problem down a layer rather than removing it. 
 
 **HTTP/3** (2022) fixes that by leaving TCP. It runs over <Term w="QUIC">A transport protocol built on UDP (originally at Google, standardized in 2021). It provides reliable, ordered streams like TCP, but each stream is ordered independently, and TLS 1.3 encryption is built into its handshake.</Term>, which runs on UDP and does its own reliability *per stream*: a lost packet only stalls the stream it belongs to. QUIC also folds the TLS handshake into the connection handshake (one round trip to start instead of two or more), and identifies connections by an ID rather than by IP address and port, so a phone switching from Wi-Fi to cellular can keep its connection.
 
-<Figure n="005" title="1.1 VS 2 VS 3" caption="Three requests, A B C. HTTP/1.1 sends them one after another on a connection (or opens more connections). HTTP/2 interleaves their frames on one TCP connection, but a lost packet (X) stalls every stream behind it, because TCP delivers in order. HTTP/3 runs streams over QUIC on UDP, so a loss stalls only its own stream." wide>
+<Figure n="006" title="1.1 VS 2 VS 3" caption="Three requests, A B C. HTTP/1.1 sends them one after another on a connection (or opens more connections). HTTP/2 interleaves their frames on one TCP connection, but a lost packet (X) stalls every stream behind it, because TCP delivers in order. HTTP/3 runs streams over QUIC on UDP, so a loss stalls only its own stream." wide>
 <svg viewBox="0 0 680 270" role="img" aria-label="Comparison of HTTP/1.1 sequential requests, HTTP/2 multiplexed frames over TCP, and HTTP/3 independent streams over QUIC">
   <text x="10" y="22" class="strong">HTTP/1.1 · TEXT · TCP</text>
   <text x="10" y="38">one at a time per connection</text>
@@ -620,6 +689,20 @@ Notice how much shorter the reading part gets: `StreamReader` keeps the leftover
 
 </Task>
 
+<Task id="t9" title="Send the client somewhere else" agent="hands">
+
+Add a tiny link table to `rawhttp.py`: a dict from a short path to a target, like `{"/go/health": "/health", "/go/away": "https://example.com/"}`. A request for one of those paths, whatever the method, answers `302 Found` with a `Location` header and `Content-Length: 0`. Then:
+
+```bash
+curl -i http://127.0.0.1:8080/go/health      # only the redirect: status line + Location
+curl -iL http://127.0.0.1:8080/go/health     # follow it: two responses, one after the other
+curl -sLv -d 'x=1' http://127.0.0.1:8080/go/health 2>&1 | grep -E '^> (GET|POST)|Switch'
+```
+
+Watch your server's log during the second command: two request lines, because curl made two requests. Then add a 307 version of the same link and rerun the third command against it. The second request should now stay a POST, body and all. What does your `/health` route answer to that?
+
+</Task>
+
 <Task id="t7" title="An ASGI app with no framework" agent="hands">
 
 Write `asgi_app.py`: the same two endpoints, as a bare ASGI callable, served by uvicorn. No FastAPI, no Starlette.
@@ -673,6 +756,7 @@ async def echo(payload: dict[str, Any]):
 - Every row of the t3 table produces the right status on both `rawhttp.py` (threaded) and `asynchttp.py`, from a script you can rerun.
 - curl reports `Re-using existing connection`, and the two-requests-in-one-write test returns two responses.
 - An idle `nc` connection no longer blocks other clients.
+- `curl -iL` on one of your `/go/` links shows a 302 and then the target's response, and you've seen a 307 keep a POST that a 302 turned into a GET.
 - `loadgen.py` at `-c 50` reports zero errors against both of your servers.
 - The bare ASGI app passes the same tests under uvicorn, and you can list what FastAPI added.
 
@@ -716,6 +800,8 @@ My numbers are from a MacBook that was also running a lot of other heavy jobs (l
 **3. Slow down a client.** Start the asyncio server, then open 200 connections that each send `GET /health HTTP/1.1\r\n` and then one header byte every few seconds, never finishing. (A loop of `nc` processes, or a small asyncio script.) Does your server still answer curl? It should, but each connection costs memory, and each stays open as long as it keeps trickling, because your timeout is per read, not per request. This is the <Term w="Slowloris">A 2009 attack that ties up a server by opening many connections and sending each request very slowly, so threads or connection slots stay busy forever.</Term> attack. Fix it with a deadline for the whole head, not just each read. Then try it on the threaded server: 200 slow clients is 200 parked threads. Which server would survive 20,000?
 
 **4. Return the wrong family.** Make your echo endpoint return 500 for invalid JSON instead of 400, and point your load generator's error counting at it. Then think about what your alerting would page on. Separately, make `/health` return 200 with `{"status": "error"}` in the body when something's wrong. A load balancer's health check only reads the status code, so it will keep sending traffic to a broken server. The status code is the API; the body is for humans.
+
+**5. Make a permanent mistake.** Change your t9 link to a `301` pointing at the wrong target, open it once in a browser with the network tab open ("Disable cache" unticked), then fix the target and restart the server. Open the link again. Most likely you land on the old, wrong target, the network tab says the 301 came from the cache, and your server's log shows no request for it at all. That's the browser doing exactly what "permanent" allowed. Clearing your own cache fixes it for you; nothing you change on the server fixes it for anyone else who already clicked. Repeat with a `302`: every visit shows up in the log, and a fix takes effect immediately. (If your browser didn't keep the 301, add `Cache-Control: max-age=3600` to make the permission explicit, and try again.)
 
 ## Explain It Back
 
@@ -763,12 +849,20 @@ Same: methods, status codes, headers, what a request means. HTTP/2 changes the p
 
 </details>
 
+<details>
+<summary>7. What's the difference between a 301 and a 302, and between a redirect and a rewrite? Which would you use for a URL shortener?</summary>
+
+Both are redirects: the server answers with a 3xx and a `Location` header, and the client makes a second request to that address itself. A 301 (or 308) says the move is permanent, and caches may store it even without caching headers, so later visits can skip your server entirely; that's hard to undo. A 302 (or 307) is temporary and isn't stored unless you allow it, so every visit comes back to you. 307 and 308 also guarantee the method and body are kept, where 301 and 302 let a client turn POST into GET. A rewrite is different: it happens inside the server or proxy, which changes the path before routing and answers the original request directly; the client sees one request and never knows. For a shortener: a redirect, because the target is another site. 302 or 307 if you need to count every click and change targets; or a 301 with a short `Cache-Control` max-age, which is what bit.ly, TinyURL and t.co send. Either way the redirect endpoint is on every click's path, so it has to be fast: one key lookup, ideally from a cache.
+
+</details>
+
 ## Go Deeper
 
 - **RFC 9112, "HTTP/1.1"** (Fielding, Nottingham, Reschke, 2022; rfc-editor.org/rfc/rfc9112). The current definition of the wire format you just implemented: message syntax, Content-Length vs Transfer-Encoding, persistent connections. Short for an RFC, and section 6 on message bodies is the one to read twice.
-- **RFC 9110, "HTTP Semantics"** (same authors, 2022). What methods, status codes and headers *mean*, for every HTTP version. The authoritative source for safe, idempotent, and every status code in the table.
+- **RFC 9110, "HTTP Semantics"** (same authors, 2022). What methods, status codes and headers *mean*, for every HTTP version. The authoritative source for safe, idempotent, and every status code in the table; section 15.4 is the redirects.
 - **Tim Berners-Lee, "The Original HTTP as defined in 1991"** (w3.org/Protocols/HTTP/AsImplemented.html). One page. The entire protocol fits on it, which is the point.
 - **MDN Web Docs, "HTTP"** (developer.mozilla.org/en-US/docs/Web/HTTP). The best practical reference, with clear pages on CORS, caching, conditional requests and every header. Read the CORS guide before your next frontend integration.
+- **MDN Web Docs, "Redirections in HTTP"**. Every 3xx code in one table (permanent or temporary, method kept or not), plus the other ways a page can redirect (an HTML meta refresh, JavaScript) and why the HTTP kind is the one to use.
 - **Ilya Grigorik, "High Performance Browser Networking"** (O'Reilly, 2013; free at hpbn.co). The chapters on HTTP/1.1, HTTP/2 and TCP explain where the round trips go and why multiplexing was needed. Some details predate HTTP/3, but the reasoning is timeless.
 - **The ASGI specification** (asgi.readthedocs.io). Short. The HTTP connection scope page lists every key in `scope` and every message type for `receive` and `send`; you can now read it as a description of what uvicorn did for you.
 - **Daniel Stenberg, "HTTP/3 explained"** (free online book, http3-explained.haxx.se). By curl's author. The clearest explanation of QUIC and why HTTP left TCP.
@@ -779,4 +873,5 @@ Same: methods, status codes, headers, what a request means. HTTP/2 changes the p
 - Builds on [Processes, threads and the GIL](/lessons/processes-threads-gil/) (thread per connection) and [Waiting vs working](/lessons/waiting-vs-working/) (asyncio streams, the event loop, your load generator). The TCP pieces come from [TCP vs UDP](/lessons/tcp-vs-udp/), and the full trip from typing a URL to rendering a page is [What happens when you type a URL](/lessons/what-happens-url/).
 - [How does HTTPS keep secrets?](/lessons/tls/) wraps everything here in encryption: the same bytes, sent through TLS instead of straight into the socket.
 - Next, [Polling, SSE and WebSockets](/lessons/streaming/) builds on chunked encoding and the ASGI `send` loop to stream LLM tokens three ways.
+- [Build a URL shortener](/lessons/url-shortener/) is a redirect with a database behind it: the 301-or-302 choice above is its first design decision, and [Short IDs and collisions](/lessons/short-ids/) is where the short part of the address comes from.
 - [Load balancing](/lessons/load-balancing/) and [Rate limits](/lessons/rate-limits/) are about proxies and status codes (502, 503, 429) you can now read at the byte level.

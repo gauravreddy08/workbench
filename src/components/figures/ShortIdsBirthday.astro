@@ -1,0 +1,151 @@
+---
+// Birthday-paradox explorer for random base62 short codes.
+// Two curves over the number of links stored (log scale):
+//   P(any two links share a code, if nobody checked) = 1 - exp(-n(n-1) / 2N)
+//   P(the next new code hits one already taken)      = n / N
+// N = 62^L. The gap between the curves is the lesson: "some collision somewhere"
+// arrives early, "my insert collides" stays rare until the table is nearly full.
+---
+<div class="sib" data-fig="short-ids-birthday">
+  <svg viewBox="0 0 640 250" role="img" aria-label="Two curves: chance of any collision among stored links, and chance a new code collides, against number of links stored"></svg>
+  <div class="ctl">
+    <label>Code length <input type="range" min="2" max="10" step="1" value="7" data-k="len" /> <output data-o="len">7</output></label>
+    <label>Links stored <input type="range" min="0" max="13" step="0.1" value="8" data-k="n" /> <output data-o="n">100M</output></label>
+  </div>
+  <p class="sib-read">
+    Possible codes 62<sup data-r="exp">7</sup> = <span class="readout" data-r="space">-</span> ·
+    50% chance of some collision after <span class="readout" data-r="half">-</span> links
+  </p>
+  <p class="sib-read">
+    If you never checked: chance two links share a code <span class="readout" data-r="any">-</span>,
+    expected clashing pairs <span class="readout" data-r="pairs">-</span>
+  </p>
+  <p class="sib-read">
+    With a check: chance the next new code is taken <span class="readout" data-r="next">-</span>,
+    average tries per insert <span class="readout" data-r="tries">-</span>,
+    random guesses per real link found <span class="readout" data-r="guess">-</span>
+  </p>
+</div>
+
+<style>
+  .sib-read { font-family: var(--mono); font-size: 12px; color: var(--ink-2); margin: 10px 0 0; line-height: 1.6; }
+  .sib-read sup { font-size: 9px; }
+</style>
+
+<script>
+  const NS = 'http://www.w3.org/2000/svg';
+  const X0 = 52, X1 = 620, Y0 = 200, Y1 = 20; // plot box
+  const NMAX = 14;                             // x axis: 10^0 .. 10^14 links
+
+  function el(tag: string, attrs: Record<string, string | number>, text?: string) {
+    const e = document.createElementNS(NS, tag);
+    for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, String(v));
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  const WORDS: [number, string][] = [[1e15, ' quadrillion'], [1e12, ' trillion'], [1e9, ' billion'], [1e6, ' million']];
+  function fmtBig(n: number): string {
+    if (n >= 1e18) return n.toExponential(1).replace('e+', ' × 10^');
+    for (const [v, w] of WORDS) if (n >= v) return (n / v).toFixed(n / v >= 100 ? 0 : 1).replace(/\.0$/, '') + w;
+    return Math.round(n).toLocaleString('en-US');
+  }
+  function fmtShort(n: number): string {
+    if (n >= 1e12) return (n / 1e12).toFixed(1).replace(/\.0$/, '') + 'T';
+    if (n >= 1e9) return (n / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+    if (n >= 1e6) return (n / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1).replace(/\.0$/, '') + 'k';
+    return String(Math.round(n));
+  }
+  function fmtP(p: number): string {
+    if (p >= 0.9999) return '≈ 100%';
+    if (p >= 0.01) return (p * 100).toFixed(1).replace(/\.0$/, '') + '%';
+    if (p <= 0) return '0';
+    return '1 in ' + fmtBig(1 / p);
+  }
+  const pAny = (n: number, N: number) => -Math.expm1(-(n * (n - 1)) / (2 * N));
+  const xOf = (lg: number) => X0 + (X1 - X0) * (lg / NMAX);
+  const yOf = (p: number) => Y0 - (Y0 - Y1) * p;
+
+  document.querySelectorAll<HTMLElement>('[data-fig="short-ids-birthday"]').forEach((root) => {
+    const svg = root.querySelector('svg')!;
+    const s = { len: 7, n: 8 };
+    const r = (k: string) => root.querySelector<HTMLElement>(`[data-r="${k}"]`)!;
+
+    function draw() {
+      const N = Math.pow(62, s.len);
+      const n = Math.round(Math.pow(10, s.n));
+      svg.replaceChildren();
+
+      // axes and grid
+      for (let lg = 0; lg <= NMAX; lg += 2) {
+        const x = xOf(lg);
+        svg.append(el('line', { x1: x, y1: Y1, x2: x, y2: Y0, style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+        svg.append(el('text', { x, y: Y0 + 16, 'text-anchor': 'middle' }, lg === 0 ? '1' : '10^' + lg));
+      }
+      for (const p of [0, 0.5, 1]) {
+        svg.append(el('line', { x1: X0, y1: yOf(p), x2: X1, y2: yOf(p), style: 'stroke:var(--rule)', 'stroke-width': 1 }));
+        svg.append(el('text', { x: X0 - 6, y: yOf(p) + 4, 'text-anchor': 'end' }, `${p * 100}%`));
+      }
+      svg.append(el('text', { x: X1, y: Y0 + 34, 'text-anchor': 'end' }, 'LINKS STORED (LOG SCALE)'));
+
+      // the code space itself
+      const lgN = Math.log10(N);
+      if (lgN <= NMAX) {
+        const x = xOf(lgN);
+        svg.append(el('line', { x1: x, y1: Y1, x2: x, y2: Y0, class: 'ink dash', 'stroke-width': 1 }));
+        svg.append(el('text', { x: x - 4, y: Y1 + 12, 'text-anchor': 'end' }, 'ALL CODES USED'));
+      }
+
+      // curves
+      let dAny = '', dNext = '';
+      for (let i = 0; i <= 280; i++) {
+        const lg = (NMAX * i) / 280;
+        const m = Math.pow(10, lg);
+        const pa = pAny(m, N);
+        const pn = Math.min(1, m / N);
+        dAny += (i ? 'L' : 'M') + xOf(lg).toFixed(1) + ',' + yOf(pa).toFixed(1);
+        dNext += (i ? 'L' : 'M') + xOf(lg).toFixed(1) + ',' + yOf(pn).toFixed(1);
+      }
+      svg.append(el('path', { d: dAny, class: 'blue', fill: 'none', 'stroke-width': 2 }));
+      svg.append(el('path', { d: dNext, class: 'ink', fill: 'none', 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }));
+
+      // 50% point of the blue curve
+      const half = Math.sqrt(2 * Math.LN2 * N);
+      const lgHalf = Math.log10(half);
+      if (lgHalf <= NMAX) {
+        svg.append(el('circle', { cx: xOf(lgHalf), cy: yOf(0.5), r: 4, class: 'fill-blue' }));
+      }
+
+      // legend
+      svg.append(el('line', { x1: X0 + 8, y1: Y1 + 10, x2: X0 + 30, y2: Y1 + 10, class: 'blue', 'stroke-width': 2 }));
+      svg.append(el('text', { x: X0 + 36, y: Y1 + 14, class: 'blue-t' }, 'SOME TWO LINKS SHARE A CODE'));
+      svg.append(el('line', { x1: X0 + 8, y1: Y1 + 28, x2: X0 + 30, y2: Y1 + 28, class: 'ink', 'stroke-width': 1.5, 'stroke-dasharray': '5 4' }));
+      svg.append(el('text', { x: X0 + 36, y: Y1 + 32 }, 'NEXT NEW CODE IS TAKEN'));
+
+      // current n
+      const xn = xOf(s.n);
+      svg.append(el('line', { x1: xn, y1: Y1, x2: xn, y2: Y0, class: 'blue', 'stroke-width': 1 }));
+      svg.append(el('circle', { cx: xn, cy: yOf(pAny(n, N)), r: 3.5, class: 'fill-wash', 'stroke-width': 1.5 }));
+      svg.append(el('circle', { cx: xn, cy: yOf(Math.min(1, n / N)), r: 3.5, class: 'fill-paper', 'stroke-width': 1.5, style: 'stroke:var(--ink)' }));
+
+      // readouts
+      const full = n >= N;
+      root.querySelector<HTMLElement>('[data-o="len"]')!.textContent = String(s.len);
+      root.querySelector<HTMLElement>('[data-o="n"]')!.textContent = fmtShort(n);
+      r('exp').textContent = String(s.len);
+      r('space').textContent = fmtBig(N);
+      r('half').textContent = fmtBig(half);
+      r('any').textContent = fmtP(pAny(n, N));
+      const pairs = (n * (n - 1)) / (2 * N);
+      r('pairs').textContent = pairs === 0 ? '0' : pairs >= 10 ? fmtBig(pairs) : pairs >= 0.01 ? pairs.toFixed(2) : pairs.toExponential(1);
+      r('next').textContent = full ? 'every code is taken' : fmtP(n / N);
+      r('tries').textContent = full ? 'forever' : (1 / (1 - n / N)).toFixed(n / N > 0.5 ? 1 : 6).replace(/0+$/, '').replace(/\.$/, '');
+      r('guess').textContent = full ? '1' : fmtBig(N / n);
+    }
+
+    root.querySelectorAll<HTMLInputElement>('input[type=range]').forEach((inp) => {
+      inp.addEventListener('input', () => { (s as any)[inp.dataset.k!] = +inp.value; draw(); });
+    });
+    draw();
+  });
+</script>
