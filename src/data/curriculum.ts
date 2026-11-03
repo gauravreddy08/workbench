@@ -147,7 +147,7 @@ export const tracks: Track[] = [
         question: 'What is HTTP really, under the frameworks?',
         why: 'FastAPI and friends are thin layers over a text protocol. Knowing it makes every API bug readable.',
         build: 'Write an HTTP/1.1 server on raw sockets that serves JSON, handles keep-alive, and survives curl.',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/http-from-scratch-0abe676c.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/http-from-scratch-a47e81d1.mp3',
       },
       {
         slug: 'streaming',
@@ -163,7 +163,7 @@ export const tracks: Track[] = [
         question: 'What actually happens when I SSH into my home server over Tailscale?',
         why: 'You already use it. Knowing keys, NAT, and WireGuard turns magic into something you can fix.',
         build: 'Harden your SSH server (keys only, config, fail2ban), then map how Tailscale punches through your router.',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ssh-and-tailscale-c56975b3.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/ssh-and-tailscale-2aeb27b4.mp3',
       },
       {
         slug: 'api-lifecycle',
@@ -205,6 +205,7 @@ export const tracks: Track[] = [
         why: 'Every short link, order number and invite code needs one. The birthday paradox catches everyone once.',
         build: 'Write base62 by hand, measure when random codes first collide, then hand out IDs from many servers without a clash.',
         source: 'interview',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/short-ids-f17894c6.mp3',
       },
       {
         slug: 'transactions',
@@ -262,7 +263,7 @@ export const tracks: Track[] = [
         why: 'The question that stumps you in interviews. It is arithmetic with the latency numbers, nothing more.',
         build: 'Estimate the hardware needed to serve your ranker at 1k, 100k, 10M queries a day; check one estimate for real.',
         source: 'interview',
-        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/back-of-envelope-dfcf7497.mp3',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/back-of-envelope-05b470bd.mp3',
       },
       {
         slug: 'tail-latency',
@@ -328,6 +329,7 @@ export const tracks: Track[] = [
         why: 'The most common "design and build" interview. Every earlier lesson in this track shows up in it once.',
         build: 'Spec it, have an agent build it on SQLite, put it on a public URL with a tunnel, explain it without looking, then plan it for a billion clicks.',
         source: 'interview',
+        audio: 'https://pub-cd4051287e094b4f8353bfe5c8e4bf3d.r2.dev/c1f861527fdd65a7c596d49669520d02/episodes/url-shortener-6e2b1001.mp3',
       },
     ],
   },
