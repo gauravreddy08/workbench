@@ -43,7 +43,15 @@ whose router is built to keep it out, without him opening anything.
    network card so sshd needed no changes. Tailscale: phone book (control server with public keys
    only) plus the hole punch (both call out at once; the other's packet looks like a reply).
 8. When punching fails: relay servers forward still-encrypted packets; every connection starts on
-   the relay and upgrades. What Tailscale can and can't see. Encrypted twice, and why that's fine.
+   the relay and upgrades. What Tailscale can and can't see.
+9. Aside off the relay's dial-out trick, B wants the opposite (a webhook, showing a friend the URL
+   shortener): public tunnels. A program dials out to the provider's edge and holds the line;
+   visitors' requests ride back down it. Same idea as the SSH forward run backwards (ssh -R to a
+   rented server). Cloudflare quick tunnel on the Mac: no account, live in seconds, visitor logged
+   as localhost, dead on Ctrl-C. Funnel ends TLS on your machine; Cloudflare and ngrok can read it.
+   No new listening port. Public means public: check what owns the port; a shortener is a free
+   phishing tool, so auth and a rate limit on creating links, and stop the tunnel.
+10. Encrypted twice, and why that's fine.
 
 ## Numbers worth saying
 
@@ -53,4 +61,6 @@ whose router is built to keep it out, without him opening anything.
 
 Exact config files and settings table, drop-in ordering, ufw and fail2ban rules, CGNAT address
 ranges, STUN naming detail, hard NAT netcheck field, packet length arithmetic, SSH connect timings,
-MagicDNS, ACLs, Tailscale SSH, key expiry, all tasks and Break It steps.
+MagicDNS, ACLs, Tailscale SSH, key expiry, all tasks and Break It steps. For tunnels: the
+comparison table, GatewayPorts, QUIC port and lsof details, CF-Connecting-IP, named-tunnel setup,
+ngrok's inspector page, Funnel's allowed ports.

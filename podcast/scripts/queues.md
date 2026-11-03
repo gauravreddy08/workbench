@@ -44,6 +44,26 @@ B: Huh. So a queue is great for spikes and useless for being permanently short.
 
 A: That's it. A spike is fine. The line jumps up, then drains at whatever spare capacity you have. But notice what that means. If you're only barely over capacity, a big backlog takes ages to drain, even though you're technically keeping up. It's the headroom that clears backlogs, not just being over the line.
 
+<!-- section: Where it doesn't belong -->
+
+A: And moving the waiting only works if the person isn't the one waiting. Every example so far has that in common. Nobody's standing at the counter for the result. The user who saved the document got their "accepted" and moved on. That's the rule. A queue belongs where nobody's waiting on the answer right now.
+
+B: [skeptical] That sounds pretty obvious when you say it.
+
+A: It does, and it's still the most common way queues get misused in design interviews. Take a URL shortener. Someone clicks a short link, and their browser holds the connection open until you tell it where to go. Now say you put a queue in front of that. The request goes on the queue, a worker picks it up, does a lookup that takes about a millisecond, and then... what?
+
+B: [working it out] It has to get the answer back to the browser somehow. And a queue only goes one way.
+
+A: Right. So whatever took the request is still sitting there holding the connection, waiting for a reply to come back through some other channel. You've added a couple of trips through the broker, and a waiting room, to the busiest path you have. And think about the two things a queue's good at. A spike? It absorbs it by making work wait. For a summary, waiting a minute is invisible. For a redirect, it's a spinner, then a timeout, then the person clicks again, and the spike gets bigger.
+
+B: Like the import button.
+
+A: Just like the import button. And a deploy? The queue does keep the request safe while the worker restarts. But the person doesn't stay. By the time a new worker picks it up, the browser gave up long ago, and the work gets done for nobody. A queue isn't a load balancer. It doesn't check who's ready, it doesn't route around a slow copy, and it can't answer anyone. What gets live requests through a deploy is having servers ready to answer them, and that's a different machine entirely.
+
+B: So the shortener just doesn't get a queue.
+
+A: It gets one, just behind the redirect instead of in front of it. Answer first, then queue the side effect. The redirect comes straight from a cache or the database. The click it caused, which link, when, where from, goes on a queue for the analytics workers, and they count it whenever they get to it. If they're mid-deploy, the clicks pile up and get counted a minute late, and nobody waited. And even putting the click on the queue shouldn't be able to break the link. If the broker's down, drop the click, or hold it for later, and send the person on. A lost click count is a lot cheaper than a broken link.
+
 <!-- section: Handing over a job -->
 
 A: Okay, now the interesting part. A worker asks the broker for a job. The broker has a decision to make. Delete the job now? Or keep it until the worker says it's done?
@@ -117,6 +137,22 @@ A: In a job queue, each ticket goes to one worker, and it's thrown away once it'
 B: [working it out] Oh. So the summarizer and the search indexer each have their own bookmark on the same log.
 
 A: Right, and a slow reader doesn't slow anyone else down. And here's the superpower. Say you find a bug in the summarizer that's been running for two days. Fix it, move its bookmark back two days, and it redoes everything. With a job queue, those tickets were gone the moment they were acked.
+
+B: [thinking] Couldn't I get the two readers with the job queue, though? Just point the indexer at the same queue the summarizer reads from.
+
+A: You'd get about half each. To the queue, they're just two more workers competing for tickets, so each one goes to whoever asks first. The summarizer quietly skips half the documents, the indexer misses the other half, and nothing errors, so nothing tells you.
+
+B: Oh, that's nasty.
+
+A: And really common. There are two ways a message can travel. Shared out, where each one goes to a single worker, which is what you want for "summarize this document", because it should happen once. Or copied, where every reader gets its own. A job queue only shares out. Copying is called publish-subscribe, pub-sub for short, or fan-out. You publish once to a named topic, and every subscriber gets a copy. On AWS that's SNS, the notification service. And the pattern you'll see most there puts the two together. A topic in front, and behind it, one queue per service.
+
+B: Why the queue, though? Why not have the topic send straight to the services?
+
+A: Because a topic on its own is a bad place to wait. It hands the message to each subscriber and it's done with it. It'll retry a failing one for a while, but it isn't keeping a backlog for a service that's down for an hour. The queue is. So each service gets its own inbox, with its own retries and its own dead-letter queue, and the indexer being slow or mid-deploy costs the summarizer nothing. Adding a new service is one more queue on the topic, and the API never changes.
+
+B: [working it out] And Kafka's already doing both.
+
+A: Kafka's the log version of the same picture. Each service's set of readers is called a consumer group, and each group keeps its own bookmark, so every group gets everything. Inside a group, the readers share the work out. One topic with three groups does what a topic plus three queues does, with replay thrown in.
 
 B: So why not use a log for everything?
 

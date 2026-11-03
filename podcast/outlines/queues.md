@@ -31,6 +31,10 @@ queue gives you more capacity", then "just have the broker delete it when it han
    later, and a new system that can fail.
 3. A queue doesn't add capacity: one worker short and the line grows forever. Spikes drain at the
    spare capacity; headroom is what clears backlogs.
+3b. Where a queue doesn't belong (added): only where nobody is waiting on the answer. URL-shortener
+   redirect behind a queue: no way to answer back, spikes become spinners, a deploy keeps the
+   request but the person leaves. A queue is not a load balancer. Answer first, then enqueue the
+   click; a broker outage must not break the link. (The deploy wrong model lives in load-balancing.)
 4. Handing over a job: delete on handover loses it; a dead process doesn't announce it's dead; the
    lease. A lease shorter than the job runs it twice with nothing crashed.
 5. The three promises. Why exactly-once delivery can't exist: silence after the save looks like
@@ -41,6 +45,9 @@ queue gives you more capacity", then "just have the broker delete it when it han
 7. Origin and the other machine: LinkedIn's pipelines between every pair, Kafka, Kreps's essay on
    the log. A log keeps everything and readers keep a bookmark; replay. Lanes, order only inside a
    lane, one slow record blocks its lane. Task versus event.
+   Pub/sub (added, after the bookmarks): B points a second service at the same queue and each gets
+   about half. Shared out versus copied; topic, fan-out, SNS; SNS in front with one SQS queue per
+   service, because a topic is a bad place to wait; Kafka consumer groups as the log version.
 8. Batch inference as a queue: chunks, keyed results, so the "which ones finished" problem
    disappears. When I killed workers constantly, nothing was lost; the non-idempotent table had
    duplicates; with a tiny gap you might see none, which is the dangerous case.
@@ -60,5 +67,5 @@ capacity. Watch the age of the oldest job.
 
 Little's Law arithmetic and worked sizes, the simulator steps, SQS and Celery specifics and
 defaults, the Redis key layout and Lua claim script, all code, Kafka offsets and commit settings,
-consumer groups in detail, share groups, the outbox and CDC (only touched), the tools table,
+consumer group mechanics, share groups, EventBridge and Google Pub/Sub, Redis PUBLISH, the outbox and CDC (only touched), the tools table,
 measured tables and knee analysis, Break It details, the overnight re-score sizing.

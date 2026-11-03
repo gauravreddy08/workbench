@@ -92,9 +92,29 @@ B: And the gateway ones? I've stared at a lot of those.
 
 A: Those are fun, because they don't come from your app. They come from whatever's sitting in front of it, the load balancer, nginx, Cloudflare. A bad gateway usually means your app crashed or hung up early or sent something that wasn't proper HTTP. A gateway timeout means your app was too slow for the proxy. And neither one shows up in your app's logs, because from your app's point of view, either nothing happened or it was still working.
 
+B: And the three hundreds? I never really think about those.
+
+A: Mostly you don't have to, because the browser handles them for you. A three-something is a redirect. It means, what you want is over there. And the reply has almost nothing in it. No page. A status line, and one header, Location, with the other address. The server doesn't go and fetch it for you. It just hands back an address. The browser reads it and makes a second request, completely on its own, maybe to a totally different machine. You clicked once, and the wire carried two whole exchanges.
+
+B: So that's basically all a link shortener is.
+
+A: That's the whole product. Look up the short code, answer with a redirect. And the interesting decision is which one. There's a permanent kind, three-oh-one, and a temporary kind, three-oh-two. And permanent has teeth, because a browser is allowed to remember a permanent redirect even if you never said anything about caching. So the next time someone clicks that link, the browser goes straight to the target. Your server never hears about it.
+
+B: [working it out] Which, for a shortener, means you lose the click.
+
+A: You lose the click count. And it's worse than that. Say someone pasted the wrong target, and you fix it. Everyone who already clicked keeps going to the old one, because it's sitting in their browser, and how long it stays there is the browser's call, not yours. You can't reach into a stranger's browser and clear it. So a wrong permanent redirect is really hard to take back. The temporary one brings every click back through you. You count it, look the target up fresh, send them on.
+
+B: So shorteners use the temporary one.
+
+A: [amused] You'd think. When I checked the big ones, bitly, TinyURL, t dot co, they all answered with the permanent one. But each with a caching header that says, don't remember this for more than a few minutes, or don't remember it at all. So the code says what it means, this short address will always mean that long one. And the caching header says how long anyone's allowed to remember it. Two different jobs.
+
+B: And that's not the same as the server just quietly serving the other page instead?
+
+A: No, that's the opposite, and people mix them up. That's a rewrite. The server takes the old path, handles it internally as the new one, and answers the original request. One request, one answer, and the address bar never changes. But a rewrite can only reach things that server can serve. A shortener's targets are other people's sites, so it has to be a redirect. Only the browser can go there.
+
 <!-- section: Reusing the pipe -->
 
-A: Okay, so, opening a connection isn't free. Before any HTTP happens, the two machines do a little greeting, and that costs a round trip. And with HTTPS, there's the encryption handshake on top. The very first version opened a fresh connection for every request. So a page with a pile of images paid a pile of greetings.
+A: Okay, so, that second request after a redirect might need a brand new connection. And opening a connection isn't free. Before any HTTP happens, the two machines do a little greeting, and that costs a round trip. And with HTTPS, there's the encryption handshake on top. The very first version opened a fresh connection for every request. So a page with a pile of images paid a pile of greetings.
 
 B: So you keep it open.
 

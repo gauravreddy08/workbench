@@ -40,6 +40,11 @@ in the right power of ten.
    keeping them in memory forever is the cost; crawling them is a concurrency problem, not
    bandwidth. Chat on Llama: the same workload hits memory size first on an H100 and memory speed
    first on the Spark. Which wall depends on the machine.
+   Then the URL shortener: the first question is the read-to-write ratio (say a hundred to one).
+   Writes are nothing; the read path is the design: CDN edge cache, in-memory cache, read replicas
+   (each term explained). Catch: clicks the edge answers never reach you. Twist: the click log is
+   pure writes, about twenty times the links table after a year, so batching, appending, an
+   LSM-tree. Same product, two opposite ratios, two designs.
 7. At ten times you add machines; at a hundred times you change the design (cheaper first stage,
    cache, distill). Then say what breaks next. That's the senior-sounding part.
 8. Estimates are hypotheses: load-test one machine, keep a journal of guess versus measured. The
@@ -48,17 +53,18 @@ in the right power of ten.
 9. Ending: B restates; A sharpens that the answer is the bottleneck plus what you'd change, and the
    check.
 
-## Numbers worth saying (five)
+## Numbers worth saying (six)
 
 - About ninety seconds for a strong answer.
 - A day is about a hundred thousand seconds.
 - Fermi off by about a factor of two.
 - "About five H100s, call it eight" for the ranker (one landmark result).
 - Ten times and a hundred times as the two horizons.
+- A hundred reads per write for the shortener, and the click log about twenty times the links.
 
 ## Left to the written lesson
 
 The five-step figure, all tables (conversions, capacity per machine, vector formats), the full FLOP
 arithmetic, two-N rule details, attention cost, MFU percentages, headroom percentages, KV cache
 formula and per-user sizes, the Spark-versus-H100 user counts, the CPU-box predict, the calculator
-figure, all Build It code and tasks, the Measure table, the five-mistakes exercise, Go Deeper.
+figure, the shortener's exact rates, row sizes, storage and code-space arithmetic, all Build It code and tasks, the Measure table, the five-mistakes exercise, Go Deeper.

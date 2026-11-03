@@ -102,7 +102,27 @@ A: That's the one. Little's law. It shows up everywhere in these estimates. And 
 
 B: [a bit surprised] So the same workload has a different bottleneck depending on the box.
 
-A: Which is exactly why "it depends" is a real answer, as long as you can say what it depends on.
+A: Which is exactly why "it depends" is a real answer, as long as you can say what it depends on. And sometimes what it depends on is a question you ask before you multiply anything. Take the classic one. "Design a URL shortener."
+
+B: [laughs] The one everybody gets. Paste in a long link, get a short one back.
+
+A: That one. And people jump straight to boxes and arrows. The first question is, how many times is each link read for every time one is made? Making a link is a write. Every click is a read. A link gets made once, and if anyone shares it at all, it gets clicked over and over. Say a hundred reads for every write. That's the read-to-write ratio, and it decides the shape of everything else.
+
+B: [working it out] So the writes barely matter.
+
+A: They're nothing. With some honest guesses you get a few dozen new links a second, which any database shrugs off, and thousands of clicks a second. And years of links come to a few terabytes. One big disk, but not one machine's memory.
+
+B: Can one database even do thousands of lookups a second?
+
+A: One well-tuned one, answering from memory, just about. But with no headroom, and all of it on one machine. So the whole design is about the read path. And clicks are probably lopsided, same as search queries. A few links get most of the traffic. So you put copies of the hot ones in front of the database. Closest to the user, a CDN. That's a company's servers in cities all over the world, keeping copies of your responses near people, so most clicks get answered right there at the edge. Behind that, an in-memory cache next to your app. Even the most popular sliver of all the links fits in one cache box's memory. And behind that, read replicas, which are copies of the database that follow every change and answer reads, for whatever's left.
+
+B: Wait, but if the edge answers the click, my server never sees it.
+
+A: [amused] Never sees it, so it can't count it. The CDN's own logs can. And that's where it turns around. Say they want analytics, every click recorded. That's one brand new event per click. So hanging off this very read-heavy thing is a log that's pure writes, at a hundred times the rate links get made. After a year, the click log is something like twenty times bigger than the table of links.
+
+B: And I guess you can't cache your way out of that.
+
+A: You can't, because every event is new. Write-heavy is a different toolbox. You batch the writes, you append instead of updating things in place, and you use storage built for that, which turns lots of small scattered writes into a few big ones in a row. That's called an LSM-tree. Same product, two opposite ratios, two designs. Saying that out loud is what turns "design a URL shortener" from boxes into an answer.
 
 <!-- section: Ten times, a hundred times -->
 

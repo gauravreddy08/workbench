@@ -8,7 +8,8 @@ under the frameworks?
 HTTP is a few lines of plain text written into a pipe that has no idea where messages begin or end.
 So almost everything in HTTP, and most HTTP bugs, comes down to one question: where does this
 thing end? The blank line ends the headers; the length (or size-labelled pieces) ends the body.
-Keep-alive, framework layering and the newer versions all follow from that.
+Keep-alive, framework layering and the newer versions all follow from that. Redirects are a short
+aside off the status-code beat.
 
 ## Opening scene
 
@@ -35,6 +36,13 @@ shipped a dozen FastAPI services; the honest answer in the moment is "I'd pip in
    ends it. That's what streaming tokens ride on.
 6. Status families: first digit says whose problem it is; client errors aren't worth retrying,
    server errors might be. Gateway errors come from the proxy, not your app's logs.
+   Aside, B asks about the three hundreds: a redirect is an address in a Location header, and the
+   browser makes a second request itself. That's a link shortener's whole product. Permanent
+   (three-oh-one) may be remembered by the browser, so clicks stop reaching you and a wrong target
+   can't be fixed; temporary (three-oh-two) brings every click back. The big shorteners send the
+   permanent one with a short caching header: the code says what it means, the header how long to
+   remember it. A rewrite is the opposite: one request, handled internally, can't leave the server.
+   Bridges into keep-alive: the second request may need a new connection.
 7. Keep-alive: reuse the pipe; your server must loop and keep leftover bytes. Silent client freezes
    a one-at-a-time server; threads or asyncio fix it. Break: ran out of ports from fresh connections.
 8. What a framework adds: uvicorn owns the socket and the text; ASGI is the narrow handoff; FastAPI
@@ -49,5 +57,6 @@ shipped a dozen FastAPI services; the honest answer in the moment is "I'd pip in
 ## Left to the written lesson
 
 The full status code table, method safety table, header details (Cache-Control, ETag, CORS),
-hex chunk sizes, the server's behaviour spec, every task and command, all benchmark numbers, the
+hex chunk sizes, three-oh-seven and three-oh-eight and the POST-to-GET history, the curl
+redirect experiments and the cached three-oh-one Break It, the server's behaviour spec, every task and command, all benchmark numbers, the
 ab/HTTP one point oh keep-alive surprise, Slowloris, HPACK and QUIC details, WSGI.

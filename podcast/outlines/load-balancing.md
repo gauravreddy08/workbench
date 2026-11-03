@@ -48,19 +48,29 @@ each user to one server." Second wrong model: "round robin is fair, everyone get
    This is a sticky session and it's fine, because the KV cache is a cache. Stickiness for speed
    good, for correctness a trap.
 9. Briefly, leaving gracefully: draining, finish in-flight work before exiting; LLM POSTs can't be
-   safely retried by the balancer. And single points of failure: one balancer, one Redis.
+   safely retried by the balancer.
+9b. Deploying without a gap (added): a rolling deploy is draining done to every server in turn;
+   start new, wait for ready, shift, then drain and stop old. Stop-first leaves you a server short:
+   the busy-fleet run was clean and still slow. Blue-green and canary in a breath each. B voices
+   Gaurav's real model: jobs waited in SQS while his worker restarted, so put SQS or Kafka in front
+   of requests. A: right for jobs (lease), wrong for live requests (nobody can answer, a queue is
+   not a load balancer). Requests need ready servers; jobs can wait in a queue. URL shortener uses
+   both.
+9c. Single points of failure: one balancer, one Redis.
 10. Ending: B restates; A sharpens the speed-versus-correctness line.
 
-## Numbers worth saying (three)
+## Numbers worth saying
 
 - Three copies.
 - Adding a fourth server with simple hashing moves about three quarters of users.
 - Typical short request: most of a second to almost nothing (relationship, not values).
+- Rolling deploy at about three quarters busy: well under a tenth of a second to about two
+  seconds, zero errors. One percent for a canary.
 
 ## Left to the written lesson
 
 L4 versus L7 details and gRPC, OSI layers, nginx config and directives, the simulator, the hash ring
 figure, the balls-in-bins math, health check intervals and liveness versus readiness detail,
-SIGTERM grace periods and preStop, idempotency and status codes in detail, all Build tasks and code,
+SIGTERM grace periods and preStop, max surge and max unavailable by name, the nginx fail_timeout benching during fast rolls, idempotency and status codes in detail, all Build tasks and code,
 the Measure tables, Break It specifics (ip hash, JSON blob race, drain too fast), Explain It Back
 scaling numbers, Go Deeper.

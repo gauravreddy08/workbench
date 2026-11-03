@@ -126,9 +126,25 @@ B: And the relay can read it?
 
 A: The relay can see which keys talk to which, when, and how much. It can't see inside. The cost is a detour, and less speed. And here's a detail I love. Tailscale actually starts every new connection through a relay, because it works instantly, and tries the hole punch in the background. When a direct path answers, it quietly switches. So if you ping the server, the first reply often says it came via the relay, and a few pings later it says direct.
 
+B: [thinking] That dialing-out thing is kind of the whole trick, isn't it. Could I use it the other way round? Like, GitHub needs to send a webhook to something running on my laptop. Or I want to show a friend my URL shortener before it's deployed anywhere.
+
+A: That's exactly how the public tunnel services work. Cloudflare Tunnel, ngrok. The router only stops connections that start outside, so you start it from inside. A little program on your laptop dials out to the provider's machines that face the internet, what they call the edge, and just keeps that connection open. They give you a public hostname. When a visitor asks for it, the edge takes the visitor's connection and sends the request back down the line your laptop already opened. The program hands it to your local server, and the reply goes back up the same way. Your router only ever sees an outgoing connection, which it was always happy to allow.
+
+B: So it's the Jupyter forward, but backwards.
+
+A: It really is. SSH can forward the other way too. You ask a server you rent, one with a public address, to listen on a port and carry whatever connects there back down your SSH connection to your laptop. The tunnel services are that idea, packaged. They run the public end, hand out the names, put certificates on them. When I ran Cloudflare's quick one on my Mac, no account, no config file, the address answered from the internet within seconds. And my local server logged every visitor as coming from the laptop itself, because from its side, the visitor is that little program. Stop the program, and the address is dead. Tailscale's version is called Funnel, and there the encryption ends on your machine, so Tailscale carries bytes it can't read. Cloudflare and ngrok unwrap it at their edge.
+
+B: [skeptical] But something on my laptop has to be listening for strangers now. Something a scanner could find.
+
+A: Nothing new. I checked. The only thing it held open toward the internet was its outgoing connection to Cloudflare. The door is on their side, and the only way through it is the hostname. Which is also the catch. Public really means public. Anyone who has that address, or guesses it, or finds it in a log, gets whatever is on that port. No Tailscale identity in the way, no firewall. So first make sure the port is the thing you think it is, because sometimes it's another project's dev server, or a notebook with no password. And then think about what the app lets a stranger do. A URL shortener on a public address is a free redirect service for anybody, and phishers love fresh short links, because the link a spam filter sees isn't where it sends you.
+
+B: So, a login to make links, a limit on how fast anyone can make them, and switch it off when I'm done.
+
+A: That's it. It's a door you open on purpose, for a little while. Everything else in this setup is about keeping doors shut.
+
 <!-- section: Encrypted twice -->
 
-B: Wait, so my SSH session is encrypted twice now. Once by SSH, once by WireGuard. Isn't that wasteful?
+B: Okay, back to my SSH session, though. It's encrypted twice now. Once by SSH, once by WireGuard. Isn't that wasteful?
 
 A: It costs a little bit of CPU you won't notice. And each layer is protecting something different. WireGuard protects the packet between two devices, and hides even that it's SSH. If you watch the wire on the home server, inside the tunnel you see an ordinary connection to port twenty-two. On the physical cable at the same moment, there's no port twenty-two at all. Just small UDP packets between two addresses. Same packets, different disguise.
 

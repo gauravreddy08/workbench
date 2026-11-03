@@ -112,13 +112,31 @@ A: It is a sticky session, and it's fine. Here's why. The KV cache is a cache. I
 
 <!-- section: Leaving gracefully -->
 
-A: Two last things, quickly, because they bite people. When you take a server out, for a deploy or to scale down, you do it gently. Stop sending it new requests, let it finish what it's already working on, then shut it down. That's called draining. And for LLM streaming, "finish what it's working on" can mean minutes, so the grace period has to be longer than your longest request.
+A: A few last things, because they bite people. When you take a server out, for a deploy or to scale down, you do it gently. Stop sending it new requests, let it finish what it's already working on, then shut it down. That's called draining. And for LLM streaming, "finish what it's working on" can mean minutes, so the grace period has to be longer than your longest request.
 
 B: And if you don't?
 
 A: Then the requests in flight just die. And here's a detail I like. When a server dies mid-request, the balancer will happily retry a read somewhere else. But it won't retry a POST, because doing a POST twice might mean two orders. And every LLM API call is a POST. So those just fail.
 
 B: Huh. Okay.
+
+A: Now do that to every server, one after another, with the new version starting up in each one's place. That's a deploy. The usual shape is called a rolling deploy, and the whole trick is the order. You start a new copy first, alongside the old ones. You wait until it's ready, and ready means it can actually answer, not just that the process started. An LLM server that's still loading its weights is up, and useless. Then the balancer starts sending it requests, and only then do you drain one old copy and stop it. Then the next one.
+
+B: And if you do it the other way round? Stop the old one, then start the new one?
+
+A: Then for every step you're one server short. Which is fine if you've got room to spare. I tried it with three copies that were already about three quarters busy, and only let two take requests at a time. Nothing crashed. Every request was drained properly. And the typical request went from well under a tenth of a second to about two seconds.
+
+B: [surprised] And no errors?
+
+A: Zero errors. Two servers were being asked for more than two servers can do, so the line just grew for as long as each step lasted. The deploy was clean, and users still had a bad minute. So whatever you take out during a deploy, what's left has to carry your peak. If it can't, start an extra copy first, or deploy when it's quiet. There are two other shapes worth knowing by name, and both spend servers to buy safety. Blue-green is a whole second fleet running the new version. You check it while it takes no real traffic, then flip the balancer over in one go. If it's bad, you flip back, and since the old fleet is still running and warm, that takes seconds. The cost is twice the servers while you deploy. And a canary sends a small slice of traffic, say one percent, to the new version, and you compare its errors and latency with the old one. Holds up, you widen it. Doesn't, you pull it, and one percent of users noticed.
+
+B: [thinking out loud] Okay, this is where my picture's been different. I've watched my worker container restart during a deploy, and the jobs just sat in SQS, and then drained once it came back. Nothing lost. So I'd sort of generalized that. If a container going down is the problem, put SQS or Kafka in front of the requests too, and they wait until it's back.
+
+A: Half of that's right. Jobs really do survive a deploy that way. A job sits in the queue, it's only lent to a worker with a deadline, and if the worker restarts halfway, the deadline passes and another worker picks it up. But a live request has someone on the other end, waiting. A queue can't answer them. It just holds the request until some worker's free. So during a deploy or a spike, the person sees a spinner, then a timeout, and the work gets done after they've left. And a queue isn't a load balancer. It doesn't check who's ready, it doesn't route around anyone.
+
+B: [working it out] So in the rolling deploy, nothing was being stored at all.
+
+A: Nothing stored, nothing replayed. The balancer only sends new requests to copies that are ready, and an old copy finishes what it started before it exits. There's just always someone ready to answer. Requests need ready servers. Jobs can wait in a queue. A URL shortener's a nice example of both. The balancer sits in front, for the redirects, and a queue sits behind them, for counting the clicks.
 
 A: And the last one. Point at every box in your diagram and ask, if this one dies, does everything stop? You put three app servers in so one could die. And then there's one balancer in front, and one Redis behind. Each of those is a single point of failure. The goal isn't to have zero of them. It's knowing where they are.
 
